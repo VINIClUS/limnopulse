@@ -1,8 +1,8 @@
-from datetime import datetime
+from datetime import UTC, datetime
 
 import pytest
 
-from limnopulse_api.adapters.dynamodb import DynamoKeyBuilder
+from limnopulse_api.adapters.dynamodb import DynamoDomainRepository, DynamoKeyBuilder
 from limnopulse_api.domain.entities import Tenant
 
 
@@ -29,3 +29,36 @@ def test_tenant_settings_cannot_be_mutated_in_place() -> None:
 
     with pytest.raises(TypeError):
         tenant.settings["timezone"] = "America/Sao_Paulo"
+
+
+class RecordingDynamoClient:
+    def __init__(self) -> None:
+        self.transact_write_items_calls: list[dict] = []
+        self.scan_calls = 0
+
+    def transact_write_items(self, **kwargs):
+        self.transact_write_items_calls.append(kwargs)
+        return {}
+
+    def scan(self, **kwargs):
+        self.scan_calls += 1
+        return {}
+
+
+@pytest.mark.asyncio
+async def test_create_tenant_with_owner_uses_transaction() -> None:
+    client = RecordingDynamoClient()
+    repo = DynamoDomainRepository(table_name="LimnopulseDomain", client=client)
+
+    tenant = await repo.create_tenant_with_owner("tnt_1", "Demo", "sub_1")
+
+    assert tenant.tenant_id == "tnt_1"
+    assert tenant.name == "Demo"
+    assert tenant.settings == {}
+    assert tenant.status == "active"
+    assert tenant.created_at.tzinfo == UTC
+    assert len(client.transact_write_items_calls) == 1
+    items = client.transact_write_items_calls[0]["TransactItems"]
+    assert len(items) == 3
+    assert all("ConditionExpression" in item["Put"] for item in items)
+    assert client.scan_calls == 0
