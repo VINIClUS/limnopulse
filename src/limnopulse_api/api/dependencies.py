@@ -13,7 +13,12 @@ from limnopulse_api.services.memberships import MembershipService
 
 
 async def get_current_principal(request: Request) -> Principal:
-    provider = build_auth_provider(request.app.state.settings)
+    provider = getattr(request.app.state, "auth_provider", None)
+    if provider is None:
+        settings = _get_state_dependency(request, "settings")
+        cache = getattr(request.app.state, "cache_repository", None)
+        provider = build_auth_provider(settings, cache=cache)
+        request.app.state.auth_provider = provider
     try:
         return await provider.authenticate(request)
     except AuthError as exc:
