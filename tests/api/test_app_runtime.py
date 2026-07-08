@@ -4,6 +4,7 @@ import jwt
 from cryptography.hazmat.primitives.asymmetric import rsa
 from fastapi import Request
 from fastapi.testclient import TestClient
+from botocore.exceptions import EndpointConnectionError
 
 from limnopulse_api.adapters.dynamodb import DynamoDomainRepository
 from limnopulse_api.adapters.redis import RedisCacheRepository
@@ -36,8 +37,20 @@ class FakeMembershipService:
         return None
 
 
+class FailingMembershipService:
+    def __init__(self, error: Exception) -> None:
+        self.error = error
+
+    async def get_active_membership(self, cognito_sub: str, tenant_id: str):
+        raise self.error
+
+
 class FakeDomainRepository:
+    def __init__(self) -> None:
+        self.get_tenant_calls = 0
+
     async def get_tenant(self, tenant_id: str):
+        self.get_tenant_calls += 1
         raise AssertionError("tenant repository should not be reached without membership")
 
 
@@ -66,13 +79,13 @@ def build_token(private_key) -> str:
 
 
 def test_app_lifespan_wires_runtime_dependencies(monkeypatch) -> None:
-    dynamo_calls: list[tuple[str, str, str | None]] = []
+    dynamo_calls: list[dict[str, str | None]] = []
     redis_calls: list[str] = []
     fake_dynamo = object()
     fake_redis = FakeRedisClient()
 
-    def fake_boto3_client(service_name: str, *, region_name: str, endpoint_url: str | None):
-        dynamo_calls.append((service_name, region_name, endpoint_url))
+    def fake_boto3_client(service_name: str, **kwargs):
+        dynamo_calls.append({"service_name": service_name, **kwargs})
         return fake_dynamo
 
     def fake_redis_from_url(url: str):
@@ -100,7 +113,15 @@ def test_app_lifespan_wires_runtime_dependencies(monkeypatch) -> None:
     assert not hasattr(app.state, "auth_provider")
 
     with TestClient(app):
-        assert dynamo_calls == [("dynamodb", "us-east-1", "http://localhost:8000")]
+        assert dynamo_calls == [
+            {
+                "service_name": "dynamodb",
+                "region_name": "us-east-1",
+                "endpoint_url": "http://localhost:8000",
+                "aws_access_key_id": "local",
+                "aws_secret_access_key": "local",
+            }
+        ]
         assert redis_calls == ["redis://localhost:6379/0"]
         assert isinstance(app.state.domain_repository, DynamoDomainRepository)
         assert app.state.domain_repository.client is fake_dynamo
@@ -113,6 +134,40 @@ def test_app_lifespan_wires_runtime_dependencies(monkeypatch) -> None:
         assert app.state.auth_provider.key_store.cache is app.state.cache_repository
 
     assert fake_redis.closed is True
+
+
+def test_app_lifespan_uses_dummy_credentials_for_local_dynamodb(monkeypatch) -> None:
+    dynamo_calls: list[dict[str, str | None]] = []
+    fake_dynamo = object()
+    fake_redis = FakeRedisClient()
+
+    def fake_boto3_client(service_name: str, **kwargs):
+        dynamo_calls.append({"service_name": service_name, **kwargs})
+        return fake_dynamo
+
+    monkeypatch.setattr("limnopulse_api.main.boto3.client", fake_boto3_client)
+    monkeypatch.setattr("limnopulse_api.main.redis.from_url", lambda url: fake_redis)
+
+    app = create_app(
+        Settings(
+            app_env="test",
+            auth_mode="dev",
+            aws_region="us-east-1",
+            dynamodb_endpoint_url="http://localhost:8000",
+            redis_url="redis://localhost:6379/0",
+        )
+    )
+
+    with TestClient(app):
+        assert dynamo_calls == [
+            {
+                "service_name": "dynamodb",
+                "region_name": "us-east-1",
+                "endpoint_url": "http://localhost:8000",
+                "aws_access_key_id": "local",
+                "aws_secret_access_key": "local",
+            }
+        ]
 
 
 def test_me_reuses_app_scoped_auth_provider(monkeypatch) -> None:
@@ -155,3 +210,19 @@ def test_cognito_identity_without_membership_gets_403() -> None:
         response = client.get("/v1/tenants/tnt_1", headers={"Authorization": f"Bearer {token}"})
 
     assert response.status_code == 403
+
+
+def test_membership_infra_failure_returns_503_and_skips_tenant_read() -> None:
+    app = create_app(Settings(app_env="test", auth_mode="dev"))
+    domain_repository = FakeDomainRepository()
+    app.state.domain_repository = domain_repository
+    app.state.membership_service = FailingMembershipService(
+        EndpointConnectionError(endpoint_url="http://localhost:8000")
+    )
+
+    with TestClient(app, raise_server_exceptions=False) as client:
+        response = client.get("/v1/tenants/tnt_1", headers={"X-Dev-User-Sub": "sub_1"})
+
+    assert response.status_code == 503
+    assert response.json() == {"detail": "service unavailable"}
+    assert domain_repository.get_tenant_calls == 0

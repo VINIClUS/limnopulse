@@ -3,6 +3,9 @@ from contextlib import asynccontextmanager
 import boto3
 import redis.asyncio as redis
 from fastapi import FastAPI
+from fastapi.requests import Request
+from fastapi.responses import JSONResponse
+from botocore.exceptions import BotoCoreError
 
 from limnopulse_api.adapters.dynamodb import DynamoDomainRepository
 from limnopulse_api.adapters.redis import RedisCacheRepository
@@ -10,6 +13,20 @@ from limnopulse_api.api.router import api_router
 from limnopulse_api.auth.providers import build_auth_provider
 from limnopulse_api.core.config import Settings, get_settings
 from limnopulse_api.services.memberships import MembershipService
+
+
+def _dynamodb_client_kwargs(settings: Settings) -> dict[str, str]:
+    kwargs: dict[str, str] = {"region_name": settings.aws_region}
+    if settings.dynamodb_endpoint_url is not None:
+        kwargs["endpoint_url"] = settings.dynamodb_endpoint_url
+    if settings.app_env in {"local", "test"} and settings.dynamodb_endpoint_url is not None:
+        kwargs["aws_access_key_id"] = "local"
+        kwargs["aws_secret_access_key"] = "local"
+    return kwargs
+
+
+async def _handle_infrastructure_error(request: Request, exc: BotoCoreError) -> JSONResponse:
+    return JSONResponse(status_code=503, content={"detail": "service unavailable"})
 
 
 def create_app(settings: Settings | None = None) -> FastAPI:
@@ -35,11 +52,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         app.state.cache_repository = RedisCacheRepository(redis_client)
         app.state.domain_repository = DynamoDomainRepository(
             table_name=resolved_settings.dynamodb_domain_table,
-            client=boto3.client(
-                "dynamodb",
-                region_name=resolved_settings.aws_region,
-                endpoint_url=resolved_settings.dynamodb_endpoint_url,
-            ),
+            client=boto3.client("dynamodb", **_dynamodb_client_kwargs(resolved_settings)),
         )
         app.state.membership_service = MembershipService(
             domain_repository=app.state.domain_repository,
@@ -58,6 +71,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
 
     app = FastAPI(title="Limnopulse API", version="0.1.0", lifespan=lifespan)
     app.state.settings = resolved_settings
+    app.add_exception_handler(BotoCoreError, _handle_infrastructure_error)
     app.include_router(api_router)
     return app
 
