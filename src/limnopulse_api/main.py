@@ -5,7 +5,7 @@ import redis.asyncio as redis
 from fastapi import FastAPI
 from fastapi.requests import Request
 from fastapi.responses import JSONResponse
-from botocore.exceptions import BotoCoreError
+from botocore.exceptions import BotoCoreError, ClientError
 
 from limnopulse_api.adapters.dynamodb import DynamoDomainRepository
 from limnopulse_api.adapters.redis import RedisCacheRepository
@@ -25,7 +25,7 @@ def _dynamodb_client_kwargs(settings: Settings) -> dict[str, str]:
     return kwargs
 
 
-async def _handle_infrastructure_error(request: Request, exc: BotoCoreError) -> JSONResponse:
+async def _handle_infrastructure_error(request: Request, exc: Exception) -> JSONResponse:
     return JSONResponse(status_code=503, content={"detail": "service unavailable"})
 
 
@@ -72,6 +72,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     app = FastAPI(title="Limnopulse API", version="0.1.0", lifespan=lifespan)
     app.state.settings = resolved_settings
     app.add_exception_handler(BotoCoreError, _handle_infrastructure_error)
+    app.add_exception_handler(ClientError, _handle_infrastructure_error)
     app.include_router(api_router)
     return app
 

@@ -1,7 +1,7 @@
 from datetime import UTC, datetime
 
 from fastapi.testclient import TestClient
-from botocore.exceptions import EndpointConnectionError
+from botocore.exceptions import ClientError, EndpointConnectionError
 
 from limnopulse_api.core.config import Settings
 from limnopulse_api.domain.entities import Membership, Tenant
@@ -66,6 +66,19 @@ class FakeDomainRepository:
 class FailingTenantReadRepository(FakeDomainRepository):
     async def get_tenant(self, tenant_id: str) -> Tenant | None:
         raise EndpointConnectionError(endpoint_url="http://localhost:8000")
+
+
+class ClientErrorTenantReadRepository(FakeDomainRepository):
+    async def get_tenant(self, tenant_id: str) -> Tenant | None:
+        raise ClientError(
+            {
+                "Error": {
+                    "Code": "InternalServerError",
+                    "Message": "DynamoDB is unavailable",
+                }
+            },
+            "GetItem",
+        )
 
 
 def make_tenant(tenant_id: str = "tnt_1", name: str = "Tenant") -> Tenant:
@@ -152,6 +165,18 @@ def test_admin_can_patch_tenant() -> None:
 def test_tenant_read_infra_failure_returns_503() -> None:
     app = create_app(Settings(app_env="test", auth_mode="dev"))
     app.state.domain_repository = FailingTenantReadRepository()
+    app.state.membership_service = FakeMembershipService(membership=make_membership(TenantRole.ADMIN))
+    client = TestClient(app, raise_server_exceptions=False)
+
+    response = client.get("/v1/tenants/tnt_1", headers={"X-Dev-User-Sub": "sub_1"})
+
+    assert response.status_code == 503
+    assert response.json() == {"detail": "service unavailable"}
+
+
+def test_tenant_read_client_error_returns_503() -> None:
+    app = create_app(Settings(app_env="test", auth_mode="dev"))
+    app.state.domain_repository = ClientErrorTenantReadRepository()
     app.state.membership_service = FakeMembershipService(membership=make_membership(TenantRole.ADMIN))
     client = TestClient(app, raise_server_exceptions=False)
 
