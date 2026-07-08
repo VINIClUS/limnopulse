@@ -11,6 +11,4 @@ class DevAuthProvider:
             raise AuthError("missing development identity")
 
         email = request.headers.get("X-Dev-User-Email")
-        raw_groups = request.headers.get("X-Dev-User-Groups", "")
-        groups = tuple(group.strip() for group in raw_groups.split(",") if group.strip())
-        return Principal(cognito_sub=sub, email=email, groups=groups)
+        return Principal(cognito_sub=sub, email=email, groups=())

@@ -30,7 +30,7 @@ async def test_dev_auth_reads_identity_headers() -> None:
 
     assert principal.cognito_sub == "user-1"
     assert principal.email == "user@example.test"
-    assert principal.groups == ("ops", "support")
+    assert principal.groups == ()
 
 
 @pytest.mark.asyncio
