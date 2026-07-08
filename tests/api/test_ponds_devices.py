@@ -233,6 +233,7 @@ def test_viewer_can_list_ponds_but_cannot_create() -> None:
     headers = {"X-Dev-User-Sub": "sub_1"}
 
     assert client.get("/v1/tenants/tnt_1/ponds", headers=headers).status_code == 200
+    assert client.get("/v1/tenants/tnt_1/ponds/pond_1", headers=headers).status_code == 200
     assert client.post("/v1/tenants/tnt_1/ponds", json={"name": "North"}, headers=headers).status_code == 403
 
 
@@ -242,6 +243,7 @@ def test_member_can_list_devices_but_cannot_patch() -> None:
     headers = {"X-Dev-User-Sub": "sub_1"}
 
     assert client.get("/v1/tenants/tnt_1/devices", headers=headers).status_code == 200
+    assert client.get("/v1/tenants/tnt_1/devices/dev_1", headers=headers).status_code == 200
     assert (
         client.patch(
             "/v1/tenants/tnt_1/devices/dev_1",
@@ -294,5 +296,26 @@ def test_owner_can_create_and_patch_device() -> None:
 def test_user_without_membership_gets_403() -> None:
     app = app_without_membership()
     client = TestClient(app)
+    headers = {"X-Dev-User-Sub": "sub_1"}
 
-    assert client.get("/v1/tenants/tnt_1/ponds", headers={"X-Dev-User-Sub": "sub_1"}).status_code == 403
+    assert client.get("/v1/tenants/tnt_1/ponds", headers=headers).status_code == 403
+    assert client.get("/v1/tenants/tnt_1/ponds/pond_1", headers=headers).status_code == 403
+    assert client.get("/v1/tenants/tnt_1/devices/dev_1", headers=headers).status_code == 403
+
+
+def test_get_pond_returns_404_when_missing() -> None:
+    app = app_with_membership(role=TenantRole.VIEWER)
+    client = TestClient(app)
+
+    response = client.get("/v1/tenants/tnt_1/ponds/pond_missing", headers={"X-Dev-User-Sub": "sub_1"})
+
+    assert response.status_code == 404
+
+
+def test_get_device_returns_404_when_missing() -> None:
+    app = app_with_membership(role=TenantRole.MEMBER)
+    client = TestClient(app)
+
+    response = client.get("/v1/tenants/tnt_1/devices/dev_missing", headers={"X-Dev-User-Sub": "sub_1"})
+
+    assert response.status_code == 404

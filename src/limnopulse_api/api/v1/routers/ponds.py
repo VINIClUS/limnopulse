@@ -43,6 +43,24 @@ async def list_ponds(
     return PondListResponse(items=[_to_pond_response(pond) for pond in ponds])
 
 
+@router.get(
+    "/{pond_id}",
+    response_model=PondResponse,
+    responses={403: {"model": ErrorResponse}, 404: {"model": ErrorResponse}, 503: {"model": ErrorResponse}},
+)
+async def get_pond(
+    tenant_id: str,
+    pond_id: str,
+    repository: DomainRepositoryDep,
+    _access: TenantAccess = Depends(require_tenant_role(*tuple(READ_ROLES))),
+) -> PondResponse:
+    service = _pond_service(repository)
+    pond = await service.get(tenant_id, pond_id)
+    if pond is None:
+        raise HTTPException(status_code=404, detail="not found")
+    return _to_pond_response(pond)
+
+
 @router.post(
     "",
     response_model=PondResponse,

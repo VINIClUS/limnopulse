@@ -45,6 +45,24 @@ async def list_devices(
     return DeviceListResponse(items=[_to_device_response(device) for device in devices])
 
 
+@router.get(
+    "/{device_id}",
+    response_model=DeviceResponse,
+    responses={403: {"model": ErrorResponse}, 404: {"model": ErrorResponse}, 503: {"model": ErrorResponse}},
+)
+async def get_device(
+    tenant_id: str,
+    device_id: str,
+    repository: DomainRepositoryDep,
+    _access: TenantAccess = Depends(require_tenant_role(*tuple(READ_ROLES))),
+) -> DeviceResponse:
+    service = _device_service(repository)
+    device = await service.get(tenant_id, device_id)
+    if device is None:
+        raise HTTPException(status_code=404, detail="not found")
+    return _to_device_response(device)
+
+
 @router.post(
     "",
     response_model=DeviceResponse,
