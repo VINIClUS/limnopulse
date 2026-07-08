@@ -1,7 +1,10 @@
 from __future__ import annotations
 
 from datetime import UTC, datetime
+from decimal import Decimal
 from typing import Any
+
+from boto3.dynamodb.types import TypeDeserializer, TypeSerializer
 
 from limnopulse_api.core.errors import ConflictError, NotFoundError
 from limnopulse_api.domain.entities import Device, Membership, Pond, Tenant
@@ -37,13 +40,15 @@ class DynamoDomainRepository:
         self.table_name = table_name
         self.client = client
         self.keys = DynamoKeyBuilder()
+        self._serializer = TypeSerializer()
+        self._deserializer = TypeDeserializer()
 
     async def get_membership(self, cognito_sub: str, tenant_id: str) -> Membership | None:
         response = self.client.get_item(
             TableName=self.table_name,
-            Key=self.keys.membership(cognito_sub, tenant_id),
+            Key=self._serialize_item(self.keys.membership(cognito_sub, tenant_id)),
         )
-        item = response.get("Item")
+        item = self._response_item(response)
         if item is None:
             return None
         return self._membership_from_item(item)
@@ -52,12 +57,14 @@ class DynamoDomainRepository:
         response = self.client.query(
             TableName=self.table_name,
             KeyConditionExpression="PK = :pk AND begins_with(SK, :sk_prefix)",
-            ExpressionAttributeValues={
-                ":pk": f"USER#{cognito_sub}",
-                ":sk_prefix": "TENANT#",
-            },
+            ExpressionAttributeValues=self._serialize_values(
+                {
+                    ":pk": f"USER#{cognito_sub}",
+                    ":sk_prefix": "TENANT#",
+                }
+            ),
         )
-        return [self._membership_from_item(item) for item in response.get("Items", [])]
+        return [self._membership_from_item(item) for item in self._response_items(response)]
 
     async def create_tenant_with_owner(self, tenant_id: str, name: str, owner_sub: str) -> Tenant:
         now = utc_now()
@@ -121,9 +128,9 @@ class DynamoDomainRepository:
     async def get_tenant(self, tenant_id: str) -> Tenant | None:
         response = self.client.get_item(
             TableName=self.table_name,
-            Key=self.keys.tenant(tenant_id),
+            Key=self._serialize_item(self.keys.tenant(tenant_id)),
         )
-        item = response.get("Item")
+        item = self._response_item(response)
         if item is None:
             return None
         return self._tenant_from_item(item)
@@ -134,12 +141,16 @@ class DynamoDomainRepository:
         expected_version: int,
         name: str | None,
     ) -> Tenant:
+        existing = await self.get_tenant(tenant_id)
+        if existing is None:
+            raise NotFoundError(f"Tenant {tenant_id} not found")
+
         response = self._update_item(
             key=self.keys.tenant(tenant_id),
             expected_version=expected_version,
             updates={"name": name},
         )
-        item = response.get("Attributes")
+        item = self._response_item(response, attribute_name="Attributes")
         if item is None:
             raise NotFoundError(f"Tenant {tenant_id} not found")
         return self._tenant_from_item(item)
@@ -148,19 +159,21 @@ class DynamoDomainRepository:
         response = self.client.query(
             TableName=self.table_name,
             KeyConditionExpression="PK = :pk AND begins_with(SK, :sk_prefix)",
-            ExpressionAttributeValues={
-                ":pk": f"TENANT#{tenant_id}",
-                ":sk_prefix": "POND#",
-            },
+            ExpressionAttributeValues=self._serialize_values(
+                {
+                    ":pk": f"TENANT#{tenant_id}",
+                    ":sk_prefix": "POND#",
+                }
+            ),
         )
-        return [self._pond_from_item(item) for item in response.get("Items", [])]
+        return [self._pond_from_item(item) for item in self._response_items(response)]
 
     async def get_pond(self, tenant_id: str, pond_id: str) -> Pond | None:
         response = self.client.get_item(
             TableName=self.table_name,
-            Key=self.keys.pond(tenant_id, pond_id),
+            Key=self._serialize_item(self.keys.pond(tenant_id, pond_id)),
         )
-        item = response.get("Item")
+        item = self._response_item(response)
         if item is None:
             return None
         return self._pond_from_item(item)
@@ -201,12 +214,16 @@ class DynamoDomainRepository:
         name: str | None,
         description: str | None,
     ) -> Pond:
+        existing = await self.get_pond(tenant_id, pond_id)
+        if existing is None:
+            raise NotFoundError(f"Pond {pond_id} not found")
+
         response = self._update_item(
             key=self.keys.pond(tenant_id, pond_id),
             expected_version=expected_version,
             updates={"name": name, "description": description},
         )
-        item = response.get("Attributes")
+        item = self._response_item(response, attribute_name="Attributes")
         if item is None:
             raise NotFoundError(f"Pond {pond_id} not found")
         return self._pond_from_item(item)
@@ -215,19 +232,21 @@ class DynamoDomainRepository:
         response = self.client.query(
             TableName=self.table_name,
             KeyConditionExpression="PK = :pk AND begins_with(SK, :sk_prefix)",
-            ExpressionAttributeValues={
-                ":pk": f"TENANT#{tenant_id}",
-                ":sk_prefix": "DEVICE#",
-            },
+            ExpressionAttributeValues=self._serialize_values(
+                {
+                    ":pk": f"TENANT#{tenant_id}",
+                    ":sk_prefix": "DEVICE#",
+                }
+            ),
         )
-        return [self._device_from_item(item) for item in response.get("Items", [])]
+        return [self._device_from_item(item) for item in self._response_items(response)]
 
     async def get_device(self, tenant_id: str, device_id: str) -> Device | None:
         response = self.client.get_item(
             TableName=self.table_name,
-            Key=self.keys.device(tenant_id, device_id),
+            Key=self._serialize_item(self.keys.device(tenant_id, device_id)),
         )
-        item = response.get("Item")
+        item = self._response_item(response)
         if item is None:
             return None
         return self._device_from_item(item)
@@ -296,65 +315,100 @@ class DynamoDomainRepository:
         if existing is None:
             raise NotFoundError(f"Device {device_id} not found")
 
+        lookup_response = self.client.get_item(
+            TableName=self.table_name,
+            Key=self._serialize_item(self.keys.device_lookup(device_id)),
+        )
+        lookup_item = self._response_item(lookup_response)
+        if lookup_item is None:
+            raise NotFoundError(f"Device {device_id} not found")
+
         now = utc_now()
-        updated_item = {
-            **self.keys.device(tenant_id, device_id),
-            "entity_type": "device",
-            "tenant_id": tenant_id,
-            "pond_id": pond_id if pond_id is not None else existing.pond_id,
-            "device_id": device_id,
-            "name": name if name is not None else existing.name,
-            "auth_type": existing.auth_type,
-            "firmware_version": firmware_version if firmware_version is not None else existing.firmware_version,
-            "status": existing.status,
-            "created_at": existing.created_at.isoformat(),
-            "updated_at": now.isoformat(),
-            "version": existing.version + 1,
-            "schema_version": existing.schema_version,
-        }
-        lookup_item = {
-            **self.keys.device_lookup(device_id),
-            "entity_type": "device_lookup",
-            "tenant_id": tenant_id,
-            "pond_id": updated_item["pond_id"],
-            "device_id": device_id,
-            "name": updated_item["name"],
-            "auth_type": updated_item["auth_type"],
-            "firmware_version": updated_item["firmware_version"],
-            "status": updated_item["status"],
-            "created_at": existing.created_at.isoformat(),
-            "updated_at": now.isoformat(),
-            "version": updated_item["version"],
-            "schema_version": existing.schema_version,
+        next_version = expected_version + 1
+        updates = {
+            "name": name,
+            "pond_id": pond_id,
+            "firmware_version": firmware_version,
         }
         try:
             self.client.transact_write_items(
                 TransactItems=[
-                    self._conditioned_update_put(updated_item, expected_version),
-                    self._conditioned_update_put(lookup_item, expected_version),
+                    self._conditioned_update(
+                        key=self.keys.device(tenant_id, device_id),
+                        expected_version=expected_version,
+                        next_version=next_version,
+                        updated_at=now.isoformat(),
+                        updates=updates,
+                    ),
+                    self._conditioned_update(
+                        key=self.keys.device_lookup(device_id),
+                        expected_version=expected_version,
+                        next_version=next_version,
+                        updated_at=now.isoformat(),
+                        updates=updates,
+                    ),
                 ]
             )
         except Exception as exc:  # pragma: no cover - defensive adapter mapping
             self._raise_if_conflict(exc)
             raise
-        return self._device_from_item(updated_item)
+
+        merged_item = {
+            **existing.model_dump(mode="json"),
+            **{field: value for field, value in updates.items() if value is not None},
+            "updated_at": now.isoformat(),
+            "version": next_version,
+        }
+        return self._device_from_item(merged_item)
 
     def _conditioned_put(self, item: dict[str, Any]) -> dict[str, Any]:
         return {
             "Put": {
                 "TableName": self.table_name,
-                "Item": item,
+                "Item": self._serialize_item(item),
                 "ConditionExpression": "attribute_not_exists(PK) AND attribute_not_exists(SK)",
             }
         }
 
-    def _conditioned_update_put(self, item: dict[str, Any], expected_version: int) -> dict[str, Any]:
+    def _conditioned_update(
+        self,
+        *,
+        key: dict[str, str],
+        expected_version: int,
+        next_version: int,
+        updated_at: str,
+        updates: dict[str, Any | None],
+    ) -> dict[str, Any]:
+        expression_names = {
+            "#updated_at": "updated_at",
+            "#version": "version",
+        }
+        expression_values: dict[str, Any] = {
+            ":updated_at": updated_at,
+            ":next_version": next_version,
+            ":expected_version": expected_version,
+        }
+        assignments = [
+            "#updated_at = :updated_at",
+            "#version = :next_version",
+        ]
+        for index, (field_name, field_value) in enumerate(updates.items()):
+            if field_value is None:
+                continue
+            name_token = f"#field_{index}"
+            value_token = f":value_{index}"
+            expression_names[name_token] = field_name
+            expression_values[value_token] = field_value
+            assignments.append(f"{name_token} = {value_token}")
+
         return {
-            "Put": {
+            "Update": {
                 "TableName": self.table_name,
-                "Item": item,
-                "ConditionExpression": "attribute_exists(PK) AND attribute_exists(SK) AND version = :expected_version",
-                "ExpressionAttributeValues": {":expected_version": expected_version},
+                "Key": self._serialize_item(key),
+                "UpdateExpression": "SET " + ", ".join(assignments),
+                "ConditionExpression": "attribute_exists(PK) AND attribute_exists(SK) AND #version = :expected_version",
+                "ExpressionAttributeNames": expression_names,
+                "ExpressionAttributeValues": self._serialize_values(expression_values),
             }
         }
 
@@ -390,23 +444,71 @@ class DynamoDomainRepository:
         try:
             return self.client.update_item(
                 TableName=self.table_name,
-                Key=key,
+                Key=self._serialize_item(key),
                 UpdateExpression="SET " + ", ".join(assignments),
                 ConditionExpression="attribute_exists(PK) AND attribute_exists(SK) AND #version = :expected_version",
                 ExpressionAttributeNames=expression_names,
-                ExpressionAttributeValues=expression_values,
+                ExpressionAttributeValues=self._serialize_values(expression_values),
                 ReturnValues="ALL_NEW",
             )
         except Exception as exc:  # pragma: no cover - defensive adapter mapping
             self._raise_if_conflict(exc)
             raise
 
+    def _serialize_item(self, item: dict[str, Any]) -> dict[str, Any]:
+        return {key: self._serializer.serialize(value) for key, value in item.items()}
+
+    def _serialize_values(self, values: dict[str, Any]) -> dict[str, Any]:
+        return {key: self._serializer.serialize(value) for key, value in values.items()}
+
+    def _response_item(
+        self,
+        response: dict[str, Any],
+        *,
+        attribute_name: str = "Item",
+    ) -> dict[str, Any] | None:
+        item = response.get(attribute_name)
+        if item is None:
+            return None
+        return self._deserialize_item(item)
+
+    def _response_items(self, response: dict[str, Any]) -> list[dict[str, Any]]:
+        return [self._deserialize_item(item) for item in response.get("Items", [])]
+
+    def _deserialize_item(self, item: dict[str, Any]) -> dict[str, Any]:
+        return {key: self._deserialize_value(value) for key, value in item.items()}
+
+    def _deserialize_value(self, value: Any) -> Any:
+        deserialized = self._deserializer.deserialize(value)
+        if isinstance(deserialized, Decimal):
+            if deserialized % 1 == 0:
+                return int(deserialized)
+            return float(deserialized)
+        if isinstance(deserialized, list):
+            return [self._normalize_deserialized_value(item) for item in deserialized]
+        if isinstance(deserialized, dict):
+            return {
+                key: self._normalize_deserialized_value(item)
+                for key, item in deserialized.items()
+            }
+        return deserialized
+
+    def _normalize_deserialized_value(self, value: Any) -> Any:
+        if isinstance(value, Decimal):
+            if value % 1 == 0:
+                return int(value)
+            return float(value)
+        if isinstance(value, list):
+            return [self._normalize_deserialized_value(item) for item in value]
+        if isinstance(value, dict):
+            return {
+                key: self._normalize_deserialized_value(item)
+                for key, item in value.items()
+            }
+        return value
+
     def _raise_if_conflict(self, exc: Exception) -> None:
-        error_code = (
-            getattr(exc, "response", {})
-            .get("Error", {})
-            .get("Code")
-        )
+        error_code = getattr(exc, "response", {}).get("Error", {}).get("Code")
         if error_code in {
             "ConditionalCheckFailedException",
             "TransactionCanceledException",
