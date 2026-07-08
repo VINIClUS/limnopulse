@@ -1,6 +1,9 @@
+from collections.abc import Mapping
 from datetime import datetime
+from types import MappingProxyType
+from typing import Any
 
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, field_serializer
 
 from limnopulse_api.auth.models import Principal
 from limnopulse_api.domain.roles import TenantRole
@@ -19,7 +22,14 @@ class VersionedEntity(BaseModel):
 class Tenant(VersionedEntity):
     tenant_id: str
     name: str
-    settings: dict[str, object] = Field(default_factory=dict)
+    settings: Mapping[str, Any] = Field(default_factory=dict)
+
+    def model_post_init(self, __context: Any) -> None:
+        object.__setattr__(self, "settings", MappingProxyType(dict(self.settings)))
+
+    @field_serializer("settings")
+    def serialize_settings(self, value: Mapping[str, Any]) -> dict[str, Any]:
+        return dict(value)
 
 
 class Pond(VersionedEntity):
