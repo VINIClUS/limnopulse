@@ -1,0 +1,18 @@
+services:
+  redis:
+    image: redis:7-alpine
+    command: redis-server --save "" --appendonly no --maxmemory 128mb --maxmemory-policy allkeys-lfu
+    ports:
+      - "6379:6379"
+
+  dynamodb-local:
+    image: amazon/dynamodb-local:latest
+    command: -jar DynamoDBLocal.jar -sharedDb -dbPath ./data
+    working_dir: /home/dynamodblocal
+    volumes:
+      - dynamodb_data:/home/dynamodblocal/data
+    ports:
+      - "8001:8000"
+
+volumes:
+  dynamodb_data:
