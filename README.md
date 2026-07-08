@@ -10,6 +10,7 @@ python -m venv .venv
 . .venv/bin/activate
 pip install -e ".[dev]"
 docker compose up -d redis dynamodb-local
+# creates LimnopulseDomain and LimnopulseAudit locally
 python scripts/dev/init_dynamodb.py
 python scripts/dev/seed_local.py
 python -m uvicorn limnopulse_api.main:app --reload --host 0.0.0.0 --port 8000
