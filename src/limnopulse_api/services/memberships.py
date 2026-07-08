@@ -26,7 +26,7 @@ class MembershipService:
             except Exception:
                 cached = None
             else:
-                membership = self._membership_from_cached(cached, tenant_id)
+                membership = self._membership_from_cached(cached, cognito_sub, tenant_id)
                 if membership is not None:
                     return membership
 
@@ -45,14 +45,23 @@ class MembershipService:
                 pass
         return membership
 
-    def _membership_from_cached(self, cached: object | None, tenant_id: str) -> Membership | None:
+    def _membership_from_cached(
+        self,
+        cached: object | None,
+        cognito_sub: str,
+        tenant_id: str,
+    ) -> Membership | None:
         if not isinstance(cached, list):
             return None
 
         for item in cached:
             if not isinstance(item, dict):
                 continue
-            if item.get("tenant_id") != tenant_id or item.get("status") != "active":
+            if (
+                item.get("tenant_id") != tenant_id
+                or item.get("status") != "active"
+                or item.get("cognito_sub") != cognito_sub
+            ):
                 continue
             try:
                 return Membership.model_validate(item)

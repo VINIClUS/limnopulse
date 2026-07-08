@@ -107,6 +107,23 @@ async def test_invalid_cached_membership_falls_back_to_dynamodb() -> None:
 
 
 @pytest.mark.asyncio
+async def test_cached_membership_with_mismatched_subject_falls_back_to_dynamodb() -> None:
+    membership = active_membership()
+    repo = FakeDomainRepository(membership)
+    cache = FakeCache()
+    cache.values["user:sub_1:memberships"] = [
+        active_membership().model_copy(update={"cognito_sub": "sub_2"}).model_dump(mode="json")
+    ]
+    service = MembershipService(repo, cache, membership_ttl_seconds=120)
+
+    result = await service.get_active_membership("sub_1", "tnt_1")
+
+    assert result == membership
+    assert repo.get_membership_calls == 1
+    assert cache.set_calls == [("user:sub_1:memberships", 120)]
+
+
+@pytest.mark.asyncio
 async def test_cache_get_failure_falls_back_to_dynamodb() -> None:
     membership = active_membership()
     repo = FakeDomainRepository(membership)
