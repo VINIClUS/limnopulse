@@ -6,6 +6,7 @@ from cryptography.hazmat.primitives.asymmetric import rsa
 from fastapi import Request
 
 from limnopulse_api.auth.cognito import CognitoJwtAuthProvider
+from limnopulse_api.auth.providers import build_auth_provider
 from limnopulse_api.core.config import Settings
 from limnopulse_api.core.errors import AuthError
 
@@ -101,3 +102,40 @@ async def test_cognito_accepts_valid_access_token(key_pair) -> None:
 
     assert principal.cognito_sub == "sub_1"
     assert principal.email == "u@example.test"
+
+
+@pytest.mark.asyncio
+async def test_cognito_factory_builds_working_jwks_provider(key_pair, monkeypatch) -> None:
+    private_key, public_key = key_pair
+    calls: list[tuple[str, int]] = []
+
+    class FakeSigningKey:
+        def __init__(self, key) -> None:
+            self.key = key
+
+    class FakePyJWKClient:
+        def __init__(self, jwks_url: str, lifespan: int) -> None:
+            calls.append((jwks_url, lifespan))
+
+        def get_signing_key(self, kid: str) -> FakeSigningKey:
+            assert kid == "kid-1"
+            return FakeSigningKey(public_key)
+
+    monkeypatch.setattr("limnopulse_api.auth.cognito.PyJWKClient", FakePyJWKClient)
+    settings = Settings(
+        app_env="test",
+        auth_mode="cognito",
+        aws_region="us-east-1",
+        cognito_user_pool_id="pool_1",
+        cognito_client_id="client_1",
+        jwks_cache_ttl_seconds=21_600,
+    )
+
+    provider = build_auth_provider(settings)
+    principal = await provider.authenticate(build_request(build_token(private_key, base_claims())))
+
+    assert principal.cognito_sub == "sub_1"
+    assert principal.email == "u@example.test"
+    assert calls == [
+        ("https://cognito-idp.us-east-1.amazonaws.com/pool_1/.well-known/jwks.json", 21_600)
+    ]

@@ -17,6 +17,6 @@ def build_auth_provider(settings: Settings) -> PrincipalProvider:
 
         return DevAuthProvider()
 
-    from limnopulse_api.auth.cognito import CognitoJwtAuthProvider
+    from limnopulse_api.auth.cognito import CognitoJwtAuthProvider, build_cognito_key_store
 
-    return CognitoJwtAuthProvider(settings=settings)
+    return CognitoJwtAuthProvider(settings=settings, key_store=build_cognito_key_store(settings))

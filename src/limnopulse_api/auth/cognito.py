@@ -5,6 +5,7 @@ from time import time
 from typing import Any
 
 import jwt
+from jwt import PyJWKClient
 from fastapi import Request
 
 from limnopulse_api.auth.models import Principal
@@ -21,6 +22,18 @@ class StaticJwksKeyStore:
         if key is None:
             raise AuthError("unknown jwt key id")
         return key
+
+
+class JwksKeyStore:
+    def __init__(self, jwks_url: str, cache_ttl_seconds: int) -> None:
+        self.client = PyJWKClient(jwks_url, lifespan=cache_ttl_seconds)
+
+    async def get_key(self, kid: str) -> Any:
+        try:
+            signing_key = self.client.get_signing_key(kid)
+        except jwt.PyJWTError as exc:
+            raise AuthError("unknown jwt key id") from exc
+        return signing_key.key
 
 
 class CognitoJwtAuthProvider:
@@ -87,3 +100,15 @@ class CognitoJwtAuthProvider:
 
         groups = tuple(claims.get("cognito:groups", ()))
         return Principal(cognito_sub=sub, email=claims.get("email"), groups=groups)
+
+
+def build_cognito_key_store(settings: Settings) -> JwksKeyStore:
+    issuer = settings.cognito_issuer or (
+        f"https://cognito-idp.{settings.aws_region}.amazonaws.com/"
+        f"{settings.cognito_user_pool_id}"
+    )
+    jwks_url = f"{issuer.rstrip('/')}/.well-known/jwks.json"
+    return JwksKeyStore(
+        jwks_url=jwks_url,
+        cache_ttl_seconds=settings.jwks_cache_ttl_seconds,
+    )
