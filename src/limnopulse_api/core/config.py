@@ -22,6 +22,11 @@ class Settings(BaseSettings):
     dynamodb_audit_table: str = "LimnopulseAudit"
     dynamodb_endpoint_url: str | None = None
     redis_url: str = "redis://localhost:6379/0"
+    influxdb_url: str = "http://localhost:8086"
+    influxdb_org: str = "limnopulse"
+    influxdb_token: str = ""
+    influxdb_raw_bucket: str = "aquafarm_raw"
+    influxdb_timeout_seconds: float = Field(default=5.0, gt=0, le=30)
     jwks_cache_ttl_seconds: int = Field(default=43_200, ge=21_600, le=86_400)
     membership_cache_ttl_seconds: int = Field(default=120, ge=60, le=300)
     device_cache_ttl_seconds: int = Field(default=1_800, ge=900, le=3_600)

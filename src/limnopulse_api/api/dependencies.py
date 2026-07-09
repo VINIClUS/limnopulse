@@ -9,6 +9,7 @@ from limnopulse_api.core.errors import AuthError
 from limnopulse_api.domain.entities import TenantAccess
 from limnopulse_api.domain.roles import READ_ROLES, TenantRole
 from limnopulse_api.repositories.domain import DomainRepository
+from limnopulse_api.repositories.telemetry import TelemetryRepository
 from limnopulse_api.services.memberships import MembershipService
 
 
@@ -39,11 +40,16 @@ def get_domain_repository(request: Request) -> DomainRepository:
     return _get_state_dependency(request, "domain_repository")
 
 
+def get_telemetry_repository(request: Request) -> TelemetryRepository:
+    return _get_state_dependency(request, "telemetry_repository")
+
+
 def get_membership_service(request: Request) -> MembershipService:
     return _get_state_dependency(request, "membership_service")
 
 
 DomainRepositoryDep = Annotated[DomainRepository, Depends(get_domain_repository)]
+TelemetryRepositoryDep = Annotated[TelemetryRepository, Depends(get_telemetry_repository)]
 MembershipServiceDep = Annotated[MembershipService, Depends(get_membership_service)]
 
 
