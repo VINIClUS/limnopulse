@@ -11,6 +11,9 @@ from limnopulse_api.core.config import Settings
 from limnopulse_api.core.errors import AuthError
 
 
+TEST_ISSUER = "https://cognito-idp.us-east-1.amazonaws.com/pool_1"
+
+
 class FakeKeyStore:
     def __init__(self, public_key) -> None:
         self.public_key = public_key
@@ -32,7 +35,7 @@ def build_token(private_key, claims: dict[str, object]) -> str:
 def base_claims() -> dict[str, object]:
     now = datetime.now(UTC)
     return {
-        "iss": "https://cognito-idp.us-east-1.amazonaws.com/pool_1",
+        "iss": TEST_ISSUER,
         "sub": "sub_1",
         "client_id": "client_1",
         "token_use": "access",
@@ -59,6 +62,7 @@ async def test_cognito_rejects_wrong_token_use(key_pair) -> None:
             auth_mode="cognito",
             cognito_user_pool_id="pool_1",
             cognito_client_id="client_1",
+            cognito_issuer=TEST_ISSUER,
         ),
         key_store=FakeKeyStore(public_key),
     )
@@ -77,6 +81,7 @@ async def test_cognito_rejects_wrong_client_id(key_pair) -> None:
             auth_mode="cognito",
             cognito_user_pool_id="pool_1",
             cognito_client_id="client_1",
+            cognito_issuer=TEST_ISSUER,
         ),
         key_store=FakeKeyStore(public_key),
     )
@@ -94,6 +99,7 @@ async def test_cognito_accepts_valid_access_token(key_pair) -> None:
             auth_mode="cognito",
             cognito_user_pool_id="pool_1",
             cognito_client_id="client_1",
+            cognito_issuer=TEST_ISSUER,
         ),
         key_store=FakeKeyStore(public_key),
     )
@@ -128,6 +134,7 @@ async def test_cognito_factory_builds_working_jwks_provider(key_pair, monkeypatc
         aws_region="us-east-1",
         cognito_user_pool_id="pool_1",
         cognito_client_id="client_1",
+        cognito_issuer=TEST_ISSUER,
         jwks_cache_ttl_seconds=21_600,
     )
 

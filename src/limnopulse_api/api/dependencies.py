@@ -48,9 +48,14 @@ def get_membership_service(request: Request) -> MembershipService:
     return _get_state_dependency(request, "membership_service")
 
 
+def get_telemetry_repository(request: Request) -> TelemetryRepository:
+    return _get_state_dependency(request, "telemetry_repository")
+
+
 DomainRepositoryDep = Annotated[DomainRepository, Depends(get_domain_repository)]
 TelemetryRepositoryDep = Annotated[TelemetryRepository, Depends(get_telemetry_repository)]
 MembershipServiceDep = Annotated[MembershipService, Depends(get_membership_service)]
+TelemetryRepositoryDep = Annotated[TelemetryRepository, Depends(get_telemetry_repository)]
 
 
 async def require_tenant_access(

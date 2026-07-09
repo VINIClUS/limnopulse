@@ -1,27 +1,19 @@
-from datetime import datetime
 from typing import Protocol
 
-from limnopulse_api.domain.telemetry import TelemetryReading
+from limnopulse_api.domain.telemetry import LatestMetrics, TelemetryReading
 
 
 class TelemetryRepository(Protocol):
-    async def list_readings(
+    async def query_readings(
         self,
+        *,
         tenant_id: str,
         pond_id: str,
-        start: datetime,
-        stop: datetime,
+        start: str,
+        stop: str | None,
         limit: int,
-        fields: tuple[str, ...],
     ) -> list[TelemetryReading]:
         raise NotImplementedError
 
-    async def latest_metrics(
-        self,
-        tenant_id: str,
-        pond_id: str,
-        start: datetime,
-        stop: datetime,
-        fields: tuple[str, ...],
-    ) -> TelemetryReading | None:
+    async def query_latest_metrics(self, *, tenant_id: str, pond_id: str) -> LatestMetrics:
         raise NotImplementedError

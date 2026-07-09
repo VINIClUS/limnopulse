@@ -1,4 +1,16 @@
 .venv/
+.env
 __pycache__/
 .superpowers/sdd/
 .serena/
+.Codex/
+.pytest_cache/
+.terraform/
+*.tfstate
+*.tfstate.*
+*.tfvars
+!*.tfvars.example
+*.tfplan
+*.tfbackend
+backend*.hcl
+!backend.example.hcl

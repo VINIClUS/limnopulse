@@ -1,36 +1,40 @@
-from collections.abc import Mapping
+import re
 from datetime import datetime
-from types import MappingProxyType
-from typing import Any, TypeAlias
 
-from pydantic import BaseModel, ConfigDict, Field, field_serializer
-
-MetricValue: TypeAlias = int | float
-
-WATER_QUALITY_FIELDS: tuple[str, ...] = (
-    "temp_c",
-    "ph",
-    "do_mg_l",
-    "turbidity_ntu",
-    "salinity_ppt",
-    "battery_v",
-    "rssi",
-    "seq",
-)
+from pydantic import BaseModel, ConfigDict
 
 
-class TelemetryReading(BaseModel):
+_RELATIVE_DURATION_PATTERN = re.compile(r"^-\d+(ns|us|ms|s|m|h|d|w)$")
+
+
+def validate_flux_time_bound(value: str) -> str:
+    if _RELATIVE_DURATION_PATTERN.match(value):
+        return value
+    datetime.fromisoformat(value.replace("Z", "+00:00"))
+    return value
+
+
+class WaterQualityFields(BaseModel):
     model_config = ConfigDict(frozen=True)
 
-    timestamp: datetime
+    temp_c: float | None = None
+    ph: float | None = None
+    do_mg_l: float | None = None
+    turbidity_ntu: float | None = None
+    salinity_ppt: float | None = None
+    battery_v: float | None = None
+    rssi: int | None = None
+    seq: int | None = None
+
+
+class TelemetryReading(WaterQualityFields):
+    measured_at: datetime
     tenant_id: str
     pond_id: str
-    device_id: str | None = None
-    metrics: Mapping[str, MetricValue] = Field(default_factory=dict)
+    device_id: str
 
-    def model_post_init(self, __context: Any) -> None:
-        object.__setattr__(self, "metrics", MappingProxyType(dict(self.metrics)))
 
-    @field_serializer("metrics")
-    def serialize_metrics(self, value: Mapping[str, MetricValue]) -> dict[str, MetricValue]:
-        return dict(value)
+class LatestMetrics(WaterQualityFields):
+    measured_at: datetime | None = None
+    tenant_id: str
+    pond_id: str

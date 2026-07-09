@@ -7,6 +7,7 @@ from fastapi import FastAPI
 from fastapi.requests import Request
 from fastapi.responses import JSONResponse
 from botocore.exceptions import BotoCoreError, ClientError
+from influxdb_client import InfluxDBClient
 
 from limnopulse_api.adapters.dynamodb import DynamoDomainRepository
 from limnopulse_api.adapters.influxdb import InfluxTelemetryRepository
@@ -46,7 +47,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
                 "cache_repository",
                 "redis_client",
                 "telemetry_repository",
-                "influx_http_client",
+                "influxdb_client",
             )
         ):
             yield
@@ -78,12 +79,24 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             resolved_settings,
             cache=app.state.cache_repository,
         )
+        influxdb_client = InfluxDBClient(
+            url=resolved_settings.influxdb_url,
+            token=resolved_settings.influxdb_token,
+            org=resolved_settings.influxdb_org,
+        )
+        app.state.influxdb_client = influxdb_client
+        app.state.telemetry_repository = InfluxTelemetryRepository(
+            query_api=influxdb_client.query_api(),
+            org=resolved_settings.influxdb_org,
+            bucket=resolved_settings.influxdb_bucket_raw,
+        )
 
         try:
             yield
         finally:
             await influx_http_client.aclose()
             await redis_client.aclose()
+            influxdb_client.close()
 
     app = FastAPI(title="Limnopulse API", version="0.1.0", lifespan=lifespan)
     app.state.settings = resolved_settings

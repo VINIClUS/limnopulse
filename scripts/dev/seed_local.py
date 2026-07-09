@@ -30,9 +30,9 @@ async def seed() -> None:
             "Local Tenant",
             "local-user-001",
         )
+        print(f"Seeded tenant {tenant.tenant_id} with owner local-user-001")
     except ConflictError:
-        print("Local seed already exists")
-        return
+        print("Local tenant already exists")
     except ClientError as exc:
         error_code = exc.response.get("Error", {}).get("Code")
         if error_code == "ResourceNotFoundException":
@@ -42,7 +42,28 @@ async def seed() -> None:
             return
         raise
 
-    print(f"Seeded tenant {tenant.tenant_id} with owner local-user-001")
+    try:
+        pond = await repository.create_pond(
+            "tnt_local_001",
+            "pond_local_001",
+            "Local Pond",
+            "Local seeded pond for telemetry development.",
+        )
+        print(f"Seeded pond {pond.pond_id}")
+    except ConflictError:
+        print("Local pond already exists")
+
+    try:
+        device = await repository.create_device(
+            "tnt_local_001",
+            "pond_local_001",
+            "local-device-001",
+            "Local Device 001",
+            "local-dev",
+        )
+        print(f"Seeded device {device.device_id}")
+    except ConflictError:
+        print("Local device already exists")
 
 
 def main() -> None:
