@@ -162,7 +162,7 @@ class InfluxTelemetryRepository:
         reader = csv.DictReader(data_lines)
         for row in reader:
             timestamp_value = row.get("_time")
-            if not timestamp_value:
+            if not timestamp_value or timestamp_value == "_time":
                 continue
 
             metrics: dict[str, MetricValue] = {}
