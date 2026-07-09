@@ -16,3 +16,7 @@ class NotFoundError(LimnopulseError):
 
 class ConflictError(LimnopulseError):
     """Conditional write or version conflict."""
+
+
+class TelemetryQueryError(LimnopulseError):
+    """Telemetry backend could not satisfy a query."""

@@ -40,6 +40,10 @@ def get_domain_repository(request: Request) -> DomainRepository:
     return _get_state_dependency(request, "domain_repository")
 
 
+def get_telemetry_repository(request: Request) -> TelemetryRepository:
+    return _get_state_dependency(request, "telemetry_repository")
+
+
 def get_membership_service(request: Request) -> MembershipService:
     return _get_state_dependency(request, "membership_service")
 
@@ -49,6 +53,7 @@ def get_telemetry_repository(request: Request) -> TelemetryRepository:
 
 
 DomainRepositoryDep = Annotated[DomainRepository, Depends(get_domain_repository)]
+TelemetryRepositoryDep = Annotated[TelemetryRepository, Depends(get_telemetry_repository)]
 MembershipServiceDep = Annotated[MembershipService, Depends(get_membership_service)]
 TelemetryRepositoryDep = Annotated[TelemetryRepository, Depends(get_telemetry_repository)]
 
