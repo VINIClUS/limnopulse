@@ -1,0 +1,11 @@
+{
+  "ts": "2026-07-09T12:00:00Z",
+  "seq": 1,
+  "temp_c": 25.1,
+  "ph": 7.2,
+  "do_mg_l": 6.4,
+  "turbidity_ntu": 3.1,
+  "salinity_ppt": 11.8,
+  "battery_v": 3.82,
+  "rssi": -67
+}

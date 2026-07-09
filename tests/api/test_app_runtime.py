@@ -15,6 +15,9 @@ from limnopulse_api.main import create_app
 from limnopulse_api.services.memberships import MembershipService
 
 
+TEST_ISSUER = "https://cognito-idp.us-east-1.amazonaws.com/pool_1"
+
+
 class FakeRedisClient:
     def __init__(self) -> None:
         self.closed = False
@@ -66,7 +69,7 @@ class FakeKeyStore:
 def build_token(private_key) -> str:
     now = datetime.now(UTC)
     claims = {
-        "iss": "https://cognito-idp.us-east-1.amazonaws.com/pool_1",
+        "iss": TEST_ISSUER,
         "sub": "sub_1",
         "client_id": "client_1",
         "token_use": "access",
@@ -81,8 +84,21 @@ def build_token(private_key) -> str:
 def test_app_lifespan_wires_runtime_dependencies(monkeypatch) -> None:
     dynamo_calls: list[dict[str, str | None]] = []
     redis_calls: list[str] = []
+    influx_calls: list[dict[str, str]] = []
     fake_dynamo = object()
     fake_redis = FakeRedisClient()
+    fake_query_api = object()
+
+    class FakeInfluxClient:
+        def __init__(self, **kwargs) -> None:
+            influx_calls.append(kwargs)
+            self.closed = False
+
+        def query_api(self):
+            return fake_query_api
+
+        def close(self) -> None:
+            self.closed = True
 
     def fake_boto3_client(service_name: str, **kwargs):
         dynamo_calls.append({"service_name": service_name, **kwargs})
@@ -94,6 +110,7 @@ def test_app_lifespan_wires_runtime_dependencies(monkeypatch) -> None:
 
     monkeypatch.setattr("limnopulse_api.main.boto3.client", fake_boto3_client)
     monkeypatch.setattr("limnopulse_api.main.redis.from_url", fake_redis_from_url)
+    monkeypatch.setattr("limnopulse_api.main.InfluxDBClient", FakeInfluxClient)
     settings = Settings(
         app_env="test",
         auth_mode="cognito",
@@ -102,15 +119,21 @@ def test_app_lifespan_wires_runtime_dependencies(monkeypatch) -> None:
         cognito_client_id="client_1",
         dynamodb_endpoint_url="http://localhost:8000",
         redis_url="redis://localhost:6379/0",
+        influxdb_url="http://localhost:8086",
+        influxdb_token="local-token",
+        influxdb_org="limnopulse",
+        influxdb_bucket_raw="limnopulse_raw",
     )
 
     app = create_app(settings)
 
     assert dynamo_calls == []
     assert redis_calls == []
+    assert influx_calls == []
     assert not hasattr(app.state, "domain_repository")
     assert not hasattr(app.state, "membership_service")
     assert not hasattr(app.state, "auth_provider")
+    assert not hasattr(app.state, "telemetry_repository")
 
     with TestClient(app):
         assert dynamo_calls == [
@@ -130,10 +153,22 @@ def test_app_lifespan_wires_runtime_dependencies(monkeypatch) -> None:
         assert isinstance(app.state.membership_service, MembershipService)
         assert app.state.membership_service.domain_repository is app.state.domain_repository
         assert app.state.membership_service.cache is app.state.cache_repository
+        assert influx_calls == [
+            {
+                "url": "http://localhost:8086",
+                "token": "local-token",
+                "org": "limnopulse",
+            }
+        ]
+        assert app.state.influxdb_client.query_api() is fake_query_api
+        assert app.state.telemetry_repository.query_api is fake_query_api
+        assert app.state.telemetry_repository.org == "limnopulse"
+        assert app.state.telemetry_repository.bucket == "limnopulse_raw"
         assert isinstance(app.state.auth_provider, CognitoJwtAuthProvider)
         assert app.state.auth_provider.key_store.cache is app.state.cache_repository
 
     assert fake_redis.closed is True
+    assert app.state.influxdb_client.closed is True
 
 
 def test_app_lifespan_uses_dummy_credentials_for_local_dynamodb(monkeypatch) -> None:
@@ -196,6 +231,7 @@ def test_cognito_identity_without_membership_gets_403() -> None:
         auth_mode="cognito",
         cognito_user_pool_id="pool_1",
         cognito_client_id="client_1",
+        cognito_issuer=TEST_ISSUER,
     )
     app = create_app(settings)
     app.state.domain_repository = FakeDomainRepository()

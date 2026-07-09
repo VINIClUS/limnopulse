@@ -1,0 +1,16 @@
+project_name = "limnopulse"
+environment  = "cloud"
+aws_region   = "us-east-2"
+
+dynamodb_domain_table = "LimnopulseDomain"
+dynamodb_audit_table  = "LimnopulseAudit"
+
+cognito_user_pool_name = "limnopulse-users"
+cognito_client_name    = "limnopulse-app"
+
+alerts_queue_name = "limnopulse-alerts"
+alerts_dlq_name   = "limnopulse-alerts-dlq"
+
+ses_email_identity = ""
+redis_url          = ""
+influxdb_url       = ""

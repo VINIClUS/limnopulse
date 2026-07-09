@@ -24,3 +24,12 @@ def test_default_table_names_use_limnopulse() -> None:
     settings = Settings(app_env="test", auth_mode="dev")
     assert settings.dynamodb_domain_table == "LimnopulseDomain"
     assert settings.dynamodb_audit_table == "LimnopulseAudit"
+
+
+def test_default_influxdb_settings_use_local_limnopulse_values() -> None:
+    settings = Settings(app_env="test", auth_mode="dev")
+    assert settings.influxdb_url == "http://localhost:8086"
+    assert settings.influxdb_org == "limnopulse"
+    assert settings.influxdb_bucket_raw == "limnopulse_raw"
+    assert settings.telemetry_default_range == "-1h"
+    assert settings.telemetry_max_limit == 1000
