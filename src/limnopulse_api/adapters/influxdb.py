@@ -3,7 +3,6 @@ from __future__ import annotations
 import csv
 import json
 from datetime import UTC, datetime
-from typing import Any
 
 import httpx
 
@@ -188,7 +187,10 @@ class InfluxTelemetryRepository:
     def _parse_metric_value(self, value: str | None) -> MetricValue | None:
         if value is None or value == "":
             return None
-        number = float(value)
+        try:
+            number = float(value)
+        except ValueError as exc:
+            raise TelemetryQueryError("InfluxDB returned non-numeric telemetry field") from exc
         if number.is_integer() and "." not in value and "e" not in value.lower():
             return int(number)
         return number
