@@ -12,9 +12,7 @@ def _read(relative_path: str) -> str:
 
 def _opentofu_text_files() -> list[Path]:
     return [
-        path
-        for path in TOFU_ROOT.rglob("*")
-        if path.is_file() and ".terraform" not in path.parts
+        path for path in TOFU_ROOT.rglob("*") if path.is_file() and ".terraform" not in path.parts
     ]
 
 
@@ -33,7 +31,11 @@ def test_opentofu_layout_documents_cloud_boundary() -> None:
         "versions.tf",
     }
 
-    assert {str(path.relative_to(TOFU_ROOT)).replace("\\", "/") for path in TOFU_ROOT.rglob("*") if path.is_file()} >= expected_files
+    assert {
+        str(path.relative_to(TOFU_ROOT)).replace("\\", "/")
+        for path in TOFU_ROOT.rglob("*")
+        if path.is_file()
+    } >= expected_files
 
     readme = _read("README.md")
     root_readme = (ROOT / "README.md").read_text(encoding="utf-8")
@@ -74,6 +76,9 @@ def test_cloud_dynamodb_tables_match_domain_contract() -> None:
     assert dynamodb.count('type = "S"') >= 4
     assert "point_in_time_recovery" in dynamodb
     assert "server_side_encryption" in dynamodb
+    assert dynamodb.count('attribute_name = "expires_at"') == 2
+    assert len(re.findall(r"ttl\s*\{", dynamodb)) == 2
+    assert len(re.findall(r"ttl\s*\{[^}]*enabled\s+=\s+true", dynamodb, re.DOTALL)) == 2
 
 
 def test_cognito_resources_export_application_environment_contract() -> None:
@@ -83,12 +88,15 @@ def test_cognito_resources_export_application_environment_contract() -> None:
     assert 'resource "aws_cognito_user_pool" "main"' in cognito
     assert 'resource "aws_cognito_user_pool_client" "api"' in cognito
     assert 'auto_verified_attributes = ["email"]' in cognito
-    assert 'generate_secret = false' in cognito
+    assert "generate_secret = false" in cognito
     assert '"ALLOW_USER_SRP_AUTH"' in cognito
     assert 'output "cognito_user_pool_id"' in outputs
     assert 'output "cognito_client_id"' in outputs
     assert 'output "cognito_issuer"' in outputs
-    assert 'https://cognito-idp.${var.aws_region}.amazonaws.com/${aws_cognito_user_pool.main.id}' in outputs
+    assert (
+        "https://cognito-idp.${var.aws_region}.amazonaws.com/${aws_cognito_user_pool.main.id}"
+        in outputs
+    )
     assert "Cloud Redis endpoint placeholder only" in outputs
     assert "Cloud InfluxDB endpoint placeholder only" in outputs
 

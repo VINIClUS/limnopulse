@@ -11,3 +11,7 @@ def new_pond_id() -> str:
 
 def new_device_id() -> str:
     return f"dev_{uuid4().hex}"
+
+
+def new_alert_rule_id() -> str:
+    return f"rule_{uuid4().hex}"

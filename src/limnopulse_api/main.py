@@ -9,6 +9,7 @@ from botocore.exceptions import BotoCoreError, ClientError
 from influxdb_client import InfluxDBClient
 
 from limnopulse_api.adapters.dynamodb import DynamoDomainRepository
+from limnopulse_api.adapters.alert_rules import DynamoAlertRuleRepository
 from limnopulse_api.adapters.influxdb import InfluxTelemetryRepository
 from limnopulse_api.adapters.redis import RedisCacheRepository
 from limnopulse_api.api.router import api_router
@@ -41,6 +42,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             hasattr(app.state, attribute_name)
             for attribute_name in (
                 "domain_repository",
+                "alert_rule_repository",
                 "membership_service",
                 "auth_provider",
                 "cache_repository",
@@ -55,9 +57,18 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         redis_client = redis.from_url(resolved_settings.redis_url)
         app.state.redis_client = redis_client
         app.state.cache_repository = RedisCacheRepository(redis_client)
+        dynamodb_client = boto3.client(
+            "dynamodb",
+            **_dynamodb_client_kwargs(resolved_settings),
+        )
         app.state.domain_repository = DynamoDomainRepository(
             table_name=resolved_settings.dynamodb_domain_table,
-            client=boto3.client("dynamodb", **_dynamodb_client_kwargs(resolved_settings)),
+            client=dynamodb_client,
+        )
+        app.state.alert_rule_repository = DynamoAlertRuleRepository(
+            domain_table_name=resolved_settings.dynamodb_domain_table,
+            audit_table_name=resolved_settings.dynamodb_audit_table,
+            client=dynamodb_client,
         )
         app.state.membership_service = MembershipService(
             domain_repository=app.state.domain_repository,

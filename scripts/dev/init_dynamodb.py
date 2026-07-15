@@ -9,22 +9,39 @@ def ensure_table(client: boto3.client, table_name: str) -> None:
     existing_tables = set(client.list_tables()["TableNames"])
     if table_name in existing_tables:
         print(f"Table {table_name} already exists")
-        return
+    else:
+        client.create_table(
+            TableName=table_name,
+            KeySchema=[
+                {"AttributeName": "PK", "KeyType": "HASH"},
+                {"AttributeName": "SK", "KeyType": "RANGE"},
+            ],
+            AttributeDefinitions=[
+                {"AttributeName": "PK", "AttributeType": "S"},
+                {"AttributeName": "SK", "AttributeType": "S"},
+            ],
+            BillingMode="PAY_PER_REQUEST",
+        )
+        client.get_waiter("table_exists").wait(TableName=table_name)
+        print(f"Created table {table_name}")
 
-    client.create_table(
+    ensure_ttl(client, table_name)
+
+
+def ensure_ttl(client: boto3.client, table_name: str) -> None:
+    response = client.describe_time_to_live(TableName=table_name)
+    status = response.get("TimeToLiveDescription", {}).get("TimeToLiveStatus")
+    if status in {"ENABLED", "ENABLING"}:
+        print(f"TTL already enabled for {table_name}")
+        return
+    client.update_time_to_live(
         TableName=table_name,
-        KeySchema=[
-            {"AttributeName": "PK", "KeyType": "HASH"},
-            {"AttributeName": "SK", "KeyType": "RANGE"},
-        ],
-        AttributeDefinitions=[
-            {"AttributeName": "PK", "AttributeType": "S"},
-            {"AttributeName": "SK", "AttributeType": "S"},
-        ],
-        BillingMode="PAY_PER_REQUEST",
+        TimeToLiveSpecification={
+            "Enabled": True,
+            "AttributeName": "expires_at",
+        },
     )
-    client.get_waiter("table_exists").wait(TableName=table_name)
-    print(f"Created table {table_name}")
+    print(f"Enabled TTL for {table_name}")
 
 
 def main() -> None:

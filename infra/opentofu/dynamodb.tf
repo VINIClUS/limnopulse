@@ -14,6 +14,11 @@ resource "aws_dynamodb_table" "domain" {
     type = "S"
   }
 
+  ttl {
+    attribute_name = "expires_at"
+    enabled        = true
+  }
+
   point_in_time_recovery {
     enabled = true
   }
@@ -37,6 +42,11 @@ resource "aws_dynamodb_table" "audit" {
   attribute {
     name = "SK"
     type = "S"
+  }
+
+  ttl {
+    attribute_name = "expires_at"
+    enabled        = true
   }
 
   point_in_time_recovery {
