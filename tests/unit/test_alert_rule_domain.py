@@ -75,6 +75,16 @@ def test_alert_rule_is_immutable() -> None:
         rule.threshold = 4.5
 
 
+def test_alert_rule_defaults_to_first_evaluation_revision() -> None:
+    assert make_rule().evaluation_revision == 1
+
+
+@pytest.mark.parametrize("metric", [AlertMetric.BATTERY_V, AlertMetric.RSSI])
+def test_device_metrics_require_device_id(metric: AlertMetric) -> None:
+    with pytest.raises(ValidationError, match="device_id is required"):
+        make_rule(metric=metric, device_id=None)
+
+
 def test_new_alert_rule_id_has_canonical_prefix() -> None:
     assert re.fullmatch(r"rule_[0-9a-f]{32}", new_alert_rule_id())
 

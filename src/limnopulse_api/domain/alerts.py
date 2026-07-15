@@ -1,9 +1,9 @@
 from collections.abc import Mapping
 from enum import StrEnum
 import re
-from typing import Annotated, Any
+from typing import Annotated, Any, Self
 
-from pydantic import AfterValidator, BaseModel, ConfigDict, Field, field_validator
+from pydantic import AfterValidator, BaseModel, ConfigDict, Field, field_validator, model_validator
 
 from limnopulse_api.domain.entities import VersionedEntity
 
@@ -79,6 +79,7 @@ class AlertRule(VersionedEntity):
     enabled: bool
     replaces_rule_id: str | None = None
     replaced_by_rule_id: str | None = None
+    evaluation_revision: int = Field(default=1, ge=1)
 
     @field_validator("channels")
     @classmethod
@@ -89,6 +90,12 @@ class AlertRule(VersionedEntity):
         if len(set(value)) != len(value):
             raise ValueError("channels must be unique")
         return value
+
+    @model_validator(mode="after")
+    def device_metrics_require_device(self) -> Self:
+        if self.metric in {AlertMetric.BATTERY_V, AlertMetric.RSSI} and self.device_id is None:
+            raise ValueError("device_id is required for battery_v and rssi alert rules")
+        return self
 
 
 class AuditContext(BaseModel):

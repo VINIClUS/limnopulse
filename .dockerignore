@@ -1,0 +1,11 @@
+.git
+.venv
+.env
+.pytest_cache
+.terraform
+docs
+examples
+infra
+scripts
+src
+tests

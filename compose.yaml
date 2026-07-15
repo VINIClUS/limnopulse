@@ -49,6 +49,26 @@ services:
       - ./infra/telegraf/telegraf.conf:/etc/telegraf/telegraf.conf:ro
       - ./infra/telegraf/device_registry.star:/etc/telegraf/device_registry.star:ro
 
+  alert-evaluator:
+    profiles: ["manual"]
+    build:
+      context: .
+      dockerfile: Dockerfile.alert-evaluator
+    depends_on:
+      - dynamodb-local
+      - influxdb
+    environment:
+      APP_ENV: local
+      AWS_REGION: us-east-1
+      DYNAMODB_DOMAIN_TABLE: LimnopulseDomain
+      DYNAMODB_ENDPOINT_URL: http://dynamodb-local:8000
+      INFLUXDB_URL: http://influxdb:8086
+      INFLUXDB_TOKEN: local-dev-token
+      INFLUXDB_ORG: limnopulse
+      INFLUXDB_BUCKET_RAW: limnopulse_raw
+    command: ["run"]
+    restart: "no"
+
 volumes:
   dynamodb_data:
   influxdb_data:

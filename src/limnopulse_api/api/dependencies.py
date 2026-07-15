@@ -10,6 +10,7 @@ from limnopulse_api.domain.entities import TenantAccess
 from limnopulse_api.domain.roles import READ_ROLES, TenantRole
 from limnopulse_api.repositories.domain import DomainRepository
 from limnopulse_api.repositories.alerts import AlertRuleRepository
+from limnopulse_api.repositories.alert_events import AlertEventRepository
 from limnopulse_api.repositories.telemetry import TelemetryRepository
 from limnopulse_api.services.memberships import MembershipService
 
@@ -53,8 +54,13 @@ def get_alert_rule_repository(request: Request) -> AlertRuleRepository:
     return _get_state_dependency(request, "alert_rule_repository")
 
 
+def get_alert_event_repository(request: Request) -> AlertEventRepository:
+    return _get_state_dependency(request, "alert_event_repository")
+
+
 DomainRepositoryDep = Annotated[DomainRepository, Depends(get_domain_repository)]
 AlertRuleRepositoryDep = Annotated[AlertRuleRepository, Depends(get_alert_rule_repository)]
+AlertEventRepositoryDep = Annotated[AlertEventRepository, Depends(get_alert_event_repository)]
 TelemetryRepositoryDep = Annotated[TelemetryRepository, Depends(get_telemetry_repository)]
 MembershipServiceDep = Annotated[MembershipService, Depends(get_membership_service)]
 

@@ -1,6 +1,6 @@
 # Limnopulse
 
-FastAPI foundation for Limnopulse with authorized telemetry reads and Phase 3A Alert Rule configuration.
+FastAPI and one-shot Go evaluation runtime for Limnopulse telemetry and alerts.
 
 ## Local Setup
 
@@ -38,7 +38,7 @@ GET /v1/tenants/{tenant_id}/ponds/{pond_id}/readings?start=-1h&limit=500
 GET /v1/tenants/{tenant_id}/ponds/{pond_id}/metrics/latest
 ```
 
-The API checks active tenant membership and verifies the pond in DynamoDB before querying InfluxDB. Clients never access InfluxDB directly. Go alert evaluation and notification delivery are not implemented yet.
+The API checks active tenant membership and verifies the pond in DynamoDB before querying InfluxDB. Clients never access InfluxDB directly.
 
 ## Alert Rules
 
@@ -75,7 +75,31 @@ Example creation body:
 
 PATCH accepts `expected_version` plus at least one mutable field. Tenant, pond, optional device, and metric form the semantic identity and cannot be patched. To change identity, call `/replace` with a complete replacement body, `expected_version`, and an `Idempotency-Key` header between 8 and 128 characters. The same key and payload replays the result for 24 hours; reusing the key with another payload returns `409`.
 
-This phase stores channel declarations but does not evaluate telemetry or send notifications. See `docs/architecture.md` for the Phase 3B evaluator and Phase 3C dispatcher boundaries.
+Phase 3B evaluates rules but does not send notifications. It stores opening and recovery outboxes durably for the Phase 3C dispatcher.
+
+## Alert Events and Evaluation
+
+Phase 3B exposes durable incident reads and administrative transitions:
+
+```text
+GET  /v1/tenants/{tenant_id}/alert-events
+GET  /v1/tenants/{tenant_id}/alert-events/{event_id}
+POST /v1/tenants/{tenant_id}/alert-events/{event_id}/acknowledge
+POST /v1/tenants/{tenant_id}/alert-events/{event_id}/resolve
+```
+
+All tenant roles may read. Members, admins and owners may acknowledge; only
+admins and owners may manually resolve. Mutations require `expected_version`.
+
+Run one local evaluation after initializing DynamoDB and telemetry:
+
+```bash
+docker compose --profile manual run --rm alert-evaluator run
+```
+
+The process exits after the owned work is complete. Scheduling remains external.
+See [Phase 3B evaluator operations](docs/alert-evaluator-phase-3b.md) for replay,
+sharding, schedule backfill, scheduler examples, exit codes and metrics.
 
 ## Local Telemetry Ingestion
 
@@ -122,10 +146,11 @@ tofu fmt -check
 tofu validate
 ```
 
-The scaffold covers DynamoDB on-demand tables, Cognito User Pool/client, SQS with DLQ, and optional SES identity. `backend.example.hcl` is a placeholder for a future real remote-state setup; do not use it for local validation. Redis cloud, InfluxDB managed provisioning, production MQTT hardening, Go workers, and notification channels remain future slices. Do not commit real backend config, `.tfvars`, state files, plans, account ids, domains, or secrets.
+The scaffold covers DynamoDB on-demand tables and alert indexes, Cognito User Pool/client, SQS with DLQ, and optional SES identity. `backend.example.hcl` is a placeholder for a future real remote-state setup; do not use it for local validation. Redis cloud, InfluxDB managed provisioning, production MQTT hardening, scheduled evaluator deployment, and notification delivery remain future slices. Do not commit real backend config, `.tfvars`, state files, plans, account ids, domains, or secrets.
 
 ## Tests
 
 ```bash
 python -m pytest -q
+go test -race ./...
 ```

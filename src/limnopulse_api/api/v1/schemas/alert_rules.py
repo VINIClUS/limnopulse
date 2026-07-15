@@ -40,6 +40,12 @@ class AlertRuleDefinition(BaseModel):
             raise ValueError("channels must be unique")
         return value
 
+    @model_validator(mode="after")
+    def device_metrics_require_device(self) -> Self:
+        if self.metric in {AlertMetric.BATTERY_V, AlertMetric.RSSI} and self.device_id is None:
+            raise ValueError("device_id is required for battery_v and rssi alert rules")
+        return self
+
 
 class AlertRuleCreate(AlertRuleDefinition):
     pass
