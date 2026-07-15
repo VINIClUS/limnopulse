@@ -377,6 +377,103 @@ async def test_cosmetic_update_preserves_evaluation_revision_and_schedule() -> N
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("mode", ["active", "pending"])
+async def test_noop_semantic_update_preserves_evaluator_generation(mode: str) -> None:
+    client = RecordingDynamoClient()
+    repository = make_repository(client)
+    client.seed("LimnopulseDomain", repository._rule_to_item(make_rule(version=2)))
+    state: dict[str, Any] = {"Mode": mode}
+    if mode == "active":
+        state.update({"ActiveEventID": "alert_1", "ActiveStatus": "open"})
+        client.seed(
+            "LimnopulseDomain",
+            {
+                "PK": "TENANT#tnt_1",
+                "SK": "ALERT_EVENT#alert_1",
+                "entity_type": "alert_event",
+                "status": "open",
+                "evaluation_revision": 1,
+                "version": 1,
+            },
+        )
+    else:
+        state.update(
+            {
+                "ConfirmedSlots": 2,
+                "PendingSince": "2026-07-15T11:58:45Z",
+                "LastBreachSlot": "2026-07-15T11:59:45Z",
+            }
+        )
+    client.seed(
+        "LimnopulseDomain",
+        {
+            "PK": "TENANT#tnt_1",
+            "SK": "ALERT_STATE#rule_1",
+            "entity_type": "alert_evaluation_state",
+            "state_revision": 4,
+            "state_json": json.dumps(state),
+        },
+    )
+
+    updated = await repository.update_rule(
+        "tnt_1", "rule_1", 2, {"threshold": 5.0}, audit_context()
+    )
+
+    assert updated.version == 3
+    assert updated.evaluation_revision == 1
+    state_item = client.items[("LimnopulseDomain", "TENANT#tnt_1", "ALERT_STATE#rule_1")]
+    assert state_item["state_revision"] == 4
+    assert json.loads(state_item["state_json"])["Mode"] == mode
+    if mode == "active":
+        event_item = client.items[
+            ("LimnopulseDomain", "TENANT#tnt_1", "ALERT_EVENT#alert_1")
+        ]
+        assert event_item["status"] == "open"
+    operations = client.transact_write_items_calls[0]["TransactItems"]
+    assert [set(operation) for operation in operations] == [{"Update"}, {"Put"}]
+
+
+@pytest.mark.asyncio
+async def test_noop_semantic_field_with_cosmetic_change_keeps_generation() -> None:
+    client = RecordingDynamoClient()
+    repository = make_repository(client)
+    client.seed("LimnopulseDomain", repository._rule_to_item(make_rule(version=2)))
+
+    updated = await repository.update_rule(
+        "tnt_1",
+        "rule_1",
+        2,
+        {"threshold": 5.0, "name": "Renamed"},
+        audit_context(),
+    )
+
+    assert updated.name == "Renamed"
+    assert updated.evaluation_revision == 1
+    operations = client.transact_write_items_calls[0]["TransactItems"]
+    assert [set(operation) for operation in operations] == [{"Update"}, {"Put"}]
+
+
+@pytest.mark.asyncio
+async def test_noop_semantic_update_on_disabled_rule_has_no_operational_removals() -> None:
+    client = RecordingDynamoClient()
+    repository = make_repository(client)
+    client.seed(
+        "LimnopulseDomain",
+        repository._rule_to_item(make_rule(version=2, enabled=False)),
+    )
+
+    updated = await repository.update_rule(
+        "tnt_1", "rule_1", 2, {"threshold": 5.0}, audit_context()
+    )
+
+    assert updated.version == 3
+    assert updated.evaluation_revision == 1
+    operations = client.transact_write_items_calls[0]["TransactItems"]
+    assert [set(operation) for operation in operations] == [{"Update"}, {"Put"}]
+    assert " REMOVE " not in operations[0]["Update"]["UpdateExpression"]
+
+
+@pytest.mark.asyncio
 async def test_semantic_update_conflicts_when_state_appears_after_snapshot() -> None:
     class RacingClient(RecordingDynamoClient):
         def transact_write_items(self, **kwargs: Any) -> dict[str, Any]:

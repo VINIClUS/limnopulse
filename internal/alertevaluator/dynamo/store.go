@@ -214,20 +214,28 @@ func (store Store) commitItems(request alertevaluator.CommitRequest) ([]types.Tr
 
 func (store Store) ruleScheduleUpdate(request alertevaluator.CommitRequest) (*types.Update, error) {
 	key, _ := attributevalue.MarshalMap(map[string]string{"PK": request.Work.PK, "SK": request.Work.SK})
-	values, err := attributevalue.MarshalMap(map[string]any{
+	valueMap := map[string]any{
 		":next_due": alertevaluator.FixedUTCTimestamp(request.NextDue),
 		":gsi_sk":   alertevaluator.FixedUTCTimestamp(request.NextDue) + "#TENANT#" + request.Work.Rule.TenantID + "#RULE#" + request.Work.Rule.RuleID,
 		":slot":     alertevaluator.FixedUTCTimestamp(request.Slot), ":quality": string(request.Evaluation.Quality),
-		":value": request.Evaluation.Value, ":version": request.Work.Rule.Version,
+		":version":             request.Work.Rule.Version,
 		":evaluation_revision": request.Work.Rule.EvaluationRevision, ":owner": request.Work.LeaseOwner,
 		":epoch": request.Work.LeaseEpoch, ":true": true, ":active": "active",
-	})
+	}
+	updateExpression := "SET #next_due = :next_due, #gsi_sk = :gsi_sk, #last_slot = :slot, #last_quality = :quality"
+	if request.Evaluation.Quality == alertevaluator.QualitySufficient {
+		valueMap[":value"] = request.Evaluation.Value
+		updateExpression += ", #last_value = :value REMOVE #lease_owner, #lease_expires"
+	} else {
+		updateExpression += " REMOVE #last_value, #lease_owner, #lease_expires"
+	}
+	values, err := attributevalue.MarshalMap(valueMap)
 	if err != nil {
 		return nil, err
 	}
 	return &types.Update{
 		TableName: aws.String(store.Table), Key: key,
-		UpdateExpression:    aws.String("SET #next_due = :next_due, #gsi_sk = :gsi_sk, #last_slot = :slot, #last_quality = :quality, #last_value = :value REMOVE #lease_owner, #lease_expires"),
+		UpdateExpression:    aws.String(updateExpression),
 		ConditionExpression: aws.String("#version = :version AND #evaluation_revision = :evaluation_revision AND #lease_owner = :owner AND #lease_epoch = :epoch AND #enabled = :true AND #status = :active"),
 		ExpressionAttributeNames: map[string]string{
 			"#next_due": "next_evaluation_at", "#gsi_sk": "GSI1SK", "#last_slot": "last_evaluated_slot",
@@ -325,35 +333,55 @@ func (store Store) outboxPut(request alertevaluator.CommitRequest, outbox alerte
 }
 
 func (store Store) eventMetadataUpdate(request alertevaluator.CommitRequest) (*types.Update, error) {
-	return store.activeEventUpdate(request, "SET #last_at = :slot, #last_quality = :quality, #last_value = :value", false)
+	if request.Evaluation.Quality == alertevaluator.QualitySufficient {
+		return store.activeEventUpdate(request, activeEventMetadataWithValue)
+	}
+	return store.activeEventUpdate(request, activeEventMetadataWithoutValue)
 }
 
 func (store Store) eventResolutionUpdate(request alertevaluator.CommitRequest) (*types.Update, error) {
-	return store.activeEventUpdate(request, "SET #status = :resolved, #resolved_at = :slot, #updated_at = :slot, #version = #version + :one, #last_at = :slot, #last_quality = :quality, #last_value = :value", true)
+	return store.activeEventUpdate(request, activeEventResolution)
 }
 
-func (store Store) activeEventUpdate(request alertevaluator.CommitRequest, expression string, resolved bool) (*types.Update, error) {
+type activeEventUpdateKind uint8
+
+const (
+	activeEventMetadataWithValue activeEventUpdateKind = iota
+	activeEventMetadataWithoutValue
+	activeEventResolution
+)
+
+func (store Store) activeEventUpdate(request alertevaluator.CommitRequest, kind activeEventUpdateKind) (*types.Update, error) {
 	eventID := request.Decision.Next.ActiveEventID
-	if resolved {
-		eventID = request.Decision.ResolvedEventID
-	}
-	key, _ := attributevalue.MarshalMap(map[string]string{"PK": request.Work.PK, "SK": eventSortKey(eventID)})
 	valueMap := map[string]any{
 		":slot": alertevaluator.FixedUTCTimestamp(request.Slot), ":quality": string(request.Evaluation.Quality),
-		":value": request.Evaluation.Value, ":open": "open", ":acknowledged": "acknowledged",
+		":open": "open", ":acknowledged": "acknowledged",
 		":suppressed": "suppressed",
 	}
 	names := map[string]string{
 		"#status": "status", "#last_at": "last_evaluated_at",
 		"#last_quality": "last_evaluation_quality", "#last_value": "last_evaluation_value",
 	}
-	if resolved {
+	var expression string
+	switch kind {
+	case activeEventMetadataWithValue:
+		expression = "SET #last_at = :slot, #last_quality = :quality, #last_value = :value"
+		valueMap[":value"] = request.Evaluation.Value
+	case activeEventMetadataWithoutValue:
+		expression = "SET #last_at = :slot, #last_quality = :quality REMOVE #last_value"
+	case activeEventResolution:
+		eventID = request.Decision.ResolvedEventID
+		expression = "SET #status = :resolved, #resolved_at = :slot, #updated_at = :slot, #version = #version + :one, #last_at = :slot, #last_quality = :quality, #last_value = :value"
+		valueMap[":value"] = request.Evaluation.Value
 		valueMap[":resolved"] = "resolved"
 		valueMap[":one"] = int64(1)
 		names["#resolved_at"] = "resolved_at"
 		names["#updated_at"] = "updated_at"
 		names["#version"] = "version"
+	default:
+		return nil, fmt.Errorf("unsupported active event update kind %d", kind)
 	}
+	key, _ := attributevalue.MarshalMap(map[string]string{"PK": request.Work.PK, "SK": eventSortKey(eventID)})
 	values, err := attributevalue.MarshalMap(valueMap)
 	if err != nil {
 		return nil, err

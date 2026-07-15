@@ -1,5 +1,8 @@
 from typing import Any
 
+import pytest
+
+from scripts.dev import init_dynamodb
 from scripts.dev.init_dynamodb import ensure_table
 
 
@@ -45,6 +48,44 @@ class FakeDynamoClient:
         self.update_ttl_calls.append(kwargs)
 
 
+class IndexLifecycleClient(FakeDynamoClient):
+    def __init__(
+        self,
+        *,
+        exists: bool = True,
+        initial_indexes: dict[str, str] | None = None,
+        activate_created_indexes: bool = True,
+    ) -> None:
+        super().__init__(exists=exists)
+        self.indexes = dict(initial_indexes or {})
+        self.activate_created_indexes = activate_created_indexes
+        self.index_describe_calls = 0
+
+    def create_table(self, **kwargs: Any) -> None:
+        super().create_table(**kwargs)
+        for index in kwargs.get("GlobalSecondaryIndexes", []):
+            self.indexes[index["IndexName"]] = "CREATING"
+
+    def describe_table(self, **kwargs: Any) -> dict[str, Any]:
+        self.index_describe_calls += 1
+        indexes = [
+            {"IndexName": name, "IndexStatus": status}
+            for name, status in self.indexes.items()
+        ]
+        if self.activate_created_indexes:
+            for name, status in tuple(self.indexes.items()):
+                if status == "CREATING":
+                    self.indexes[name] = "ACTIVE"
+        return {"Table": {"GlobalSecondaryIndexes": indexes}}
+
+    def update_table(self, **kwargs: Any) -> None:
+        if any(status != "ACTIVE" for status in self.indexes.values()):
+            raise AssertionError("attempted to create a GSI while another index was not ACTIVE")
+        super().update_table(**kwargs)
+        index_name = kwargs["GlobalSecondaryIndexUpdates"][0]["Create"]["IndexName"]
+        self.indexes[index_name] = "CREATING"
+
+
 def expected_ttl_call() -> dict[str, Any]:
     return {
         "TableName": "LimnopulseDomain",
@@ -75,8 +116,11 @@ def test_new_local_table_is_created_before_ttl_is_enabled() -> None:
     assert client.update_ttl_calls == [expected_ttl_call()]
 
 
-def test_new_domain_table_includes_alert_evaluation_and_event_indexes() -> None:
-    client = FakeDynamoClient(exists=False)
+def test_new_domain_table_includes_alert_evaluation_and_event_indexes(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(init_dynamodb, "GSI_WAIT_DELAY_SECONDS", 0, raising=False)
+    client = IndexLifecycleClient(exists=False)
 
     ensure_table(client, "LimnopulseDomain", include_alert_indexes=True)
 
@@ -106,3 +150,67 @@ def test_already_enabled_ttl_is_left_unchanged() -> None:
 
     assert client.describe_ttl_calls == [{"TableName": "LimnopulseDomain"}]
     assert client.update_ttl_calls == []
+
+
+def test_existing_table_waits_for_each_index_before_creating_next(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(init_dynamodb, "GSI_WAIT_DELAY_SECONDS", 0, raising=False)
+    client = IndexLifecycleClient()
+
+    ensure_table(client, "LimnopulseDomain", include_alert_indexes=True)
+
+    created = [
+        call["GlobalSecondaryIndexUpdates"][0]["Create"]["IndexName"]
+        for call in client.update_table_calls
+    ]
+    assert created == ["AlertEvaluationByDue", "AlertEventsByTenantTime"]
+    assert client.indexes == {
+        "AlertEvaluationByDue": "ACTIVE",
+        "AlertEventsByTenantTime": "ACTIVE",
+    }
+
+
+def test_new_table_waits_for_all_indexes_before_returning(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(init_dynamodb, "GSI_WAIT_DELAY_SECONDS", 0, raising=False)
+    client = IndexLifecycleClient(exists=False)
+
+    ensure_table(client, "LimnopulseDomain", include_alert_indexes=True)
+
+    assert client.update_table_calls == []
+    assert client.indexes == {
+        "AlertEvaluationByDue": "ACTIVE",
+        "AlertEventsByTenantTime": "ACTIVE",
+    }
+    assert client.index_describe_calls >= 3
+
+
+def test_existing_creating_index_is_awaited(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(init_dynamodb, "GSI_WAIT_DELAY_SECONDS", 0, raising=False)
+    client = IndexLifecycleClient(
+        initial_indexes={
+            "AlertEvaluationByDue": "CREATING",
+            "AlertEventsByTenantTime": "ACTIVE",
+        }
+    )
+
+    ensure_table(client, "LimnopulseDomain", include_alert_indexes=True)
+
+    assert client.update_table_calls == []
+    assert client.indexes["AlertEvaluationByDue"] == "ACTIVE"
+    assert client.index_describe_calls >= 2
+
+
+def test_index_wait_times_out_with_index_name(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(init_dynamodb, "GSI_WAIT_DELAY_SECONDS", 0, raising=False)
+    monkeypatch.setattr(init_dynamodb, "GSI_WAIT_MAX_ATTEMPTS", 2, raising=False)
+    client = IndexLifecycleClient(activate_created_indexes=False)
+
+    with pytest.raises(TimeoutError, match="AlertEvaluationByDue.*CREATING"):
+        ensure_table(client, "LimnopulseDomain", include_alert_indexes=True)

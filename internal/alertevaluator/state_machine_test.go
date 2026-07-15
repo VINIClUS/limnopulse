@@ -68,6 +68,27 @@ func TestIndeterminateDataNeverOpensOrResolves(t *testing.T) {
 	}
 }
 
+func TestIndeterminateDataPreservesLastSufficientValue(t *testing.T) {
+	rule := testRule()
+	state := State{
+		Mode:          ModeActive,
+		ActiveEventID: "alert_1",
+		ActiveStatus:  StatusOpen,
+		LastValue:     4.2,
+	}
+
+	decision := Decide(
+		rule,
+		state,
+		Evaluation{Slot: testSlot, Quality: QualityQueryError, Value: 0},
+		time.Minute,
+	)
+
+	if decision.Next.LastValue != 4.2 {
+		t.Fatalf("last value = %v, want last sufficient value 4.2", decision.Next.LastValue)
+	}
+}
+
 func TestCooldownCreatesDurableSuppressedEpisodeWithoutOutbox(t *testing.T) {
 	rule := testRule()
 	state := State{CooldownUntil: testSlot.Add(time.Hour), LastNotifiedEventID: "alert_previous"}

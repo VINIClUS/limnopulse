@@ -190,6 +190,64 @@ func TestCommitOpeningAtomicallyWritesEventTransitionAndOutboxes(t *testing.T) {
 	}
 }
 
+func TestCommitStoresEvaluationValueOnlyForSufficientQuality(t *testing.T) {
+	qualities := []struct {
+		name      string
+		quality   alertevaluator.Quality
+		value     float64
+		wantValue bool
+	}{
+		{name: "insufficient data", quality: alertevaluator.QualityInsufficientData},
+		{name: "stale data", quality: alertevaluator.QualityStaleData, value: 9.9},
+		{name: "query error", quality: alertevaluator.QualityQueryError},
+		{name: "sufficient zero", quality: alertevaluator.QualitySufficient, value: 0, wantValue: true},
+	}
+	for _, test := range qualities {
+		t.Run(test.name, func(t *testing.T) {
+			work, err := workFromItem(ruleItemWithLease())
+			if err != nil {
+				t.Fatal(err)
+			}
+			slot := time.Date(2026, 7, 15, 12, 1, 45, 0, time.UTC)
+			current := alertevaluator.State{
+				Mode:          alertevaluator.ModeActive,
+				ActiveEventID: "alert_1",
+				ActiveStatus:  alertevaluator.StatusOpen,
+				LastValue:     4.2,
+			}
+			evaluation := alertevaluator.Evaluation{
+				Slot: slot, Quality: test.quality, Value: test.value, Breached: true,
+			}
+			decision := alertevaluator.Decide(work.Rule.Rule, current, evaluation, time.Minute)
+			request := alertevaluator.CommitRequest{
+				Work: work, PreviousState: alertevaluator.VersionedState{State: current, Revision: 1},
+				Evaluation: evaluation, Decision: decision, Slot: slot, NextDue: slot.Add(time.Minute),
+			}
+
+			items, err := (Store{Table: "domain"}).commitItems(request)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if len(items) != 3 || items[0].Update == nil || items[2].Update == nil {
+				t.Fatalf("transaction shape = %#v", items)
+			}
+			for name, update := range map[string]*types.Update{
+				"rule": items[0].Update, "event": items[2].Update,
+			} {
+				expression := *update.UpdateExpression
+				_, hasValue := update.ExpressionAttributeValues[":value"]
+				if test.wantValue {
+					if !strings.Contains(expression, "#last_value = :value") || !hasValue {
+						t.Fatalf("%s sufficient update = %s, values = %#v", name, expression, update.ExpressionAttributeValues)
+					}
+				} else if !strings.Contains(expression, "REMOVE #last_value") || hasValue {
+					t.Fatalf("%s indeterminate update = %s, values = %#v", name, expression, update.ExpressionAttributeValues)
+				}
+			}
+		})
+	}
+}
+
 func ruleItem() map[string]any {
 	return map[string]any{
 		"PK": "TENANT#tnt_1", "SK": "ALERT_RULE#rule_1", "tenant_id": "tnt_1", "rule_id": "rule_1",

@@ -122,7 +122,6 @@ func Decide(rule Rule, current State, evaluation Evaluation, cadence time.Durati
 	}
 	next.LastEvaluatedSlot = evaluation.Slot
 	next.LastQuality = evaluation.Quality
-	next.LastValue = evaluation.Value
 
 	if evaluation.MissedSlots > 0 && next.Mode == ModePending {
 		resetPending(&next)
@@ -130,6 +129,7 @@ func Decide(rule Rule, current State, evaluation Evaluation, cadence time.Durati
 	if evaluation.Quality != QualitySufficient {
 		return Decision{Next: next, Transition: TransitionNone}
 	}
+	next.LastValue = evaluation.Value
 
 	if next.Mode == ModeActive {
 		if evaluation.Breached {

@@ -110,7 +110,11 @@ class DynamoAlertRuleRepository:
             raise NotFoundError(f"Alert rule {rule_id} not found")
 
         now = self.clock()
-        semantic_change = bool(EVALUATION_SEMANTIC_FIELDS.intersection(updates))
+        semantic_change = any(
+            field_name in updates
+            and updates[field_name] != getattr(existing, field_name)
+            for field_name in EVALUATION_SEMANTIC_FIELDS
+        )
         evaluation_revision = existing.evaluation_revision + int(semantic_change)
         updated = AlertRule.model_validate(
             {
@@ -137,7 +141,7 @@ class DynamoAlertRuleRepository:
         if semantic_change and updated.enabled:
             operational_updates.update(alert_evaluation_schedule(tenant_id, rule_id, now))
             removed_fields.update({"lease_owner", "lease_expires_at"})
-        elif not updated.enabled:
+        elif semantic_change and not updated.enabled:
             removed_fields.update(EVALUATION_SCHEDULE_FIELDS)
 
         resolution_operations = (
