@@ -1,7 +1,6 @@
 from contextlib import asynccontextmanager
 
 import boto3
-import httpx
 import redis.asyncio as redis
 from fastapi import FastAPI
 from fastapi.requests import Request
@@ -54,21 +53,11 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             return
 
         redis_client = redis.from_url(resolved_settings.redis_url)
-        influx_http_client = httpx.AsyncClient(base_url=resolved_settings.influxdb_url.rstrip("/"))
         app.state.redis_client = redis_client
-        app.state.influx_http_client = influx_http_client
         app.state.cache_repository = RedisCacheRepository(redis_client)
         app.state.domain_repository = DynamoDomainRepository(
             table_name=resolved_settings.dynamodb_domain_table,
             client=boto3.client("dynamodb", **_dynamodb_client_kwargs(resolved_settings)),
-        )
-        app.state.telemetry_repository = InfluxTelemetryRepository(
-            base_url=resolved_settings.influxdb_url,
-            org=resolved_settings.influxdb_org,
-            bucket=resolved_settings.influxdb_raw_bucket,
-            token=resolved_settings.influxdb_token,
-            timeout_seconds=resolved_settings.influxdb_timeout_seconds,
-            client=influx_http_client,
         )
         app.state.membership_service = MembershipService(
             domain_repository=app.state.domain_repository,
@@ -94,7 +83,6 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         try:
             yield
         finally:
-            await influx_http_client.aclose()
             await redis_client.aclose()
             influxdb_client.close()
 
