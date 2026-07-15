@@ -4,6 +4,7 @@ __pycache__/
 .superpowers/sdd/
 .serena/
 .Codex/
+.worktrees/
 .pytest_cache/
 .terraform/
 *.tfstate
