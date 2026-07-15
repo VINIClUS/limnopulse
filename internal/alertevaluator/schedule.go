@@ -39,6 +39,15 @@ func LatestCompleteSlot(evaluationTime time.Time, cadence, allowedLateness time.
 	return evaluationTime.UTC().Truncate(cadence).Add(-allowedLateness)
 }
 
+func NextCompleteSlot(value time.Time, cadence, allowedLateness time.Duration) time.Time {
+	shifted := value.UTC().Add(allowedLateness)
+	boundary := shifted.Truncate(cadence)
+	if !boundary.Equal(shifted) {
+		boundary = boundary.Add(cadence)
+	}
+	return boundary.Add(-allowedLateness)
+}
+
 func FixedUTCTimestamp(value time.Time) string {
 	return value.UTC().Format("2006-01-02T15:04:05.000000000Z")
 }

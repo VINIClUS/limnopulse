@@ -43,3 +43,12 @@ func TestLatestCompleteSlotIsStableWithinCadence(t *testing.T) {
 		t.Fatalf("LatestCompleteSlot() = %s, want %s", got, want)
 	}
 }
+
+func TestNextCompleteSlotMatchesPersistedPythonContract(t *testing.T) {
+	value := time.Date(2026, 7, 15, 12, 0, 0, 0, time.UTC)
+	got := NextCompleteSlot(value, time.Minute, 15*time.Second)
+	want := time.Date(2026, 7, 15, 12, 0, 45, 0, time.UTC)
+	if !got.Equal(want) {
+		t.Fatalf("NextCompleteSlot() = %s, want %s", got, want)
+	}
+}
