@@ -1,0 +1,386 @@
+from copy import deepcopy
+from datetime import UTC, datetime, timedelta
+from decimal import Decimal
+from typing import Any
+
+import pytest
+from boto3.dynamodb.types import TypeDeserializer, TypeSerializer
+
+from limnopulse_api.adapters.alert_rules import DynamoAlertRuleRepository
+from limnopulse_api.core.errors import ConflictError, NotFoundError
+from limnopulse_api.domain.alerts import (
+    AlertAggregation,
+    AlertChannel,
+    AlertMetric,
+    AlertOperator,
+    AlertRule,
+    AlertSeverity,
+    AuditContext,
+)
+
+
+class TransactionFailure(Exception):
+    def __init__(self) -> None:
+        self.response = {"Error": {"Code": "TransactionCanceledException"}}
+        super().__init__("transaction cancelled")
+
+
+class RecordingDynamoClient:
+    def __init__(self) -> None:
+        self.serializer = TypeSerializer()
+        self.deserializer = TypeDeserializer()
+        self.items: dict[tuple[str, str, str], dict[str, Any]] = {}
+        self.query_calls: list[dict[str, Any]] = []
+        self.get_item_calls: list[dict[str, Any]] = []
+        self.transact_write_items_calls: list[dict[str, Any]] = []
+        self.scan_calls = 0
+
+    def seed(self, table_name: str, item: dict[str, Any]) -> None:
+        self.items[(table_name, item["PK"], item["SK"])] = deepcopy(item)
+
+    def query(self, **kwargs: Any) -> dict[str, Any]:
+        self.query_calls.append(kwargs)
+        values = self._decode_item(kwargs["ExpressionAttributeValues"])
+        table_name = kwargs["TableName"]
+        items = [
+            item
+            for (table, pk, sk), item in self.items.items()
+            if table == table_name
+            and pk == values[":pk"]
+            and sk.startswith(values[":sk_prefix"])
+        ]
+        items.sort(key=lambda item: item["SK"])
+        return {"Items": [self._encode_item(item) for item in items]}
+
+    def get_item(self, **kwargs: Any) -> dict[str, Any]:
+        self.get_item_calls.append(kwargs)
+        key = self._decode_item(kwargs["Key"])
+        item = self.items.get((kwargs["TableName"], key["PK"], key["SK"]))
+        if item is None:
+            return {}
+        return {"Item": self._encode_item(item)}
+
+    def transact_write_items(self, **kwargs: Any) -> dict[str, Any]:
+        self.transact_write_items_calls.append(kwargs)
+        candidate = deepcopy(self.items)
+        for operation in kwargs["TransactItems"]:
+            if "Put" in operation:
+                self._apply_put(candidate, operation["Put"])
+            else:
+                self._apply_update(candidate, operation["Update"])
+        self.items = candidate
+        return {}
+
+    def scan(self, **kwargs: Any) -> dict[str, Any]:
+        self.scan_calls += 1
+        return {}
+
+    def _apply_put(
+        self,
+        items: dict[tuple[str, str, str], dict[str, Any]],
+        put: dict[str, Any],
+    ) -> None:
+        item = self._decode_item(put["Item"])
+        key = (put["TableName"], item["PK"], item["SK"])
+        existing = items.get(key)
+        condition = put.get("ConditionExpression", "")
+        if existing is not None and "attribute_not_exists" in condition:
+            values = self._decode_item(put.get("ExpressionAttributeValues", {}))
+            now = values.get(":now")
+            if now is None or existing.get("expires_at", now + 1) > now:
+                raise TransactionFailure()
+        items[key] = item
+
+    def _apply_update(
+        self,
+        items: dict[tuple[str, str, str], dict[str, Any]],
+        update: dict[str, Any],
+    ) -> None:
+        key_fields = self._decode_item(update["Key"])
+        key = (update["TableName"], key_fields["PK"], key_fields["SK"])
+        existing = items.get(key)
+        if existing is None:
+            raise TransactionFailure()
+        values = self._decode_item(update["ExpressionAttributeValues"])
+        if existing.get("version") != values.get(":expected_version"):
+            raise TransactionFailure()
+        if ":active" in values and existing.get("status") != values[":active"]:
+            raise TransactionFailure()
+        updated = dict(existing)
+        for assignment in update["UpdateExpression"].removeprefix("SET ").split(", "):
+            name_token, value_token = assignment.split(" = ")
+            field_name = update["ExpressionAttributeNames"][name_token]
+            updated[field_name] = values[value_token]
+        items[key] = updated
+
+    def _encode_item(self, item: dict[str, Any]) -> dict[str, Any]:
+        return {
+            key: self.serializer.serialize(self._normalize_for_dynamodb(value))
+            for key, value in item.items()
+        }
+
+    def _decode_item(self, item: dict[str, Any]) -> dict[str, Any]:
+        return {key: self.deserializer.deserialize(value) for key, value in item.items()}
+
+    def _normalize_for_dynamodb(self, value: Any) -> Any:
+        if isinstance(value, float):
+            return Decimal(str(value))
+        if isinstance(value, dict):
+            return {
+                key: self._normalize_for_dynamodb(item)
+                for key, item in value.items()
+            }
+        if isinstance(value, (list, tuple)):
+            return [self._normalize_for_dynamodb(item) for item in value]
+        return value
+
+
+NOW = datetime(2026, 7, 15, 12, 0, tzinfo=UTC)
+
+
+def make_rule(
+    *,
+    rule_id: str = "rule_1",
+    version: int = 1,
+    metric: AlertMetric = AlertMetric.DO_MG_L,
+    threshold: float = 5.0,
+    status: str = "active",
+    enabled: bool = True,
+    replaces_rule_id: str | None = None,
+    replaced_by_rule_id: str | None = None,
+) -> AlertRule:
+    return AlertRule(
+        tenant_id="tnt_1",
+        rule_id=rule_id,
+        pond_id="pond_1",
+        device_id="dev_1",
+        metric=metric,
+        name="Low oxygen",
+        operator=AlertOperator.LESS_THAN,
+        threshold=threshold,
+        aggregation=AlertAggregation.MIN,
+        window="5m",
+        duration="3m",
+        severity=AlertSeverity.CRITICAL,
+        channels=(AlertChannel.EMAIL, AlertChannel.TELEGRAM),
+        cooldown_seconds=1_800,
+        enabled=enabled,
+        replaces_rule_id=replaces_rule_id,
+        replaced_by_rule_id=replaced_by_rule_id,
+        status=status,
+        created_at=NOW,
+        updated_at=NOW,
+        version=version,
+    )
+
+
+def make_repository(client: RecordingDynamoClient) -> DynamoAlertRuleRepository:
+    return DynamoAlertRuleRepository(
+        domain_table_name="LimnopulseDomain",
+        audit_table_name="LimnopulseAudit",
+        client=client,
+        clock=lambda: NOW,
+    )
+
+
+def audit_context() -> AuditContext:
+    return AuditContext(actor_id="sub_1", ip="203.0.113.5", user_agent="pytest")
+
+
+def decode_put(client: RecordingDynamoClient, operation: dict[str, Any]) -> dict[str, Any]:
+    return client._decode_item(operation["Put"]["Item"])
+
+
+@pytest.mark.asyncio
+async def test_list_rules_queries_alert_rule_prefix_without_scan() -> None:
+    client = RecordingDynamoClient()
+    client.seed("LimnopulseDomain", make_repository(client)._rule_to_item(make_rule()))
+    repository = make_repository(client)
+
+    rules = await repository.list_rules("tnt_1")
+
+    assert [rule.rule_id for rule in rules] == ["rule_1"]
+    assert client.query_calls[0]["KeyConditionExpression"] == (
+        "PK = :pk AND begins_with(SK, :sk_prefix)"
+    )
+    assert client._decode_item(client.query_calls[0]["ExpressionAttributeValues"]) == {
+        ":pk": "TENANT#tnt_1",
+        ":sk_prefix": "ALERT_RULE#",
+    }
+    assert client.scan_calls == 0
+
+
+@pytest.mark.asyncio
+async def test_create_rule_atomically_puts_rule_and_redacted_audit() -> None:
+    client = RecordingDynamoClient()
+    repository = make_repository(client)
+
+    created = await repository.create_rule(make_rule(), audit_context())
+
+    assert created.version == 1
+    transaction = client.transact_write_items_calls[0]["TransactItems"]
+    assert [operation["Put"]["TableName"] for operation in transaction] == [
+        "LimnopulseDomain",
+        "LimnopulseAudit",
+    ]
+    audit = decode_put(client, transaction[1])
+    assert audit["action"] == "alert_rule.created"
+    assert audit["actor_id"] == "sub_1"
+    assert audit["resource_id"] == "rule_1"
+    assert len(audit["before_hash"]) == 64
+    assert len(audit["after_hash"]) == 64
+    assert audit["expires_at"] == int((NOW + timedelta(days=90)).timestamp())
+    assert "token" not in audit
+    assert "payload" not in audit
+
+
+@pytest.mark.asyncio
+async def test_create_rule_maps_conditional_transaction_to_conflict() -> None:
+    client = RecordingDynamoClient()
+    repository = make_repository(client)
+    client.seed("LimnopulseDomain", repository._rule_to_item(make_rule()))
+
+    with pytest.raises(ConflictError):
+        await repository.create_rule(make_rule(), audit_context())
+
+
+@pytest.mark.asyncio
+async def test_update_rule_conditions_on_version_and_writes_audit() -> None:
+    client = RecordingDynamoClient()
+    repository = make_repository(client)
+    client.seed("LimnopulseDomain", repository._rule_to_item(make_rule(version=2)))
+
+    updated = await repository.update_rule(
+        "tnt_1",
+        "rule_1",
+        2,
+        {"threshold": 4.5, "enabled": False},
+        audit_context(),
+    )
+
+    assert updated.version == 3
+    assert updated.threshold == 4.5
+    assert updated.enabled is False
+    transaction = client.transact_write_items_calls[0]["TransactItems"]
+    assert [set(operation) for operation in transaction] == [{"Update"}, {"Put"}]
+    update = transaction[0]["Update"]
+    assert client._decode_item(update["ExpressionAttributeValues"])[":expected_version"] == 2
+    assert "#status = :active" in update["ConditionExpression"]
+    assert decode_put(client, transaction[1])["action"] == "alert_rule.updated"
+
+
+@pytest.mark.asyncio
+async def test_update_rule_missing_target_raises_not_found() -> None:
+    repository = make_repository(RecordingDynamoClient())
+
+    with pytest.raises(NotFoundError):
+        await repository.update_rule(
+            "tnt_1", "rule_missing", 1, {"threshold": 4.5}, audit_context()
+        )
+
+
+@pytest.mark.asyncio
+async def test_replace_rule_is_atomic_and_replays_same_request() -> None:
+    client = RecordingDynamoClient()
+    repository = make_repository(client)
+    client.seed("LimnopulseDomain", repository._rule_to_item(make_rule(rule_id="rule_old")))
+    replacement = make_rule(
+        rule_id="rule_new",
+        metric=AlertMetric.PH,
+        threshold=6.5,
+        replaces_rule_id="rule_old",
+    )
+
+    first = await repository.replace_rule(
+        "tnt_1",
+        "rule_old",
+        1,
+        replacement,
+        "replace-request-123",
+        "a" * 64,
+        audit_context(),
+    )
+    replay = await repository.replace_rule(
+        "tnt_1",
+        "rule_old",
+        1,
+        replacement,
+        "replace-request-123",
+        "a" * 64,
+        audit_context(),
+    )
+
+    assert replay == first
+    assert first.replaced.status == "replaced"
+    assert first.replaced.enabled is False
+    assert first.replaced.version == 2
+    assert first.replaced.replaced_by_rule_id == "rule_new"
+    assert first.replacement.replaces_rule_id == "rule_old"
+    assert len(client.transact_write_items_calls) == 1
+    transaction = client.transact_write_items_calls[0]["TransactItems"]
+    assert [set(operation) for operation in transaction] == [
+        {"Update"},
+        {"Put"},
+        {"Put"},
+        {"Put"},
+    ]
+    idempotency = decode_put(client, transaction[3])
+    assert idempotency["expires_at"] == int((NOW + timedelta(hours=24)).timestamp())
+    assert "replace-request-123" not in str(idempotency)
+
+
+@pytest.mark.asyncio
+async def test_replace_rule_rejects_idempotency_key_reuse_with_other_payload() -> None:
+    client = RecordingDynamoClient()
+    repository = make_repository(client)
+    client.seed("LimnopulseDomain", repository._rule_to_item(make_rule(rule_id="rule_old")))
+    replacement = make_rule(rule_id="rule_new", replaces_rule_id="rule_old")
+    await repository.replace_rule(
+        "tnt_1",
+        "rule_old",
+        1,
+        replacement,
+        "replace-request-123",
+        "a" * 64,
+        audit_context(),
+    )
+
+    with pytest.raises(ConflictError):
+        await repository.replace_rule(
+            "tnt_1",
+            "rule_old",
+            1,
+            replacement,
+            "replace-request-123",
+            "b" * 64,
+            audit_context(),
+        )
+
+
+@pytest.mark.asyncio
+async def test_expired_idempotency_record_does_not_block_replacement() -> None:
+    client = RecordingDynamoClient()
+    repository = make_repository(client)
+    client.seed("LimnopulseDomain", repository._rule_to_item(make_rule(rule_id="rule_old")))
+    idempotency_key = repository._idempotency_key("tnt_1", "replace-request-123")
+    client.seed(
+        "LimnopulseDomain",
+        {
+            **idempotency_key,
+            "entity_type": "idempotency",
+            "request_hash": "old",
+            "expires_at": int((NOW - timedelta(seconds=1)).timestamp()),
+        },
+    )
+
+    result = await repository.replace_rule(
+        "tnt_1",
+        "rule_old",
+        1,
+        make_rule(rule_id="rule_new", replaces_rule_id="rule_old"),
+        "replace-request-123",
+        "new",
+        audit_context(),
+    )
+
+    assert result.replacement.rule_id == "rule_new"
