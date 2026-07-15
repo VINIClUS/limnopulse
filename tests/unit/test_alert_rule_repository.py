@@ -66,8 +66,10 @@ class RecordingDynamoClient:
         for operation in kwargs["TransactItems"]:
             if "Put" in operation:
                 self._apply_put(candidate, operation["Put"])
-            else:
+            elif "Update" in operation:
                 self._apply_update(candidate, operation["Update"])
+            else:
+                self._apply_condition_check(candidate, operation["ConditionCheck"])
         self.items = candidate
         return {}
 
@@ -84,8 +86,15 @@ class RecordingDynamoClient:
         key = (put["TableName"], item["PK"], item["SK"])
         existing = items.get(key)
         condition = put.get("ConditionExpression", "")
-        if existing is not None and "attribute_not_exists" in condition:
-            values = self._decode_item(put.get("ExpressionAttributeValues", {}))
+        values = self._decode_item(put.get("ExpressionAttributeValues", {}))
+        if "#revision = :expected_revision" in condition:
+            revision_name = put["ExpressionAttributeNames"]["#revision"]
+            if (
+                existing is None
+                or existing.get(revision_name) != values[":expected_revision"]
+            ):
+                raise TransactionFailure()
+        elif existing is not None and "attribute_not_exists" in condition:
             now = values.get(":now")
             if now is None or existing.get("expires_at", now + 1) > now:
                 raise TransactionFailure()
@@ -102,20 +111,55 @@ class RecordingDynamoClient:
         if existing is None:
             raise TransactionFailure()
         values = self._decode_item(update["ExpressionAttributeValues"])
-        if existing.get("version") != values.get(":expected_version"):
-            raise TransactionFailure()
-        if ":active" in values and existing.get("status") != values[":active"]:
-            raise TransactionFailure()
+        if ":expected_version" in values:
+            if existing.get("version") != values[":expected_version"]:
+                raise TransactionFailure()
+            if ":active" in values and existing.get("status") != values[":active"]:
+                raise TransactionFailure()
+        elif ":revision" in values:
+            active_statuses = {
+                values[":open"],
+                values[":acknowledged"],
+                values[":suppressed"],
+            }
+            if (
+                existing.get("status") not in active_statuses
+                or existing.get("evaluation_revision") != values[":revision"]
+            ):
+                raise TransactionFailure()
         updated = dict(existing)
         set_expression, _, remove_expression = update["UpdateExpression"].partition(" REMOVE ")
         for assignment in set_expression.removeprefix("SET ").split(", "):
-            name_token, value_token = assignment.split(" = ")
+            name_token, assignment_value = assignment.split(" = ")
             field_name = update["ExpressionAttributeNames"][name_token]
-            updated[field_name] = values[value_token]
+            if " + " in assignment_value:
+                source_token, value_token = assignment_value.split(" + ")
+                source_name = update["ExpressionAttributeNames"][source_token]
+                updated[field_name] = updated[source_name] + values[value_token]
+            else:
+                updated[field_name] = values[assignment_value]
         if remove_expression:
             for name_token in remove_expression.split(", "):
                 updated.pop(update["ExpressionAttributeNames"][name_token], None)
         items[key] = updated
+
+    def _apply_condition_check(
+        self,
+        items: dict[tuple[str, str, str], dict[str, Any]],
+        check: dict[str, Any],
+    ) -> None:
+        key_fields = self._decode_item(check["Key"])
+        key = (check["TableName"], key_fields["PK"], key_fields["SK"])
+        existing = items.get(key)
+        condition = check["ConditionExpression"]
+        if "attribute_not_exists" in condition:
+            if existing is not None:
+                raise TransactionFailure()
+            return
+        values = self._decode_item(check["ExpressionAttributeValues"])
+        revision_name = check["ExpressionAttributeNames"]["#revision"]
+        if existing is None or existing.get(revision_name) != values[":expected_revision"]:
+            raise TransactionFailure()
 
     def _encode_item(self, item: dict[str, Any]) -> dict[str, Any]:
         return {
@@ -292,16 +336,22 @@ async def test_update_rule_conditions_on_version_and_writes_audit() -> None:
     assert updated.enabled is False
     assert updated.evaluation_revision == 2
     transaction = client.transact_write_items_calls[0]["TransactItems"]
-    assert [set(operation) for operation in transaction] == [{"Update"}, {"Put"}]
+    assert [set(operation) for operation in transaction] == [
+        {"Update"},
+        {"ConditionCheck"},
+        {"Put"},
+    ]
     update = transaction[0]["Update"]
     assert client._decode_item(update["ExpressionAttributeValues"])[":expected_version"] == 2
     assert "#status = :active" in update["ConditionExpression"]
     assert " REMOVE " in update["UpdateExpression"]
+    state_check = transaction[1]["ConditionCheck"]
+    assert "attribute_not_exists(PK)" in state_check["ConditionExpression"]
     stored = client.items[("LimnopulseDomain", "TENANT#tnt_1", "ALERT_RULE#rule_1")]
     assert "GSI1PK" not in stored
     assert "GSI1SK" not in stored
     assert "next_evaluation_at" not in stored
-    assert decode_put(client, transaction[1])["action"] == "alert_rule.updated"
+    assert decode_put(client, transaction[2])["action"] == "alert_rule.updated"
 
 
 @pytest.mark.asyncio
@@ -320,8 +370,194 @@ async def test_cosmetic_update_preserves_evaluation_revision_and_schedule() -> N
 
     assert updated.version == 3
     assert updated.evaluation_revision == 1
+    transaction = client.transact_write_items_calls[0]["TransactItems"]
+    assert [set(operation) for operation in transaction] == [{"Update"}, {"Put"}]
     stored = client.items[("LimnopulseDomain", "TENANT#tnt_1", "ALERT_RULE#rule_1")]
     assert stored["GSI1PK"] == "ALERT_EVALUATION#V1#BUCKET#29"
+
+
+@pytest.mark.asyncio
+async def test_semantic_update_conflicts_when_state_appears_after_snapshot() -> None:
+    class RacingClient(RecordingDynamoClient):
+        def transact_write_items(self, **kwargs: Any) -> dict[str, Any]:
+            self.seed(
+                "LimnopulseDomain",
+                {
+                    "PK": "TENANT#tnt_1",
+                    "SK": "ALERT_STATE#rule_1",
+                    "entity_type": "alert_evaluation_state",
+                    "state_revision": 1,
+                    "state_json": json.dumps({"Mode": "healthy"}),
+                },
+            )
+            return super().transact_write_items(**kwargs)
+
+    client = RacingClient()
+    repository = make_repository(client)
+    client.seed("LimnopulseDomain", repository._rule_to_item(make_rule(version=2)))
+
+    with pytest.raises(ConflictError):
+        await repository.update_rule(
+            "tnt_1", "rule_1", 2, {"threshold": 4.5}, audit_context()
+        )
+
+    stored = client.items[("LimnopulseDomain", "TENANT#tnt_1", "ALERT_RULE#rule_1")]
+    assert stored["version"] == 2
+
+    updated = await repository.update_rule(
+        "tnt_1", "rule_1", 2, {"threshold": 4.5}, audit_context()
+    )
+
+    assert updated.version == 3
+    stored = client.items[("LimnopulseDomain", "TENANT#tnt_1", "ALERT_RULE#rule_1")]
+    assert stored["version"] == 3
+
+
+@pytest.mark.asyncio
+async def test_semantic_update_conflicts_when_healthy_state_revision_changes() -> None:
+    class RacingClient(RecordingDynamoClient):
+        def transact_write_items(self, **kwargs: Any) -> dict[str, Any]:
+            state_key = (
+                "LimnopulseDomain",
+                "TENANT#tnt_1",
+                "ALERT_STATE#rule_1",
+            )
+            self.items[state_key]["state_revision"] = 5
+            return super().transact_write_items(**kwargs)
+
+    client = RacingClient()
+    repository = make_repository(client)
+    client.seed("LimnopulseDomain", repository._rule_to_item(make_rule(version=2)))
+    client.seed(
+        "LimnopulseDomain",
+        {
+            "PK": "TENANT#tnt_1",
+            "SK": "ALERT_STATE#rule_1",
+            "entity_type": "alert_evaluation_state",
+            "state_revision": 4,
+            "state_json": json.dumps({"Mode": "healthy"}),
+        },
+    )
+
+    with pytest.raises(ConflictError):
+        await repository.update_rule(
+            "tnt_1", "rule_1", 2, {"threshold": 4.5}, audit_context()
+        )
+
+    stored = client.items[("LimnopulseDomain", "TENANT#tnt_1", "ALERT_RULE#rule_1")]
+    assert stored["version"] == 2
+
+
+@pytest.mark.asyncio
+async def test_semantic_update_retries_after_pending_state_revision_race() -> None:
+    class RacingClient(RecordingDynamoClient):
+        raced = False
+
+        def transact_write_items(self, **kwargs: Any) -> dict[str, Any]:
+            if not self.raced:
+                state_key = (
+                    "LimnopulseDomain",
+                    "TENANT#tnt_1",
+                    "ALERT_STATE#rule_1",
+                )
+                self.items[state_key]["state_revision"] += 1
+                self.raced = True
+            return super().transact_write_items(**kwargs)
+
+    client = RacingClient()
+    repository = make_repository(client)
+    client.seed("LimnopulseDomain", repository._rule_to_item(make_rule(version=2)))
+    client.seed(
+        "LimnopulseDomain",
+        {
+            "PK": "TENANT#tnt_1",
+            "SK": "ALERT_STATE#rule_1",
+            "entity_type": "alert_evaluation_state",
+            "state_revision": 4,
+            "state_json": json.dumps(
+                {
+                    "Mode": "pending",
+                    "ConfirmedSlots": 2,
+                    "PendingSince": "2026-07-15T11:58:45Z",
+                    "LastBreachSlot": "2026-07-15T11:59:45Z",
+                }
+            ),
+        },
+    )
+
+    with pytest.raises(ConflictError):
+        await repository.update_rule(
+            "tnt_1", "rule_1", 2, {"threshold": 4.5}, audit_context()
+        )
+
+    updated = await repository.update_rule(
+        "tnt_1", "rule_1", 2, {"threshold": 4.5}, audit_context()
+    )
+
+    assert updated.version == 3
+    state_item = client.items[("LimnopulseDomain", "TENANT#tnt_1", "ALERT_STATE#rule_1")]
+    assert state_item["state_revision"] == 6
+    assert json.loads(state_item["state_json"])["Mode"] == "healthy"
+
+
+@pytest.mark.asyncio
+async def test_semantic_update_retries_after_active_state_revision_race() -> None:
+    class RacingClient(RecordingDynamoClient):
+        raced = False
+
+        def transact_write_items(self, **kwargs: Any) -> dict[str, Any]:
+            if not self.raced:
+                state_key = (
+                    "LimnopulseDomain",
+                    "TENANT#tnt_1",
+                    "ALERT_STATE#rule_1",
+                )
+                self.items[state_key]["state_revision"] += 1
+                self.raced = True
+            return super().transact_write_items(**kwargs)
+
+    client = RacingClient()
+    repository = make_repository(client)
+    client.seed("LimnopulseDomain", repository._rule_to_item(make_rule(version=2)))
+    client.seed(
+        "LimnopulseDomain",
+        {
+            "PK": "TENANT#tnt_1",
+            "SK": "ALERT_STATE#rule_1",
+            "entity_type": "alert_evaluation_state",
+            "state_revision": 4,
+            "state_json": json.dumps(
+                {"Mode": "active", "ActiveEventID": "alert_1", "ActiveStatus": "open"}
+            ),
+        },
+    )
+    client.seed(
+        "LimnopulseDomain",
+        {
+            "PK": "TENANT#tnt_1",
+            "SK": "ALERT_EVENT#alert_1",
+            "entity_type": "alert_event",
+            "status": "open",
+            "evaluation_revision": 1,
+            "version": 1,
+        },
+    )
+
+    with pytest.raises(ConflictError):
+        await repository.update_rule(
+            "tnt_1", "rule_1", 2, {"threshold": 4.5}, audit_context()
+        )
+
+    updated = await repository.update_rule(
+        "tnt_1", "rule_1", 2, {"threshold": 4.5}, audit_context()
+    )
+
+    assert updated.version == 3
+    state_item = client.items[("LimnopulseDomain", "TENANT#tnt_1", "ALERT_STATE#rule_1")]
+    event_item = client.items[("LimnopulseDomain", "TENANT#tnt_1", "ALERT_EVENT#alert_1")]
+    assert state_item["state_revision"] == 6
+    assert json.loads(state_item["state_json"])["Mode"] == "healthy"
+    assert event_item["status"] == "resolved"
 
 
 @pytest.mark.asyncio
@@ -464,13 +700,52 @@ async def test_replace_rule_is_atomic_and_replays_same_request() -> None:
     transaction = client.transact_write_items_calls[0]["TransactItems"]
     assert [set(operation) for operation in transaction] == [
         {"Update"},
+        {"ConditionCheck"},
         {"Put"},
         {"Put"},
         {"Put"},
     ]
-    idempotency = decode_put(client, transaction[3])
+    idempotency = decode_put(client, transaction[4])
     assert idempotency["expires_at"] == int((NOW + timedelta(hours=24)).timestamp())
     assert "replace-request-123" not in str(idempotency)
+
+
+@pytest.mark.asyncio
+async def test_replace_rule_conflicts_when_state_appears_after_snapshot() -> None:
+    class RacingClient(RecordingDynamoClient):
+        def transact_write_items(self, **kwargs: Any) -> dict[str, Any]:
+            self.seed(
+                "LimnopulseDomain",
+                {
+                    "PK": "TENANT#tnt_1",
+                    "SK": "ALERT_STATE#rule_old",
+                    "entity_type": "alert_evaluation_state",
+                    "state_revision": 1,
+                    "state_json": json.dumps({"Mode": "healthy"}),
+                },
+            )
+            return super().transact_write_items(**kwargs)
+
+    client = RacingClient()
+    repository = make_repository(client)
+    client.seed(
+        "LimnopulseDomain",
+        repository._rule_to_item(make_rule(rule_id="rule_old")),
+    )
+
+    with pytest.raises(ConflictError):
+        await repository.replace_rule(
+            "tnt_1",
+            "rule_old",
+            1,
+            make_rule(rule_id="rule_new", replaces_rule_id="rule_old"),
+            "replace-request-123",
+            "a" * 64,
+            audit_context(),
+        )
+
+    stored = client.items[("LimnopulseDomain", "TENANT#tnt_1", "ALERT_RULE#rule_old")]
+    assert stored["status"] == "active"
 
 
 @pytest.mark.asyncio

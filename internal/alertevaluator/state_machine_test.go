@@ -99,6 +99,39 @@ func TestCleanWindowResolvesAndCreatesBlockedChannelDependencies(t *testing.T) {
 	}
 }
 
+func TestRecoveryUsesPersistedOpeningChannelsInStableOrder(t *testing.T) {
+	rule := testRule()
+	rule.Channels = []Channel{ChannelTelegram, Channel("webhook")}
+	state := State{
+		Mode:          ModeActive,
+		ActiveEventID: "alert_episode",
+		ActiveStatus:  StatusOpen,
+		OpeningOutboxes: map[Channel]string{
+			ChannelTelegram: "outbox_open_telegram",
+			ChannelEmail:    "outbox_open_email",
+		},
+	}
+
+	recovered := Decide(rule, state, sufficient(testSlot, false), time.Minute)
+
+	if len(recovered.Outboxes) != 2 {
+		t.Fatalf("recovery outboxes = %#v", recovered.Outboxes)
+	}
+	want := []struct {
+		channel   Channel
+		openingID string
+	}{
+		{channel: ChannelEmail, openingID: "outbox_open_email"},
+		{channel: ChannelTelegram, openingID: "outbox_open_telegram"},
+	}
+	for index, expected := range want {
+		outbox := recovered.Outboxes[index]
+		if outbox.Channel != expected.channel || outbox.DependsOnOutboxID != expected.openingID {
+			t.Fatalf("recovery outbox %d = %#v", index, outbox)
+		}
+	}
+}
+
 func TestEventIdentityIncludesOpeningWindowAndVersions(t *testing.T) {
 	rule := testRule()
 	a := EventID(rule, testSlot)

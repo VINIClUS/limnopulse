@@ -306,9 +306,9 @@ class DynamoAlertRuleRepository:
         }
         state_item = self._get_item(self.domain_table_name, state_key, consistent=True)
         if state_item is None:
-            return []
+            return [self._state_snapshot_condition(state_key)]
         try:
-            state, _ = decode_evaluator_state(state_item)
+            state, state_revision = decode_evaluator_state(state_item)
         except ValueError as exc:
             raise ConflictError("alert evaluation state is invalid") from exc
         if state.get("Mode") == "pending":
@@ -319,13 +319,13 @@ class DynamoAlertRuleRepository:
             return [self._state_put(reset_state, previous_revision)]
         event_id = str(state.get("ActiveEventID", ""))
         if not event_id:
-            return []
+            return [self._state_snapshot_condition(state_key, state_revision)]
         try:
             resolved = resolved_evaluator_state(state_item, event_id, now)
         except ValueError as exc:
             raise ConflictError("alert evaluation state is invalid") from exc
         if resolved is None:
-            return []
+            return [self._state_snapshot_condition(state_key, state_revision)]
         resolved_state, state_revision = resolved
         event_key = {
             "PK": f"TENANT#{rule.tenant_id}",
@@ -390,6 +390,31 @@ class DynamoAlertRuleRepository:
             self._state_put(resolved_state, state_revision),
             self._conditioned_put(self.domain_table_name, transition_item),
         ]
+
+    def _state_snapshot_condition(
+        self,
+        key: Mapping[str, str],
+        expected_revision: int | None = None,
+    ) -> dict[str, Any]:
+        condition: dict[str, Any] = {
+            "TableName": self.domain_table_name,
+            "Key": self._serialize_item(dict(key)),
+        }
+        if expected_revision is None:
+            condition["ConditionExpression"] = (
+                "attribute_not_exists(PK) AND attribute_not_exists(SK)"
+            )
+        else:
+            condition.update(
+                {
+                    "ConditionExpression": "#revision = :expected_revision",
+                    "ExpressionAttributeNames": {"#revision": "state_revision"},
+                    "ExpressionAttributeValues": self._serialize_values(
+                        {":expected_revision": expected_revision}
+                    ),
+                }
+            )
+        return {"ConditionCheck": condition}
 
     def _state_put(
         self,

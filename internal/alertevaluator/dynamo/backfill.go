@@ -100,17 +100,21 @@ func (store Store) updateSchedule(ctx context.Context, pk, sk, tenantID, ruleID 
 	key, _ := attributevalue.MarshalMap(map[string]string{"PK": pk, "SK": sk})
 	values, _ := attributevalue.MarshalMap(map[string]any{
 		":bucket": bucket, ":next_due": dueText,
-		":gsi_pk": fmt.Sprintf("ALERT_EVALUATION#V1#BUCKET#%02d", bucket),
-		":gsi_sk": dueText + "#TENANT#" + tenantID + "#RULE#" + ruleID,
-		":true":   true, ":active": "active",
+		":gsi_pk":           fmt.Sprintf("ALERT_EVALUATION#V1#BUCKET#%02d", bucket),
+		":gsi_sk":           dueText + "#TENANT#" + tenantID + "#RULE#" + ruleID,
+		":initial_revision": 1, ":true": true, ":active": "active",
 	})
 	_, err := store.Client.UpdateItem(ctx, &dynamodb.UpdateItemInput{
 		TableName: aws.String(store.Table), Key: key,
-		UpdateExpression:    aws.String("SET #bucket = :bucket, #next_due = :next_due, #gsi_pk = :gsi_pk, #gsi_sk = :gsi_sk"),
+		UpdateExpression: aws.String(
+			"SET #bucket = :bucket, #next_due = :next_due, #gsi_pk = :gsi_pk, #gsi_sk = :gsi_sk, " +
+				"#evaluation_revision = if_not_exists(#evaluation_revision, :initial_revision)",
+		),
 		ConditionExpression: aws.String("#enabled = :true AND #status = :active"),
 		ExpressionAttributeNames: map[string]string{
 			"#bucket": "evaluation_bucket", "#next_due": "next_evaluation_at",
 			"#gsi_pk": "GSI1PK", "#gsi_sk": "GSI1SK", "#enabled": "enabled", "#status": "status",
+			"#evaluation_revision": "evaluation_revision",
 		}, ExpressionAttributeValues: values,
 	})
 	if err != nil {

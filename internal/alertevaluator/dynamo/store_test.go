@@ -60,6 +60,20 @@ func TestBackfillQueriesExplicitTenantAndOnlyUpdatesEnabledActiveRules(t *testin
 	if client.queryInput.IndexName != nil || !strings.Contains(*client.queryInput.KeyConditionExpression, "begins_with(SK") {
 		t.Fatalf("backfill did not use tenant Query: %#v", client.queryInput)
 	}
+	update := client.updateInputs[0]
+	if !strings.Contains(
+		*update.UpdateExpression,
+		"#evaluation_revision = if_not_exists(#evaluation_revision, :initial_revision)",
+	) {
+		t.Fatalf("backfill did not initialize evaluation revision: %s", *update.UpdateExpression)
+	}
+	if update.ExpressionAttributeNames["#evaluation_revision"] != "evaluation_revision" {
+		t.Fatalf("evaluation revision attribute name = %#v", update.ExpressionAttributeNames)
+	}
+	initialRevision, ok := update.ExpressionAttributeValues[":initial_revision"].(*types.AttributeValueMemberN)
+	if !ok || initialRevision.Value != "1" {
+		t.Fatalf("initial evaluation revision = %#v", update.ExpressionAttributeValues[":initial_revision"])
+	}
 }
 
 func (client *fakeClient) GetItem(_ context.Context, _ *dynamodb.GetItemInput, _ ...func(*dynamodb.Options)) (*dynamodb.GetItemOutput, error) {

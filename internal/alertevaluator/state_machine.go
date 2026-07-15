@@ -4,6 +4,7 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"fmt"
+	"sort"
 	"time"
 )
 
@@ -198,7 +199,12 @@ func recoverIncident(rule Rule, next State, evaluation Evaluation) Decision {
 	resolvedEventID := next.ActiveEventID
 	outboxes := make([]OutboxDecision, 0, len(next.OpeningOutboxes))
 	if next.ActiveStatus != StatusSuppressed {
-		for _, channel := range rule.Channels {
+		channels := make([]Channel, 0, len(next.OpeningOutboxes))
+		for channel := range next.OpeningOutboxes {
+			channels = append(channels, channel)
+		}
+		sort.Slice(channels, func(i, j int) bool { return channels[i] < channels[j] })
+		for _, channel := range channels {
 			openingID := next.OpeningOutboxes[channel]
 			if openingID == "" {
 				continue
