@@ -74,6 +74,9 @@ def test_cloud_dynamodb_tables_match_domain_contract() -> None:
     assert dynamodb.count('type = "S"') >= 4
     assert "point_in_time_recovery" in dynamodb
     assert "server_side_encryption" in dynamodb
+    assert dynamodb.count('attribute_name = "expires_at"') == 2
+    assert len(re.findall(r"ttl\s*\{", dynamodb)) == 2
+    assert len(re.findall(r'ttl\s*\{[^}]*enabled\s+=\s+true', dynamodb, re.DOTALL)) == 2
 
 
 def test_cognito_resources_export_application_environment_contract() -> None:
