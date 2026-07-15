@@ -3,6 +3,8 @@ package telemetry
 import (
 	"context"
 	"errors"
+	"net/url"
+	"strings"
 	"time"
 
 	"github.com/VINIClUS/limnopulse/internal/alertevaluator"
@@ -29,12 +31,25 @@ func New(ctx context.Context, endpoint string) (*Recorder, error) {
 	if endpoint == "" {
 		return nil, nil
 	}
-	exporter, err := otlpmetrichttp.New(ctx, otlpmetrichttp.WithEndpointURL(endpoint))
+	exporter, err := otlpmetrichttp.New(ctx, otlpmetrichttp.WithEndpointURL(metricsEndpoint(endpoint)))
 	if err != nil {
 		return nil, err
 	}
 	reader := sdkmetric.NewPeriodicReader(exporter, sdkmetric.WithInterval(time.Hour))
 	return newRecorder(reader)
+}
+
+func metricsEndpoint(endpoint string) string {
+	parsed, err := url.Parse(endpoint)
+	if err != nil || parsed.Scheme == "" || parsed.Host == "" {
+		return endpoint
+	}
+	if parsed.Path == "" || parsed.Path == "/" {
+		parsed.Path = "/v1/metrics"
+	} else if !strings.HasSuffix(parsed.Path, "/v1/metrics") {
+		return endpoint
+	}
+	return parsed.String()
 }
 
 func newRecorder(reader sdkmetric.Reader) (*Recorder, error) {

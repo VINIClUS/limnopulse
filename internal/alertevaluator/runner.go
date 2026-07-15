@@ -166,11 +166,11 @@ func (runner Runner) processCandidate(ctx context.Context, candidate Candidate, 
 		return candidateResult{skipped: 1}
 	}
 	if err != nil {
-		return candidateResult{fatal: true, category: "claim"}
+		return candidateResult{fatal: true, withError: 1, category: "claim"}
 	}
 	state, err := runner.Store.LoadState(ctx, work)
 	if err != nil {
-		return candidateResult{fatal: true, category: "state_read"}
+		return candidateResult{fatal: true, withError: 1, category: "state_read"}
 	}
 	missed := missedSlots(work.NextEvaluationAt, slot)
 	result := candidateResult{missedSlots: missed}
@@ -200,7 +200,7 @@ func (runner Runner) processCandidate(ctx context.Context, candidate Candidate, 
 		Work: work, PreviousState: state, Evaluation: evaluation, Decision: decision,
 		Slot: slot, NextDue: slot.Add(EvaluationCadence),
 	}); err != nil {
-		return candidateResult{fatal: true, category: "commit", missedSlots: missed, coalesced: result.coalesced}
+		return candidateResult{fatal: true, withError: 1, category: "commit", missedSlots: missed, coalesced: result.coalesced}
 	}
 	result.evaluated = 1
 	switch decision.Transition {

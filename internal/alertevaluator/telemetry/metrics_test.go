@@ -49,3 +49,12 @@ func TestEmptyEndpointDisablesOTLP(t *testing.T) {
 		t.Fatalf("recorder = %#v, err = %v", recorder, err)
 	}
 }
+
+func TestMetricsEndpointUsesStandardOTLPHTTPPath(t *testing.T) {
+	if got := metricsEndpoint("http://collector:4318"); got != "http://collector:4318/v1/metrics" {
+		t.Fatalf("metricsEndpoint() = %q", got)
+	}
+	if got := metricsEndpoint("http://collector/custom"); got != "http://collector/custom" {
+		t.Fatalf("custom metricsEndpoint() = %q", got)
+	}
+}
