@@ -14,6 +14,7 @@ import (
 	"github.com/VINIClUS/limnopulse/internal/alertevaluator"
 	dynamoadapter "github.com/VINIClUS/limnopulse/internal/alertevaluator/dynamo"
 	influxadapter "github.com/VINIClUS/limnopulse/internal/alertevaluator/influx"
+	"github.com/VINIClUS/limnopulse/internal/alertevaluator/telemetry"
 	"github.com/aws/aws-sdk-go-v2/aws"
 	awsconfig "github.com/aws/aws-sdk-go-v2/config"
 	"github.com/aws/aws-sdk-go-v2/credentials"
@@ -65,6 +66,17 @@ func runEvaluator(ctx context.Context, args []string) int {
 		},
 	}
 	summary := runner.Run(ctx, config)
+	metrics, metricsErr := telemetry.New(context.Background(), config.OTLPEndpoint)
+	if metricsErr != nil {
+		summary.TelemetryExportError = metricsErr.Error()
+	} else if metrics != nil {
+		flushCtx, cancel := context.WithTimeout(context.Background(), config.OTLPFlushTimeout)
+		metrics.Record(flushCtx, summary)
+		if err := metrics.Shutdown(flushCtx); err != nil {
+			summary.TelemetryExportError = err.Error()
+		}
+		cancel()
+	}
 	writeJSON(summary)
 	return summary.ExitCode
 }

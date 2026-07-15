@@ -275,6 +275,8 @@ func (store Store) eventPut(request alertevaluator.CommitRequest) (*types.Put, e
 		"metric": request.Work.Rule.Metric, "operator": request.Work.Rule.Operator,
 		"threshold": request.Work.Rule.Threshold, "aggregation": string(request.Work.Rule.Aggregation),
 		"severity": request.Work.Rule.Severity, "status": string(status), "opened_at": alertevaluator.FixedUTCTimestamp(request.Slot),
+		"created_at": alertevaluator.FixedUTCTimestamp(request.Slot), "updated_at": alertevaluator.FixedUTCTimestamp(request.Slot),
+		"version": int64(1), "schema_version": int64(1),
 		"confirmed_open_window_end": alertevaluator.FixedUTCTimestamp(request.Slot),
 		"window_start":              alertevaluator.FixedUTCTimestamp(request.Slot.Add(-request.Work.Rule.Window)),
 		"window_end":                alertevaluator.FixedUTCTimestamp(request.Slot), "last_evaluated_at": alertevaluator.FixedUTCTimestamp(request.Slot),
@@ -327,7 +329,7 @@ func (store Store) eventMetadataUpdate(request alertevaluator.CommitRequest) (*t
 }
 
 func (store Store) eventResolutionUpdate(request alertevaluator.CommitRequest) (*types.Update, error) {
-	return store.activeEventUpdate(request, "SET #status = :resolved, #resolved_at = :slot, #last_at = :slot, #last_quality = :quality, #last_value = :value", true)
+	return store.activeEventUpdate(request, "SET #status = :resolved, #resolved_at = :slot, #updated_at = :slot, #version = #version + :one, #last_at = :slot, #last_quality = :quality, #last_value = :value", true)
 }
 
 func (store Store) activeEventUpdate(request alertevaluator.CommitRequest, expression string, resolved bool) (*types.Update, error) {
@@ -347,7 +349,10 @@ func (store Store) activeEventUpdate(request alertevaluator.CommitRequest, expre
 	}
 	if resolved {
 		valueMap[":resolved"] = "resolved"
+		valueMap[":one"] = int64(1)
 		names["#resolved_at"] = "resolved_at"
+		names["#updated_at"] = "updated_at"
+		names["#version"] = "version"
 	}
 	values, err := attributevalue.MarshalMap(valueMap)
 	if err != nil {

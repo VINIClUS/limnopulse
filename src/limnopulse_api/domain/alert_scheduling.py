@@ -16,6 +16,7 @@ EVALUATION_SCHEDULE_FIELDS = frozenset(
         "GSI1SK",
         "lease_owner",
         "lease_expires_at",
+        "lease_epoch",
     }
 )
 

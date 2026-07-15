@@ -10,6 +10,7 @@ from influxdb_client import InfluxDBClient
 
 from limnopulse_api.adapters.dynamodb import DynamoDomainRepository
 from limnopulse_api.adapters.alert_rules import DynamoAlertRuleRepository
+from limnopulse_api.adapters.alert_events import DynamoAlertEventRepository
 from limnopulse_api.adapters.influxdb import InfluxTelemetryRepository
 from limnopulse_api.adapters.redis import RedisCacheRepository
 from limnopulse_api.api.router import api_router
@@ -43,6 +44,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             for attribute_name in (
                 "domain_repository",
                 "alert_rule_repository",
+                "alert_event_repository",
                 "membership_service",
                 "auth_provider",
                 "cache_repository",
@@ -66,6 +68,11 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             client=dynamodb_client,
         )
         app.state.alert_rule_repository = DynamoAlertRuleRepository(
+            domain_table_name=resolved_settings.dynamodb_domain_table,
+            audit_table_name=resolved_settings.dynamodb_audit_table,
+            client=dynamodb_client,
+        )
+        app.state.alert_event_repository = DynamoAlertEventRepository(
             domain_table_name=resolved_settings.dynamodb_domain_table,
             audit_table_name=resolved_settings.dynamodb_audit_table,
             client=dynamodb_client,

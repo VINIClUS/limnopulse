@@ -131,9 +131,20 @@ class DynamoAlertRuleRepository:
         removed_fields: set[str] = set()
         if semantic_change and updated.enabled:
             operational_updates.update(alert_evaluation_schedule(tenant_id, rule_id, now))
+            removed_fields.update({"lease_owner", "lease_expires_at"})
         elif not updated.enabled:
             removed_fields.update(EVALUATION_SCHEDULE_FIELDS)
 
+        resolution_operations = (
+            self._administrative_resolution_operations(
+                existing,
+                audit,
+                now,
+                reason="rule_semantics_changed",
+            )
+            if semantic_change
+            else []
+        )
         self._transact(
             [
                 self._conditioned_rule_update(
@@ -148,6 +159,7 @@ class DynamoAlertRuleRepository:
                     },
                     remove_fields=removed_fields,
                 ),
+                *resolution_operations,
                 self._conditioned_put(self.audit_table_name, audit_item),
             ]
         )
@@ -227,6 +239,12 @@ class DynamoAlertRuleRepository:
             }
         }
         try:
+            resolution_operations = self._administrative_resolution_operations(
+                existing,
+                audit,
+                now,
+                reason="rule_replaced",
+            )
             self.client.transact_write_items(
                 TransactItems=[
                     self._conditioned_rule_update(
@@ -243,6 +261,7 @@ class DynamoAlertRuleRepository:
                         },
                         remove_fields=EVALUATION_SCHEDULE_FIELDS,
                     ),
+                    *resolution_operations,
                     self._conditioned_put(
                         self.domain_table_name,
                         self._rule_to_item(replacement),
@@ -267,6 +286,123 @@ class DynamoAlertRuleRepository:
             self._raise_if_conflict(exc)
             raise
         return result
+
+    def _administrative_resolution_operations(
+        self,
+        rule: AlertRule,
+        audit: AuditContext,
+        now: datetime,
+        *,
+        reason: str,
+    ) -> list[dict[str, Any]]:
+        state_key = {
+            "PK": f"TENANT#{rule.tenant_id}",
+            "SK": f"ALERT_STATE#{rule.rule_id}",
+        }
+        state_item = self._get_item(self.domain_table_name, state_key, consistent=True)
+        if state_item is None:
+            return []
+        try:
+            state = json.loads(str(state_item["state_json"]))
+            state_revision = int(state_item["state_revision"])
+        except (KeyError, TypeError, ValueError, json.JSONDecodeError) as exc:
+            raise ConflictError("alert evaluation state is invalid") from exc
+        event_id = str(state.get("ActiveEventID", ""))
+        if state.get("Mode") != "active" or not event_id:
+            return []
+
+        state.update(
+            {
+                "Mode": "healthy",
+                "ConfirmedSlots": 0,
+                "PendingSince": "0001-01-01T00:00:00Z",
+                "LastBreachSlot": "0001-01-01T00:00:00Z",
+                "ActiveEventID": "",
+                "ActiveStatus": "",
+                "ActiveOpenedAt": "0001-01-01T00:00:00Z",
+                "OpeningOutboxes": None,
+                "SuppressionSourceEventID": "",
+            }
+        )
+        resolved_state = {
+            **state_item,
+            "state_json": json.dumps(state, separators=(",", ":"), sort_keys=True),
+            "state_revision": state_revision + 1,
+            "updated_at": now.isoformat(),
+        }
+        event_key = {
+            "PK": f"TENANT#{rule.tenant_id}",
+            "SK": f"ALERT_EVENT#{event_id}",
+        }
+        event_values = self._serialize_values(
+            {
+                ":open": "open",
+                ":acknowledged": "acknowledged",
+                ":suppressed": "suppressed",
+                ":resolved": "resolved",
+                ":resolved_at": now.isoformat(),
+                ":resolved_by": audit.actor_id,
+                ":reason": reason,
+                ":revision": rule.evaluation_revision,
+                ":one": 1,
+            }
+        )
+        transition_id = f"transition_{uuid4().hex}"
+        transition_item = {
+            "PK": f"TENANT#{rule.tenant_id}",
+            "SK": (
+                f"ALERT_EVENT#{event_id}#TRANSITION#{now.isoformat()}#{transition_id}"
+            ),
+            "entity_type": "alert_event_transition",
+            "transition_id": transition_id,
+            "event_id": event_id,
+            "tenant_id": rule.tenant_id,
+            "rule_id": rule.rule_id,
+            "transition": "resolved",
+            "reason": reason,
+            "actor_type": "user",
+            "actor_id": audit.actor_id,
+            "created_at": now.isoformat(),
+        }
+        return [
+            {
+                "Update": {
+                    "TableName": self.domain_table_name,
+                    "Key": self._serialize_item(event_key),
+                    "UpdateExpression": (
+                        "SET #status = :resolved, #resolved_at = :resolved_at, "
+                        "#resolved_by = :resolved_by, #resolution_reason = :reason, "
+                        "#updated_at = :resolved_at, #version = #version + :one"
+                    ),
+                    "ConditionExpression": (
+                        "#status IN (:open, :acknowledged, :suppressed) "
+                        "AND #evaluation_revision = :revision"
+                    ),
+                    "ExpressionAttributeNames": {
+                        "#status": "status",
+                        "#resolved_at": "resolved_at",
+                        "#resolved_by": "resolved_by",
+                        "#resolution_reason": "resolution_reason",
+                        "#updated_at": "updated_at",
+                        "#version": "version",
+                        "#evaluation_revision": "evaluation_revision",
+                    },
+                    "ExpressionAttributeValues": event_values,
+                }
+            },
+            {
+                "Put": {
+                    "TableName": self.domain_table_name,
+                    "Item": self._serialize_item(resolved_state),
+                    "ConditionExpression": "#revision = :expected_revision",
+                    "ExpressionAttributeNames": {"#revision": "state_revision"},
+                    "ExpressionAttributeValues": self._serialize_values(
+                        {":expected_revision": state_revision}
+                    ),
+                }
+            },
+            self._conditioned_put(self.domain_table_name, transition_item),
+        ]
 
     async def get_replacement_replay(
         self,
@@ -293,10 +429,13 @@ class DynamoAlertRuleRepository:
         self,
         table_name: str,
         key: Mapping[str, str],
+        *,
+        consistent: bool = False,
     ) -> dict[str, Any] | None:
         response = self.client.get_item(
             TableName=table_name,
             Key=self._serialize_item(dict(key)),
+            ConsistentRead=consistent,
         )
         item = response.get("Item")
         if item is None:

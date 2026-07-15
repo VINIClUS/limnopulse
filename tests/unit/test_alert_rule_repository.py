@@ -1,6 +1,7 @@
 from copy import deepcopy
 from datetime import UTC, datetime, timedelta
 from decimal import Decimal
+import json
 from typing import Any
 
 import pytest
@@ -321,6 +322,50 @@ async def test_cosmetic_update_preserves_evaluation_revision_and_schedule() -> N
     assert updated.evaluation_revision == 1
     stored = client.items[("LimnopulseDomain", "TENANT#tnt_1", "ALERT_RULE#rule_1")]
     assert stored["GSI1PK"] == "ALERT_EVALUATION#V1#BUCKET#29"
+
+
+@pytest.mark.asyncio
+async def test_semantic_update_resolves_active_generation_without_outbox() -> None:
+    class CapturingClient(RecordingDynamoClient):
+        def transact_write_items(self, **kwargs: Any) -> dict[str, Any]:
+            self.transact_write_items_calls.append(kwargs)
+            return {}
+
+    client = CapturingClient()
+    repository = make_repository(client)
+    client.seed("LimnopulseDomain", repository._rule_to_item(make_rule(version=2)))
+    client.seed(
+        "LimnopulseDomain",
+        {
+            "PK": "TENANT#tnt_1",
+            "SK": "ALERT_STATE#rule_1",
+            "entity_type": "alert_evaluation_state",
+            "state_revision": 4,
+            "state_json": json.dumps(
+                {"Mode": "active", "ActiveEventID": "alert_1", "ActiveStatus": "open"}
+            ),
+        },
+    )
+
+    updated = await repository.update_rule(
+        "tnt_1", "rule_1", 2, {"threshold": 4.5}, audit_context()
+    )
+
+    assert updated.evaluation_revision == 2
+    operations = client.transact_write_items_calls[0]["TransactItems"]
+    assert [set(operation) for operation in operations] == [
+        {"Update"},
+        {"Update"},
+        {"Put"},
+        {"Put"},
+        {"Put"},
+    ]
+    assert all(
+        "NOTIFICATION_OUTBOX" not in str(operation)
+        for operation in operations
+    )
+    event_update = operations[1]["Update"]
+    assert "#evaluation_revision = :revision" in event_update["ConditionExpression"]
 
 
 @pytest.mark.asyncio
