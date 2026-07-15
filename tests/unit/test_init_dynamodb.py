@@ -19,12 +19,19 @@ class FakeDynamoClient:
         self.wait_calls: list[dict[str, Any]] = []
         self.describe_ttl_calls: list[dict[str, Any]] = []
         self.update_ttl_calls: list[dict[str, Any]] = []
+        self.update_table_calls: list[dict[str, Any]] = []
 
     def list_tables(self) -> dict[str, list[str]]:
         return {"TableNames": ["LimnopulseDomain"] if self.exists else []}
 
     def create_table(self, **kwargs: Any) -> None:
         self.create_calls.append(kwargs)
+
+    def describe_table(self, **kwargs: Any) -> dict[str, Any]:
+        return {"Table": {"GlobalSecondaryIndexes": []}}
+
+    def update_table(self, **kwargs: Any) -> None:
+        self.update_table_calls.append(kwargs)
 
     def get_waiter(self, name: str) -> FakeWaiter:
         assert name == "table_exists"
@@ -66,6 +73,30 @@ def test_new_local_table_is_created_before_ttl_is_enabled() -> None:
     assert len(client.create_calls) == 1
     assert client.wait_calls == [{"TableName": "LimnopulseDomain"}]
     assert client.update_ttl_calls == [expected_ttl_call()]
+
+
+def test_new_domain_table_includes_alert_evaluation_and_event_indexes() -> None:
+    client = FakeDynamoClient(exists=False)
+
+    ensure_table(client, "LimnopulseDomain", include_alert_indexes=True)
+
+    create = client.create_calls[0]
+    assert {definition["AttributeName"] for definition in create["AttributeDefinitions"]} == {
+        "PK",
+        "SK",
+        "GSI1PK",
+        "GSI1SK",
+        "GSI2PK",
+        "GSI2SK",
+    }
+    assert [index["IndexName"] for index in create["GlobalSecondaryIndexes"]] == [
+        "AlertEvaluationByDue",
+        "AlertEventsByTenantTime",
+    ]
+    assert create["GlobalSecondaryIndexes"][0]["Projection"] == {
+        "ProjectionType": "KEYS_ONLY"
+    }
+    assert create["GlobalSecondaryIndexes"][1]["Projection"] == {"ProjectionType": "ALL"}
 
 
 def test_already_enabled_ttl_is_left_unchanged() -> None:

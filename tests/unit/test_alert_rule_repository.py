@@ -106,10 +106,14 @@ class RecordingDynamoClient:
         if ":active" in values and existing.get("status") != values[":active"]:
             raise TransactionFailure()
         updated = dict(existing)
-        for assignment in update["UpdateExpression"].removeprefix("SET ").split(", "):
+        set_expression, _, remove_expression = update["UpdateExpression"].partition(" REMOVE ")
+        for assignment in set_expression.removeprefix("SET ").split(", "):
             name_token, value_token = assignment.split(" = ")
             field_name = update["ExpressionAttributeNames"][name_token]
             updated[field_name] = values[value_token]
+        if remove_expression:
+            for name_token in remove_expression.split(", "):
+                updated.pop(update["ExpressionAttributeNames"][name_token], None)
         items[key] = updated
 
     def _encode_item(self, item: dict[str, Any]) -> dict[str, Any]:
@@ -219,6 +223,11 @@ async def test_create_rule_atomically_puts_rule_and_redacted_audit() -> None:
         "LimnopulseDomain",
         "LimnopulseAudit",
     ]
+    rule_item = decode_put(client, transaction[0])
+    assert rule_item["evaluation_revision"] == 1
+    assert rule_item["evaluation_bucket"] == 29
+    assert rule_item["GSI1PK"] == "ALERT_EVALUATION#V1#BUCKET#29"
+    assert rule_item["GSI1SK"].startswith("2026-07-15T12:00:45.000000000Z#")
     audit = decode_put(client, transaction[1])
     assert audit["action"] == "alert_rule.created"
     assert audit["actor_id"] == "sub_1"
@@ -280,12 +289,38 @@ async def test_update_rule_conditions_on_version_and_writes_audit() -> None:
     assert updated.version == 3
     assert updated.threshold == 4.5
     assert updated.enabled is False
+    assert updated.evaluation_revision == 2
     transaction = client.transact_write_items_calls[0]["TransactItems"]
     assert [set(operation) for operation in transaction] == [{"Update"}, {"Put"}]
     update = transaction[0]["Update"]
     assert client._decode_item(update["ExpressionAttributeValues"])[":expected_version"] == 2
     assert "#status = :active" in update["ConditionExpression"]
+    assert " REMOVE " in update["UpdateExpression"]
+    stored = client.items[("LimnopulseDomain", "TENANT#tnt_1", "ALERT_RULE#rule_1")]
+    assert "GSI1PK" not in stored
+    assert "GSI1SK" not in stored
+    assert "next_evaluation_at" not in stored
     assert decode_put(client, transaction[1])["action"] == "alert_rule.updated"
+
+
+@pytest.mark.asyncio
+async def test_cosmetic_update_preserves_evaluation_revision_and_schedule() -> None:
+    client = RecordingDynamoClient()
+    repository = make_repository(client)
+    client.seed("LimnopulseDomain", repository._rule_to_item(make_rule(version=2)))
+
+    updated = await repository.update_rule(
+        "tnt_1",
+        "rule_1",
+        2,
+        {"name": "Renamed"},
+        audit_context(),
+    )
+
+    assert updated.version == 3
+    assert updated.evaluation_revision == 1
+    stored = client.items[("LimnopulseDomain", "TENANT#tnt_1", "ALERT_RULE#rule_1")]
+    assert stored["GSI1PK"] == "ALERT_EVALUATION#V1#BUCKET#29"
 
 
 @pytest.mark.asyncio

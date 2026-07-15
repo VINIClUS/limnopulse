@@ -79,6 +79,14 @@ def test_cloud_dynamodb_tables_match_domain_contract() -> None:
     assert dynamodb.count('attribute_name = "expires_at"') == 2
     assert len(re.findall(r"ttl\s*\{", dynamodb)) == 2
     assert len(re.findall(r"ttl\s*\{[^}]*enabled\s+=\s+true", dynamodb, re.DOTALL)) == 2
+    assert re.search(r'name\s+=\s+"AlertEvaluationByDue"', dynamodb)
+    assert re.search(r'name\s+=\s+"AlertEventsByTenantTime"', dynamodb)
+    assert 'hash_key        = "GSI1PK"' in dynamodb
+    assert 'range_key       = "GSI1SK"' in dynamodb
+    assert 'hash_key        = "GSI2PK"' in dynamodb
+    assert 'range_key       = "GSI2SK"' in dynamodb
+    assert 'projection_type = "KEYS_ONLY"' in dynamodb
+    assert 'projection_type = "ALL"' in dynamodb
 
 
 def test_cognito_resources_export_application_environment_contract() -> None:

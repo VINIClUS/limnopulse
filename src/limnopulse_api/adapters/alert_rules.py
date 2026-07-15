@@ -18,6 +18,11 @@ from limnopulse_api.domain.alerts import (
     AlertRuleUpdates,
     AuditContext,
 )
+from limnopulse_api.domain.alert_scheduling import (
+    EVALUATION_SCHEDULE_FIELDS,
+    EVALUATION_SEMANTIC_FIELDS,
+    alert_evaluation_schedule,
+)
 
 
 AUDIT_RETENTION = timedelta(days=90)
@@ -100,12 +105,15 @@ class DynamoAlertRuleRepository:
             raise NotFoundError(f"Alert rule {rule_id} not found")
 
         now = self.clock()
+        semantic_change = bool(EVALUATION_SEMANTIC_FIELDS.intersection(updates))
+        evaluation_revision = existing.evaluation_revision + int(semantic_change)
         updated = AlertRule.model_validate(
             {
                 **existing.model_dump(mode="python"),
                 **dict(updates),
                 "updated_at": now,
                 "version": expected_version + 1,
+                "evaluation_revision": evaluation_revision,
             }
         )
         audit_item = self._audit_item(
@@ -117,6 +125,15 @@ class DynamoAlertRuleRepository:
             context=audit,
             now=now,
         )
+        operational_updates: dict[str, Any] = {
+            "evaluation_revision": evaluation_revision,
+        }
+        removed_fields: set[str] = set()
+        if semantic_change and updated.enabled:
+            operational_updates.update(alert_evaluation_schedule(tenant_id, rule_id, now))
+        elif not updated.enabled:
+            removed_fields.update(EVALUATION_SCHEDULE_FIELDS)
+
         self._transact(
             [
                 self._conditioned_rule_update(
@@ -127,7 +144,9 @@ class DynamoAlertRuleRepository:
                         **dict(updates),
                         "updated_at": now.isoformat(),
                         "version": expected_version + 1,
+                        **operational_updates,
                     },
+                    remove_fields=removed_fields,
                 ),
                 self._conditioned_put(self.audit_table_name, audit_item),
             ]
@@ -166,6 +185,7 @@ class DynamoAlertRuleRepository:
                 "replaced_by_rule_id": replacement.rule_id,
                 "updated_at": now,
                 "version": expected_version + 1,
+                "evaluation_revision": existing.evaluation_revision + 1,
             }
         )
         replacement = AlertRule.model_validate(
@@ -219,7 +239,9 @@ class DynamoAlertRuleRepository:
                             "replaced_by_rule_id": replacement.rule_id,
                             "updated_at": now.isoformat(),
                             "version": expected_version + 1,
+                            "evaluation_revision": existing.evaluation_revision + 1,
                         },
+                        remove_fields=EVALUATION_SCHEDULE_FIELDS,
                     ),
                     self._conditioned_put(
                         self.domain_table_name,
@@ -301,6 +323,7 @@ class DynamoAlertRuleRepository:
         rule_id: str,
         expected_version: int,
         updates: Mapping[str, Any],
+        remove_fields: set[str] | frozenset[str] = frozenset(),
     ) -> dict[str, Any]:
         names = {
             "#version": "version",
@@ -317,11 +340,19 @@ class DynamoAlertRuleRepository:
             names[name_token] = field_name
             values[value_token] = field_value
             assignments.append(f"{name_token} = {value_token}")
+        removals: list[str] = []
+        for index, field_name in enumerate(sorted(remove_fields)):
+            name_token = f"#remove_{index}"
+            names[name_token] = field_name
+            removals.append(name_token)
+        update_expression = "SET " + ", ".join(assignments)
+        if removals:
+            update_expression += " REMOVE " + ", ".join(removals)
         return {
             "Update": {
                 "TableName": self.domain_table_name,
                 "Key": self._serialize_item(self._rule_key(tenant_id, rule_id)),
-                "UpdateExpression": "SET " + ", ".join(assignments),
+                "UpdateExpression": update_expression,
                 "ConditionExpression": (
                     "attribute_exists(PK) AND attribute_exists(SK) "
                     "AND #version = :expected_version AND #status = :active"
@@ -424,11 +455,14 @@ class DynamoAlertRuleRepository:
         return sha256(value).hexdigest()[:36]
 
     def _rule_to_item(self, rule: AlertRule) -> dict[str, Any]:
-        return {
+        item = {
             **self._rule_key(rule.tenant_id, rule.rule_id),
             "entity_type": "alert_rule",
             **rule.model_dump(mode="json"),
         }
+        if rule.enabled and rule.status == "active":
+            item.update(alert_evaluation_schedule(rule.tenant_id, rule.rule_id, rule.created_at))
+        return item
 
     def _rule_from_item(self, item: Mapping[str, Any]) -> AlertRule:
         values = {
