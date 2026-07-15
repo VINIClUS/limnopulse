@@ -7,6 +7,7 @@ from fastapi.testclient import TestClient
 from botocore.exceptions import EndpointConnectionError
 
 from limnopulse_api.adapters.dynamodb import DynamoDomainRepository
+from limnopulse_api.adapters.alert_rules import DynamoAlertRuleRepository
 from limnopulse_api.adapters.redis import RedisCacheRepository
 from limnopulse_api.auth.cognito import CognitoJwtAuthProvider
 from limnopulse_api.auth.models import Principal
@@ -131,6 +132,7 @@ def test_app_lifespan_wires_runtime_dependencies(monkeypatch) -> None:
     assert redis_calls == []
     assert influx_calls == []
     assert not hasattr(app.state, "domain_repository")
+    assert not hasattr(app.state, "alert_rule_repository")
     assert not hasattr(app.state, "membership_service")
     assert not hasattr(app.state, "auth_provider")
     assert not hasattr(app.state, "telemetry_repository")
@@ -148,6 +150,8 @@ def test_app_lifespan_wires_runtime_dependencies(monkeypatch) -> None:
         assert redis_calls == ["redis://localhost:6379/0"]
         assert isinstance(app.state.domain_repository, DynamoDomainRepository)
         assert app.state.domain_repository.client is fake_dynamo
+        assert isinstance(app.state.alert_rule_repository, DynamoAlertRuleRepository)
+        assert app.state.alert_rule_repository.client is fake_dynamo
         assert isinstance(app.state.cache_repository, RedisCacheRepository)
         assert app.state.cache_repository.redis is fake_redis
         assert isinstance(app.state.membership_service, MembershipService)
