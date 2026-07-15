@@ -171,6 +171,52 @@ def test_app_lifespan_wires_runtime_dependencies(monkeypatch) -> None:
     assert app.state.influxdb_client.closed is True
 
 
+def test_lifespan_uses_only_official_influx_client_and_closes_it(monkeypatch) -> None:
+    created_clients = []
+    fake_query_api = object()
+    fake_redis = FakeRedisClient()
+
+    class FakeInfluxClient:
+        def __init__(self, **kwargs) -> None:
+            self.init_kwargs = kwargs
+            self.close_calls = 0
+            created_clients.append(self)
+
+        def query_api(self):
+            return fake_query_api
+
+        def close(self) -> None:
+            self.close_calls += 1
+
+    monkeypatch.setattr("limnopulse_api.main.boto3.client", lambda *args, **kwargs: object())
+    monkeypatch.setattr("limnopulse_api.main.redis.from_url", lambda url: fake_redis)
+    monkeypatch.setattr("limnopulse_api.main.InfluxDBClient", FakeInfluxClient)
+
+    app = create_app(
+        Settings(
+            app_env="test",
+            auth_mode="dev",
+            influxdb_url="http://localhost:8086",
+            influxdb_token="local-token",
+            influxdb_org="limnopulse",
+            influxdb_bucket_raw="limnopulse_raw",
+        )
+    )
+
+    with TestClient(app):
+        assert len(created_clients) == 1
+        influxdb_client = created_clients[0]
+        assert influxdb_client.init_kwargs == {
+            "url": "http://localhost:8086",
+            "token": "local-token",
+            "org": "limnopulse",
+        }
+        assert app.state.telemetry_repository.query_api is fake_query_api
+        assert not hasattr(app.state, "influx_http_client")
+
+    assert influxdb_client.close_calls == 1
+
+
 def test_app_lifespan_uses_dummy_credentials_for_local_dynamodb(monkeypatch) -> None:
     dynamo_calls: list[dict[str, str | None]] = []
     fake_dynamo = object()
