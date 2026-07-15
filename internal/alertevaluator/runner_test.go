@@ -196,3 +196,26 @@ func TestRunnerReturnsFatalWhenDiscoveryFails(t *testing.T) {
 		t.Fatalf("summary = %#v", summary)
 	}
 }
+
+func TestRunnerEscalatesSystemicWindowFailures(t *testing.T) {
+	evaluationTime := time.Date(2026, 7, 15, 12, 1, 0, 0, time.UTC)
+	slot := LatestCompleteSlot(evaluationTime, time.Minute, 15*time.Second)
+	store := &fakeStore{work: map[string]Work{}, states: map[string]VersionedState{}}
+	for _, ruleID := range []string{"rule_1", "rule_2", "rule_3"} {
+		work := runnableWork(slot)
+		work.SK = "ALERT_RULE#" + ruleID
+		work.Rule.RuleID = ruleID
+		store.work[ruleID] = work
+		store.candidates = append(store.candidates, Candidate{
+			PK: work.PK, SK: work.SK, RuleID: ruleID,
+			Bucket: EvaluationBucket(work.Rule.TenantID, ruleID),
+		})
+	}
+	runner := Runner{Store: store, Windows: fakeWindowReader{err: errors.New("influx unavailable")}}
+
+	summary := runner.Run(context.Background(), runnableConfig(evaluationTime))
+
+	if summary.ExitCode != ExitFatal || summary.ScopeCompleted || summary.RulesWithError != 3 {
+		t.Fatalf("summary = %#v", summary)
+	}
+}

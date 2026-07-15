@@ -97,7 +97,7 @@ func (recorder *Recorder) Record(ctx context.Context, summary alertevaluator.Run
 	}
 	options := metric.WithAttributes(attribute.String("result", summary.Result))
 	recorder.evaluated.Add(ctx, int64(summary.RulesEvaluated), options)
-	recorder.delayed.Add(ctx, int64(summary.MissedSlots), options)
+	recorder.delayed.Add(ctx, int64(summary.CoalescedRules), options)
 	recorder.fired.Add(ctx, int64(summary.IncidentsFired), options)
 	recorder.recovered.Add(ctx, int64(summary.IncidentsRecovered), options)
 	recorder.skipped.Add(ctx, int64(summary.RulesSkipped), options)

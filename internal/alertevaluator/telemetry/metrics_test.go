@@ -17,7 +17,7 @@ func TestRecorderEmitsBoundedRunMetrics(t *testing.T) {
 		t.Fatal(err)
 	}
 	recorder.Record(context.Background(), alertevaluator.RunSummary{
-		Result: "success", RulesEvaluated: 7, MissedSlots: 2, IncidentsFired: 1,
+		Result: "success", RulesEvaluated: 7, MissedSlots: 8, CoalescedRules: 2, IncidentsFired: 1,
 		IncidentsRecovered: 1, RulesSkipped: 3, RulesWithError: 1,
 		Duration: 1250 * time.Millisecond,
 	})

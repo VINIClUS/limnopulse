@@ -2,13 +2,13 @@ from collections.abc import Callable, Mapping
 from copy import deepcopy
 from datetime import UTC, datetime, timedelta
 from decimal import Decimal
-import json
 from typing import Any
 from uuid import uuid4
 
 from boto3.dynamodb.types import TypeDeserializer, TypeSerializer
 
 from limnopulse_api.core.errors import ConflictError, NotFoundError
+from limnopulse_api.adapters.alert_event_state import resolved_evaluator_state
 from limnopulse_api.domain.alert_events import AlertEvent, AlertEventStatus
 from limnopulse_api.domain.alerts import AuditContext
 
@@ -171,31 +171,12 @@ class DynamoAlertEventRepository:
         if item is None:
             return None
         try:
-            state = json.loads(str(item["state_json"]))
-            revision = int(item["state_revision"])
-        except (KeyError, TypeError, ValueError, json.JSONDecodeError) as exc:
+            resolved = resolved_evaluator_state(item, event.event_id, now)
+        except ValueError as exc:
             raise ConflictError("alert evaluation state is invalid") from exc
-        if state.get("ActiveEventID") != event.event_id:
+        if resolved is None:
             return None
-        state.update(
-            {
-                "Mode": "healthy",
-                "ConfirmedSlots": 0,
-                "PendingSince": "0001-01-01T00:00:00Z",
-                "LastBreachSlot": "0001-01-01T00:00:00Z",
-                "ActiveEventID": "",
-                "ActiveStatus": "",
-                "ActiveOpenedAt": "0001-01-01T00:00:00Z",
-                "OpeningOutboxes": None,
-                "SuppressionSourceEventID": "",
-            }
-        )
-        updated_item = {
-            **item,
-            "state_json": json.dumps(state, separators=(",", ":"), sort_keys=True),
-            "state_revision": revision + 1,
-            "updated_at": now.isoformat(),
-        }
+        updated_item, revision = resolved
         return {
             "Put": {
                 "TableName": self.domain_table_name,

@@ -129,6 +129,10 @@ func (runner Runner) Run(parent context.Context, config RunConfig) RunSummary {
 			summary.RetryRecommended = true
 		}
 	}
+	if summary.ErrorCategories["window_query"] >= config.SystemicErrorThreshold {
+		summary.ScopeCompleted = false
+		summary.RetryRecommended = true
+	}
 
 	exitCode := ExitSuccess
 	if !summary.ScopeCompleted {

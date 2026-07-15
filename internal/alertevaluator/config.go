@@ -37,7 +37,6 @@ type RunConfig struct {
 	InfluxDBToken          string
 	InfluxDBOrg            string
 	InfluxDBBucket         string
-	RedisURL               string
 	OTLPEndpoint           string
 }
 
@@ -66,7 +65,6 @@ func defaultRunConfig() RunConfig {
 		InfluxDBToken:          "local-dev-token",
 		InfluxDBOrg:            "limnopulse",
 		InfluxDBBucket:         "limnopulse_raw",
-		RedisURL:               "redis://localhost:6379/0",
 	}
 }
 
@@ -94,6 +92,7 @@ func LoadRunConfig(args []string, lookup LookupEnv) (RunConfig, error) {
 	fs.IntVar(&config.QueryParallelism, "query-parallelism", config.QueryParallelism, "parallel GSI queries")
 	fs.IntVar(&config.MaxRules, "max-rules", config.MaxRules, "maximum rules per run")
 	fs.IntVar(&config.PageSize, "page-size", config.PageSize, "DynamoDB query page size")
+	fs.IntVar(&config.SystemicErrorThreshold, "systemic-error-threshold", config.SystemicErrorThreshold, "rule errors that make a run systemic")
 	fs.DurationVar(&config.ExpectedSampleInterval, "expected-sample-interval", config.ExpectedSampleInterval, "quality bucket width")
 	fs.Float64Var(&config.MinimumCoverageRatio, "min-coverage-ratio", config.MinimumCoverageRatio, "minimum quality coverage")
 	fs.IntVar(&config.MinimumPoints, "min-points", config.MinimumPoints, "minimum occupied buckets")
@@ -139,7 +138,6 @@ func applyEnvironment(config *RunConfig, lookup LookupEnv, explicit map[string]b
 		"INFLUXDB_TOKEN":              &config.InfluxDBToken,
 		"INFLUXDB_ORG":                &config.InfluxDBOrg,
 		"INFLUXDB_BUCKET_RAW":         &config.InfluxDBBucket,
-		"REDIS_URL":                   &config.RedisURL,
 		"OTEL_EXPORTER_OTLP_ENDPOINT": &config.OTLPEndpoint,
 	}
 	for key, target := range stringValues {
@@ -148,13 +146,14 @@ func applyEnvironment(config *RunConfig, lookup LookupEnv, explicit map[string]b
 		}
 	}
 	intValues := map[string]*int{
-		"ALERT_EVALUATOR_SHARD":                  &config.Shard,
-		"ALERT_EVALUATOR_SHARD_COUNT":            &config.ShardCount,
-		"ALERT_EVALUATOR_EVALUATION_PARALLELISM": &config.EvaluationParallelism,
-		"ALERT_EVALUATOR_QUERY_PARALLELISM":      &config.QueryParallelism,
-		"ALERT_EVALUATOR_MAX_RULES":              &config.MaxRules,
-		"ALERT_EVALUATOR_PAGE_SIZE":              &config.PageSize,
-		"ALERT_EVALUATOR_MIN_POINTS":             &config.MinimumPoints,
+		"ALERT_EVALUATOR_SHARD":                    &config.Shard,
+		"ALERT_EVALUATOR_SHARD_COUNT":              &config.ShardCount,
+		"ALERT_EVALUATOR_EVALUATION_PARALLELISM":   &config.EvaluationParallelism,
+		"ALERT_EVALUATOR_QUERY_PARALLELISM":        &config.QueryParallelism,
+		"ALERT_EVALUATOR_MAX_RULES":                &config.MaxRules,
+		"ALERT_EVALUATOR_PAGE_SIZE":                &config.PageSize,
+		"ALERT_EVALUATOR_MIN_POINTS":               &config.MinimumPoints,
+		"ALERT_EVALUATOR_SYSTEMIC_ERROR_THRESHOLD": &config.SystemicErrorThreshold,
 	}
 	for key, target := range intValues {
 		if value, ok := lookup(key); ok {
@@ -210,7 +209,7 @@ func validateRunConfig(config RunConfig, qualityExplicit map[string]bool) error 
 	if config.PerRuleTimeout <= 0 || config.LeaseTTL <= config.PerRuleTimeout {
 		return fmt.Errorf("lease-ttl must be greater than per-rule-timeout")
 	}
-	if config.EvaluationParallelism < 1 || config.QueryParallelism < 1 || config.MaxRules < 1 || config.PageSize < 1 {
+	if config.EvaluationParallelism < 1 || config.QueryParallelism < 1 || config.MaxRules < 1 || config.PageSize < 1 || config.SystemicErrorThreshold < 1 {
 		return fmt.Errorf("parallelism and work limits must be positive")
 	}
 	if config.ExpectedSampleInterval <= 0 || config.MinimumCoverageRatio <= 0 || config.MinimumCoverageRatio > 1 || config.MinimumPoints < 1 || config.AllowedLateness < 0 || config.MaximumSampleAge <= 0 {

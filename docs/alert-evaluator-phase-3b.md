@@ -119,3 +119,9 @@ Alert Events, transitions, cooldown state and notification outboxes live in
 DynamoDB. Redis is optional and never authoritative. Phase 3B does not publish
 SQS messages and does not call SES or Telegram; outbox publication and delivery
 start at the Phase 3C boundary.
+
+Recovery currently occurs on the first complete, sufficiently covered, fresh
+and valid clean window. `recovery_duration` and
+`recovery_threshold`/hysteresis are reserved schema extensions if tests or
+production telemetry later show flapping; opening `duration` is not implicitly
+reused for recovery.

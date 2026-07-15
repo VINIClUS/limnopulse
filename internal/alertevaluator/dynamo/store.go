@@ -394,6 +394,9 @@ func workFromItem(item map[string]types.AttributeValue) (alertevaluator.Work, er
 	if err := attributevalue.UnmarshalMap(item, &raw); err != nil {
 		return alertevaluator.Work{}, err
 	}
+	if err := validateRawRule(raw); err != nil {
+		return alertevaluator.Work{}, err
+	}
 	window, err := time.ParseDuration(raw.Window)
 	if err != nil {
 		return alertevaluator.Work{}, fmt.Errorf("window: %w", err)
@@ -425,20 +428,52 @@ func workFromItem(item map[string]types.AttributeValue) (alertevaluator.Work, er
 	}, nil
 }
 
+func validateRawRule(raw rawRule) error {
+	if raw.PK == "" || raw.SK == "" || raw.TenantID == "" || raw.RuleID == "" || raw.PondID == "" {
+		return fmt.Errorf("alert rule identity is incomplete")
+	}
+	if raw.Version < 1 || raw.EvaluationRevision < 1 {
+		return fmt.Errorf("alert rule versions must be positive")
+	}
+	switch raw.Operator {
+	case "<", "<=", ">", ">=":
+	default:
+		return fmt.Errorf("unsupported alert operator %q", raw.Operator)
+	}
+	switch alertevaluator.Aggregation(raw.Aggregation) {
+	case alertevaluator.AggregationMin, alertevaluator.AggregationMax,
+		alertevaluator.AggregationMean, alertevaluator.AggregationLast:
+	default:
+		return fmt.Errorf("unsupported alert aggregation %q", raw.Aggregation)
+	}
+	for _, channel := range raw.Channels {
+		if channel != string(alertevaluator.ChannelEmail) && channel != string(alertevaluator.ChannelTelegram) {
+			return fmt.Errorf("unsupported alert channel %q", channel)
+		}
+	}
+	return nil
+}
+
 type tokenKey struct {
-	PK string `json:"pk"`
-	SK string `json:"sk"`
+	PK     string `json:"pk"`
+	SK     string `json:"sk"`
+	GSI1PK string `json:"gsi1_pk,omitempty"`
+	GSI1SK string `json:"gsi1_sk,omitempty"`
 }
 
 func encodeToken(key map[string]types.AttributeValue) (string, error) {
 	var value struct {
-		PK string `dynamodbav:"PK"`
-		SK string `dynamodbav:"SK"`
+		PK     string `dynamodbav:"PK"`
+		SK     string `dynamodbav:"SK"`
+		GSI1PK string `dynamodbav:"GSI1PK"`
+		GSI1SK string `dynamodbav:"GSI1SK"`
 	}
 	if err := attributevalue.UnmarshalMap(key, &value); err != nil {
 		return "", err
 	}
-	encoded, err := json.Marshal(tokenKey{PK: value.PK, SK: value.SK})
+	encoded, err := json.Marshal(tokenKey{
+		PK: value.PK, SK: value.SK, GSI1PK: value.GSI1PK, GSI1SK: value.GSI1SK,
+	})
 	if err != nil {
 		return "", err
 	}
@@ -457,14 +492,32 @@ func decodeToken(token string) (map[string]types.AttributeValue, error) {
 	if value.PK == "" || value.SK == "" {
 		return nil, fmt.Errorf("pagination token is missing its key")
 	}
-	return attributevalue.MarshalMap(map[string]string{"PK": value.PK, "SK": value.SK})
+	key := map[string]string{"PK": value.PK, "SK": value.SK}
+	if value.GSI1PK != "" || value.GSI1SK != "" {
+		if value.GSI1PK == "" || value.GSI1SK == "" {
+			return nil, fmt.Errorf("pagination token has an incomplete index key")
+		}
+		key["GSI1PK"] = value.GSI1PK
+		key["GSI1SK"] = value.GSI1SK
+	}
+	return attributevalue.MarshalMap(key)
 }
 
 func stateSortKey(ruleID string) string  { return "ALERT_STATE#" + ruleID }
 func eventSortKey(eventID string) string { return "ALERT_EVENT#" + eventID }
 
 func commitToken(request alertevaluator.CommitRequest) string {
-	canonical := fmt.Sprintf("%s\x00%s\x00%d\x00%s", request.Work.Rule.TenantID, request.Work.Rule.RuleID, request.Work.LeaseEpoch, alertevaluator.FixedUTCTimestamp(request.Slot))
+	canonical := fmt.Sprintf(
+		"%s\x00%s\x00%d\x00%d\x00%s\x00%s\x00%s\x00%s",
+		request.Work.Rule.TenantID,
+		request.Work.Rule.RuleID,
+		request.Work.LeaseEpoch,
+		request.PreviousState.Revision,
+		alertevaluator.FixedUTCTimestamp(request.Slot),
+		request.Evaluation.Quality,
+		request.Decision.Transition,
+		request.Decision.EventID+request.Decision.ResolvedEventID,
+	)
 	digest := sha256.Sum256([]byte(canonical))
 	return "eval-" + hex.EncodeToString(digest[:])[:31]
 }

@@ -72,7 +72,12 @@ func (client *fakeClient) TransactWriteItems(_ context.Context, input *dynamodb.
 }
 
 func TestQueryDueUsesEvaluationGSIAndPaginatesWithoutScan(t *testing.T) {
-	lastKey := map[string]types.AttributeValue{"PK": &types.AttributeValueMemberS{Value: "TENANT#tnt_1"}, "SK": &types.AttributeValueMemberS{Value: "ALERT_RULE#rule_1"}}
+	lastKey := map[string]types.AttributeValue{
+		"PK":     &types.AttributeValueMemberS{Value: "TENANT#tnt_1"},
+		"SK":     &types.AttributeValueMemberS{Value: "ALERT_RULE#rule_1"},
+		"GSI1PK": &types.AttributeValueMemberS{Value: "ALERT_EVALUATION#V1#BUCKET#06"},
+		"GSI1SK": &types.AttributeValueMemberS{Value: "2026-07-15T12:00:45.000000000Z#TENANT#tnt_1#RULE#rule_1"},
+	}
 	client := &fakeClient{queryOutput: &dynamodb.QueryOutput{
 		Items: []map[string]types.AttributeValue{lastKey}, LastEvaluatedKey: lastKey,
 	}}
@@ -90,7 +95,7 @@ func TestQueryDueUsesEvaluationGSIAndPaginatesWithoutScan(t *testing.T) {
 		t.Fatalf("page = %#v", page)
 	}
 	decoded, err := decodeToken(page.NextToken)
-	if err != nil || len(decoded) != 2 {
+	if err != nil || len(decoded) != 4 {
 		t.Fatalf("token = %q, err = %v", page.NextToken, err)
 	}
 }
@@ -121,6 +126,18 @@ func TestClaimUsesDueBoundLeaseExpiryAndFencingEpoch(t *testing.T) {
 	}
 	if work.LeaseEpoch != 4 || work.Rule.Duration != 2*time.Minute || work.Rule.EvaluationRevision != 3 {
 		t.Fatalf("work = %#v", work)
+	}
+}
+
+func TestWorkDecodeRejectsUnknownOperatorInsteadOfTreatingItAsClean(t *testing.T) {
+	item := ruleItem()
+	item["operator"] = "unknown"
+	encoded, err := attributevalue.MarshalMap(item)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := workFromItem(encoded); err == nil || !strings.Contains(err.Error(), "operator") {
+		t.Fatalf("workFromItem() error = %v", err)
 	}
 }
 

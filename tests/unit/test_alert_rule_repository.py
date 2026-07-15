@@ -369,6 +369,51 @@ async def test_semantic_update_resolves_active_generation_without_outbox() -> No
 
 
 @pytest.mark.asyncio
+async def test_semantic_update_resets_pending_confirmation_from_previous_generation() -> None:
+    class CapturingClient(RecordingDynamoClient):
+        def transact_write_items(self, **kwargs: Any) -> dict[str, Any]:
+            self.transact_write_items_calls.append(kwargs)
+            return {}
+
+    client = CapturingClient()
+    repository = make_repository(client)
+    client.seed("LimnopulseDomain", repository._rule_to_item(make_rule(version=2)))
+    client.seed(
+        "LimnopulseDomain",
+        {
+            "PK": "TENANT#tnt_1",
+            "SK": "ALERT_STATE#rule_1",
+            "entity_type": "alert_evaluation_state",
+            "state_revision": 4,
+            "state_json": json.dumps(
+                {
+                    "Mode": "pending",
+                    "ConfirmedSlots": 2,
+                    "PendingSince": "2026-07-15T11:58:45Z",
+                    "LastBreachSlot": "2026-07-15T11:59:45Z",
+                }
+            ),
+        },
+    )
+
+    await repository.update_rule(
+        "tnt_1", "rule_1", 2, {"threshold": 4.5}, audit_context()
+    )
+
+    operations = client.transact_write_items_calls[0]["TransactItems"]
+    assert [set(operation) for operation in operations] == [
+        {"Update"},
+        {"Put"},
+        {"Put"},
+    ]
+    state_item = client._decode_item(operations[1]["Put"]["Item"])
+    state = json.loads(state_item["state_json"])
+    assert state["Mode"] == "healthy"
+    assert state["ConfirmedSlots"] == 0
+    assert state_item["state_revision"] == 5
+
+
+@pytest.mark.asyncio
 async def test_update_rule_missing_target_raises_not_found() -> None:
     repository = make_repository(RecordingDynamoClient())
 

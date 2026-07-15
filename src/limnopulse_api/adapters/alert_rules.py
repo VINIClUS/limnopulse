@@ -12,6 +12,11 @@ from boto3.dynamodb.types import TypeDeserializer, TypeSerializer
 from pydantic import BaseModel
 
 from limnopulse_api.core.errors import ConflictError, NotFoundError
+from limnopulse_api.adapters.alert_event_state import (
+    decode_evaluator_state,
+    reset_pending_evaluator_state,
+    resolved_evaluator_state,
+)
 from limnopulse_api.domain.alerts import (
     AlertRule,
     AlertRuleReplacement,
@@ -303,33 +308,25 @@ class DynamoAlertRuleRepository:
         if state_item is None:
             return []
         try:
-            state = json.loads(str(state_item["state_json"]))
-            state_revision = int(state_item["state_revision"])
-        except (KeyError, TypeError, ValueError, json.JSONDecodeError) as exc:
+            state, _ = decode_evaluator_state(state_item)
+        except ValueError as exc:
             raise ConflictError("alert evaluation state is invalid") from exc
+        if state.get("Mode") == "pending":
+            pending_reset = reset_pending_evaluator_state(state_item, now)
+            if pending_reset is None:
+                return []
+            reset_state, previous_revision = pending_reset
+            return [self._state_put(reset_state, previous_revision)]
         event_id = str(state.get("ActiveEventID", ""))
-        if state.get("Mode") != "active" or not event_id:
+        if not event_id:
             return []
-
-        state.update(
-            {
-                "Mode": "healthy",
-                "ConfirmedSlots": 0,
-                "PendingSince": "0001-01-01T00:00:00Z",
-                "LastBreachSlot": "0001-01-01T00:00:00Z",
-                "ActiveEventID": "",
-                "ActiveStatus": "",
-                "ActiveOpenedAt": "0001-01-01T00:00:00Z",
-                "OpeningOutboxes": None,
-                "SuppressionSourceEventID": "",
-            }
-        )
-        resolved_state = {
-            **state_item,
-            "state_json": json.dumps(state, separators=(",", ":"), sort_keys=True),
-            "state_revision": state_revision + 1,
-            "updated_at": now.isoformat(),
-        }
+        try:
+            resolved = resolved_evaluator_state(state_item, event_id, now)
+        except ValueError as exc:
+            raise ConflictError("alert evaluation state is invalid") from exc
+        if resolved is None:
+            return []
+        resolved_state, state_revision = resolved
         event_key = {
             "PK": f"TENANT#{rule.tenant_id}",
             "SK": f"ALERT_EVENT#{event_id}",
@@ -390,19 +387,26 @@ class DynamoAlertRuleRepository:
                     "ExpressionAttributeValues": event_values,
                 }
             },
-            {
-                "Put": {
-                    "TableName": self.domain_table_name,
-                    "Item": self._serialize_item(resolved_state),
-                    "ConditionExpression": "#revision = :expected_revision",
-                    "ExpressionAttributeNames": {"#revision": "state_revision"},
-                    "ExpressionAttributeValues": self._serialize_values(
-                        {":expected_revision": state_revision}
-                    ),
-                }
-            },
+            self._state_put(resolved_state, state_revision),
             self._conditioned_put(self.domain_table_name, transition_item),
         ]
+
+    def _state_put(
+        self,
+        item: Mapping[str, Any],
+        previous_revision: int,
+    ) -> dict[str, Any]:
+        return {
+            "Put": {
+                "TableName": self.domain_table_name,
+                "Item": self._serialize_item(item),
+                "ConditionExpression": "#revision = :expected_revision",
+                "ExpressionAttributeNames": {"#revision": "state_revision"},
+                "ExpressionAttributeValues": self._serialize_values(
+                    {":expected_revision": previous_revision}
+                ),
+            }
+        }
 
     async def get_replacement_replay(
         self,
