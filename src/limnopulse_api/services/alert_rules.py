@@ -82,16 +82,23 @@ class AlertRuleService:
         idempotency_key: str,
         audit: AuditContext,
     ) -> AlertRuleReplacement:
-        await self._validate_target(
-            tenant_id,
-            pond_id=str(definition["pond_id"]),
-            device_id=self._optional_string(definition.get("device_id")),
-        )
         request_hash = self._replacement_request_hash(
             tenant_id,
             rule_id,
             expected_version,
             definition,
+        )
+        replay = await self.repository.get_replacement_replay(
+            tenant_id,
+            idempotency_key,
+            request_hash,
+        )
+        if replay is not None:
+            return replay
+        await self._validate_target(
+            tenant_id,
+            pond_id=str(definition["pond_id"]),
+            device_id=self._optional_string(definition.get("device_id")),
         )
         now = self.clock()
         replacement = AlertRule.model_validate(

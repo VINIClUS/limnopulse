@@ -130,6 +130,20 @@ class FakeAlertRuleRepository:
         self.audits.append(audit)
         return updated
 
+    async def get_replacement_replay(
+        self,
+        tenant_id: str,
+        idempotency_key: str,
+        request_hash: str,
+    ) -> AlertRuleReplacement | None:
+        replay = self.idempotency.get(idempotency_key)
+        if replay is None:
+            return None
+        stored_hash, stored_result = replay
+        if stored_hash != request_hash:
+            raise ConflictError("idempotency conflict")
+        return stored_result
+
     async def replace_rule(
         self,
         tenant_id: str,
@@ -405,6 +419,22 @@ def test_replace_returns_old_and_new_rule_and_replays() -> None:
     assert first.json()["replacement"]["metric"] == "ph"
     assert first.json()["replacement"]["replaces_rule_id"] == "rule_1"
     assert len(repository.idempotency) == 1
+
+
+def test_replace_replay_does_not_depend_on_current_target_state() -> None:
+    app, _, domain_repository = app_for_role(TenantRole.ADMIN)
+    client = TestClient(app)
+    path = "/v1/tenants/tnt_1/alert-rules/rule_1/replace"
+    payload = {"expected_version": 1, **create_payload(metric="ph")}
+    headers = dev_headers(**{"Idempotency-Key": "replace-123"})
+
+    first = client.post(path, json=payload, headers=headers)
+    domain_repository.devices.pop("dev_1")
+    replay = client.post(path, json=payload, headers=headers)
+
+    assert first.status_code == 201
+    assert replay.status_code == 201
+    assert replay.json() == first.json()
 
 
 def test_replace_rejects_same_idempotency_key_with_other_payload() -> None:

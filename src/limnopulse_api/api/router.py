@@ -1,6 +1,14 @@
 from fastapi import APIRouter
 
-from limnopulse_api.api.v1.routers import alert_rules, devices, health, me, ponds, telemetry, tenants
+from limnopulse_api.api.v1.routers import (
+    alert_rules,
+    devices,
+    health,
+    me,
+    ponds,
+    telemetry,
+    tenants,
+)
 
 api_router = APIRouter()
 api_router.include_router(health.router)

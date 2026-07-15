@@ -5,6 +5,7 @@ from typing import Any
 
 import pytest
 from boto3.dynamodb.types import TypeDeserializer, TypeSerializer
+from botocore.exceptions import ClientError
 
 from limnopulse_api.adapters.alert_rules import DynamoAlertRuleRepository
 from limnopulse_api.core.errors import ConflictError, NotFoundError
@@ -45,9 +46,7 @@ class RecordingDynamoClient:
         items = [
             item
             for (table, pk, sk), item in self.items.items()
-            if table == table_name
-            and pk == values[":pk"]
-            and sk.startswith(values[":sk_prefix"])
+            if table == table_name and pk == values[":pk"] and sk.startswith(values[":sk_prefix"])
         ]
         items.sort(key=lambda item: item["SK"])
         return {"Items": [self._encode_item(item) for item in items]}
@@ -126,10 +125,7 @@ class RecordingDynamoClient:
         if isinstance(value, float):
             return Decimal(str(value))
         if isinstance(value, dict):
-            return {
-                key: self._normalize_for_dynamodb(item)
-                for key, item in value.items()
-            }
+            return {key: self._normalize_for_dynamodb(item) for key, item in value.items()}
         if isinstance(value, (list, tuple)):
             return [self._normalize_for_dynamodb(item) for item in value]
         return value
@@ -242,6 +238,29 @@ async def test_create_rule_maps_conditional_transaction_to_conflict() -> None:
 
     with pytest.raises(ConflictError):
         await repository.create_rule(make_rule(), audit_context())
+
+
+@pytest.mark.asyncio
+async def test_transaction_throttling_remains_an_infrastructure_error() -> None:
+    class ThrottledDynamoClient(RecordingDynamoClient):
+        def transact_write_items(self, **kwargs: Any) -> dict[str, Any]:
+            raise ClientError(
+                {
+                    "Error": {
+                        "Code": "TransactionCanceledException",
+                        "Message": "transaction cancelled",
+                    },
+                    "CancellationReasons": [{"Code": "ThrottlingError"}],
+                },
+                "TransactWriteItems",
+            )
+
+    repository = make_repository(ThrottledDynamoClient())
+
+    with pytest.raises(ClientError) as captured:
+        await repository.create_rule(make_rule(), audit_context())
+
+    assert captured.value.response["CancellationReasons"] == [{"Code": "ThrottlingError"}]
 
 
 @pytest.mark.asyncio

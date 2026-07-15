@@ -146,8 +146,11 @@ class DynamoAlertRuleRepository:
     ) -> AlertRuleReplacement:
         now = self.clock()
         idempotency_key_fields = self._idempotency_key(tenant_id, idempotency_key)
-        stored = self._get_item(self.domain_table_name, idempotency_key_fields)
-        replay = self._replay_idempotency(stored, request_hash, now)
+        replay = await self.get_replacement_replay(
+            tenant_id,
+            idempotency_key,
+            request_hash,
+        )
         if replay is not None:
             return replay
 
@@ -200,9 +203,7 @@ class DynamoAlertRuleRepository:
                 "Item": self._serialize_item(idempotency_item),
                 "ConditionExpression": "attribute_not_exists(PK) OR #expires_at <= :now",
                 "ExpressionAttributeNames": {"#expires_at": "expires_at"},
-                "ExpressionAttributeValues": self._serialize_values(
-                    {":now": int(now.timestamp())}
-                ),
+                "ExpressionAttributeValues": self._serialize_values({":now": int(now.timestamp())}),
             }
         }
         try:
@@ -244,6 +245,18 @@ class DynamoAlertRuleRepository:
             self._raise_if_conflict(exc)
             raise
         return result
+
+    async def get_replacement_replay(
+        self,
+        tenant_id: str,
+        idempotency_key: str,
+        request_hash: str,
+    ) -> AlertRuleReplacement | None:
+        item = self._get_item(
+            self.domain_table_name,
+            self._idempotency_key(tenant_id, idempotency_key),
+        )
+        return self._replay_idempotency(item, request_hash, self.clock())
 
     def _get_rule(self, tenant_id: str, rule_id: str) -> AlertRule | None:
         item = self._get_item(
@@ -326,12 +339,20 @@ class DynamoAlertRuleRepository:
             raise
 
     def _raise_if_conflict(self, exc: Exception) -> None:
-        error_code = getattr(exc, "response", {}).get("Error", {}).get("Code")
+        response = getattr(exc, "response", {})
+        error_code = response.get("Error", {}).get("Code")
         if error_code in {
             "ConditionalCheckFailedException",
-            "TransactionCanceledException",
             "IdempotentParameterMismatchException",
         }:
+            raise ConflictError(str(exc)) from exc
+        if error_code != "TransactionCanceledException":
+            return
+        reasons = response.get("CancellationReasons")
+        if reasons is None or any(
+            reason.get("Code") in {"ConditionalCheckFailed", "TransactionConflict"}
+            for reason in reasons
+        ):
             raise ConflictError(str(exc)) from exc
 
     def _audit_item(
@@ -411,9 +432,7 @@ class DynamoAlertRuleRepository:
 
     def _rule_from_item(self, item: Mapping[str, Any]) -> AlertRule:
         values = {
-            key: value
-            for key, value in item.items()
-            if key not in {"PK", "SK", "entity_type"}
+            key: value for key, value in item.items() if key not in {"PK", "SK", "entity_type"}
         }
         return AlertRule.model_validate(values)
 
@@ -447,10 +466,7 @@ class DynamoAlertRuleRepository:
         if isinstance(value, float):
             return Decimal(str(value))
         if isinstance(value, Mapping):
-            return {
-                key: self._normalize_for_dynamodb(item)
-                for key, item in value.items()
-            }
+            return {key: self._normalize_for_dynamodb(item) for key, item in value.items()}
         if isinstance(value, (list, tuple)):
             return [self._normalize_for_dynamodb(item) for item in value]
         return value
@@ -469,8 +485,5 @@ class DynamoAlertRuleRepository:
         if isinstance(value, list):
             return [self._normalize_from_dynamodb(item) for item in value]
         if isinstance(value, Mapping):
-            return {
-                key: self._normalize_from_dynamodb(item)
-                for key, item in value.items()
-            }
+            return {key: self._normalize_from_dynamodb(item) for key, item in value.items()}
         return value

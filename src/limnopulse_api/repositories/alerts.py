@@ -25,6 +25,14 @@ class AlertRuleRepository(Protocol):
     ) -> AlertRule:
         raise NotImplementedError
 
+    async def get_replacement_replay(
+        self,
+        tenant_id: str,
+        idempotency_key: str,
+        request_hash: str,
+    ) -> AlertRuleReplacement | None:
+        raise NotImplementedError
+
     async def replace_rule(
         self,
         tenant_id: str,

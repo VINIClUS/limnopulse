@@ -263,7 +263,9 @@ def test_me_reuses_app_scoped_auth_provider(monkeypatch) -> None:
     def fail_build_auth_provider(settings, cache=None):
         raise AssertionError("auth provider should be reused from app state")
 
-    monkeypatch.setattr("limnopulse_api.api.dependencies.build_auth_provider", fail_build_auth_provider)
+    monkeypatch.setattr(
+        "limnopulse_api.api.dependencies.build_auth_provider", fail_build_auth_provider
+    )
 
     with TestClient(app) as client:
         first = client.get("/v1/me")
