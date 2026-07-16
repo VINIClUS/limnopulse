@@ -74,16 +74,17 @@ class NotificationPreferenceService:
         audit: AuditContext,
     ) -> NotificationPreferenceView:
         existing = await self.repository.get(tenant_id, principal.cognito_sub)
+        if expected_version is None:
+            if existing is not None:
+                raise ConflictError("notification preference already exists")
+        elif existing is None or existing.version != expected_version:
+            raise ConflictError("notification preference version conflict")
+
         identity = None
         if expected_version is None or email_enabled:
             if self.identity_verifier is None:
                 raise IdentityServiceUnavailableError("identity verifier unavailable")
             identity = await self.identity_verifier.verify(principal)
-        elif existing is None:
-            raise ConflictError("notification preference does not exist")
-
-        if expected_version is not None and existing is None:
-            raise ConflictError("notification preference does not exist")
 
         now = self.clock()
         preference = NotificationPreference(

@@ -168,7 +168,7 @@ def make_preference(**updates: object) -> NotificationPreference:
 
 def build_app(
     repository: InMemoryNotificationPreferenceRepository,
-    identity_verifier: object,
+    identity_verifier: object | None,
     *,
     auth_provider: StaticAuthProvider | None = None,
     membership_active: bool = True,
@@ -177,7 +177,8 @@ def build_app(
     app.state.auth_provider = auth_provider or StaticAuthProvider()
     app.state.membership_service = FakeMembershipService(active=membership_active)
     app.state.notification_preference_repository = repository
-    app.state.cognito_identity_verifier = identity_verifier
+    if identity_verifier is not None:
+        app.state.cognito_identity_verifier = identity_verifier
     return app
 
 
@@ -290,6 +291,19 @@ def test_put_enabled_update_rechecks_cognito_and_disable_does_not() -> None:
     assert disabled.json()["version"] == 3
     assert disabled.json()["email"]["enabled"] is False
     assert disabled.json()["email"]["effective_enabled"] is False
+
+
+def test_put_disable_existing_does_not_require_cognito_verifier_wiring() -> None:
+    repository = InMemoryNotificationPreferenceRepository(make_preference())
+
+    response = TestClient(build_app(repository, None)).put(
+        PATH,
+        json={"expected_version": 1, "email_enabled": False},
+    )
+
+    assert response.status_code == 200
+    assert response.json()["version"] == 2
+    assert response.json()["email"]["enabled"] is False
 
 
 @pytest.mark.parametrize(

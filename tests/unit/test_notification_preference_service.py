@@ -295,6 +295,63 @@ async def test_update_of_absent_preference_is_conflict_without_mutation() -> Non
 
 
 @pytest.mark.asyncio
+async def test_duplicate_create_preflight_returns_conflict_without_cognito() -> None:
+    repository = FakeNotificationPreferenceRepository(make_preference(version=1))
+    verifier = FakeIdentityVerifier(error=IdentityEmailError("must not win over conflict"))
+
+    with pytest.raises(ConflictError):
+        await NotificationPreferenceService(repository, verifier).put(
+            "tnt_1",
+            PRINCIPAL,
+            expected_version=None,
+            email_enabled=True,
+            minimum_severity=AlertSeverity.CRITICAL,
+            audit=AUDIT,
+        )
+
+    assert verifier.calls == []
+    assert repository.save_calls == []
+
+
+@pytest.mark.asyncio
+async def test_enabled_stale_update_preflight_returns_conflict_without_cognito() -> None:
+    repository = FakeNotificationPreferenceRepository(make_preference(version=3))
+    verifier = FakeIdentityVerifier(error=IdentityEmailError("must not win over conflict"))
+
+    with pytest.raises(ConflictError):
+        await NotificationPreferenceService(repository, verifier).put(
+            "tnt_1",
+            PRINCIPAL,
+            expected_version=2,
+            email_enabled=True,
+            minimum_severity=AlertSeverity.CRITICAL,
+            audit=AUDIT,
+        )
+
+    assert verifier.calls == []
+    assert repository.save_calls == []
+
+
+@pytest.mark.asyncio
+async def test_enabled_absent_update_preflight_returns_conflict_without_cognito() -> None:
+    repository = FakeNotificationPreferenceRepository()
+    verifier = FakeIdentityVerifier(error=IdentityEmailError("must not win over conflict"))
+
+    with pytest.raises(ConflictError):
+        await NotificationPreferenceService(repository, verifier).put(
+            "tnt_1",
+            PRINCIPAL,
+            expected_version=1,
+            email_enabled=True,
+            minimum_severity=AlertSeverity.CRITICAL,
+            audit=AUDIT,
+        )
+
+    assert verifier.calls == []
+    assert repository.save_calls == []
+
+
+@pytest.mark.asyncio
 async def test_identity_failure_leaves_repository_unmodified() -> None:
     repository = FakeNotificationPreferenceRepository()
     verifier = FakeIdentityVerifier(error=IdentityEmailError("invalid email"))

@@ -68,8 +68,8 @@ def get_notification_preference_repository(
     return _get_state_dependency(request, "notification_preference_repository")
 
 
-def get_cognito_identity_verifier(request: Request) -> CognitoIdentityVerifier:
-    return _get_state_dependency(request, "cognito_identity_verifier")
+def get_cognito_identity_verifier(request: Request) -> CognitoIdentityVerifier | None:
+    return getattr(request.app.state, "cognito_identity_verifier", None)
 
 
 DomainRepositoryDep = Annotated[DomainRepository, Depends(get_domain_repository)]
@@ -81,7 +81,7 @@ NotificationPreferenceRepositoryDep = Annotated[
     Depends(get_notification_preference_repository),
 ]
 CognitoIdentityVerifierDep = Annotated[
-    CognitoIdentityVerifier,
+    CognitoIdentityVerifier | None,
     Depends(get_cognito_identity_verifier),
 ]
 MembershipServiceDep = Annotated[MembershipService, Depends(get_membership_service)]
