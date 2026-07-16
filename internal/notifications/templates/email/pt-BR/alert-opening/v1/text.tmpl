@@ -1,0 +1,15 @@
+Alerta aberto
+
+Regra: {{.RuleName}}
+Severidade: {{.Severity}}
+Tenant: {{.TenantID}}
+Viveiro: {{.PondID}}
+Dispositivo: {{.DeviceID}}
+Métrica: {{.Metric}} ({{.Unit}})
+Condição: {{.Operator}} {{number .Threshold}} {{.Unit}}
+{{if .ObservedValue}}Valor observado: {{numberPtr .ObservedValue}} {{.Unit}}
+{{end}}Janela de avaliação: {{duration .EvaluationWindow}}
+Início da janela: {{utc .WindowStart}}
+Fim da janela: {{utc .WindowEnd}}
+Avaliado em: {{utc .EvaluatedAt}}
+ID do evento: {{.EventID}}

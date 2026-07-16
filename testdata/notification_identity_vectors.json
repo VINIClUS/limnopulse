@@ -1,0 +1,48 @@
+{
+  "schema_version": 1,
+  "relay_vectors": [
+    {
+      "work_kind": "INTENT",
+      "tenant_id": "tnt_1",
+      "item_id": "outbox_1",
+      "scheduled_at": "2026-07-16T12:34:56.123456789Z",
+      "bucket": 29,
+      "gsi_pk": "NOTIFICATION_RELAY#V1#BUCKET#29",
+      "gsi_sk": "2026-07-16T12:34:56.123456789Z#INTENT#dG50XzE#b3V0Ym94XzE"
+    },
+    {
+      "work_kind": "DEPENDENCY",
+      "tenant_id": "tenant#br",
+      "item_id": "opening/outbox #7",
+      "scheduled_at": "2026-01-02T03:04:05.000000006Z",
+      "bucket": 50,
+      "gsi_pk": "NOTIFICATION_RELAY#V1#BUCKET#50",
+      "gsi_sk": "2026-01-02T03:04:05.000000006Z#DEPENDENCY#dGVuYW50I2Jy#b3BlbmluZy9vdXRib3ggIzc"
+    },
+    {
+      "work_kind": "DELIVERY",
+      "tenant_id": "tnt_águas",
+      "item_id": "del_☃",
+      "scheduled_at": "2026-12-31T23:59:59.999999999Z",
+      "bucket": 55,
+      "gsi_pk": "NOTIFICATION_RELAY#V1#BUCKET#55",
+      "gsi_sk": "2026-12-31T23:59:59.999999999Z#DELIVERY#dG50X8OhZ3Vhcw#ZGVsX-KYgw"
+    }
+  ],
+  "delivery_vectors": [
+    {
+      "event_id": "alert_01",
+      "kind": "opening",
+      "channel": "email",
+      "recipient_id": "user_01",
+      "delivery_id": "del_cd9fe119d214ba2da36a8f6febb463781955a03b0940cf4b1dad2fc8d23b1889"
+    },
+    {
+      "event_id": "alert_deadbeef",
+      "kind": "recovery",
+      "channel": "email",
+      "recipient_id": "recipient#south/1",
+      "delivery_id": "del_8960699de5c6208f6905c227347b300f8be0be0fbf60b7837f22cae05dc14b03"
+    }
+  ]
+}
