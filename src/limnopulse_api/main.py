@@ -11,6 +11,9 @@ from influxdb_client import InfluxDBClient
 from limnopulse_api.adapters.dynamodb import DynamoDomainRepository
 from limnopulse_api.adapters.alert_rules import DynamoAlertRuleRepository
 from limnopulse_api.adapters.alert_events import DynamoAlertEventRepository
+from limnopulse_api.adapters.notification_preferences import (
+    DynamoNotificationPreferenceRepository,
+)
 from limnopulse_api.adapters.influxdb import InfluxTelemetryRepository
 from limnopulse_api.adapters.redis import RedisCacheRepository
 from limnopulse_api.api.router import api_router
@@ -18,6 +21,7 @@ from limnopulse_api.auth.providers import build_auth_provider
 from limnopulse_api.core.config import Settings, get_settings
 from limnopulse_api.core.errors import TelemetryQueryError
 from limnopulse_api.services.memberships import MembershipService
+from limnopulse_api.services.cognito_identity import CognitoIdentityVerifier
 
 
 def _dynamodb_client_kwargs(settings: Settings) -> dict[str, str]:
@@ -25,6 +29,14 @@ def _dynamodb_client_kwargs(settings: Settings) -> dict[str, str]:
     if settings.dynamodb_endpoint_url is not None:
         kwargs["endpoint_url"] = settings.dynamodb_endpoint_url
     if settings.app_env in {"local", "test"} and settings.dynamodb_endpoint_url is not None:
+        kwargs["aws_access_key_id"] = "local"
+        kwargs["aws_secret_access_key"] = "local"
+    return kwargs
+
+
+def _cognito_client_kwargs(settings: Settings) -> dict[str, str]:
+    kwargs = {"region_name": settings.aws_region}
+    if settings.app_env in {"local", "test"}:
         kwargs["aws_access_key_id"] = "local"
         kwargs["aws_secret_access_key"] = "local"
     return kwargs
@@ -45,6 +57,9 @@ def create_app(settings: Settings | None = None) -> FastAPI:
                 "domain_repository",
                 "alert_rule_repository",
                 "alert_event_repository",
+                "notification_preference_repository",
+                "cognito_identity_verifier",
+                "cognito_client",
                 "membership_service",
                 "auth_provider",
                 "cache_repository",
@@ -77,6 +92,17 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             audit_table_name=resolved_settings.dynamodb_audit_table,
             client=dynamodb_client,
         )
+        app.state.notification_preference_repository = DynamoNotificationPreferenceRepository(
+            domain_table_name=resolved_settings.dynamodb_domain_table,
+            audit_table_name=resolved_settings.dynamodb_audit_table,
+            client=dynamodb_client,
+        )
+        cognito_client = boto3.client(
+            "cognito-idp",
+            **_cognito_client_kwargs(resolved_settings),
+        )
+        app.state.cognito_client = cognito_client
+        app.state.cognito_identity_verifier = CognitoIdentityVerifier(cognito_client)
         app.state.membership_service = MembershipService(
             domain_repository=app.state.domain_repository,
             cache=app.state.cache_repository,

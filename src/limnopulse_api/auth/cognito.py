@@ -147,7 +147,14 @@ class CognitoJwtAuthProvider:
             raise AuthError("expired cognito token")
 
         groups = tuple(claims.get("cognito:groups", ()))
-        return Principal(cognito_sub=sub, email=claims.get("email"), groups=groups)
+        scopes = frozenset(str(claims.get("scope", "")).split())
+        return Principal(
+            cognito_sub=sub,
+            email=claims.get("email"),
+            groups=groups,
+            access_token=token,
+            scopes=scopes,
+        )
 
 
 def build_cognito_key_store(

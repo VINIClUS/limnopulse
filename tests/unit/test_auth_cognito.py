@@ -39,6 +39,7 @@ def base_claims() -> dict[str, object]:
         "sub": "sub_1",
         "client_id": "client_1",
         "token_use": "access",
+        "scope": "openid aws.cognito.signin.user.admin",
         "email": "u@example.test",
         "iat": int(now.timestamp()),
         "nbf": int(now.timestamp()),
@@ -104,10 +105,15 @@ async def test_cognito_accepts_valid_access_token(key_pair) -> None:
         key_store=FakeKeyStore(public_key),
     )
 
-    principal = await provider.authenticate(build_request(build_token(private_key, base_claims())))
+    token = build_token(private_key, base_claims())
+    principal = await provider.authenticate(build_request(token))
 
     assert principal.cognito_sub == "sub_1"
     assert principal.email == "u@example.test"
+    assert principal.access_token == token
+    assert principal.scopes == frozenset({"openid", "aws.cognito.signin.user.admin"})
+    assert "access_token" not in principal.model_dump()
+    assert "scopes" not in principal.model_dump()
 
 
 @pytest.mark.asyncio

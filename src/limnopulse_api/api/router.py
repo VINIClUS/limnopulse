@@ -6,6 +6,7 @@ from limnopulse_api.api.v1.routers import (
     devices,
     health,
     me,
+    notification_preferences,
     ponds,
     telemetry,
     tenants,
@@ -14,6 +15,7 @@ from limnopulse_api.api.v1.routers import (
 api_router = APIRouter()
 api_router.include_router(health.router)
 api_router.include_router(me.router, prefix="/v1")
+api_router.include_router(notification_preferences.router, prefix="/v1")
 api_router.include_router(tenants.router, prefix="/v1")
 api_router.include_router(ponds.router, prefix="/v1")
 api_router.include_router(telemetry.router, prefix="/v1")
