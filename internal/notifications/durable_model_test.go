@@ -1,6 +1,7 @@
 package notifications
 
 import (
+	"encoding/json"
 	"reflect"
 	"strings"
 	"testing"
@@ -29,7 +30,7 @@ func TestDurableModelsCarryRequiredProvenanceAndNoTTL(t *testing.T) {
 		t.Fatalf("Outbox.Validate() error = %v", err)
 	}
 
-	delivery := Delivery{
+	delivery, err := NewPendingDelivery(DeliveryParams{
 		TenantID:            "tnt_1",
 		OutboxID:            outbox.OutboxID,
 		DeliveryID:          deliveryID,
@@ -42,10 +43,12 @@ func TestDurableModelsCarryRequiredProvenanceAndNoTTL(t *testing.T) {
 		RecipientID:         "user_1",
 		NormalizedEmail:     "owner@example.com",
 		MembershipSnapshot:  MembershipSnapshot{Role: "owner", Status: "active", Version: 7},
-		State:               DeliveryStatePending,
 		Content:             content,
 		CreatedAt:           now,
 		UpdatedAt:           now,
+	})
+	if err != nil {
+		t.Fatalf("NewPendingDelivery() error = %v", err)
 	}
 	if err := delivery.Validate(); err != nil {
 		t.Fatalf("Delivery.Validate() error = %v", err)
@@ -93,11 +96,12 @@ func TestRecoveryModelsRequireOpeningRelationship(t *testing.T) {
 	if err != nil {
 		t.Fatalf("NewDeliveryID() error = %v", err)
 	}
-	delivery := validDelivery(t, deliveryID)
-	delivery.Kind = NotificationKindRecovery
-	delivery.DependsOnOutboxID = "outbox_opening_1"
-	delivery.DependsOnDeliveryID = ""
-	if err := delivery.Validate(); err == nil {
+	params := validDeliveryParams(t, deliveryID)
+	params.Kind = NotificationKindRecovery
+	params.Content = mustRenderedContentFor(t, TemplateAlertRecoveryV1)
+	params.DependsOnOutboxID = "outbox_opening_1"
+	params.DependsOnDeliveryID = ""
+	if _, err := NewPendingDelivery(params); err == nil {
 		t.Fatal("recovery delivery without opening delivery accepted")
 	}
 }
@@ -126,9 +130,9 @@ func TestDeliveryValidationUsesOnlyCanonicalDeliveryIdentityInputs(t *testing.T)
 }
 
 func TestDurableModelsRejectUnknownEnumsAndNULIdentityInputs(t *testing.T) {
-	delivery := validDelivery(t, "del_invalid")
+	delivery := validDelivery(t, mustDeliveryID(t))
 	delivery.TenantID = "tnt\x001"
-	delivery.State = "finished"
+	delivery.state = "finished"
 	if err := delivery.Validate(); err == nil {
 		t.Fatal("invalid delivery accepted")
 	}
@@ -156,10 +160,153 @@ func TestDeliveryRequiresTemplateMatchingNotificationKind(t *testing.T) {
 	}
 }
 
+func TestDeliveryConstructorsRestrictInitialState(t *testing.T) {
+	deliveryID, err := NewDeliveryID("alert_1", NotificationKindOpening, ChannelEmail, "user_1")
+	if err != nil {
+		t.Fatalf("NewDeliveryID() error = %v", err)
+	}
+	params := validDeliveryParams(t, deliveryID)
+
+	pending, err := NewPendingDelivery(params)
+	if err != nil {
+		t.Fatalf("NewPendingDelivery() error = %v", err)
+	}
+	if pending.State() != DeliveryStatePending {
+		t.Fatalf("pending state = %q", pending.State())
+	}
+
+	cancelled, err := NewCancelledDelivery(params)
+	if err != nil {
+		t.Fatalf("NewCancelledDelivery() error = %v", err)
+	}
+	if cancelled.State() != DeliveryStateCancelled {
+		t.Fatalf("cancelled state = %q", cancelled.State())
+	}
+}
+
+func TestDeliveryStateTransitionMatrix(t *testing.T) {
+	allowed := map[[2]DeliveryState]bool{
+		{DeliveryStatePending, DeliveryStateQueued}:             true,
+		{DeliveryStatePending, DeliveryStateCancelled}:          true,
+		{DeliveryStateQueued, DeliveryStateProcessing}:          true,
+		{DeliveryStateQueued, DeliveryStateCancelled}:           true,
+		{DeliveryStateProcessing, DeliveryStateRetryableFailed}: true,
+		{DeliveryStateProcessing, DeliveryStateSucceeded}:       true,
+		{DeliveryStateProcessing, DeliveryStatePermanentFailed}: true,
+		{DeliveryStateProcessing, DeliveryStateCancelled}:       true,
+		{DeliveryStateProcessing, DeliveryStateUnknown}:         true,
+		{DeliveryStateRetryableFailed, DeliveryStateProcessing}: true,
+		{DeliveryStateRetryableFailed, DeliveryStateCancelled}:  true,
+	}
+
+	for _, current := range DeliveryStates() {
+		for _, next := range DeliveryStates() {
+			name := string(current) + "_to_" + string(next)
+			t.Run(name, func(t *testing.T) {
+				delivery := validDelivery(t, mustDeliveryID(t))
+				delivery.state = current
+
+				changed, err := delivery.ApplyTransition(next)
+				if current == next {
+					if err != nil || changed || delivery.State() != current {
+						t.Fatalf("same-state result = changed:%v state:%q err:%v", changed, delivery.State(), err)
+					}
+					return
+				}
+				if allowed[[2]DeliveryState{current, next}] {
+					if err != nil || !changed || delivery.State() != next {
+						t.Fatalf("allowed result = changed:%v state:%q err:%v", changed, delivery.State(), err)
+					}
+					return
+				}
+				if err == nil || changed || delivery.State() != current {
+					t.Fatalf("forbidden result = changed:%v state:%q err:%v", changed, delivery.State(), err)
+				}
+			})
+		}
+	}
+}
+
+func TestLateAcceptanceIsExplicitAndCannotResurrectCancelled(t *testing.T) {
+	delivery := validDelivery(t, mustDeliveryID(t))
+	delivery.state = DeliveryStateUnknown
+
+	if changed, err := delivery.ApplyTransition(DeliveryStateSucceeded); err == nil || changed {
+		t.Fatalf("general unknown -> succeeded = changed:%v err:%v", changed, err)
+	}
+	if delivery.State() != DeliveryStateUnknown {
+		t.Fatalf("failed general transition changed state to %q", delivery.State())
+	}
+	if changed, err := delivery.ApplyLateAcceptance(); err != nil || !changed {
+		t.Fatalf("late acceptance = changed:%v err:%v", changed, err)
+	}
+	if delivery.State() != DeliveryStateSucceeded {
+		t.Fatalf("late acceptance state = %q", delivery.State())
+	}
+	if changed, err := delivery.ApplyLateAcceptance(); err != nil || changed {
+		t.Fatalf("duplicate late acceptance = changed:%v err:%v", changed, err)
+	}
+
+	cancelled := validDelivery(t, mustDeliveryID(t))
+	cancelled.state = DeliveryStateCancelled
+	if changed, err := cancelled.ApplyLateAcceptance(); err == nil || changed {
+		t.Fatalf("cancelled late acceptance = changed:%v err:%v", changed, err)
+	}
+	if cancelled.State() != DeliveryStateCancelled {
+		t.Fatalf("cancelled delivery resurrected as %q", cancelled.State())
+	}
+}
+
+func TestDeliverySnapshotMarshalsAndRestoresEncapsulatedState(t *testing.T) {
+	delivery := validDelivery(t, mustDeliveryID(t))
+	if changed, err := delivery.ApplyTransition(DeliveryStateQueued); err != nil || !changed {
+		t.Fatalf("ApplyTransition() = changed:%v err:%v", changed, err)
+	}
+
+	snapshot := delivery.Snapshot()
+	encoded, err := json.Marshal(snapshot)
+	if err != nil {
+		t.Fatalf("json.Marshal() error = %v", err)
+	}
+	var fields map[string]any
+	if err := json.Unmarshal(encoded, &fields); err != nil {
+		t.Fatalf("decode snapshot JSON: %v", err)
+	}
+	if fields["state"] != string(DeliveryStateQueued) {
+		t.Fatalf("marshaled state = %#v, JSON = %s", fields["state"], encoded)
+	}
+
+	restored, err := RestoreDelivery(snapshot)
+	if err != nil {
+		t.Fatalf("RestoreDelivery() error = %v", err)
+	}
+	if restored.State() != DeliveryStateQueued {
+		t.Fatalf("restored state = %q", restored.State())
+	}
+
+	snapshot.State = DeliveryStateUnknown
+	if delivery.State() != DeliveryStateQueued {
+		t.Fatalf("snapshot mutation changed entity state to %q", delivery.State())
+	}
+	snapshot.State = "invalid"
+	if _, err := RestoreDelivery(snapshot); err == nil {
+		t.Fatal("invalid persisted state restored")
+	}
+}
+
 func validDelivery(t *testing.T, deliveryID string) Delivery {
 	t.Helper()
+	delivery, err := NewPendingDelivery(validDeliveryParams(t, deliveryID))
+	if err != nil {
+		t.Fatalf("NewPendingDelivery() error = %v", err)
+	}
+	return delivery
+}
+
+func validDeliveryParams(t *testing.T, deliveryID string) DeliveryParams {
+	t.Helper()
 	now := time.Date(2026, 7, 16, 12, 10, 0, 0, time.UTC)
-	return Delivery{
+	return DeliveryParams{
 		TenantID:           "tnt_1",
 		OutboxID:           "outbox_1",
 		DeliveryID:         deliveryID,
@@ -170,11 +317,19 @@ func validDelivery(t *testing.T, deliveryID string) Delivery {
 		RecipientID:        "user_1",
 		NormalizedEmail:    "owner@example.com",
 		MembershipSnapshot: MembershipSnapshot{Role: "owner", Status: "active", Version: 7},
-		State:              DeliveryStatePending,
 		Content:            mustRenderedContent(t),
 		CreatedAt:          now,
 		UpdatedAt:          now,
 	}
+}
+
+func mustDeliveryID(t *testing.T) string {
+	t.Helper()
+	deliveryID, err := NewDeliveryID("alert_1", NotificationKindOpening, ChannelEmail, "user_1")
+	if err != nil {
+		t.Fatalf("NewDeliveryID() error = %v", err)
+	}
+	return deliveryID
 }
 
 func mustRenderedContent(t *testing.T) RenderedContent {

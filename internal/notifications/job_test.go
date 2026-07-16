@@ -94,6 +94,56 @@ func TestDeliveryJobJSONDecodeValidatesEnvelope(t *testing.T) {
 	}
 }
 
+func TestDeliveryJobJSONRejectsUnknownAndContentFields(t *testing.T) {
+	for _, field := range []string{
+		"unexpected",
+		"email",
+		"subject",
+		"html",
+		"text",
+		"token",
+		"traceparent",
+	} {
+		t.Run(field, func(t *testing.T) {
+			body := validDeliveryJobJSONWithExtraField(field, "must-not-enter-body")
+			original := JobEnvelope{TenantID: "unchanged"}
+			job := original
+			if err := json.Unmarshal([]byte(body), &job); err == nil {
+				t.Fatalf("job with %q decoded: %#v", field, job)
+			}
+			if job != original {
+				t.Fatalf("failed decode mutated receiver: got %#v, want %#v", job, original)
+			}
+		})
+	}
+}
+
+func TestDeliveryJobJSONRejectsMultipleValuesAndTrailingJSON(t *testing.T) {
+	valid := `{"schema_version":1,"message_type":"notification.delivery","tenant_id":"tnt_1","outbox_id":"outbox_1","delivery_id":"del_1","event_id":"alert_1","kind":"opening","channel":"email"}`
+	for _, suffix := range []string{
+		valid,
+		` null`,
+		` []`,
+		` {"traceparent":"forbidden"}`,
+		` trailing`,
+	} {
+		var job JobEnvelope
+		if err := json.Unmarshal([]byte(valid+suffix), &job); err == nil {
+			t.Fatalf("job with trailing %q decoded: %#v", suffix, job)
+		}
+	}
+
+	var job JobEnvelope
+	if err := json.Unmarshal([]byte(valid+" \n\t"), &job); err != nil {
+		t.Fatalf("job with trailing whitespace rejected: %v", err)
+	}
+}
+
+func validDeliveryJobJSONWithExtraField(field, value string) string {
+	return `{"schema_version":1,"message_type":"notification.delivery","tenant_id":"tnt_1","outbox_id":"outbox_1","delivery_id":"del_1","event_id":"alert_1","kind":"opening","channel":"email","` +
+		field + `":"` + value + `"}`
+}
+
 func slicesSort(values []string) {
 	for index := 1; index < len(values); index++ {
 		for cursor := index; cursor > 0 && values[cursor] < values[cursor-1]; cursor-- {

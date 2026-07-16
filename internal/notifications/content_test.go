@@ -35,7 +35,10 @@ func TestDeliveryStateChangesDoNotRerenderContent(t *testing.T) {
 	delivery := validDelivery(t, deliveryID)
 	original := delivery.Content
 
-	delivery.State = DeliveryStateQueued
+	changed, err := delivery.ApplyTransition(DeliveryStateQueued)
+	if err != nil || !changed {
+		t.Fatalf("ApplyTransition() = changed:%v err:%v", changed, err)
+	}
 	delivery.UpdatedAt = delivery.UpdatedAt.Add(1)
 	if delivery.Content != original {
 		t.Fatal("delivery transition changed persisted rendered content")

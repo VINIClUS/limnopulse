@@ -1,8 +1,10 @@
 package notifications
 
 import (
+	"bytes"
 	"encoding/json"
 	"fmt"
+	"io"
 )
 
 const (
@@ -80,8 +82,17 @@ func (job JobEnvelope) MarshalJSON() ([]byte, error) {
 func (job *JobEnvelope) UnmarshalJSON(data []byte) error {
 	type plain JobEnvelope
 	var decoded plain
-	if err := json.Unmarshal(data, &decoded); err != nil {
+	decoder := json.NewDecoder(bytes.NewReader(data))
+	decoder.DisallowUnknownFields()
+	if err := decoder.Decode(&decoded); err != nil {
 		return err
+	}
+	var trailing any
+	if err := decoder.Decode(&trailing); err != io.EOF {
+		if err == nil {
+			return fmt.Errorf("job JSON must contain exactly one value")
+		}
+		return fmt.Errorf("job JSON has trailing data: %w", err)
 	}
 	candidate := JobEnvelope(decoded)
 	if err := candidate.Validate(); err != nil {

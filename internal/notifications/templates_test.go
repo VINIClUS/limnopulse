@@ -206,6 +206,47 @@ func TestTemplateRendererValidatesBundleAtStartup(t *testing.T) {
 	}
 }
 
+func TestTemplateRendererStartupRejectsInvalidRenderedOutput(t *testing.T) {
+	tests := []struct {
+		name    string
+		subject string
+		text    string
+		html    string
+	}{
+		{
+			name:    "subject CRLF",
+			subject: "static subject\r\nBcc: victim@example.com",
+			text:    "text",
+			html:    "<p>html</p>",
+		},
+		{
+			name:    "subject runes",
+			subject: strings.Repeat("á", MaxEmailSubjectRunes+1),
+			text:    "text",
+			html:    "<p>html</p>",
+		},
+		{
+			name:    "plain text bytes",
+			subject: "subject",
+			text:    strings.Repeat("t", MaxEmailTextBytes+1),
+			html:    "<p>html</p>",
+		},
+		{
+			name:    "HTML bytes",
+			subject: "subject",
+			text:    "text",
+			html:    strings.Repeat("h", MaxEmailHTMLBytes+1),
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if _, err := newTemplateRenderer(validTemplateFS(tt.subject, tt.text, tt.html)); err == nil {
+				t.Fatal("invalid rendered startup output accepted")
+			}
+		})
+	}
+}
+
 func validEmailTemplateData() EmailTemplateData {
 	observed := 4.75
 	return EmailTemplateData{

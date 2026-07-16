@@ -230,16 +230,19 @@ func validateCompiledTemplate(compiled compiledEmailTemplate) error {
 		ObservedValue:    &observed,
 		EvaluationWindow: time.Minute,
 	}
-	if _, err := executeTextTemplate(compiled.subject, data); err != nil {
+	subject, err := executeTextTemplate(compiled.subject, data)
+	if err != nil {
 		return fmt.Errorf("execute subject: %w", err)
 	}
-	if _, err := executeTextTemplate(compiled.text, data); err != nil {
+	text, err := executeTextTemplate(compiled.text, data)
+	if err != nil {
 		return fmt.Errorf("execute plain text: %w", err)
 	}
-	if _, err := executeHTMLTemplate(compiled.html, data); err != nil {
+	html, err := executeHTMLTemplate(compiled.html, data)
+	if err != nil {
 		return fmt.Errorf("execute HTML: %w", err)
 	}
-	return nil
+	return validateRenderedEmail(subject, text, html)
 }
 
 func executeTextTemplate(template *texttemplate.Template, data EmailTemplateData) (string, error) {
