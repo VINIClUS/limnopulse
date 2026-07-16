@@ -12,6 +12,7 @@ import (
 	"time"
 
 	"github.com/VINIClUS/limnopulse/internal/alertevaluator"
+	"github.com/VINIClUS/limnopulse/internal/notifications"
 	"github.com/aws/aws-sdk-go-v2/aws"
 	"github.com/aws/aws-sdk-go-v2/feature/dynamodb/attributevalue"
 	"github.com/aws/aws-sdk-go-v2/service/dynamodb"
@@ -319,13 +320,35 @@ func (store Store) outboxPut(request alertevaluator.CommitRequest, outbox alerte
 	if eventID == "" {
 		eventID = request.Decision.ResolvedEventID
 	}
-	item, err := attributevalue.MarshalMap(map[string]any{
+	createdAt := alertevaluator.FixedUTCTimestamp(request.Slot)
+	values := map[string]any{
 		"PK": request.Work.PK, "SK": "NOTIFICATION_OUTBOX#" + outbox.OutboxID,
 		"entity_type": "notification_outbox", "outbox_id": outbox.OutboxID,
 		"event_id": eventID, "tenant_id": request.Work.Rule.TenantID, "rule_id": request.Work.Rule.RuleID,
 		"channel": string(outbox.Channel), "kind": string(outbox.Kind), "status": string(outbox.Status),
-		"depends_on_outbox_id": outbox.DependsOnOutboxID, "created_at": alertevaluator.FixedUTCTimestamp(request.Slot),
-	})
+		"depends_on_outbox_id": outbox.DependsOnOutboxID, "created_at": createdAt,
+	}
+	if outbox.Channel == alertevaluator.ChannelEmail {
+		workKind := notifications.WorkKindIntent
+		if outbox.Status == alertevaluator.OutboxBlocked {
+			workKind = notifications.WorkKindDependency
+		}
+		relayKey, err := notifications.BuildRelayIndexKey(
+			workKind,
+			request.Work.Rule.TenantID,
+			outbox.OutboxID,
+			request.Slot,
+		)
+		if err != nil {
+			return nil, fmt.Errorf("build notification relay index key: %w", err)
+		}
+		values["relay_schema_version"] = 1
+		values["expansion_status"] = "pending"
+		values["available_at"] = createdAt
+		values["relay_gsi_pk"] = relayKey.PartitionKey
+		values["relay_gsi_sk"] = relayKey.SortKey
+	}
+	item, err := attributevalue.MarshalMap(values)
 	if err != nil {
 		return nil, err
 	}

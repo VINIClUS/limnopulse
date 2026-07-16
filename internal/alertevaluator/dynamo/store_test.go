@@ -8,6 +8,7 @@ import (
 	"time"
 
 	"github.com/VINIClUS/limnopulse/internal/alertevaluator"
+	"github.com/VINIClUS/limnopulse/internal/notifications"
 	"github.com/aws/aws-sdk-go-v2/feature/dynamodb/attributevalue"
 	"github.com/aws/aws-sdk-go-v2/service/dynamodb"
 	"github.com/aws/aws-sdk-go-v2/service/dynamodb/types"
@@ -187,6 +188,115 @@ func TestCommitOpeningAtomicallyWritesEventTransitionAndOutboxes(t *testing.T) {
 	event := unmarshalItem(t, items[2].Put.Item)
 	if event["event_id"] != decision.EventID || fmt.Sprint(event["rule_version"]) != "2" || event["window_end"] != alertevaluator.FixedUTCTimestamp(slot) {
 		t.Fatalf("event = %#v", event)
+	}
+
+	email := unmarshalItem(t, items[4].Put.Item)
+	wantRelay, err := notifications.BuildRelayIndexKey(
+		notifications.WorkKindIntent,
+		work.Rule.TenantID,
+		decision.Outboxes[0].OutboxID,
+		slot,
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if fmt.Sprint(email["relay_schema_version"]) != "1" ||
+		email["expansion_status"] != "pending" ||
+		email["available_at"] != alertevaluator.FixedUTCTimestamp(slot) ||
+		email["relay_gsi_pk"] != wantRelay.PartitionKey ||
+		email["relay_gsi_sk"] != wantRelay.SortKey {
+		t.Fatalf("email outbox relay fields = %#v", email)
+	}
+	if email["channel"] != "email" || email["kind"] != "opening" || email["status"] != "ready" {
+		t.Fatalf("email outbox legacy fields changed = %#v", email)
+	}
+	if len(email) != 17 || email["outbox_id"] != decision.Outboxes[0].OutboxID ||
+		email["event_id"] != decision.EventID || email["rule_id"] != work.Rule.RuleID ||
+		email["created_at"] != alertevaluator.FixedUTCTimestamp(slot) {
+		t.Fatalf("email outbox identity or field set changed = %#v", email)
+	}
+
+	telegram := unmarshalItem(t, items[5].Put.Item)
+	for _, field := range []string{"relay_schema_version", "expansion_status", "available_at", "relay_gsi_pk", "relay_gsi_sk"} {
+		if _, exists := telegram[field]; exists {
+			t.Fatalf("telegram outbox unexpectedly has %s: %#v", field, telegram)
+		}
+	}
+	if telegram["channel"] != "telegram" || telegram["kind"] != "opening" || telegram["status"] != "ready" {
+		t.Fatalf("telegram outbox changed = %#v", telegram)
+	}
+	if len(telegram) != 12 || telegram["outbox_id"] != decision.Outboxes[1].OutboxID ||
+		telegram["event_id"] != decision.EventID || telegram["rule_id"] != work.Rule.RuleID ||
+		telegram["created_at"] != alertevaluator.FixedUTCTimestamp(slot) {
+		t.Fatalf("telegram outbox identity or field set changed = %#v", telegram)
+	}
+}
+
+func TestCommitRecoveryAddsDependencyRelayIndexOnlyToEmailOutbox(t *testing.T) {
+	client := &fakeClient{}
+	store := Store{Table: "domain", Client: client}
+	slot := time.Date(2026, 7, 15, 12, 5, 45, 0, time.UTC)
+	work, err := workFromItem(ruleItemWithLease())
+	if err != nil {
+		t.Fatal(err)
+	}
+	current := alertevaluator.State{
+		Mode:          alertevaluator.ModeActive,
+		ActiveEventID: "alert_existing",
+		ActiveStatus:  alertevaluator.StatusOpen,
+		OpeningOutboxes: map[alertevaluator.Channel]string{
+			alertevaluator.ChannelEmail:    "outbox_open_email",
+			alertevaluator.ChannelTelegram: "outbox_open_telegram",
+		},
+	}
+	evaluation := alertevaluator.Evaluation{Slot: slot, Quality: alertevaluator.QualitySufficient, Value: 8.1}
+	decision := alertevaluator.Decide(work.Rule.Rule, current, evaluation, time.Minute)
+
+	err = store.Commit(context.Background(), alertevaluator.CommitRequest{
+		Work: work, PreviousState: alertevaluator.VersionedState{State: current, Revision: 1},
+		Evaluation: evaluation, Decision: decision, Slot: slot, NextDue: slot.Add(time.Minute),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	items := client.transactInput.TransactItems
+	if len(items) != 6 {
+		t.Fatalf("transaction has %d items, want rule + state + event update + transition + 2 outboxes", len(items))
+	}
+
+	email := unmarshalItem(t, items[4].Put.Item)
+	wantRelay, err := notifications.BuildRelayIndexKey(
+		notifications.WorkKindDependency,
+		work.Rule.TenantID,
+		decision.Outboxes[0].OutboxID,
+		slot,
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if email["status"] != "blocked" || email["depends_on_outbox_id"] != "outbox_open_email" ||
+		fmt.Sprint(email["relay_schema_version"]) != "1" || email["expansion_status"] != "pending" ||
+		email["available_at"] != alertevaluator.FixedUTCTimestamp(slot) ||
+		email["relay_gsi_pk"] != wantRelay.PartitionKey || email["relay_gsi_sk"] != wantRelay.SortKey {
+		t.Fatalf("email recovery outbox = %#v", email)
+	}
+	if len(email) != 17 || email["outbox_id"] != decision.Outboxes[0].OutboxID ||
+		email["event_id"] != decision.ResolvedEventID || email["kind"] != "recovery" {
+		t.Fatalf("email recovery identity or field set changed = %#v", email)
+	}
+
+	telegram := unmarshalItem(t, items[5].Put.Item)
+	for _, field := range []string{"relay_schema_version", "expansion_status", "available_at", "relay_gsi_pk", "relay_gsi_sk"} {
+		if _, exists := telegram[field]; exists {
+			t.Fatalf("telegram recovery unexpectedly has %s: %#v", field, telegram)
+		}
+	}
+	if telegram["status"] != "blocked" || telegram["depends_on_outbox_id"] != "outbox_open_telegram" {
+		t.Fatalf("telegram recovery changed = %#v", telegram)
+	}
+	if len(telegram) != 12 || telegram["outbox_id"] != decision.Outboxes[1].OutboxID ||
+		telegram["event_id"] != decision.ResolvedEventID || telegram["kind"] != "recovery" {
+		t.Fatalf("telegram recovery identity or field set changed = %#v", telegram)
 	}
 }
 
