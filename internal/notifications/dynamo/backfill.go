@@ -62,6 +62,7 @@ type migrationKind uint8
 const (
 	migrationNoop migrationKind = iota
 	migrationUpdateEmail
+	migrationUpdateWorkKind
 	migrationUpdateTelegram
 	migrationSchemaConflict
 )
@@ -227,6 +228,9 @@ func classifyRelayOutbox(
 	if isCanonicalEmail(item, migration) {
 		return migrationNoop, migration, nil
 	}
+	if isCanonicalEmailWithoutWorkKind(item, migration) {
+		return migrationUpdateWorkKind, migration, nil
+	}
 	return migrationSchemaConflict, migration, nil
 }
 
@@ -247,6 +251,20 @@ func isCanonicalEmail(item map[string]types.AttributeValue, migration relayMigra
 		stringAttributeEquals(item, "expansion_status", migration.Expansion) &&
 		stringAttributeEquals(item, "available_at", migration.AvailableAt) &&
 		stringAttributeEquals(item, "relay_work_kind", string(migration.WorkKind)) &&
+		stringAttributeEquals(item, "relay_gsi_pk", migration.RelayIndexKey.PartitionKey) &&
+		stringAttributeEquals(item, "relay_gsi_sk", migration.RelayIndexKey.SortKey)
+}
+
+func isCanonicalEmailWithoutWorkKind(
+	item map[string]types.AttributeValue,
+	migration relayMigration,
+) bool {
+	if _, exists := item["relay_work_kind"]; exists {
+		return false
+	}
+	return numberAttributeEquals(item, "relay_schema_version", "1") &&
+		stringAttributeEquals(item, "expansion_status", migration.Expansion) &&
+		stringAttributeEquals(item, "available_at", migration.AvailableAt) &&
 		stringAttributeEquals(item, "relay_gsi_pk", migration.RelayIndexKey.PartitionKey) &&
 		stringAttributeEquals(item, "relay_gsi_sk", migration.RelayIndexKey.SortKey)
 }
@@ -293,6 +311,11 @@ func (store Store) updateRelayOutbox(
 		":expansion_status":    migration.Expansion,
 	}
 	updateExpression := "SET #expansion_status = :expansion_status"
+	conditionExpression := "#tenant_id = :expected_tenant_id AND #outbox_id = :expected_outbox_id AND " +
+		"#channel = :expected_channel AND #status = :expected_status AND #created_at = :expected_created_at AND " +
+		"attribute_not_exists(#relay_schema_version) AND attribute_not_exists(#expansion_status) AND " +
+		"attribute_not_exists(#available_at) AND attribute_not_exists(#relay_work_kind) AND " +
+		"attribute_not_exists(#relay_gsi_pk) AND attribute_not_exists(#relay_gsi_sk)"
 	if kind == migrationUpdateEmail {
 		valueMap[":relay_schema_version"] = 1
 		valueMap[":available_at"] = migration.AvailableAt
@@ -302,22 +325,31 @@ func (store Store) updateRelayOutbox(
 		updateExpression = "SET #relay_schema_version = :relay_schema_version, #expansion_status = :expansion_status, " +
 			"#available_at = :available_at, #relay_work_kind = :relay_work_kind, " +
 			"#relay_gsi_pk = :relay_gsi_pk, #relay_gsi_sk = :relay_gsi_sk"
+	} else if kind == migrationUpdateWorkKind {
+		delete(valueMap, ":expansion_status")
+		valueMap[":relay_work_kind"] = string(migration.WorkKind)
+		valueMap[":expected_relay_schema_version"] = 1
+		valueMap[":expected_expansion_status"] = migration.Expansion
+		valueMap[":expected_available_at"] = migration.AvailableAt
+		valueMap[":expected_relay_gsi_pk"] = migration.RelayIndexKey.PartitionKey
+		valueMap[":expected_relay_gsi_sk"] = migration.RelayIndexKey.SortKey
+		updateExpression = "SET #relay_work_kind = :relay_work_kind"
+		conditionExpression = "#tenant_id = :expected_tenant_id AND #outbox_id = :expected_outbox_id AND " +
+			"#channel = :expected_channel AND #status = :expected_status AND #created_at = :expected_created_at AND " +
+			"#relay_schema_version = :expected_relay_schema_version AND " +
+			"#expansion_status = :expected_expansion_status AND #available_at = :expected_available_at AND " +
+			"#relay_gsi_pk = :expected_relay_gsi_pk AND #relay_gsi_sk = :expected_relay_gsi_sk AND " +
+			"attribute_not_exists(#relay_work_kind)"
 	}
 	values, err := attributevalue.MarshalMap(valueMap)
 	if err != nil {
 		return fmt.Errorf("encode relay backfill update: %w", err)
 	}
 	_, err = store.Client.UpdateItem(ctx, &awssdk.UpdateItemInput{
-		TableName:        aws.String(store.Table),
-		Key:              key,
-		UpdateExpression: aws.String(updateExpression),
-		ConditionExpression: aws.String(
-			"#tenant_id = :expected_tenant_id AND #outbox_id = :expected_outbox_id AND " +
-				"#channel = :expected_channel AND #status = :expected_status AND #created_at = :expected_created_at AND " +
-				"attribute_not_exists(#relay_schema_version) AND attribute_not_exists(#expansion_status) AND " +
-				"attribute_not_exists(#available_at) AND attribute_not_exists(#relay_work_kind) AND " +
-				"attribute_not_exists(#relay_gsi_pk) AND attribute_not_exists(#relay_gsi_sk)",
-		),
+		TableName:           aws.String(store.Table),
+		Key:                 key,
+		UpdateExpression:    aws.String(updateExpression),
+		ConditionExpression: aws.String(conditionExpression),
 		ExpressionAttributeNames: map[string]string{
 			"#tenant_id": "tenant_id", "#outbox_id": "outbox_id", "#channel": "channel",
 			"#status": "status", "#created_at": "created_at", "#relay_schema_version": "relay_schema_version",

@@ -25,6 +25,7 @@ def test_notification_relay_is_query_only_bounded_and_one_shot() -> None:
     assert "for {" not in sources
     assert "ReceiveMessage" not in sources
     assert "service/ses" not in sources
+    assert "attribute_not_exists(#relay_work_kind)" in sources
     assert "TransactItems" in sources
     assert "SendMessage" in sources
 

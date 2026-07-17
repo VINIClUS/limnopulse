@@ -206,6 +206,61 @@ func TestBackfillRelayApplyWritesCanonicalEmailAndTelegramFieldsIdempotently(t *
 	}
 }
 
+func TestBackfillRelayUpgradesOnlyMissingWorkKindOnCanonicalV1EmailRows(t *testing.T) {
+	ready := canonicalEmailOutbox(
+		t, legacyOutbox("outbox_ready", "email", "ready"), notifications.WorkKindIntent,
+	)
+	blockedLegacy := legacyOutbox("outbox_blocked", "email", "blocked")
+	blockedLegacy["kind"] = "recovery"
+	blockedLegacy["depends_on_outbox_id"] = "outbox_opening"
+	blocked := canonicalEmailOutbox(t, blockedLegacy, notifications.WorkKindDependency)
+	delete(ready, "relay_work_kind")
+	delete(blocked, "relay_work_kind")
+	client := &fakeClient{queryOutputs: []*awssdk.QueryOutput{{Items: []map[string]types.AttributeValue{
+		mustMarshalMap(t, ready), mustMarshalMap(t, blocked),
+	}}}}
+
+	summary, err := (Store{Table: "domain", Client: client}).BackfillRelay(
+		context.Background(),
+		BackfillOptions{Tenants: []string{"tnt_1"}, Apply: true, PageSize: 25},
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if summary.RowsNeedingUpdate != 2 || summary.Updated != 2 ||
+		summary.SchemaConflicts != 0 || summary.RowFailures != 0 {
+		t.Fatalf("summary = %#v", summary)
+	}
+	if len(client.updateInputs) != 2 {
+		t.Fatalf("UpdateItem calls = %d", len(client.updateInputs))
+	}
+	for index, wantKind := range []notifications.WorkKind{
+		notifications.WorkKindIntent, notifications.WorkKindDependency,
+	} {
+		input := client.updateInputs[index]
+		if aws.ToString(input.UpdateExpression) != "SET #relay_work_kind = :relay_work_kind" {
+			t.Fatalf("marker-only update = %s", aws.ToString(input.UpdateExpression))
+		}
+		condition := aws.ToString(input.ConditionExpression)
+		for _, fragment := range []string{
+			"#relay_schema_version = :expected_relay_schema_version",
+			"#expansion_status = :expected_expansion_status",
+			"#available_at = :expected_available_at",
+			"#relay_gsi_pk = :expected_relay_gsi_pk",
+			"#relay_gsi_sk = :expected_relay_gsi_sk",
+			"attribute_not_exists(#relay_work_kind)",
+		} {
+			if !strings.Contains(condition, fragment) {
+				t.Fatalf("marker-only condition missing %q: %s", fragment, condition)
+			}
+		}
+		values := unmarshalValues(t, input.ExpressionAttributeValues)
+		if values[":relay_work_kind"] != string(wantKind) {
+			t.Fatalf("marker-only values = %#v", values)
+		}
+	}
+}
+
 func TestBackfillRelayClassifiesVersionMismatchAndDivergentRelayFieldsAsSchemaConflicts(t *testing.T) {
 	wrongVersion := legacyOutbox("outbox_wrong_version", "email", "ready")
 	wrongVersion["relay_schema_version"] = 2
@@ -216,6 +271,7 @@ func TestBackfillRelayClassifiesVersionMismatchAndDivergentRelayFieldsAsSchemaCo
 		legacyOutbox("outbox_wrong_index", "email", "ready"),
 		notifications.WorkKindIntent,
 	)
+	delete(wrongIndex, "relay_work_kind")
 	wrongIndex["relay_gsi_pk"] = "NOTIFICATION_RELAY#V1#BUCKET#63"
 
 	telegramWithRelayIndex := legacyOutbox("outbox_telegram_indexed", "telegram", "ready")

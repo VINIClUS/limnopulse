@@ -70,7 +70,8 @@ func TestClaimConditionsCurrentIndexStateRevisionCursorAndFencesLease(t *testing
 		t.Fatalf("nonzero revision was not fenced exactly: %s", condition)
 	}
 	for _, fragment := range []string{
-		"#relay_schema = :schema", "#relay_work_kind = :relay_work_kind",
+		"#relay_schema = :schema",
+		"(attribute_not_exists(#relay_work_kind) OR #relay_work_kind = :relay_work_kind)",
 		"#relay_pk = :relay_pk", "#relay_sk = :relay_sk",
 		"#available_at <= :due", "#state = :state", "#revision = :revision",
 		"#cursor = :cursor", "attribute_not_exists(#lease_expires)",
@@ -82,6 +83,7 @@ func TestClaimConditionsCurrentIndexStateRevisionCursorAndFencesLease(t *testing
 	}
 	update := aws.ToString(input.UpdateExpression)
 	for _, fragment := range []string{
+		"#relay_work_kind = if_not_exists(#relay_work_kind, :relay_work_kind)",
 		"#lease_owner = :owner", "#lease_expires = :expires",
 		"#lease_epoch = if_not_exists(#lease_epoch, :zero) + :one",
 	} {
@@ -102,6 +104,42 @@ func TestClaimConditionsCurrentIndexStateRevisionCursorAndFencesLease(t *testing
 		values[":state"] != "pending" || values[":relay_work_kind"] != string(notifications.WorkKindIntent) ||
 		fmt.Sprint(values[":revision"]) != "3" {
 		t.Fatalf("condition values = %#v", values)
+	}
+}
+
+func TestClaimLazilyMaterializesWorkKindForMarkerlessOutboxAndDelivery(t *testing.T) {
+	now := time.Date(2026, 7, 16, 12, 30, 0, 0, time.UTC)
+	tests := []struct {
+		name string
+		work relay.Work
+	}{
+		{name: "outbox", work: openingWork(t, now)},
+		{name: "delivery", work: deliveryWork(t, now)},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			client := &fakeClient{updateOutputs: []*awssdk.UpdateItemOutput{{Attributes: marshalMap(t, map[string]any{
+				"relay_work_kind":   string(test.work.Kind),
+				"relay_lease_epoch": test.work.LeaseEpoch + 1,
+			})}}}
+			store := Store{Table: "domain", Client: client}
+
+			claimed, acquired, err := store.Claim(context.Background(), test.work, relay.LeaseRequest{
+				Owner: "run_2", Now: now, ExpiresAt: now.Add(20 * time.Second), DueThrough: now,
+			})
+			if err != nil || !acquired || claimed.LeaseEpoch != test.work.LeaseEpoch+1 {
+				t.Fatalf("claimed = %#v, acquired = %t, error = %v", claimed, acquired, err)
+			}
+			input := client.updateInputs[0]
+			if !strings.Contains(aws.ToString(input.ConditionExpression),
+				"(attribute_not_exists(#relay_work_kind) OR #relay_work_kind = :relay_work_kind)") {
+				t.Fatalf("condition = %s", aws.ToString(input.ConditionExpression))
+			}
+			if !strings.Contains(aws.ToString(input.UpdateExpression),
+				"#relay_work_kind = if_not_exists(#relay_work_kind, :relay_work_kind)") {
+				t.Fatalf("update = %s", aws.ToString(input.UpdateExpression))
+			}
+		})
 	}
 }
 

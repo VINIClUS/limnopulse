@@ -3,6 +3,7 @@ package relay
 import (
 	"context"
 	"errors"
+	"fmt"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -66,12 +67,18 @@ type lanePageKey struct {
 type laneStore struct {
 	mu             sync.Mutex
 	pages          map[lanePageKey][]DuePage
+	queries        []DueRequest
+	onQuery        func(DueRequest)
 	processedKinds []notifications.WorkKind
 }
 
 func (store *laneStore) QueryDue(_ context.Context, request DueRequest) (DuePage, error) {
 	store.mu.Lock()
 	defer store.mu.Unlock()
+	store.queries = append(store.queries, request)
+	if store.onQuery != nil {
+		store.onQuery(request)
+	}
 	key := lanePageKey{kind: request.Kind, bucket: request.Bucket}
 	pages := store.pages[key]
 	if len(pages) == 0 {
@@ -80,6 +87,70 @@ func (store *laneStore) QueryDue(_ context.Context, request DueRequest) (DuePage
 	page := pages[0]
 	store.pages[key] = pages[1:]
 	return page, nil
+}
+
+func TestRunInterleavesLaneCursorsBeforeDiscoveryCutoff(t *testing.T) {
+	start := time.Date(2026, 7, 16, 13, 0, 0, 0, time.UTC)
+	for (start.Unix()/60)%3 != 0 {
+		start = start.Add(time.Minute)
+	}
+	const bucket = 0
+	intent := laneCandidateInBucket(
+		t, notifications.WorkKindIntent, "intent", bucket, start.Add(-time.Minute),
+	)
+	dependency := laneCandidateInBucket(
+		t, notifications.WorkKindDependency, "dependency", bucket, start.Add(-time.Minute),
+	)
+	deliveryPages := make([]DuePage, 12)
+	for index := range deliveryPages {
+		deliveryPages[index].NextToken = fmt.Sprintf("delivery_page_%d", index+2)
+	}
+	store := &laneStore{pages: map[lanePageKey][]DuePage{
+		{kind: notifications.WorkKindDelivery, bucket: bucket}:   deliveryPages,
+		{kind: notifications.WorkKindIntent, bucket: bucket}:     {{Candidates: []Candidate{intent}}},
+		{kind: notifications.WorkKindDependency, bucket: bucket}: {{Candidates: []Candidate{dependency}}},
+	}}
+	var elapsedNanos atomic.Int64
+	store.onQuery = func(DueRequest) {
+		elapsedNanos.Add(int64(4 * time.Second))
+	}
+	clock := func() time.Time {
+		return start.Add(time.Duration(elapsedNanos.Load()))
+	}
+	runner := Runner{
+		Store: store, Publisher: fakePublisher{}, Clock: clock,
+		IDFactory: func() string { return "run_cutoff" },
+	}
+	config := relayconfig.RunConfig{
+		Shard: bucket, ShardCount: notifications.RelayBucketCount,
+		QueryParallelism: 1, WorkParallelism: 1, MaxWork: 2, FanoutPageSize: 20,
+		GlobalDeadline: 45 * time.Second, SoftDeadline: 40 * time.Second,
+		ItemTimeout: 10 * time.Second, LeaseTTL: 20 * time.Second,
+	}
+
+	summary := runner.Run(context.Background(), config)
+	firstQuery := map[notifications.WorkKind]int{}
+	for index, request := range store.queries {
+		if _, exists := firstQuery[request.Kind]; !exists {
+			firstQuery[request.Kind] = index
+		}
+	}
+	if _, ok := firstQuery[notifications.WorkKindIntent]; !ok {
+		t.Fatalf("INTENT lane not queried before cutoff: %#v", store.queries)
+	}
+	if _, ok := firstQuery[notifications.WorkKindDependency]; !ok {
+		t.Fatalf("DEPENDENCY lane not queried before cutoff: %#v", store.queries)
+	}
+	if firstQuery[notifications.WorkKindIntent] > 2 || firstQuery[notifications.WorkKindDependency] > 2 {
+		t.Fatalf("first discovery round did not advance every lane: %#v", store.queries)
+	}
+	if summary.WorkProcessed != 2 || summary.IntentsProcessed != 1 ||
+		summary.DependenciesProcessed != 1 {
+		t.Fatalf("discovered work was not processed: %#v", summary)
+	}
+	if !summary.DeadlineReached || summary.ScopeCompleted {
+		t.Fatalf("discovery cutoff was not reported: %#v", summary)
+	}
 }
 
 func (store *laneStore) Reload(_ context.Context, candidate Candidate, _ time.Time) (Work, bool, error) {
@@ -148,6 +219,22 @@ func laneCandidate(t *testing.T, kind notifications.WorkKind, itemID string, ava
 	}
 }
 
+func laneCandidateInBucket(
+	t *testing.T,
+	kind notifications.WorkKind,
+	prefix string,
+	bucket int,
+	availableAt time.Time,
+) Candidate {
+	t.Helper()
+	for index := 0; ; index++ {
+		candidate := laneCandidate(t, kind, fmt.Sprintf("%s_%d", prefix, index), availableAt)
+		if deliveryBucket(candidate) == bucket {
+			return candidate
+		}
+	}
+}
+
 func TestRunFindsDeliveryLaneAfterOlderIntentLaneReachesMaxWork(t *testing.T) {
 	start := time.Date(2026, 7, 16, 13, 0, 0, 0, time.UTC)
 	delivery := laneCandidate(t, notifications.WorkKindDelivery, "delivery_1", start.Add(-time.Minute))
@@ -190,6 +277,9 @@ func TestRunFindsDeliveryLaneAfterOlderIntentLaneReachesMaxWork(t *testing.T) {
 
 func TestRunAppliesWeightedGlobalCapAcrossLaneBacklogs(t *testing.T) {
 	start := time.Date(2026, 7, 16, 13, 0, 0, 0, time.UTC)
+	for (start.Unix()/60)%6 != 0 {
+		start = start.Add(time.Minute)
+	}
 	store := &laneStore{pages: make(map[lanePageKey][]DuePage)}
 	for index := range 6 {
 		addLaneCandidate(t, store, laneCandidate(
@@ -234,6 +324,68 @@ func TestRunAppliesWeightedGlobalCapAcrossLaneBacklogs(t *testing.T) {
 			t.Fatalf("processed kinds = %#v, want %#v", store.processedKinds, want)
 		}
 	}
+}
+
+func TestRunRotatesWeightedSelectionAcrossSmallCapsWithoutStarvation(t *testing.T) {
+	start := time.Date(2026, 7, 16, 14, 0, 0, 0, time.UTC)
+	for maxWork := 1; maxWork <= 5; maxWork++ {
+		t.Run(fmt.Sprintf("max_work_%d", maxWork), func(t *testing.T) {
+			totals := map[notifications.WorkKind]int{}
+			for minute := range 6 {
+				relayTime := start.Add(time.Duration(minute) * time.Minute)
+				summary, processed := runContinuousLaneBacklog(t, relayTime, maxWork)
+				if summary.WorkProcessed != maxWork || len(processed) != maxWork ||
+					summary.WorkProcessed > maxWork || summary.Backlog > 3*maxWork {
+					t.Fatalf("minute %d summary = %#v, processed = %#v", minute, summary, processed)
+				}
+				for _, kind := range processed {
+					totals[kind]++
+				}
+			}
+			if totals[notifications.WorkKindDelivery] != 4*maxWork ||
+				totals[notifications.WorkKindIntent] != maxWork ||
+				totals[notifications.WorkKindDependency] != maxWork {
+				t.Fatalf("six-run selection = %#v", totals)
+			}
+
+			_, first := runContinuousLaneBacklog(t, start, maxWork)
+			_, replay := runContinuousLaneBacklog(t, start, maxWork)
+			if fmt.Sprint(first) != fmt.Sprint(replay) {
+				t.Fatalf("same relay-time changed selection: first=%#v replay=%#v", first, replay)
+			}
+		})
+	}
+}
+
+func runContinuousLaneBacklog(
+	t *testing.T,
+	relayTime time.Time,
+	maxWork int,
+) (RunSummary, []notifications.WorkKind) {
+	t.Helper()
+	store := &laneStore{pages: make(map[lanePageKey][]DuePage)}
+	for _, kind := range []notifications.WorkKind{
+		notifications.WorkKindDelivery,
+		notifications.WorkKindIntent,
+		notifications.WorkKindDependency,
+	} {
+		for index := range 5 {
+			addLaneCandidate(t, store, laneCandidate(
+				t, kind, fmt.Sprintf("%s_%d", kind, index), relayTime.Add(-time.Hour),
+			))
+		}
+	}
+	runner := Runner{
+		Store: store, Publisher: fakePublisher{}, Clock: func() time.Time { return relayTime },
+		IDFactory: func() string { return "run_rotating_cap" },
+	}
+	config := relayconfig.RunConfig{
+		ShardCount: 1, QueryParallelism: 3, WorkParallelism: 1, MaxWork: maxWork,
+		FanoutPageSize: 20, GlobalDeadline: 45 * time.Second,
+		SoftDeadline: 40 * time.Second, ItemTimeout: 10 * time.Second, LeaseTTL: 20 * time.Second,
+	}
+	summary := runner.Run(context.Background(), config)
+	return summary, append([]notifications.WorkKind(nil), store.processedKinds...)
 }
 
 func TestRunUsesGlobalCapacityWhenWeightedLanesAreSparse(t *testing.T) {
@@ -407,13 +559,40 @@ func TestRunPaginatesBucketsAndRotatesTheFirstBucketDeterministically(t *testing
 	if summary.ExitCode != ExitSuccess {
 		t.Fatalf("summary = %#v", summary)
 	}
-	if len(store.queries) != 3*notifications.RelayBucketCount+1 ||
-		store.queries[0].Kind != notifications.WorkKindDelivery || store.queries[0].Bucket != first ||
-		store.queries[0].NextToken != "" || store.queries[64].Bucket != first ||
-		store.queries[64].Kind != notifications.WorkKindDelivery || store.queries[64].NextToken != "page_2" ||
-		store.queries[65].Kind != notifications.WorkKindIntent ||
-		store.queries[129].Kind != notifications.WorkKindDependency {
+	if len(store.queries) != 3*notifications.RelayBucketCount+1 {
 		t.Fatalf("paginated query order = %#v", store.queries)
+	}
+	seen := make(map[lanePageKey][]DueRequest)
+	firstByLane := make(map[notifications.WorkKind]DueRequest)
+	for _, request := range store.queries {
+		key := lanePageKey{kind: request.Kind, bucket: request.Bucket}
+		seen[key] = append(seen[key], request)
+		if _, exists := firstByLane[request.Kind]; !exists {
+			firstByLane[request.Kind] = request
+		}
+	}
+	for _, kind := range []notifications.WorkKind{
+		notifications.WorkKindDelivery,
+		notifications.WorkKindIntent,
+		notifications.WorkKindDependency,
+	} {
+		if firstByLane[kind].Bucket != first {
+			t.Fatalf("lane %s started at bucket %d, want %d", kind, firstByLane[kind].Bucket, first)
+		}
+	}
+	deliveryFirst := seen[lanePageKey{kind: notifications.WorkKindDelivery, bucket: first}]
+	if len(deliveryFirst) != 2 || deliveryFirst[0].NextToken != "" ||
+		deliveryFirst[1].NextToken != "page_2" {
+		t.Fatalf("delivery cursor = %#v", deliveryFirst)
+	}
+	for key, requests := range seen {
+		want := 1
+		if key.kind == notifications.WorkKindDelivery && key.bucket == first {
+			want = 2
+		}
+		if len(requests) != want {
+			t.Fatalf("cursor %#v queried %d times, want %d", key, len(requests), want)
+		}
 	}
 }
 
@@ -485,7 +664,7 @@ func TestRunNeverClaimsWithLeaseTimestampAtOrAfterSoftDeadline(t *testing.T) {
 	store := &publicationStore{candidate: candidate, work: Work{Candidate: candidate}}
 	var clockCalls atomic.Int32
 	clock := func() time.Time {
-		if clockCalls.Add(1) >= 7 {
+		if clockCalls.Add(1) >= 9 {
 			return start.Add(40 * time.Second)
 		}
 		return start
@@ -517,7 +696,7 @@ func TestCandidatePriorityFavorsDeliveryWithoutStarvingIntentOrDependency(t *tes
 		Candidate{SK: "intent", Kind: notifications.WorkKindIntent},
 		Candidate{SK: "dependency", Kind: notifications.WorkKindDependency},
 	)
-	ordered := prioritizeCandidates(candidates)
+	ordered := prioritizeCandidates(candidates, time.Unix(0, 0).UTC())
 	wantKinds := []notifications.WorkKind{
 		notifications.WorkKindDelivery, notifications.WorkKindDelivery,
 		notifications.WorkKindIntent, notifications.WorkKindDelivery,

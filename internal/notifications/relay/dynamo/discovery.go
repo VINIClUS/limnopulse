@@ -41,7 +41,9 @@ func (store Store) QueryDue(ctx context.Context, request relay.DueRequest) (rela
 		TableName:              aws.String(store.Table),
 		IndexName:              aws.String(RelayIndex),
 		KeyConditionExpression: aws.String("#relay_pk = :pk AND #relay_sk <= :due"),
-		FilterExpression:       aws.String("#relay_work_kind = :relay_work_kind"),
+		FilterExpression: aws.String(
+			"(#relay_work_kind = :relay_work_kind OR attribute_not_exists(#relay_work_kind))",
+		),
 		ExpressionAttributeNames: map[string]string{
 			"#relay_pk":        "relay_gsi_pk",
 			"#relay_sk":        "relay_gsi_sk",
@@ -63,15 +65,22 @@ func (store Store) QueryDue(ctx context.Context, request relay.DueRequest) (rela
 	}
 	page := relay.DuePage{Candidates: make([]relay.Candidate, 0, len(output.Items))}
 	for _, item := range output.Items {
+		marker, markerExists, markerErr := relayWorkKindMarker(item)
+		if markerErr != nil {
+			return relay.DuePage{}, fmt.Errorf("decode relay candidate marker: %w", markerErr)
+		}
 		candidate, decodeErr := candidateFromItem(item)
 		if decodeErr != nil {
 			return relay.DuePage{}, fmt.Errorf("decode relay candidate: %w", decodeErr)
 		}
-		if candidate.Kind != request.Kind {
+		if markerExists && (marker != candidate.Kind || marker != request.Kind) {
 			return relay.DuePage{}, fmt.Errorf(
-				"decode relay candidate: work kind %q does not match lane %q",
-				candidate.Kind, request.Kind,
+				"decode relay candidate: marker %q, work kind %q, and lane %q diverge",
+				marker, candidate.Kind, request.Kind,
 			)
+		}
+		if candidate.Kind != request.Kind {
+			continue
 		}
 		page.Candidates = append(page.Candidates, candidate)
 	}
@@ -84,6 +93,24 @@ func (store Store) QueryDue(ctx context.Context, request relay.DueRequest) (rela
 	return page, nil
 }
 
+func relayWorkKindMarker(
+	item map[string]types.AttributeValue,
+) (notifications.WorkKind, bool, error) {
+	value, exists := item["relay_work_kind"]
+	if !exists {
+		return "", false, nil
+	}
+	encoded, ok := value.(*types.AttributeValueMemberS)
+	if !ok {
+		return "", true, fmt.Errorf("relay_work_kind is not a string")
+	}
+	kind := notifications.WorkKind(encoded.Value)
+	if err := kind.Validate(); err != nil {
+		return "", true, err
+	}
+	return kind, true, nil
+}
+
 func candidateFromItem(item map[string]types.AttributeValue) (relay.Candidate, error) {
 	var raw struct {
 		PK      string `dynamodbav:"PK"`
@@ -94,7 +121,7 @@ func candidateFromItem(item map[string]types.AttributeValue) (relay.Candidate, e
 	if err := attributevalue.UnmarshalMap(item, &raw); err != nil {
 		return relay.Candidate{}, err
 	}
-	parts := strings.SplitN(raw.RelaySK, "#", 4)
+	parts := strings.Split(raw.RelaySK, "#")
 	if raw.PK == "" || raw.SK == "" || raw.RelayPK == "" || len(parts) != 4 {
 		return relay.Candidate{}, fmt.Errorf("candidate is missing relay identity")
 	}
@@ -102,14 +129,52 @@ func candidateFromItem(item map[string]types.AttributeValue) (relay.Candidate, e
 	if err != nil {
 		return relay.Candidate{}, fmt.Errorf("available time: %w", err)
 	}
+	if availableAt.UTC().Format(fixedUTCLayout) != parts[0] {
+		return relay.Candidate{}, fmt.Errorf("available time is not canonical")
+	}
 	kind := notifications.WorkKind(parts[1])
 	if err := kind.Validate(); err != nil {
 		return relay.Candidate{}, err
+	}
+	tenantID, err := decodeRelayIdentityPart(parts[2])
+	if err != nil {
+		return relay.Candidate{}, fmt.Errorf("tenant identity: %w", err)
+	}
+	itemID, err := decodeRelayIdentityPart(parts[3])
+	if err != nil {
+		return relay.Candidate{}, fmt.Errorf("item identity: %w", err)
+	}
+	wantIndex, err := notifications.BuildRelayIndexKey(kind, tenantID, itemID, availableAt)
+	if err != nil {
+		return relay.Candidate{}, fmt.Errorf("canonical relay identity: %w", err)
+	}
+	if raw.RelayPK != wantIndex.PartitionKey || raw.RelaySK != wantIndex.SortKey {
+		return relay.Candidate{}, fmt.Errorf("relay index identity is not canonical")
+	}
+	switch kind {
+	case notifications.WorkKindIntent, notifications.WorkKindDependency:
+		if raw.PK != "TENANT#"+tenantID || raw.SK != "NOTIFICATION_OUTBOX#"+itemID {
+			return relay.Candidate{}, fmt.Errorf("outbox storage identity is not canonical")
+		}
+	case notifications.WorkKindDelivery:
+		outboxID := strings.TrimPrefix(raw.PK, "NOTIFICATION_OUTBOX#")
+		key, keyErr := notifications.DeliveryStorageKey(outboxID, itemID)
+		if keyErr != nil || raw.PK != key.PartitionKey || raw.SK != key.SortKey {
+			return relay.Candidate{}, fmt.Errorf("delivery storage identity is not canonical")
+		}
 	}
 	return relay.Candidate{
 		PK: raw.PK, SK: raw.SK, RelayPK: raw.RelayPK, RelaySK: raw.RelaySK,
 		Kind: kind, AvailableAt: availableAt,
 	}, nil
+}
+
+func decodeRelayIdentityPart(encoded string) (string, error) {
+	decoded, err := base64.RawURLEncoding.DecodeString(encoded)
+	if err != nil || base64.RawURLEncoding.EncodeToString(decoded) != encoded {
+		return "", fmt.Errorf("identity is not canonical base64url")
+	}
+	return string(decoded), nil
 }
 
 type pageToken struct {

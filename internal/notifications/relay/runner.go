@@ -104,7 +104,16 @@ func (runner Runner) Run(parent context.Context, config relayconfig.RunConfig) R
 		return finishSummary(summary, ExitFatal, budgetStartedAt, clock().UTC())
 	}
 	buckets = rotateBuckets(buckets, relayTime)
-	discovery, err := runner.discover(ctx, buckets, config, relayTime, softDeadline, clock)
+	discoveryCutoff := softDeadline.Add(-config.ItemTimeout)
+	discovery := discoveryResult{complete: false, deadlineReached: true}
+	remainingDiscovery := discoveryCutoff.Sub(clock().UTC())
+	if remainingDiscovery > 0 {
+		discoveryCtx, cancelDiscovery := context.WithTimeout(ctx, remainingDiscovery)
+		discovery, err = runner.discover(
+			discoveryCtx, buckets, config, relayTime, discoveryCutoff, clock,
+		)
+		cancelDiscovery()
+	}
 	if err != nil {
 		summary.ScopeCompleted = false
 		summary.RetryRecommended = true
@@ -119,7 +128,7 @@ func (runner Runner) Run(parent context.Context, config relayconfig.RunConfig) R
 			summary.OldestBacklogAgeSeconds = seconds
 		}
 	}
-	ordered := prioritizeCandidates(candidates)
+	ordered := prioritizeCandidates(candidates, relayTime)
 	if len(ordered) > config.MaxWork {
 		ordered = ordered[:config.MaxWork]
 		discovery.complete = false
@@ -191,102 +200,103 @@ func (runner Runner) discover(
 	buckets []int,
 	config relayconfig.RunConfig,
 	relayTime time.Time,
-	softDeadline time.Time,
+	discoveryCutoff time.Time,
 	clock func() time.Time,
 ) (discoveryResult, error) {
-	result := discoveryResult{complete: true, candidates: make([]Candidate, 0, 3*config.MaxWork)}
+	lanes := make(map[notifications.WorkKind]*discoveryLane, 3)
 	for _, kind := range []notifications.WorkKind{
 		notifications.WorkKindDelivery,
 		notifications.WorkKindIntent,
 		notifications.WorkKindDependency,
 	} {
-		lane, err := runner.discoverLane(
-			ctx, buckets, kind, config, relayTime, softDeadline, clock,
-		)
-		if err != nil {
-			return discoveryResult{}, err
+		lane := &discoveryLane{
+			kind: kind, candidates: make([]Candidate, 0, config.MaxWork),
+			cursors: make([]*discoveryCursor, 0, len(buckets)),
 		}
+		for _, bucket := range buckets {
+			lane.cursors = append(lane.cursors, &discoveryCursor{kind: kind, bucket: bucket})
+		}
+		lanes[kind] = lane
+	}
+	deadlineReached := false
+	minuteSlot := relayTime.Unix() / 60
+	for round := int64(0); discoveryHasActiveLane(lanes, config.MaxWork); round++ {
+		if discoveryStopped(ctx, discoveryCutoff, clock) {
+			deadlineReached = true
+			break
+		}
+		baseKinds := rotateDiscoveryKinds([]notifications.WorkKind{
+			notifications.WorkKindDelivery,
+			notifications.WorkKindIntent,
+			notifications.WorkKindDependency,
+		}, minuteSlot+round)
+		for offset := 0; offset < len(baseKinds); offset += config.QueryParallelism {
+			if discoveryStopped(ctx, discoveryCutoff, clock) {
+				deadlineReached = true
+				break
+			}
+			end := min(offset+config.QueryParallelism, len(baseKinds))
+			_, stopped, err := runner.queryDiscoveryWave(
+				ctx, lanes, baseKinds[offset:end], config, relayTime,
+			)
+			if err != nil {
+				return discoveryResult{}, err
+			}
+			if stopped {
+				deadlineReached = true
+				break
+			}
+		}
+		if deadlineReached {
+			break
+		}
+		remainingDeliveryWeight := 3
+		for remainingDeliveryWeight > 0 && lanes[notifications.WorkKindDelivery].active(config.MaxWork) {
+			if discoveryStopped(ctx, discoveryCutoff, clock) {
+				deadlineReached = true
+				break
+			}
+			weight := min(remainingDeliveryWeight, config.QueryParallelism)
+			kinds := make([]notifications.WorkKind, weight)
+			for index := range kinds {
+				kinds[index] = notifications.WorkKindDelivery
+			}
+			queried, stopped, err := runner.queryDiscoveryWave(
+				ctx, lanes, kinds, config, relayTime,
+			)
+			if err != nil {
+				return discoveryResult{}, err
+			}
+			if stopped {
+				deadlineReached = true
+				break
+			}
+			if queried == 0 {
+				break
+			}
+			remainingDeliveryWeight -= queried
+		}
+		if deadlineReached {
+			break
+		}
+	}
+	result := discoveryResult{
+		complete: !deadlineReached, deadlineReached: deadlineReached,
+		candidates: make([]Candidate, 0, 3*config.MaxWork),
+	}
+	for _, kind := range []notifications.WorkKind{
+		notifications.WorkKindDelivery,
+		notifications.WorkKindIntent,
+		notifications.WorkKindDependency,
+	} {
+		lane := lanes[kind]
 		result.candidates = append(result.candidates, lane.candidates...)
-		if !lane.complete {
+		if lane.capReached {
+			result.capReached = true
 			result.complete = false
 		}
-		result.capReached = result.capReached || lane.capReached
-		result.deadlineReached = result.deadlineReached || lane.deadlineReached
 	}
 	return result, nil
-}
-
-func (runner Runner) discoverLane(
-	ctx context.Context,
-	buckets []int,
-	kind notifications.WorkKind,
-	config relayconfig.RunConfig,
-	relayTime time.Time,
-	softDeadline time.Time,
-	clock func() time.Time,
-) (laneDiscoveryResult, error) {
-	tokens := make(map[int]string, len(buckets))
-	done := make(map[int]bool, len(buckets))
-	candidates := make([]Candidate, 0, config.MaxWork)
-	for len(done) < len(buckets) {
-		pending := make([]int, 0, len(buckets)-len(done))
-		for _, bucket := range buckets {
-			if !done[bucket] {
-				pending = append(pending, bucket)
-			}
-		}
-		for offset := 0; offset < len(pending); offset += config.QueryParallelism {
-			if !clock().Before(softDeadline) {
-				return laneDiscoveryResult{
-					candidates: candidates, deadlineReached: true,
-				}, nil
-			}
-			if len(candidates) >= config.MaxWork {
-				return laneDiscoveryResult{candidates: candidates, capReached: true}, nil
-			}
-			end := min(offset+config.QueryParallelism, len(pending))
-			results := make([]dueQueryResult, end-offset)
-			var queries sync.WaitGroup
-			for index, bucket := range pending[offset:end] {
-				queries.Add(1)
-				go func(index, bucket int) {
-					defer queries.Done()
-					results[index].bucket = bucket
-					results[index].page, results[index].err = runner.Store.QueryDue(ctx, DueRequest{
-						Bucket: bucket, Kind: kind, DueThrough: relayTime,
-						PageSize: discoveryPageSize(config.MaxWork, len(buckets)), NextToken: tokens[bucket],
-					})
-				}(index, bucket)
-			}
-			queries.Wait()
-			truncated := false
-			for _, result := range results {
-				if result.err != nil {
-					return laneDiscoveryResult{}, result.err
-				}
-				remaining := config.MaxWork - len(candidates)
-				if len(result.page.Candidates) > remaining {
-					candidates = append(candidates, result.page.Candidates[:remaining]...)
-					truncated = true
-				} else {
-					candidates = append(candidates, result.page.Candidates...)
-				}
-				if result.page.NextToken == "" {
-					done[result.bucket] = true
-					continue
-				}
-				if result.page.NextToken == tokens[result.bucket] {
-					return laneDiscoveryResult{}, context.Canceled
-				}
-				tokens[result.bucket] = result.page.NextToken
-			}
-			if truncated || (len(candidates) >= config.MaxWork &&
-				(end < len(pending) || len(done) < len(buckets))) {
-				return laneDiscoveryResult{candidates: candidates, capReached: true}, nil
-			}
-		}
-	}
-	return laneDiscoveryResult{candidates: candidates, complete: true}, nil
 }
 
 type discoveryResult struct {
@@ -296,11 +306,146 @@ type discoveryResult struct {
 	deadlineReached bool
 }
 
-type laneDiscoveryResult struct {
-	candidates      []Candidate
-	complete        bool
-	capReached      bool
-	deadlineReached bool
+type discoveryCursor struct {
+	kind      notifications.WorkKind
+	bucket    int
+	nextToken string
+	done      bool
+	inFlight  bool
+}
+
+type discoveryLane struct {
+	kind       notifications.WorkKind
+	cursors    []*discoveryCursor
+	nextCursor int
+	candidates []Candidate
+	capReached bool
+}
+
+func (lane *discoveryLane) active(maxWork int) bool {
+	if lane.capReached || len(lane.candidates) >= maxWork {
+		return false
+	}
+	for _, cursor := range lane.cursors {
+		if !cursor.done {
+			return true
+		}
+	}
+	return false
+}
+
+func (lane *discoveryLane) takeCursor(maxWork int) *discoveryCursor {
+	if !lane.active(maxWork) {
+		return nil
+	}
+	for offset := range len(lane.cursors) {
+		index := (lane.nextCursor + offset) % len(lane.cursors)
+		cursor := lane.cursors[index]
+		if cursor.done || cursor.inFlight {
+			continue
+		}
+		cursor.inFlight = true
+		lane.nextCursor = (index + 1) % len(lane.cursors)
+		return cursor
+	}
+	return nil
+}
+
+func (lane *discoveryLane) hasRemainingCursor() bool {
+	for _, cursor := range lane.cursors {
+		if !cursor.done {
+			return true
+		}
+	}
+	return false
+}
+
+func discoveryHasActiveLane(lanes map[notifications.WorkKind]*discoveryLane, maxWork int) bool {
+	for _, lane := range lanes {
+		if lane.active(maxWork) {
+			return true
+		}
+	}
+	return false
+}
+
+func discoveryStopped(ctx context.Context, cutoff time.Time, clock func() time.Time) bool {
+	return ctx.Err() != nil || !clock().Before(cutoff)
+}
+
+func rotateDiscoveryKinds(kinds []notifications.WorkKind, slot int64) []notifications.WorkKind {
+	offset := int(slot % int64(len(kinds)))
+	if offset < 0 {
+		offset += len(kinds)
+	}
+	rotated := make([]notifications.WorkKind, 0, len(kinds))
+	rotated = append(rotated, kinds[offset:]...)
+	rotated = append(rotated, kinds[:offset]...)
+	return rotated
+}
+
+func (runner Runner) queryDiscoveryWave(
+	ctx context.Context,
+	lanes map[notifications.WorkKind]*discoveryLane,
+	kinds []notifications.WorkKind,
+	config relayconfig.RunConfig,
+	relayTime time.Time,
+) (int, bool, error) {
+	queries := make([]dueQueryResult, 0, len(kinds))
+	for _, kind := range kinds {
+		cursor := lanes[kind].takeCursor(config.MaxWork)
+		if cursor == nil {
+			continue
+		}
+		queries = append(queries, dueQueryResult{cursor: cursor})
+	}
+	var wait sync.WaitGroup
+	for index := range queries {
+		wait.Add(1)
+		go func(result *dueQueryResult) {
+			defer wait.Done()
+			result.page, result.err = runner.Store.QueryDue(ctx, DueRequest{
+				Bucket: result.cursor.bucket, Kind: result.cursor.kind, DueThrough: relayTime,
+				PageSize:  discoveryPageSize(config.MaxWork, len(lanes[result.cursor.kind].cursors)),
+				NextToken: result.cursor.nextToken,
+			})
+		}(&queries[index])
+	}
+	wait.Wait()
+	stopped := false
+	for index := range queries {
+		result := &queries[index]
+		lane := lanes[result.cursor.kind]
+		result.cursor.inFlight = false
+		if result.err != nil {
+			if ctx.Err() != nil {
+				stopped = true
+				continue
+			}
+			return 0, false, result.err
+		}
+		remaining := config.MaxWork - len(lane.candidates)
+		if len(result.page.Candidates) > remaining {
+			lane.candidates = append(lane.candidates, result.page.Candidates[:remaining]...)
+			lane.capReached = true
+		} else {
+			lane.candidates = append(lane.candidates, result.page.Candidates...)
+		}
+		if result.page.NextToken == "" {
+			result.cursor.done = true
+		} else {
+			if result.page.NextToken == result.cursor.nextToken {
+				return 0, false, context.Canceled
+			}
+			result.cursor.nextToken = result.page.NextToken
+		}
+	}
+	for _, lane := range lanes {
+		if len(lane.candidates) >= config.MaxWork && lane.hasRemainingCursor() {
+			lane.capReached = true
+		}
+	}
+	return len(queries), stopped, nil
 }
 
 type candidateResult struct {
@@ -429,7 +574,7 @@ func (runner Runner) retryResult(
 	return candidateResult{withError: 1, category: category}
 }
 
-func prioritizeCandidates(candidates []Candidate) []Candidate {
+func prioritizeCandidates(candidates []Candidate, relayTime time.Time) []Candidate {
 	queues := map[notifications.WorkKind][]Candidate{
 		notifications.WorkKindDelivery:   {},
 		notifications.WorkKindIntent:     {},
@@ -443,6 +588,11 @@ func prioritizeCandidates(candidates []Candidate) []Candidate {
 		notifications.WorkKindIntent, notifications.WorkKindDelivery,
 		notifications.WorkKindDelivery, notifications.WorkKindDependency,
 	}
+	offset := int((relayTime.Unix() / 60) % int64(len(pattern)))
+	if offset < 0 {
+		offset += len(pattern)
+	}
+	pattern = rotateDiscoveryKinds(pattern, int64(offset))
 	ordered := make([]Candidate, 0, len(candidates))
 	for len(ordered) < len(candidates) {
 		progress := false
@@ -473,7 +623,7 @@ func discoveryPageSize(maxWork, bucketCount int) int {
 }
 
 type dueQueryResult struct {
-	bucket int
+	cursor *discoveryCursor
 	page   DuePage
 	err    error
 }

@@ -49,7 +49,8 @@ func (store Store) Claim(
 		"#lease_owner": "relay_lease_owner", "#lease_epoch": "relay_lease_epoch",
 		"#lease_expires": "relay_lease_expires_at",
 	}
-	condition := "#relay_schema = :schema AND #relay_work_kind = :relay_work_kind " +
+	condition := "#relay_schema = :schema AND " +
+		"(attribute_not_exists(#relay_work_kind) OR #relay_work_kind = :relay_work_kind) " +
 		"AND #relay_pk = :relay_pk AND #relay_sk = :relay_sk " +
 		"AND #available_at <= :due AND #state = :state "
 	if work.Revision == 0 {
@@ -74,7 +75,8 @@ func (store Store) Claim(
 	output, err := store.Client.UpdateItem(ctx, &awssdk.UpdateItemInput{
 		TableName: aws.String(store.Table), Key: key,
 		UpdateExpression: aws.String(
-			"SET #lease_owner = :owner, #lease_expires = :expires, " +
+			"SET #relay_work_kind = if_not_exists(#relay_work_kind, :relay_work_kind), " +
+				"#lease_owner = :owner, #lease_expires = :expires, " +
 				"#lease_epoch = if_not_exists(#lease_epoch, :zero) + :one",
 		),
 		ConditionExpression:       aws.String(condition),
@@ -97,6 +99,9 @@ func (store Store) Claim(
 	}
 	if claimed.RelayLeaseEpoch <= work.LeaseEpoch {
 		return relay.Work{}, false, fmt.Errorf("relay lease epoch did not advance")
+	}
+	if claimed.RelayWorkKind != work.Kind {
+		return relay.Work{}, false, fmt.Errorf("relay claim did not materialize canonical work kind")
 	}
 	work.LeaseEpoch = claimed.RelayLeaseEpoch
 	work.LeaseOwner = lease.Owner

@@ -110,7 +110,8 @@ func TestQueryDueUsesRelayGSIAndRoundTripsPaginationToken(t *testing.T) {
 	input := client.queryInputs[0]
 	if aws.ToString(input.IndexName) != RelayIndex ||
 		aws.ToString(input.KeyConditionExpression) != "#relay_pk = :pk AND #relay_sk <= :due" ||
-		aws.ToString(input.FilterExpression) != "#relay_work_kind = :relay_work_kind" ||
+		aws.ToString(input.FilterExpression) !=
+			"(#relay_work_kind = :relay_work_kind OR attribute_not_exists(#relay_work_kind))" ||
 		aws.ToInt32(input.Limit) != 25 || aws.ToBool(input.ConsistentRead) {
 		t.Fatalf("query input = %#v", input)
 	}
@@ -136,6 +137,124 @@ func TestQueryDueUsesRelayGSIAndRoundTripsPaginationToken(t *testing.T) {
 	}
 	if !reflect.DeepEqual(client.queryInputs[1].ExclusiveStartKey, lastKey) {
 		t.Fatalf("exclusive start key = %#v, want %#v", client.queryInputs[1].ExclusiveStartKey, lastKey)
+	}
+}
+
+func TestQueryDueRoutesCanonicalMarkerlessRowsOnlyToTheirInferredLane(t *testing.T) {
+	due := time.Date(2026, 7, 16, 12, 30, 0, 0, time.UTC)
+	indexKey, err := notifications.BuildRelayIndexKey(
+		notifications.WorkKindIntent, "tnt_1", "outbox_1", due.Add(-time.Minute),
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	markerless := marshalMap(t, map[string]any{
+		"PK": "TENANT#tnt_1", "SK": "NOTIFICATION_OUTBOX#outbox_1",
+		"relay_gsi_pk": indexKey.PartitionKey, "relay_gsi_sk": indexKey.SortKey,
+	})
+	deliveryIndexKey, err := notifications.BuildRelayIndexKey(
+		notifications.WorkKindDelivery, "tnt_1", "delivery_1", due.Add(-time.Minute),
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	markerlessDelivery := marshalMap(t, map[string]any{
+		"PK": "NOTIFICATION_OUTBOX#outbox_1", "SK": "DELIVERY#delivery_1",
+		"relay_gsi_pk": deliveryIndexKey.PartitionKey, "relay_gsi_sk": deliveryIndexKey.SortKey,
+	})
+	client := &fakeClient{queryOutputs: []*awssdk.QueryOutput{
+		{Items: []map[string]types.AttributeValue{markerless}},
+		{Items: []map[string]types.AttributeValue{markerless}},
+		{Items: []map[string]types.AttributeValue{markerlessDelivery}},
+	}}
+	store := Store{Table: "domain", Client: client}
+
+	wrongLane, err := store.QueryDue(context.Background(), relay.DueRequest{
+		Bucket: indexKey.Bucket, Kind: notifications.WorkKindDelivery,
+		DueThrough: due, PageSize: 25,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(wrongLane.Candidates) != 0 {
+		t.Fatalf("markerless INTENT leaked into DELIVERY lane: %#v", wrongLane)
+	}
+	intentLane, err := store.QueryDue(context.Background(), relay.DueRequest{
+		Bucket: indexKey.Bucket, Kind: notifications.WorkKindIntent,
+		DueThrough: due, PageSize: 25,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(intentLane.Candidates) != 1 || intentLane.Candidates[0].Kind != notifications.WorkKindIntent {
+		t.Fatalf("markerless INTENT page = %#v", intentLane)
+	}
+	deliveryLane, err := store.QueryDue(context.Background(), relay.DueRequest{
+		Bucket: deliveryIndexKey.Bucket, Kind: notifications.WorkKindDelivery,
+		DueThrough: due, PageSize: 25,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(deliveryLane.Candidates) != 1 ||
+		deliveryLane.Candidates[0].Kind != notifications.WorkKindDelivery {
+		t.Fatalf("markerless DELIVERY page = %#v", deliveryLane)
+	}
+}
+
+func TestQueryDueRejectsNoncanonicalMarkerlessStorageAndIndexIdentity(t *testing.T) {
+	due := time.Date(2026, 7, 16, 12, 30, 0, 0, time.UTC)
+	tests := []struct {
+		name   string
+		kind   notifications.WorkKind
+		itemID string
+		mutate func(map[string]any)
+	}{
+		{
+			name: "outbox base key", kind: notifications.WorkKindIntent, itemID: "outbox_1",
+			mutate: func(item map[string]any) { item["PK"] = "WRONG#tnt_1" },
+		},
+		{
+			name: "delivery base key", kind: notifications.WorkKindDelivery, itemID: "delivery_1",
+			mutate: func(item map[string]any) { item["PK"] = "TENANT#tnt_1" },
+		},
+		{
+			name: "GSI partition", kind: notifications.WorkKindIntent, itemID: "outbox_1",
+			mutate: func(item map[string]any) {
+				item["relay_gsi_pk"] = "NOTIFICATION_RELAY#V1#BUCKET#63"
+			},
+		},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			indexKey, err := notifications.BuildRelayIndexKey(
+				test.kind, "tnt_1", test.itemID, due.Add(-time.Minute),
+			)
+			if err != nil {
+				t.Fatal(err)
+			}
+			item := map[string]any{
+				"relay_gsi_pk": indexKey.PartitionKey, "relay_gsi_sk": indexKey.SortKey,
+			}
+			if test.kind == notifications.WorkKindDelivery {
+				item["PK"] = "NOTIFICATION_OUTBOX#outbox_1"
+				item["SK"] = "DELIVERY#" + test.itemID
+			} else {
+				item["PK"] = "TENANT#tnt_1"
+				item["SK"] = "NOTIFICATION_OUTBOX#" + test.itemID
+			}
+			test.mutate(item)
+			store := Store{Table: "domain", Client: &fakeClient{
+				queryOutputs: []*awssdk.QueryOutput{{Items: []map[string]types.AttributeValue{marshalMap(t, item)}}},
+			}}
+
+			page, err := store.QueryDue(context.Background(), relay.DueRequest{
+				Bucket: indexKey.Bucket, Kind: test.kind, DueThrough: due, PageSize: 25,
+			})
+			if err == nil || len(page.Candidates) != 0 {
+				t.Fatalf("page = %#v, error = %v", page, err)
+			}
+		})
 	}
 }
 
@@ -204,11 +323,18 @@ func TestReloadReadsBaseConsistentlyAndSkipsMissingOrIndexDivergentRows(t *testi
 		mismatchedLane[key] = value
 	}
 	mismatchedLane["relay_work_kind"] = string(notifications.WorkKindDependency)
+	markerless := make(map[string]any, len(base)-1)
+	for key, value := range base {
+		if key != "relay_work_kind" {
+			markerless[key] = value
+		}
+	}
 	client := &fakeClient{getOutputs: []*awssdk.GetItemOutput{
 		{},
 		{Item: marshalMap(t, divergent)},
 		{Item: marshalMap(t, terminal)},
 		{Item: marshalMap(t, mismatchedLane)},
+		{Item: marshalMap(t, markerless)},
 		{Item: marshalMap(t, base)},
 	}}
 	store := Store{Table: "domain", Client: client}
@@ -225,6 +351,9 @@ func TestReloadReadsBaseConsistentlyAndSkipsMissingOrIndexDivergentRows(t *testi
 	if work, current, err := store.Reload(context.Background(), candidate, relayTime); err == nil || current || work != (relay.Work{}) {
 		t.Fatalf("mismatched lane reload = %#v, %t, %v", work, current, err)
 	}
+	if work, current, err := store.Reload(context.Background(), candidate, relayTime); err != nil || !current || work.Kind != notifications.WorkKindIntent {
+		t.Fatalf("markerless reload = %#v, %t, %v", work, current, err)
+	}
 	work, current, err := store.Reload(context.Background(), candidate, relayTime)
 	if err != nil {
 		t.Fatal(err)
@@ -236,7 +365,7 @@ func TestReloadReadsBaseConsistentlyAndSkipsMissingOrIndexDivergentRows(t *testi
 		work.Revision != 3 || work.Cursor != "cursor_1" {
 		t.Fatalf("work = %#v", work)
 	}
-	if len(client.getInputs) != 5 {
+	if len(client.getInputs) != 6 {
 		t.Fatalf("GetItem calls = %d", len(client.getInputs))
 	}
 	for _, input := range client.getInputs {
@@ -250,6 +379,40 @@ func TestReloadReadsBaseConsistentlyAndSkipsMissingOrIndexDivergentRows(t *testi
 		if key["PK"] != candidate.PK || key["SK"] != candidate.SK {
 			t.Fatalf("base key = %#v", key)
 		}
+	}
+}
+
+func TestReloadAcceptsCanonicalMarkerlessPendingDelivery(t *testing.T) {
+	relayTime := time.Date(2026, 7, 16, 12, 30, 0, 0, time.UTC)
+	available := relayTime.Add(-time.Minute)
+	deliveryID := "delivery_1"
+	indexKey, err := notifications.BuildRelayIndexKey(
+		notifications.WorkKindDelivery, "tnt_1", deliveryID, available,
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	candidate := relay.Candidate{
+		PK: "NOTIFICATION_OUTBOX#outbox_1", SK: "DELIVERY#" + deliveryID,
+		RelayPK: indexKey.PartitionKey, RelaySK: indexKey.SortKey,
+		Kind: notifications.WorkKindDelivery, AvailableAt: available,
+	}
+	base := map[string]any{
+		"PK": candidate.PK, "SK": candidate.SK, "entity_type": "notification_delivery",
+		"tenant_id": "tnt_1", "outbox_id": "outbox_1", "delivery_id": deliveryID,
+		"event_id": "event_1", "rule_id": "rule_1", "kind": "opening", "channel": "email",
+		"state": "pending", "delivery_revision": int64(1),
+		"available_at": available.Format(fixedUTCLayout), "relay_schema_version": int64(1),
+		"relay_gsi_pk": indexKey.PartitionKey, "relay_gsi_sk": indexKey.SortKey,
+	}
+	store := Store{Table: "domain", Client: &fakeClient{
+		getOutputs: []*awssdk.GetItemOutput{{Item: marshalMap(t, base)}},
+	}}
+
+	work, current, err := store.Reload(context.Background(), candidate, relayTime)
+	if err != nil || !current || work.Kind != notifications.WorkKindDelivery ||
+		work.DeliveryID != deliveryID || work.State != "pending" {
+		t.Fatalf("work = %#v, current = %t, error = %v", work, current, err)
 	}
 }
 
