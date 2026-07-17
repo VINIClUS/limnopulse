@@ -132,6 +132,7 @@ func Load(args []string, lookup LookupEnv) (RunConfig, error) {
 	fs.IntVar(&config.FeedbackConcurrency, "feedback-concurrency", config.FeedbackConcurrency, "concurrent SES feedback messages")
 	fs.Float64Var(&config.MaxSendRate, "max-send-rate", config.MaxSendRate, "maximum provider calls per second")
 	fs.IntVar(&config.SendBurst, "send-burst", config.SendBurst, "send rate limiter burst")
+	fs.DurationVar(&config.ReceiveWait, "receive-wait", config.ReceiveWait, "SQS long-poll wait (0s disables only in local/test)")
 	if err := fs.Parse(args); err != nil {
 		return RunConfig{}, err
 	}
@@ -146,6 +147,9 @@ func Load(args []string, lookup LookupEnv) (RunConfig, error) {
 	if config.AppEnv == "staging" || config.AppEnv == "prod" {
 		if !explicitRate {
 			return RunConfig{}, fmt.Errorf("NOTIFICATION_MAX_SEND_RATE must be explicit in staging and prod")
+		}
+		if config.ReceiveWait == 0 {
+			return RunConfig{}, fmt.Errorf("zero receive wait is allowed only in local or test")
 		}
 	} else if config.AppEnv != "local" && config.AppEnv != "test" {
 		return RunConfig{}, fmt.Errorf("APP_ENV must be local, test, staging or prod")
@@ -180,6 +184,9 @@ func Load(args []string, lookup LookupEnv) (RunConfig, error) {
 	if config.SendConcurrency < 1 || config.FeedbackConcurrency < 1 || config.MaxSendRate <= 0 || math.IsNaN(config.MaxSendRate) ||
 		math.IsInf(config.MaxSendRate, 0) || config.SendBurst < 1 {
 		return RunConfig{}, fmt.Errorf("send concurrency, rate and burst must be positive")
+	}
+	if config.ReceiveWait < 0 || config.ReceiveWait > 20*time.Second || config.ReceiveWait%time.Second != 0 {
+		return RunConfig{}, fmt.Errorf("receive wait must be a whole number of seconds between 0s and 20s")
 	}
 	return config, nil
 }

@@ -86,8 +86,10 @@ def test_cloud_dynamodb_tables_match_domain_contract() -> None:
     assert 'range_key       = "GSI1SK"' in dynamodb
     assert 'hash_key        = "GSI2PK"' in dynamodb
     assert 'range_key       = "GSI2SK"' in dynamodb
-    assert 'hash_key        = "relay_gsi_pk"' in dynamodb
-    assert 'range_key       = "relay_gsi_sk"' in dynamodb
+    assert re.search(r'hash_key\s+=\s+"relay_gsi_pk"', dynamodb)
+    assert re.search(r'range_key\s+=\s+"relay_gsi_sk"', dynamodb)
+    assert re.search(r'projection_type\s+=\s+"INCLUDE"', dynamodb)
+    assert re.search(r'non_key_attributes\s+=\s+\["relay_work_kind"\]', dynamodb)
     assert 'projection_type = "KEYS_ONLY"' in dynamodb
     assert 'projection_type = "ALL"' in dynamodb
 
@@ -160,9 +162,7 @@ def test_notification_queues_and_ses_eventbridge_boundary_are_safe_by_default() 
         tfvars,
         re.MULTILINE,
     )
-    assert re.search(
-        r'^ses_events_queue_name\s+=\s+"limnopulse-ses-events"$', tfvars, re.MULTILINE
-    )
+    assert re.search(r'^ses_events_queue_name\s+=\s+"limnopulse-ses-events"$', tfvars, re.MULTILINE)
 
 
 def test_notification_outputs_expose_runtime_queue_contract() -> None:

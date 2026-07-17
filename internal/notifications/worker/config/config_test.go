@@ -1,6 +1,7 @@
 package config
 
 import (
+	"maps"
 	"strings"
 	"testing"
 	"time"
@@ -80,9 +81,17 @@ func TestLoadRequiresExplicitProductionRateAndValidatesFlags(t *testing.T) {
 	if loaded.MaxSendRate != 12.5 || loaded.SendConcurrency != 7 || loaded.FeedbackConcurrency != 5 || loaded.SendBurst != 3 {
 		t.Fatalf("overrides = %#v", loaded)
 	}
+	local := maps.Clone(base)
+	local["APP_ENV"] = "test"
+	loaded, err = Load([]string{"--receive-wait=0s"}, lookup(local))
+	if err != nil || loaded.ReceiveWait != 0 {
+		t.Fatalf("zero receive wait for deterministic local execution = %#v, %v", loaded, err)
+	}
 	for _, args := range [][]string{
 		{"--send-concurrency=0"}, {"--max-send-rate=0"}, {"--max-send-rate=NaN"},
-		{"--max-send-rate=+Inf"}, {"--send-burst=0"}, {"--feedback-concurrency=0"}, {"extra"},
+		{"--max-send-rate=+Inf"}, {"--send-burst=0"}, {"--feedback-concurrency=0"},
+		{"--receive-wait=0s"}, {"--receive-wait=-1s"}, {"--receive-wait=21s"},
+		{"--receive-wait=500ms"}, {"extra"},
 	} {
 		if _, err := Load(args, lookup(base)); err == nil {
 			t.Fatalf("Load(%v) error = nil", args)

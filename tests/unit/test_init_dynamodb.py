@@ -69,8 +69,7 @@ class IndexLifecycleClient(FakeDynamoClient):
     def describe_table(self, **kwargs: Any) -> dict[str, Any]:
         self.index_describe_calls += 1
         indexes = [
-            {"IndexName": name, "IndexStatus": status}
-            for name, status in self.indexes.items()
+            {"IndexName": name, "IndexStatus": status} for name, status in self.indexes.items()
         ]
         if self.activate_created_indexes:
             for name, status in tuple(self.indexes.items()):
@@ -140,12 +139,11 @@ def test_new_domain_table_includes_alert_evaluation_and_event_indexes(
         "AlertEventsByTenantTime",
         "NotificationRelayByAvailableAt",
     ]
-    assert create["GlobalSecondaryIndexes"][0]["Projection"] == {
-        "ProjectionType": "KEYS_ONLY"
-    }
+    assert create["GlobalSecondaryIndexes"][0]["Projection"] == {"ProjectionType": "KEYS_ONLY"}
     assert create["GlobalSecondaryIndexes"][1]["Projection"] == {"ProjectionType": "ALL"}
     assert create["GlobalSecondaryIndexes"][2]["Projection"] == {
-        "ProjectionType": "KEYS_ONLY"
+        "ProjectionType": "INCLUDE",
+        "NonKeyAttributes": ["relay_work_kind"],
     }
 
 

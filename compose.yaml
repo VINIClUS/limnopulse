@@ -7,6 +7,9 @@ services:
 
   dynamodb-local:
     image: amazon/dynamodb-local:latest
+    # The image writes SQLite under the named volume; Docker creates that
+    # volume root-owned on first use.
+    user: root
     command: -jar DynamoDBLocal.jar -sharedDb -dbPath ./data
     working_dir: /home/dynamodblocal
     volumes:

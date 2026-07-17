@@ -31,7 +31,10 @@ ALERT_INDEXES = (
             {"AttributeName": "relay_gsi_pk", "KeyType": "HASH"},
             {"AttributeName": "relay_gsi_sk", "KeyType": "RANGE"},
         ],
-        "Projection": {"ProjectionType": "KEYS_ONLY"},
+        "Projection": {
+            "ProjectionType": "INCLUDE",
+            "NonKeyAttributes": ["relay_work_kind"],
+        },
     },
 )
 GSI_WAIT_DELAY_SECONDS = 20
@@ -123,8 +126,7 @@ def wait_for_index_active(
         if attempt + 1 < GSI_WAIT_MAX_ATTEMPTS:
             time.sleep(GSI_WAIT_DELAY_SECONDS)
     raise TimeoutError(
-        f"Index {index_name} on {table_name} did not become ACTIVE; "
-        f"last status was {last_status}"
+        f"Index {index_name} on {table_name} did not become ACTIVE; last status was {last_status}"
     )
 
 

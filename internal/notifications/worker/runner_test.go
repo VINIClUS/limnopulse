@@ -30,6 +30,25 @@ func TestRunnerStopsReceivingAndGracefullyDrainsInflightWork(t *testing.T) {
 	}
 }
 
+func TestRunnerPassesZeroReceiveWaitToQueue(t *testing.T) {
+	queue := newRunnerQueue(nil)
+	queue.receiveWait = make(chan time.Duration, 1)
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan RunSummary, 1)
+	go func() {
+		done <- (Runner{Queue: queue, Handler: handlerFunc(func(context.Context, QueueMessage) Decision {
+			return Decision{Action: ActionDelete}
+		}), Concurrency: 1, ReceiveBatch: 10, ReceiveWait: 0, Visibility: time.Minute}).Run(ctx)
+	}()
+	if wait := <-queue.receiveWait; wait != 0 {
+		t.Fatalf("receive wait = %s", wait)
+	}
+	cancel()
+	if summary := <-done; !summary.Graceful || summary.Fatal {
+		t.Fatalf("summary = %#v", summary)
+	}
+}
+
 func TestRunnerFatalProducedDuringSignalDrainCannotExitSuccessfully(t *testing.T) {
 	queue := newRunnerQueue([]QueueMessage{{MessageID: "m1", ReceiptHandle: "r1"}})
 	queue.receiveCancelled = make(chan struct{})
@@ -115,6 +134,29 @@ func TestRunnerFatalStopsReceivesAfterVisibilityAndDrains(t *testing.T) {
 		ReceiveWait: 20 * time.Second, Visibility: time.Minute, DrainTimeout: 100 * time.Millisecond}
 	summary := runner.Run(context.Background())
 	if !summary.Fatal || summary.Graceful || summary.VisibilityChanged != 1 || summary.ErrorCategories["fatal_credentials"] != 1 {
+		t.Fatalf("summary = %#v", summary)
+	}
+}
+
+func TestRunnerReportsNonfatalDecisionCategory(t *testing.T) {
+	queue := newRunnerQueue([]QueueMessage{{MessageID: "m1", ReceiptHandle: "r1"}})
+	queue.changedMessages = make(chan QueueMessage, 1)
+	handler := handlerFunc(func(context.Context, QueueMessage) Decision {
+		return Decision{
+			Action: ActionChangeVisibility, Visibility: time.Minute,
+			ErrorCategory: "attempt_start_failure",
+		}
+	})
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan RunSummary, 1)
+	go func() {
+		done <- (Runner{Queue: queue, Handler: handler, Concurrency: 1, ReceiveBatch: 10,
+			ReceiveWait: 20 * time.Second, Visibility: time.Minute}).Run(ctx)
+	}()
+	<-queue.changedMessages
+	cancel()
+	summary := <-done
+	if !summary.Graceful || summary.ErrorCategories["attempt_start_failure"] != 1 {
 		t.Fatalf("summary = %#v", summary)
 	}
 }
@@ -273,12 +315,16 @@ type runnerQueue struct {
 	deleteError      error
 	changeError      error
 	receiveCancelled chan struct{}
+	receiveWait      chan time.Duration
 	changedMessages  chan QueueMessage
 }
 
 func newRunnerQueue(messages []QueueMessage) *runnerQueue { return &runnerQueue{initial: messages} }
-func (queue *runnerQueue) Receive(ctx context.Context, _ int, _ time.Duration, _ time.Duration) ([]QueueMessage, error) {
+func (queue *runnerQueue) Receive(ctx context.Context, _ int, wait time.Duration, _ time.Duration) ([]QueueMessage, error) {
 	queue.receives.Add(1)
+	if queue.receiveWait != nil {
+		queue.receiveWait <- wait
+	}
 	queue.mu.Lock()
 	if !queue.delivered {
 		queue.delivered = true

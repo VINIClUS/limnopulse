@@ -96,7 +96,8 @@ func (state *runFatalState) current() string {
 func (runner Runner) Run(ctx context.Context) RunSummary {
 	collector := &summaryCollector{summary: RunSummary{ErrorCategories: map[string]int{}}}
 	if runner.Queue == nil || runner.Handler == nil || runner.Concurrency < 1 ||
-		runner.ReceiveBatch < 1 || runner.ReceiveBatch > 10 || runner.ReceiveWait < 0 || runner.Visibility <= 0 {
+		runner.ReceiveBatch < 1 || runner.ReceiveBatch > 10 || runner.ReceiveWait < 0 ||
+		runner.ReceiveWait > 20*time.Second || runner.ReceiveWait%time.Second != 0 || runner.Visibility <= 0 {
 		collector.addError("configuration")
 		collector.summary.Fatal = true
 		return collector.snapshot()
@@ -216,6 +217,9 @@ func (runner Runner) applyDecision(
 			return
 		}
 		collector.addVisibility()
+		if decision.Action == ActionChangeVisibility {
+			collector.addError(decision.ErrorCategory)
+		}
 	default:
 		collector.addQueueError("invalid_decision")
 	}

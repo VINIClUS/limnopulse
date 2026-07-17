@@ -59,10 +59,11 @@ resource "aws_dynamodb_table" "domain" {
   }
 
   global_secondary_index {
-    name            = "NotificationRelayByAvailableAt"
-    hash_key        = "relay_gsi_pk"
-    range_key       = "relay_gsi_sk"
-    projection_type = "KEYS_ONLY"
+    name               = "NotificationRelayByAvailableAt"
+    hash_key           = "relay_gsi_pk"
+    range_key          = "relay_gsi_sk"
+    projection_type    = "INCLUDE"
+    non_key_attributes = ["relay_work_kind"]
   }
 
   ttl {
