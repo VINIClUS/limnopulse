@@ -474,12 +474,14 @@ func TestBackfillRelayReportsIncompleteScopeAtTotalRowLimit(t *testing.T) {
 		commandOutbox(t, map[string]any{
 			"PK": "TENANT#private_tenant", "SK": "NOTIFICATION_OUTBOX#private_1",
 			"entity_type": "notification_outbox", "tenant_id": "private_tenant", "outbox_id": "private_1",
-			"channel": "email", "status": "ready", "created_at": "2026-07-15T12:00:45.000000000Z",
+			"channel": "email", "kind": "opening", "status": "ready",
+			"created_at": "2026-07-15T12:00:45.000000000Z",
 		}),
 		commandOutbox(t, map[string]any{
 			"PK": "TENANT#private_tenant", "SK": "NOTIFICATION_OUTBOX#private_2",
 			"entity_type": "notification_outbox", "tenant_id": "private_tenant", "outbox_id": "private_2",
-			"channel": "email", "status": "ready", "created_at": "2026-07-15T12:00:45.000000000Z",
+			"channel": "email", "kind": "opening", "status": "ready",
+			"created_at": "2026-07-15T12:00:45.000000000Z",
 		}),
 	}
 	client := &fakeDynamo{queryOutput: &awssdk.QueryOutput{Items: privateRows}}
@@ -514,12 +516,14 @@ func TestBackfillRelayExitCodesCoverSuccessPartialAndFatalResults(t *testing.T) 
 	legacy := commandOutbox(t, map[string]any{
 		"PK": "TENANT#private_tenant", "SK": "NOTIFICATION_OUTBOX#private_outbox",
 		"entity_type": "notification_outbox", "tenant_id": "private_tenant", "outbox_id": "private_outbox",
-		"channel": "email", "status": "ready", "created_at": "2026-07-15T12:00:45.000000000Z",
+		"channel": "email", "kind": "opening", "status": "ready",
+		"created_at": "2026-07-15T12:00:45.000000000Z",
 	})
 	conflictValues := map[string]any{
 		"PK": "TENANT#private_tenant", "SK": "NOTIFICATION_OUTBOX#private_outbox",
 		"entity_type": "notification_outbox", "tenant_id": "private_tenant", "outbox_id": "private_outbox",
-		"channel": "email", "status": "ready", "created_at": "2026-07-15T12:00:45.000000000Z",
+		"channel": "email", "kind": "opening", "status": "ready",
+		"created_at":           "2026-07-15T12:00:45.000000000Z",
 		"relay_schema_version": 2,
 	}
 	conflict := commandOutbox(t, conflictValues)
