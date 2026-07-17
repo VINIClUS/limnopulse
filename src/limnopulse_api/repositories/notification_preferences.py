@@ -26,5 +26,7 @@ class NotificationPreferenceRepository(Protocol):
         preference: NotificationPreference,
         expected_version: int | None,
         audit: AuditContext,
+        *,
+        previous: NotificationPreference | None,
     ) -> NotificationPreference:
         raise NotImplementedError

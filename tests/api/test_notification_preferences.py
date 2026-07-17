@@ -97,6 +97,8 @@ class InMemoryNotificationPreferenceRepository:
         preference: NotificationPreference,
         expected_version: int | None,
         audit: AuditContext,
+        *,
+        previous: NotificationPreference | None,
     ) -> NotificationPreference:
         if expected_version is None:
             if self.preference is not None:

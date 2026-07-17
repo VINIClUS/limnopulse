@@ -22,6 +22,17 @@ from limnopulse_api.domain.notification_preferences import (
 NOW = datetime(2026, 7, 16, 12, 0, tzinfo=UTC)
 
 
+def state_hash(preference: NotificationPreference | None) -> str:
+    value = None if preference is None else preference.model_dump(mode="json")
+    encoded = json.dumps(
+        value,
+        sort_keys=True,
+        separators=(",", ":"),
+        ensure_ascii=True,
+    ).encode()
+    return sha256(encoded).hexdigest()
+
+
 class TransactionFailure(Exception):
     def __init__(self) -> None:
         self.response = {"Error": {"Code": "TransactionCanceledException"}}
@@ -207,6 +218,7 @@ async def test_create_conditionally_persists_preference_and_redacted_audit_atomi
         preference,
         None,
         AuditContext(actor_id="sub_1", ip="127.0.0.1", user_agent="tests"),
+        previous=None,
     )
 
     assert saved == preference
@@ -230,6 +242,8 @@ async def test_create_conditionally_persists_preference_and_redacted_audit_atomi
         "minimum_severity": "critical",
         "email_hash": sha256(b"verified@example.com").hexdigest(),
     }
+    assert audit["before_hash"] == state_hash(None)
+    assert audit["after_hash"] == state_hash(preference)
     assert "verified@example.com" not in json.dumps(audit, default=str)
     assert "access-token" not in json.dumps(transaction, default=str)
 
@@ -250,6 +264,35 @@ async def test_update_conditions_on_expected_version_and_maps_stale_write_to_con
             make_preference(version=2, email_enabled=False),
             1,
             AuditContext(actor_id="sub_1"),
+            previous=make_preference(version=1),
         )
 
     assert len(client.items) == 1
+
+
+@pytest.mark.asyncio
+async def test_update_audit_hashes_the_exact_previous_and_next_states() -> None:
+    client = RecordingDynamoClient()
+    previous = make_preference(version=1, email_enabled=True)
+    updated = make_preference(version=2, email_enabled=False)
+    client.seed("domain", preference_item(version=1, email_enabled=True))
+    repository = DynamoNotificationPreferenceRepository(
+        "domain",
+        "audit",
+        client,
+        clock=lambda: NOW,
+    )
+
+    await repository.save(
+        updated,
+        1,
+        AuditContext(actor_id="sub_1"),
+        previous=previous,
+    )
+
+    transaction = client.transact_write_items_calls[0]["TransactItems"]
+    audit = client._decode(transaction[1]["Put"]["Item"])
+    assert audit["action"] == "notification_preference.updated"
+    assert audit["before_hash"] == state_hash(previous)
+    assert audit["after_hash"] == state_hash(updated)
+    assert "verified@example.com" not in json.dumps(audit, default=str)

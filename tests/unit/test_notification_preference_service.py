@@ -27,7 +27,14 @@ class FakeNotificationPreferenceRepository:
         self.deliverability = deliverability
         self.get_calls: list[tuple[str, str]] = []
         self.deliverability_calls: list[str] = []
-        self.save_calls: list[tuple[NotificationPreference, int | None, AuditContext]] = []
+        self.save_calls: list[
+            tuple[
+                NotificationPreference,
+                int | None,
+                AuditContext,
+                NotificationPreference | None,
+            ]
+        ] = []
 
     async def get(self, tenant_id: str, cognito_sub: str) -> NotificationPreference | None:
         self.get_calls.append((tenant_id, cognito_sub))
@@ -45,13 +52,15 @@ class FakeNotificationPreferenceRepository:
         preference: NotificationPreference,
         expected_version: int | None,
         audit: AuditContext,
+        *,
+        previous: NotificationPreference | None,
     ) -> NotificationPreference:
         if expected_version is None:
             if self.preference is not None:
                 raise ConflictError("preference already exists")
         elif self.preference is None or self.preference.version != expected_version:
             raise ConflictError("preference version conflict")
-        self.save_calls.append((preference, expected_version, audit))
+        self.save_calls.append((preference, expected_version, audit, previous))
         self.preference = preference
         return preference
 
@@ -203,9 +212,10 @@ async def test_create_always_verifies_cognito_and_conditionally_creates_version_
     )
 
     assert verifier.calls == [PRINCIPAL]
-    saved, expected_version, audit = repository.save_calls[0]
+    saved, expected_version, audit, previous = repository.save_calls[0]
     assert expected_version is None
     assert audit == AUDIT
+    assert previous is None
     assert saved.version == 1
     assert saved.email_enabled is email_enabled
     assert saved.email_address == "verified@example.com"
@@ -238,9 +248,10 @@ async def test_enabled_update_refreshes_identity_and_increments_expected_version
         audit=AUDIT,
     )
 
-    saved, expected_version, _ = repository.save_calls[0]
+    saved, expected_version, _, previous = repository.save_calls[0]
     assert verifier.calls == [PRINCIPAL]
     assert expected_version == 2
+    assert previous == existing
     assert saved.version == 3
     assert saved.email_address == "fresh@example.com"
     assert saved.created_at == existing.created_at
@@ -266,12 +277,13 @@ async def test_disable_existing_preference_preserves_identity_without_cognito() 
         audit=AUDIT,
     )
 
-    saved, _, _ = repository.save_calls[0]
+    saved, _, _, previous = repository.save_calls[0]
     assert verifier.calls == []
     assert saved.version == 3
     assert saved.email_enabled is False
     assert saved.email_address == existing.email_address
     assert saved.checked_at == existing.checked_at
+    assert previous == existing
     assert result.email.effective_enabled is False
 
 

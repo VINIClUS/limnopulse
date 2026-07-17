@@ -109,7 +109,12 @@ class NotificationPreferenceService:
         deliverability_record = await self.repository.get_email_deliverability(
             preference.email_address
         )
-        saved = await self.repository.save(preference, expected_version, audit)
+        saved = await self.repository.save(
+            preference,
+            expected_version,
+            audit,
+            previous=existing,
+        )
         return self._view(saved, deliverability_record)
 
     def _view(

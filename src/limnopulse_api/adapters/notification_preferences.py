@@ -3,6 +3,7 @@ from asyncio import to_thread
 from datetime import UTC, datetime, timedelta
 from decimal import Decimal
 from hashlib import sha256
+import json
 from typing import Any
 from uuid import uuid4
 
@@ -81,7 +82,10 @@ class DynamoNotificationPreferenceRepository:
         preference: NotificationPreference,
         expected_version: int | None,
         audit: AuditContext,
+        *,
+        previous: NotificationPreference | None,
     ) -> NotificationPreference:
+        self._validate_change(preference, expected_version, previous)
         now = self.clock()
         preference_put: dict[str, Any] = {
             "TableName": self.domain_table_name,
@@ -107,7 +111,7 @@ class DynamoNotificationPreferenceRepository:
             )
             action = "notification_preference.updated"
 
-        audit_item = self._audit_item(preference, audit, action, now)
+        audit_item = self._audit_item(preference, previous, audit, action, now)
         try:
             await to_thread(
                 self.client.transact_write_items,
@@ -140,6 +144,7 @@ class DynamoNotificationPreferenceRepository:
     def _audit_item(
         self,
         preference: NotificationPreference,
+        previous: NotificationPreference | None,
         context: AuditContext,
         action: str,
         now: datetime,
@@ -156,6 +161,8 @@ class DynamoNotificationPreferenceRepository:
             "action": action,
             "resource_type": "notification_preference",
             "resource_id": f"USER#{preference.cognito_sub}",
+            "before_hash": self._hash_state(previous),
+            "after_hash": self._hash_state(preference),
             "details": {
                 "email_enabled": preference.email_enabled,
                 "email_verified": preference.email_verified,
@@ -167,6 +174,35 @@ class DynamoNotificationPreferenceRepository:
             "created_at": now.isoformat(),
             "expires_at": int((now + AUDIT_RETENTION).timestamp()),
         }
+
+    def _validate_change(
+        self,
+        preference: NotificationPreference,
+        expected_version: int | None,
+        previous: NotificationPreference | None,
+    ) -> None:
+        if expected_version is None:
+            if previous is not None or preference.version != 1:
+                raise ValueError("notification preference create state is invalid")
+            return
+        if (
+            previous is None
+            or previous.tenant_id != preference.tenant_id
+            or previous.cognito_sub != preference.cognito_sub
+            or previous.version != expected_version
+            or preference.version != expected_version + 1
+        ):
+            raise ValueError("notification preference update state is invalid")
+
+    def _hash_state(self, preference: NotificationPreference | None) -> str:
+        value = None if preference is None else preference.model_dump(mode="json")
+        encoded = json.dumps(
+            value,
+            sort_keys=True,
+            separators=(",", ":"),
+            ensure_ascii=True,
+        ).encode()
+        return sha256(encoded).hexdigest()
 
     def _preference_key(self, tenant_id: str, cognito_sub: str) -> dict[str, str]:
         return {
