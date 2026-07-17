@@ -9,7 +9,10 @@ ROOT = Path(__file__).parents[2]
 def test_evaluator_has_no_dynamodb_scan_or_phase3c_clients() -> None:
     go_sources = "\n".join(
         path.read_text()
-        for directory in (ROOT / "cmd", ROOT / "internal" / "alertevaluator")
+        for directory in (
+            ROOT / "cmd" / "alert-evaluator",
+            ROOT / "internal" / "alertevaluator",
+        )
         for path in directory.rglob("*.go")
     )
 

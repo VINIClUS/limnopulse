@@ -11,12 +11,20 @@ import (
 	"os/signal"
 	"strings"
 	"syscall"
+	"time"
 
+	"github.com/VINIClUS/limnopulse/internal/notifications"
 	notificationdynamo "github.com/VINIClUS/limnopulse/internal/notifications/dynamo"
+	"github.com/VINIClUS/limnopulse/internal/notifications/relay"
+	relayconfig "github.com/VINIClUS/limnopulse/internal/notifications/relay/config"
+	relaydynamo "github.com/VINIClUS/limnopulse/internal/notifications/relay/dynamo"
+	relaysqs "github.com/VINIClUS/limnopulse/internal/notifications/relay/sqs"
+	relaytelemetry "github.com/VINIClUS/limnopulse/internal/notifications/relay/telemetry"
 	"github.com/aws/aws-sdk-go-v2/aws"
 	awsconfig "github.com/aws/aws-sdk-go-v2/config"
 	"github.com/aws/aws-sdk-go-v2/credentials"
 	awssdk "github.com/aws/aws-sdk-go-v2/service/dynamodb"
+	awssqs "github.com/aws/aws-sdk-go-v2/service/sqs"
 )
 
 const (
@@ -27,11 +35,13 @@ const (
 )
 
 type loadDynamoFunc func(context.Context, string, string) (notificationdynamo.Client, error)
+type runRelayFunc func(context.Context, relayconfig.RunConfig) (relay.RunSummary, error)
 
 type dependencies struct {
 	Output     io.Writer
 	LookupEnv  func(string) (string, bool)
 	LoadDynamo loadDynamoFunc
+	RunRelay   runRelayFunc
 }
 
 type commandResult struct {
@@ -78,6 +88,7 @@ func defaultDependencies() dependencies {
 		Output:     os.Stdout,
 		LookupEnv:  os.LookupEnv,
 		LoadDynamo: loadDynamo,
+		RunRelay:   executeRelay,
 	}
 }
 
@@ -86,11 +97,30 @@ func runMain(ctx context.Context, args []string, deps dependencies) int {
 		return writeFatal(deps.Output, "configuration")
 	}
 	switch args[0] {
+	case "relay":
+		return runRelayCommand(ctx, args[1:], deps)
 	case "backfill-relay":
 		return runBackfillRelay(ctx, args[1:], deps)
 	default:
 		return writeFatal(deps.Output, "configuration")
 	}
+}
+
+func runRelayCommand(ctx context.Context, args []string, deps dependencies) int {
+	budgetStartedAt := time.Now().UTC()
+	config, err := relayconfig.Load(args, deps.LookupEnv)
+	if err != nil || deps.RunRelay == nil {
+		return writeFatal(deps.Output, "configuration")
+	}
+	config.BudgetStartedAt = &budgetStartedAt
+	runCtx, cancel := context.WithDeadline(ctx, budgetStartedAt.Add(config.GlobalDeadline))
+	defer cancel()
+	summary, err := deps.RunRelay(runCtx, config)
+	if err != nil {
+		return writeFatal(deps.Output, "aws_configuration")
+	}
+	writeResult(deps.Output, summary)
+	return summary.ExitCode
 }
 
 func runBackfillRelay(ctx context.Context, args []string, deps dependencies) int {
@@ -219,7 +249,7 @@ func writeFatal(output io.Writer, category string) int {
 	return exitFatal
 }
 
-func writeResult(output io.Writer, result commandResult) {
+func writeResult(output io.Writer, result any) {
 	encoder := json.NewEncoder(output)
 	encoder.SetEscapeHTML(false)
 	_ = encoder.Encode(result)
@@ -233,13 +263,7 @@ func envOr(lookup func(string) (string, bool), key, fallback string) string {
 }
 
 func loadDynamo(ctx context.Context, region, endpoint string) (notificationdynamo.Client, error) {
-	options := []func(*awsconfig.LoadOptions) error{awsconfig.WithRegion(region)}
-	if endpoint != "" {
-		options = append(options, awsconfig.WithCredentialsProvider(
-			credentials.NewStaticCredentialsProvider("local", "local", ""),
-		))
-	}
-	config, err := awsconfig.LoadDefaultConfig(ctx, options...)
+	config, err := loadAWSConfig(ctx, region, endpoint)
 	if err != nil {
 		return nil, err
 	}
@@ -248,4 +272,59 @@ func loadDynamo(ctx context.Context, region, endpoint string) (notificationdynam
 			options.BaseEndpoint = aws.String(endpoint)
 		}
 	}), nil
+}
+
+func loadAWSConfig(ctx context.Context, region, endpoint string) (aws.Config, error) {
+	options := []func(*awsconfig.LoadOptions) error{awsconfig.WithRegion(region)}
+	if endpoint != "" {
+		options = append(options, awsconfig.WithCredentialsProvider(
+			credentials.NewStaticCredentialsProvider("local", "local", ""),
+		))
+	}
+	return awsconfig.LoadDefaultConfig(ctx, options...)
+}
+
+func executeRelay(ctx context.Context, config relayconfig.RunConfig) (relay.RunSummary, error) {
+	awsConfig, err := loadAWSConfig(ctx, config.AWSRegion, config.DynamoDBEndpoint)
+	if err != nil {
+		return relay.RunSummary{}, err
+	}
+	dynamoClient := awssdk.NewFromConfig(awsConfig, func(options *awssdk.Options) {
+		if config.DynamoDBEndpoint != "" {
+			options.BaseEndpoint = aws.String(config.DynamoDBEndpoint)
+		}
+	})
+	sqsClient := awssqs.NewFromConfig(awsConfig, func(options *awssqs.Options) {
+		if config.SQSEndpoint != "" {
+			options.BaseEndpoint = aws.String(config.SQSEndpoint)
+		}
+	})
+	renderer, err := notifications.NewTemplateRenderer()
+	if err != nil {
+		return relay.RunSummary{}, err
+	}
+	runner := relay.Runner{
+		Store: relaydynamo.Store{
+			Table: config.DynamoDBTable, Client: dynamoClient, Renderer: renderer,
+		},
+		Publisher: relaysqs.Publisher{
+			Client: sqsClient, QueueURL: config.SQSQueueURL,
+			RequestTimeout: config.SQSRequestTimeout,
+		},
+	}
+	summary := runner.Run(ctx, config)
+	flushCtx, cancel := context.WithTimeout(ctx, config.OTLPFlushTimeout)
+	defer cancel()
+	recorder, metricsErr := relaytelemetry.New(flushCtx, config.OTLPEndpoint)
+	if metricsErr != nil {
+		summary.TelemetryExportError = "initialization_failed"
+		return summary, nil
+	}
+	if recorder != nil {
+		recorder.Record(flushCtx, summary)
+		if err := recorder.Shutdown(flushCtx); err != nil {
+			summary.TelemetryExportError = "export_failed"
+		}
+	}
+	return summary, nil
 }

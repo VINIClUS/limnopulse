@@ -10,13 +10,112 @@ import (
 	"reflect"
 	"strings"
 	"testing"
+	"time"
 
 	notificationdynamo "github.com/VINIClUS/limnopulse/internal/notifications/dynamo"
+	"github.com/VINIClUS/limnopulse/internal/notifications/relay"
+	relayconfig "github.com/VINIClUS/limnopulse/internal/notifications/relay/config"
 	"github.com/aws/aws-sdk-go-v2/aws"
 	"github.com/aws/aws-sdk-go-v2/feature/dynamodb/attributevalue"
 	awssdk "github.com/aws/aws-sdk-go-v2/service/dynamodb"
 	"github.com/aws/aws-sdk-go-v2/service/dynamodb/types"
 )
+
+func TestRelayLoadsValidatedOneShotConfigAndWritesNoPIISummary(t *testing.T) {
+	privateQueue := "http://sqs:9324/queue/private-jobs"
+	environment := map[string]string{
+		"AWS_REGION": "us-east-1", "DYNAMODB_DOMAIN_TABLE": "private-domain",
+		"DYNAMODB_ENDPOINT_URL": "http://dynamodb:8000", "SQS_NOTIFICATION_JOBS_URL": privateQueue,
+	}
+	var captured relayconfig.RunConfig
+	var capturedDeadline time.Time
+	runCalls := 0
+	var output bytes.Buffer
+	exitCode := runMain(context.Background(), []string{
+		"relay", "--relay-time=2026-07-16T13:00:00Z", "--shard=1", "--shard-count=2",
+		"--query-parallelism=3", "--work-parallelism=5", "--max-work=77", "--fanout-page-size=19",
+	}, dependencies{
+		Output: &output,
+		LookupEnv: func(key string) (string, bool) {
+			value, ok := environment[key]
+			return value, ok
+		},
+		RunRelay: func(ctx context.Context, config relayconfig.RunConfig) (relay.RunSummary, error) {
+			runCalls++
+			captured = config
+			capturedDeadline, _ = ctx.Deadline()
+			return relay.RunSummary{
+				RunID: "run_1", RelayTime: *config.RelayTime, Shard: config.Shard,
+				ShardCount: config.ShardCount, Result: "success", ExitCode: relay.ExitSuccess,
+				ScopeCompleted: true,
+			}, nil
+		},
+	})
+	if exitCode != relay.ExitSuccess || runCalls != 1 {
+		t.Fatalf("exit = %d, run calls = %d, output = %s", exitCode, runCalls, output.String())
+	}
+	if captured.RelayTime == nil || captured.Shard != 1 || captured.ShardCount != 2 ||
+		captured.QueryParallelism != 3 || captured.WorkParallelism != 5 || captured.MaxWork != 77 ||
+		captured.FanoutPageSize != 19 || captured.GlobalDeadline != 45*time.Second ||
+		captured.SoftDeadline != 40*time.Second || captured.ItemTimeout != 10*time.Second ||
+		captured.LeaseTTL != 20*time.Second || captured.SQSRequestTimeout != 5*time.Second {
+		t.Fatalf("captured config = %#v", captured)
+	}
+	if captured.BudgetStartedAt == nil || capturedDeadline.IsZero() ||
+		capturedDeadline.Before(captured.BudgetStartedAt.Add(44*time.Second)) ||
+		capturedDeadline.After(captured.BudgetStartedAt.Add(45*time.Second)) {
+		t.Fatalf("budget start = %#v, deadline = %s", captured.BudgetStartedAt, capturedDeadline)
+	}
+	for _, private := range []string{privateQueue, "private-domain", "dynamodb:8000"} {
+		if strings.Contains(output.String(), private) {
+			t.Fatalf("relay summary leaked %q: %s", private, output.String())
+		}
+	}
+	var summary relay.RunSummary
+	if err := json.Unmarshal(output.Bytes(), &summary); err != nil {
+		t.Fatalf("decode summary: %v; output = %s", err, output.String())
+	}
+	if summary.Result != "success" || summary.RunID != "run_1" {
+		t.Fatalf("summary = %#v", summary)
+	}
+}
+
+func TestRelayRejectsMissingEnvironmentAndInvalidFlagsBeforeAWS(t *testing.T) {
+	tests := []struct {
+		name      string
+		args      []string
+		lookupEnv func(string) (string, bool)
+	}{
+		{name: "missing environment", args: []string{"relay"}, lookupEnv: func(string) (string, bool) { return "", false }},
+		{name: "invalid flag", args: []string{"relay", "--max-work=0"}, lookupEnv: relayCommandLookup},
+		{name: "positional", args: []string{"relay", "extra"}, lookupEnv: relayCommandLookup},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			runCalls := 0
+			var output bytes.Buffer
+			exitCode := runMain(context.Background(), test.args, dependencies{
+				Output: &output, LookupEnv: test.lookupEnv,
+				RunRelay: func(context.Context, relayconfig.RunConfig) (relay.RunSummary, error) {
+					runCalls++
+					return relay.RunSummary{}, nil
+				},
+			})
+			if exitCode != relay.ExitFatal || runCalls != 0 {
+				t.Fatalf("exit = %d, run calls = %d, output = %s", exitCode, runCalls, output.String())
+			}
+		})
+	}
+}
+
+func relayCommandLookup(key string) (string, bool) {
+	values := map[string]string{
+		"AWS_REGION": "us-east-1", "DYNAMODB_DOMAIN_TABLE": "domain",
+		"DYNAMODB_ENDPOINT_URL": "http://dynamodb:8000", "SQS_NOTIFICATION_JOBS_URL": "queue",
+	}
+	value, ok := values[key]
+	return value, ok
+}
 
 type fakeDynamo struct {
 	queryOutput  *awssdk.QueryOutput

@@ -176,7 +176,7 @@ class DynamoNotificationPreferenceRepository:
 
     def _deliverability_key(self, address: str) -> dict[str, str]:
         return {
-            "PK": f"EMAIL#{self._email_hash(address)}",
+            "PK": f"EMAIL_IDENTITY#{self._email_hash(address)}",
             "SK": "DELIVERABILITY",
         }
 

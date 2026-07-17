@@ -134,7 +134,7 @@ async def test_deliverability_lookup_uses_email_hash_and_absence_is_none() -> No
     assert await repository.get_email_deliverability("verified@example.com") is None
     lookup_key = client._decode(client.get_item_calls[-1]["Key"])
     assert lookup_key == {
-        "PK": f"EMAIL#{sha256(b'verified@example.com').hexdigest()}",
+        "PK": f"EMAIL_IDENTITY#{sha256(b'verified@example.com').hexdigest()}",
         "SK": "DELIVERABILITY",
     }
 
@@ -146,7 +146,7 @@ async def test_deliverability_lookup_returns_suppression_state_and_reason() -> N
     client.seed(
         "domain",
         {
-            "PK": f"EMAIL#{digest}",
+            "PK": f"EMAIL_IDENTITY#{digest}",
             "SK": "DELIVERABILITY",
             "deliverability": "suppressed",
             "suppression_reason": "bounce",

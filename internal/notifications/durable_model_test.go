@@ -184,6 +184,32 @@ func TestDeliveryConstructorsRestrictInitialState(t *testing.T) {
 	}
 }
 
+func TestCancelledDeliveryCarriesReasonWithoutRenderedContent(t *testing.T) {
+	deliveryID := mustDeliveryID(t)
+	params := validDeliveryParams(t, deliveryID)
+	params.Content = RenderedContent{}
+	params.CancellationReason = CancellationReasonEmailSuppressed
+
+	cancelled, err := NewCancelledDelivery(params)
+	if err != nil {
+		t.Fatalf("NewCancelledDelivery() error = %v", err)
+	}
+	if cancelled.State() != DeliveryStateCancelled ||
+		cancelled.CancellationReason() != CancellationReasonEmailSuppressed {
+		t.Fatalf("cancelled delivery = %#v", cancelled.Snapshot())
+	}
+	if snapshot := cancelled.Snapshot(); snapshot.Content != (RenderedContentSnapshot{}) {
+		t.Fatalf("cancelled delivery rendered content = %#v", snapshot.Content)
+	}
+	if _, err := NewPendingDelivery(params); err == nil {
+		t.Fatal("pending delivery accepted cancellation reason and missing content")
+	}
+	restored, err := RestoreDelivery(cancelled.Snapshot())
+	if err != nil || restored.CancellationReason() != CancellationReasonEmailSuppressed {
+		t.Fatalf("RestoreDelivery() = %#v, %v", restored.Snapshot(), err)
+	}
+}
+
 func TestDeliveryStateTransitionMatrix(t *testing.T) {
 	allowed := map[[2]DeliveryState]bool{
 		{DeliveryStatePending, DeliveryStateQueued}:             true,

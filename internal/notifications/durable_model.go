@@ -5,6 +5,27 @@ import (
 	"time"
 )
 
+type CancellationReason string
+
+const (
+	CancellationReasonCancelled                   CancellationReason = "cancelled"
+	CancellationReasonEmailSuppressed             CancellationReason = "email_suppressed"
+	CancellationReasonRecipientMembershipInactive CancellationReason = "recipient_membership_inactive"
+	CancellationReasonOpeningNotSucceeded         CancellationReason = "opening_delivery_not_succeeded"
+)
+
+func (reason CancellationReason) Validate() error {
+	switch reason {
+	case CancellationReasonCancelled,
+		CancellationReasonEmailSuppressed,
+		CancellationReasonRecipientMembershipInactive,
+		CancellationReasonOpeningNotSucceeded:
+		return nil
+	default:
+		return fmt.Errorf("unknown delivery cancellation reason %q", reason)
+	}
+}
+
 type Outbox struct {
 	TenantID          string
 	OutboxID          string
@@ -75,6 +96,7 @@ type DeliveryParams struct {
 	NormalizedEmail     string
 	MembershipSnapshot  MembershipSnapshot
 	Content             RenderedContent
+	CancellationReason  CancellationReason
 	CreatedAt           time.Time
 	UpdatedAt           time.Time
 }
@@ -93,6 +115,7 @@ type Delivery struct {
 	NormalizedEmail     string
 	MembershipSnapshot  MembershipSnapshot
 	Content             RenderedContent
+	cancellationReason  CancellationReason
 	CreatedAt           time.Time
 	UpdatedAt           time.Time
 	state               DeliveryState
@@ -113,6 +136,7 @@ type DeliverySnapshot struct {
 	MembershipSnapshot  MembershipSnapshot      `json:"membership_snapshot"`
 	State               DeliveryState           `json:"state"`
 	Content             RenderedContentSnapshot `json:"content"`
+	CancellationReason  CancellationReason      `json:"cancellation_reason,omitempty"`
 	CreatedAt           time.Time               `json:"created_at"`
 	UpdatedAt           time.Time               `json:"updated_at"`
 }
@@ -122,6 +146,9 @@ func NewPendingDelivery(params DeliveryParams) (Delivery, error) {
 }
 
 func NewCancelledDelivery(params DeliveryParams) (Delivery, error) {
+	if params.CancellationReason == "" {
+		params.CancellationReason = CancellationReasonCancelled
+	}
 	return newDelivery(params, DeliveryStateCancelled)
 }
 
@@ -140,6 +167,7 @@ func newDelivery(params DeliveryParams, state DeliveryState) (Delivery, error) {
 		NormalizedEmail:     params.NormalizedEmail,
 		MembershipSnapshot:  params.MembershipSnapshot,
 		Content:             params.Content,
+		cancellationReason:  params.CancellationReason,
 		CreatedAt:           params.CreatedAt,
 		UpdatedAt:           params.UpdatedAt,
 		state:               state,
@@ -152,6 +180,10 @@ func newDelivery(params DeliveryParams, state DeliveryState) (Delivery, error) {
 
 func (delivery Delivery) State() DeliveryState {
 	return delivery.state
+}
+
+func (delivery Delivery) CancellationReason() CancellationReason {
+	return delivery.cancellationReason
 }
 
 func (delivery Delivery) Snapshot() DeliverySnapshot {
@@ -170,15 +202,20 @@ func (delivery Delivery) Snapshot() DeliverySnapshot {
 		MembershipSnapshot:  delivery.MembershipSnapshot,
 		State:               delivery.state,
 		Content:             delivery.Content.Snapshot(),
+		CancellationReason:  delivery.cancellationReason,
 		CreatedAt:           delivery.CreatedAt,
 		UpdatedAt:           delivery.UpdatedAt,
 	}
 }
 
 func RestoreDelivery(snapshot DeliverySnapshot) (Delivery, error) {
-	content, err := RestoreRenderedContent(snapshot.Content)
-	if err != nil {
-		return Delivery{}, err
+	var content RenderedContent
+	if snapshot.Content != (RenderedContentSnapshot{}) {
+		var err error
+		content, err = RestoreRenderedContent(snapshot.Content)
+		if err != nil {
+			return Delivery{}, err
+		}
 	}
 	delivery := Delivery{
 		TenantID:            snapshot.TenantID,
@@ -194,6 +231,7 @@ func RestoreDelivery(snapshot DeliverySnapshot) (Delivery, error) {
 		NormalizedEmail:     snapshot.NormalizedEmail,
 		MembershipSnapshot:  snapshot.MembershipSnapshot,
 		Content:             content,
+		cancellationReason:  snapshot.CancellationReason,
 		CreatedAt:           snapshot.CreatedAt,
 		UpdatedAt:           snapshot.UpdatedAt,
 		state:               snapshot.State,
@@ -240,6 +278,9 @@ func (delivery *Delivery) ApplyTransition(next DeliveryState) (bool, error) {
 		return false, fmt.Errorf("delivery state transition %q -> %q is not allowed", delivery.state, next)
 	}
 	delivery.state = next
+	if next == DeliveryStateCancelled && delivery.cancellationReason == "" {
+		delivery.cancellationReason = CancellationReasonCancelled
+	}
 	return true, nil
 }
 
@@ -290,16 +331,6 @@ func (delivery Delivery) Validate() error {
 	if err := delivery.MembershipSnapshot.Validate(); err != nil {
 		return err
 	}
-	if err := delivery.Content.Validate(); err != nil {
-		return err
-	}
-	wantTemplateID := TemplateAlertOpeningV1
-	if delivery.Kind == NotificationKindRecovery {
-		wantTemplateID = TemplateAlertRecoveryV1
-	}
-	if delivery.Content.TemplateID() != wantTemplateID {
-		return fmt.Errorf("template ID %q does not match notification kind %q", delivery.Content.TemplateID(), delivery.Kind)
-	}
 	wantID, err := NewDeliveryID(delivery.EventID, delivery.Kind, delivery.Channel, delivery.RecipientID)
 	if err != nil {
 		return err
@@ -312,6 +343,36 @@ func (delivery Delivery) Validate() error {
 	}
 	if delivery.UpdatedAt.Before(delivery.CreatedAt) {
 		return fmt.Errorf("delivery updated time must not precede created time")
+	}
+	if delivery.state == DeliveryStateCancelled {
+		if err := delivery.cancellationReason.Validate(); err != nil {
+			return err
+		}
+		if delivery.Content != (RenderedContent{}) {
+			if err := delivery.Content.Validate(); err != nil {
+				return err
+			}
+		}
+	} else {
+		if delivery.cancellationReason != "" {
+			return fmt.Errorf("non-cancelled delivery must not have a cancellation reason")
+		}
+		if err := delivery.Content.Validate(); err != nil {
+			return err
+		}
+	}
+	if delivery.Content == (RenderedContent{}) {
+		if delivery.state != DeliveryStateCancelled {
+			return fmt.Errorf("non-cancelled delivery must have rendered content")
+		}
+		return nil
+	}
+	wantTemplateID := TemplateAlertOpeningV1
+	if delivery.Kind == NotificationKindRecovery {
+		wantTemplateID = TemplateAlertRecoveryV1
+	}
+	if delivery.Content.TemplateID() != wantTemplateID {
+		return fmt.Errorf("template ID %q does not match notification kind %q", delivery.Content.TemplateID(), delivery.Kind)
 	}
 	return nil
 }
