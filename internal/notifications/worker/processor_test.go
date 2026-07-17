@@ -363,6 +363,35 @@ func TestProcessorFatalProviderPersistenceFailureStillStopsWorker(t *testing.T) 
 	}
 }
 
+func TestProcessorDeletesWhenFeedbackWinsAttemptCompletionRace(t *testing.T) {
+	for _, sender := range []*fakeSender{
+		{result: SendResult{ProviderMessageID: "ses_message_1"}},
+		{err: NewSendError(ErrorRetryableService, errors.New("late provider response"))},
+	} {
+		store := &fakeStore{
+			acquire: claimedRecord(t, 0), gate: GateResult{Allowed: true},
+			completeErr: ErrConcurrentTerminal,
+		}
+		decision := testProcessor(store, sender).Handle(context.Background(), validMessage(t))
+		if decision.Action != ActionDelete || decision.ErrorCategory != "" || store.completion == nil {
+			t.Fatalf("decision=%#v completion=%#v", decision, store.completion)
+		}
+	}
+}
+
+func TestProcessorPreservesFatalSystemicDecisionWhenFeedbackWinsCompletionRace(t *testing.T) {
+	store := &fakeStore{
+		acquire: claimedRecord(t, 0), gate: GateResult{Allowed: true},
+		completeErr: ErrConcurrentTerminal,
+	}
+	sender := &fakeSender{err: NewSendError(ErrorFatalCredentials, errors.New("credentials"))}
+	decision := testProcessor(store, sender).Handle(context.Background(), validMessage(t))
+	if decision.Action != ActionFatal || decision.ErrorCategory != string(ErrorFatalCredentials) ||
+		decision.Visibility != 15*time.Minute {
+		t.Fatalf("fatal decision = %#v", decision)
+	}
+}
+
 type fakeStore struct {
 	acquire            AcquireResult
 	acquireErr         error

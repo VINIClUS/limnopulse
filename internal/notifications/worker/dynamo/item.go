@@ -59,12 +59,15 @@ type contentItem struct {
 }
 
 type attemptItem struct {
-	PK         string                       `dynamodbav:"PK"`
-	SK         string                       `dynamodbav:"SK"`
-	EntityType string                       `dynamodbav:"entity_type"`
-	DeliveryID string                       `dynamodbav:"delivery_id"`
-	AttemptID  string                       `dynamodbav:"attempt_id"`
-	Outcome    notifications.AttemptOutcome `dynamodbav:"outcome"`
+	PK                string                        `dynamodbav:"PK"`
+	SK                string                        `dynamodbav:"SK"`
+	EntityType        string                        `dynamodbav:"entity_type"`
+	DeliveryID        string                        `dynamodbav:"delivery_id"`
+	AttemptID         string                        `dynamodbav:"attempt_id"`
+	Outcome           notifications.AttemptOutcome  `dynamodbav:"outcome"`
+	CompletedAt       string                        `dynamodbav:"completed_at"`
+	ProviderOutcome   notifications.ProviderOutcome `dynamodbav:"provider_outcome"`
+	ProviderMessageID string                        `dynamodbav:"provider_message_id"`
 }
 
 func decodeDelivery(item map[string]types.AttributeValue) (deliveryItem, worker.DeliveryRecord, error) {

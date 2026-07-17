@@ -2,11 +2,14 @@ package worker
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"time"
 
 	"github.com/VINIClUS/limnopulse/internal/notifications"
 )
+
+var ErrConcurrentTerminal = errors.New("delivery became terminal during worker completion")
 
 type AcquireDisposition uint8
 

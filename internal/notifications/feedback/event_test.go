@@ -76,6 +76,48 @@ func TestParseEventBridgeSESRejectsMalformedIdentityAndUnknownEvents(t *testing.
 	}
 }
 
+func TestEventValidationRejectsSemanticallyIncoherentFabricatedEvents(t *testing.T) {
+	canonical := []Event{
+		{EventBridgeID: "evt", ProviderMessageID: "ses", DeliveryID: "del", AttemptID: "att", SemanticType: SemanticSend, ProviderOutcome: notifications.ProviderOutcomeAccepted, AcceptedEvidence: true},
+		{EventBridgeID: "evt", ProviderMessageID: "ses", DeliveryID: "del", AttemptID: "att", SemanticType: SemanticDelivery, ProviderOutcome: notifications.ProviderOutcomeDeliveredToMailServer, AcceptedEvidence: true},
+		{EventBridgeID: "evt", ProviderMessageID: "ses", DeliveryID: "del", AttemptID: "att", SemanticType: SemanticDeliveryDelay, ProviderOutcome: notifications.ProviderOutcomeDelayed, AcceptedEvidence: true},
+		{EventBridgeID: "evt", ProviderMessageID: "ses", DeliveryID: "del", AttemptID: "att", SemanticType: SemanticSoftBounce, ProviderOutcome: notifications.ProviderOutcomeSoftBounced, AcceptedEvidence: true},
+		{EventBridgeID: "evt", ProviderMessageID: "ses", DeliveryID: "del", AttemptID: "att", SemanticType: SemanticHardBounce, ProviderOutcome: notifications.ProviderOutcomeHardBounced, SuppressionReason: SuppressionHardBounce, AcceptedEvidence: true},
+		{EventBridgeID: "evt", ProviderMessageID: "ses", DeliveryID: "del", AttemptID: "att", SemanticType: SemanticComplaint, ProviderOutcome: notifications.ProviderOutcomeComplained, SuppressionReason: SuppressionComplaint, AcceptedEvidence: true},
+		{EventBridgeID: "evt", ProviderMessageID: "ses", DeliveryID: "del", AttemptID: "att", SemanticType: SemanticReject, ProviderOutcome: notifications.ProviderOutcomeRejected, PermanentFailure: true},
+		{EventBridgeID: "evt", ProviderMessageID: "ses", DeliveryID: "del", AttemptID: "att", SemanticType: SemanticReject, ProviderOutcome: notifications.ProviderOutcomeRejected, SuppressionReason: SuppressionRecipientReject, PermanentFailure: true},
+	}
+	for index, event := range canonical {
+		if err := event.Validate(); err != nil {
+			t.Fatalf("canonical event %d rejected: %v", index, err)
+		}
+	}
+
+	invalid := []Event{
+		withEvent(canonical[0], func(event *Event) { event.ProviderOutcome = notifications.ProviderOutcomeRejected }),
+		withEvent(canonical[0], func(event *Event) { event.AcceptedEvidence = false }),
+		withEvent(canonical[1], func(event *Event) { event.PermanentFailure = true }),
+		withEvent(canonical[2], func(event *Event) { event.SuppressionReason = SuppressionHardBounce }),
+		withEvent(canonical[3], func(event *Event) { event.SuppressionReason = SuppressionHardBounce }),
+		withEvent(canonical[4], func(event *Event) { event.SuppressionReason = "" }),
+		withEvent(canonical[4], func(event *Event) { event.SuppressionReason = SuppressionComplaint }),
+		withEvent(canonical[5], func(event *Event) { event.SuppressionReason = SuppressionHardBounce }),
+		withEvent(canonical[6], func(event *Event) { event.AcceptedEvidence = true }),
+		withEvent(canonical[6], func(event *Event) { event.PermanentFailure = false }),
+		withEvent(canonical[6], func(event *Event) { event.SuppressionReason = SuppressionComplaint }),
+	}
+	for index, event := range invalid {
+		if err := event.Validate(); err == nil {
+			t.Fatalf("incoherent event %d accepted: %#v", index, event)
+		}
+	}
+}
+
+func withEvent(event Event, change func(*Event)) Event {
+	change(&event)
+	return event
+}
+
 func eventJSON(eventType, detail string) string {
 	return `{"version":"0","id":"evt_1","detail-type":"Email ` + eventType +
 		`","source":"aws.ses","account":"123","time":"2026-07-17T12:00:00Z","region":"sa-east-1","resources":[],"detail":{"eventType":"` + eventType +

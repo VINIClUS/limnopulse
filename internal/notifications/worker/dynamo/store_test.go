@@ -2,6 +2,7 @@ package dynamo
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"strings"
 	"testing"
@@ -271,12 +272,108 @@ func TestAttemptTransactionsFenceLeaseAndNeverCopyRenderedContentOrEmail(t *test
 	}
 }
 
+func TestCompleteAttemptReportsConcurrentTerminalFeedbackAsSafeNoOp(t *testing.T) {
+	record := testRecord(t)
+	record.AttemptCount = 1
+	record.LastAttemptID = "att_1"
+	terminal := testDeliveryItem(t, notifications.DeliveryStateSucceeded)
+	terminal["delivery_revision"] = record.Revision + 1
+	terminal["attempt_count"] = int64(1)
+	terminal["last_attempt_id"] = "att_1"
+	terminal["provider_outcome"] = "accepted"
+	terminal["provider_message_id"] = "ses_message_1"
+	completedAttempt := testAttemptItem(record, "att_1", notifications.AttemptOutcomeSucceeded)
+	completedAttempt["provider_outcome"] = "accepted"
+	completedAttempt["provider_message_id"] = "ses_message_1"
+	completedAttempt["completed_at"] = testNow().Format(time.RFC3339Nano)
+	client := &fakeClient{
+		getItems:          []map[string]types.AttributeValue{marshal(t, terminal), marshal(t, completedAttempt)},
+		transactionErrors: []error{&types.TransactionCanceledException{}},
+	}
+
+	err := (Store{Table: "domain", Client: client}).CompleteAttempt(
+		context.Background(), record, worker.AttemptCompletion{
+			AttemptID: "att_1", CompletedAt: testNow(),
+			Outcome: notifications.AttemptOutcomeSucceeded, NextState: notifications.DeliveryStateSucceeded,
+			ProviderOutcome: notifications.ProviderOutcomeAccepted, ProviderMessageID: "ses_message_1",
+		},
+	)
+	if !errors.Is(err, worker.ErrConcurrentTerminal) {
+		t.Fatalf("CompleteAttempt() error = %v", err)
+	}
+	if len(client.gets) != 2 || len(client.transactions) != 1 || len(client.updates) != 0 ||
+		client.gets[0].ConsistentRead == nil || !*client.gets[0].ConsistentRead ||
+		client.gets[1].ConsistentRead == nil || !*client.gets[1].ConsistentRead {
+		t.Fatalf("terminal reconciliation reads = %#v", client.gets)
+	}
+}
+
+func TestCompleteAttemptFinalizesCurrentStartedAttemptWhenOlderFeedbackTerminalizesDelivery(t *testing.T) {
+	for _, terminalState := range []notifications.DeliveryState{
+		notifications.DeliveryStateSucceeded,
+		notifications.DeliveryStateCancelled,
+	} {
+		t.Run(string(terminalState), func(t *testing.T) {
+			record := testRecord(t)
+			record.AttemptCount = 2
+			record.LastAttemptID = "att_current"
+			terminal := testDeliveryItem(t, terminalState)
+			terminal["delivery_revision"] = record.Revision + 1
+			terminal["attempt_count"] = int64(2)
+			terminal["last_attempt_id"] = "att_current"
+			terminal["provider_outcome"] = "accepted"
+			terminal["provider_message_id"] = "ses_previous"
+			if terminalState == notifications.DeliveryStateCancelled {
+				terminal["cancellation_reason"] = "email_suppressed"
+			}
+			startedAttempt := testAttemptItem(record, "att_current", notifications.AttemptOutcomeStarted)
+			client := &fakeClient{
+				getItems:          []map[string]types.AttributeValue{marshal(t, terminal), marshal(t, startedAttempt)},
+				transactionErrors: []error{&types.TransactionCanceledException{}},
+			}
+
+			err := (Store{Table: "domain", Client: client}).CompleteAttempt(
+				context.Background(), record, worker.AttemptCompletion{
+					AttemptID: "att_current", CompletedAt: testNow(), Outcome: notifications.AttemptOutcomeRetryable,
+					ErrorCategory: "retryable_service_unavailable", NextState: notifications.DeliveryStateRetryableFailed,
+					NextAttemptAt: testNow().Add(time.Minute),
+				},
+			)
+			if !errors.Is(err, worker.ErrConcurrentTerminal) || len(client.transactions) != 2 {
+				t.Fatalf("CompleteAttempt() error=%v transactions=%d", err, len(client.transactions))
+			}
+			cleanup := client.transactions[1]
+			if len(cleanup.TransactItems) != 2 || cleanup.TransactItems[0].ConditionCheck == nil || cleanup.TransactItems[1].Update == nil {
+				t.Fatalf("terminal Attempt cleanup transaction = %#v", cleanup.TransactItems)
+			}
+			if condition := *cleanup.TransactItems[0].ConditionCheck.ConditionExpression; !strings.Contains(condition, "#state = :terminal_state") || !strings.Contains(condition, "#revision = :terminal_revision") {
+				t.Fatalf("terminal delivery fence = %s", condition)
+			}
+			update := cleanup.TransactItems[1].Update
+			var key map[string]string
+			if err := attributevalue.UnmarshalMap(update.Key, &key); err != nil {
+				t.Fatal(err)
+			}
+			if key["PK"] != "NOTIFICATION_DELIVERY#"+record.Delivery.DeliveryID || key["SK"] != "ATTEMPT#att_current" ||
+				!strings.Contains(*update.ConditionExpression, "#outcome = :started") ||
+				strings.Contains(*update.UpdateExpression, "delivery_revision") || strings.Contains(*update.UpdateExpression, "#state") {
+				t.Fatalf("current Attempt cleanup = key:%#v condition:%s update:%s", key, *update.ConditionExpression, *update.UpdateExpression)
+			}
+			values := decodeExpressionValues(t, update.ExpressionAttributeValues)
+			if values[":outcome"] != "retryable" || values[":completed_at"] == "" {
+				t.Fatalf("current Attempt cleanup values = %#v", values)
+			}
+		})
+	}
+}
+
 type fakeClient struct {
-	getItems     []map[string]types.AttributeValue
-	updateItems  []map[string]types.AttributeValue
-	gets         []*awssdk.GetItemInput
-	updates      []*awssdk.UpdateItemInput
-	transactions []*awssdk.TransactWriteItemsInput
+	getItems          []map[string]types.AttributeValue
+	updateItems       []map[string]types.AttributeValue
+	gets              []*awssdk.GetItemInput
+	updates           []*awssdk.UpdateItemInput
+	transactions      []*awssdk.TransactWriteItemsInput
+	transactionErrors []error
 }
 
 func (client *fakeClient) GetItem(_ context.Context, input *awssdk.GetItemInput, _ ...func(*awssdk.Options)) (*awssdk.GetItemOutput, error) {
@@ -297,6 +394,11 @@ func (client *fakeClient) UpdateItem(_ context.Context, input *awssdk.UpdateItem
 }
 func (client *fakeClient) TransactWriteItems(_ context.Context, input *awssdk.TransactWriteItemsInput, _ ...func(*awssdk.Options)) (*awssdk.TransactWriteItemsOutput, error) {
 	client.transactions = append(client.transactions, input)
+	if len(client.transactionErrors) != 0 {
+		err := client.transactionErrors[0]
+		client.transactionErrors = client.transactionErrors[1:]
+		return &awssdk.TransactWriteItemsOutput{}, err
+	}
 	return &awssdk.TransactWriteItemsOutput{}, nil
 }
 
@@ -319,6 +421,23 @@ func testDeliveryItem(t *testing.T, state notifications.DeliveryState) map[strin
 		},
 		"created_at": snapshot.CreatedAt.Format(time.RFC3339Nano), "updated_at": snapshot.UpdatedAt.Format(time.RFC3339Nano),
 	}
+}
+
+func testAttemptItem(record worker.DeliveryRecord, attemptID string, outcome notifications.AttemptOutcome) map[string]any {
+	return map[string]any{
+		"PK": "NOTIFICATION_DELIVERY#" + record.Delivery.DeliveryID, "SK": "ATTEMPT#" + attemptID,
+		"entity_type": "notification_attempt", "delivery_id": record.Delivery.DeliveryID,
+		"attempt_id": attemptID, "outcome": string(outcome),
+	}
+}
+
+func decodeExpressionValues(t *testing.T, values map[string]types.AttributeValue) map[string]any {
+	t.Helper()
+	var decoded map[string]any
+	if err := attributevalue.UnmarshalMap(values, &decoded); err != nil {
+		t.Fatal(err)
+	}
+	return decoded
 }
 
 func testRecord(t *testing.T) worker.DeliveryRecord {

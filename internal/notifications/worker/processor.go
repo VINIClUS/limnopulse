@@ -264,6 +264,9 @@ func (processor Processor) completePreSendCancellation(
 	mutationCtx, cancel := mutationContext(ctx)
 	defer cancel()
 	if err := processor.Store.CompleteAttempt(mutationCtx, record, completion); err != nil {
+		if errors.Is(err, ErrConcurrentTerminal) {
+			return Decision{Action: ActionDelete}
+		}
 		return Decision{Action: ActionChangeVisibility, Visibility: time.Minute, ErrorCategory: "attempt_completion_failure"}
 	}
 	return decision
@@ -286,6 +289,9 @@ func (processor Processor) completeInterrupted(
 	mutationCtx, cancel := mutationContext(ctx)
 	defer cancel()
 	if err := processor.Store.CompleteAttempt(mutationCtx, record, completion); err != nil {
+		if errors.Is(err, ErrConcurrentTerminal) {
+			return Decision{Action: ActionDelete}
+		}
 		return Decision{Action: ActionChangeVisibility, Visibility: time.Minute, ErrorCategory: "interrupted_attempt_recovery_failure"}
 	}
 	processor.Metrics.RecordRetry(ErrorAmbiguousConnectionReset, true)
@@ -382,6 +388,12 @@ func (processor Processor) finishAttempt(
 	mutationCtx, cancel := mutationContext(ctx)
 	defer cancel()
 	if err := processor.Store.CompleteAttempt(mutationCtx, record, completion); err != nil {
+		if errors.Is(err, ErrConcurrentTerminal) {
+			if decision.Action == ActionFatal {
+				return decision
+			}
+			return Decision{Action: ActionDelete}
+		}
 		if decision.Action == ActionFatal {
 			return Decision{
 				Action: ActionFatal, Visibility: decision.Visibility,

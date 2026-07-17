@@ -186,9 +186,155 @@ func (store Store) CompleteAttempt(
 		}},
 	}})
 	if err != nil {
+		terminal, reconcileErr := store.completeAttemptBesideTerminal(ctx, record, completion)
+		if reconcileErr == nil && terminal {
+			return worker.ErrConcurrentTerminal
+		}
+		if reconcileErr != nil {
+			return fmt.Errorf("persist notification attempt completion after terminal race: %w", reconcileErr)
+		}
 		return fmt.Errorf("persist notification attempt completion: %w", err)
 	}
 	return nil
+}
+
+func (store Store) completeAttemptBesideTerminal(
+	ctx context.Context,
+	record worker.DeliveryRecord,
+	completion worker.AttemptCompletion,
+) (bool, error) {
+	refreshed, terminal, err := store.Refresh(ctx, record)
+	if err != nil || !terminal {
+		return false, err
+	}
+	attemptKey, err := notifications.AttemptStorageKey(record.Delivery.DeliveryID, completion.AttemptID)
+	if err != nil {
+		return false, err
+	}
+	attempt, err := store.loadAttemptForTerminalCompletion(ctx, attemptKey, record.Delivery.DeliveryID, completion)
+	if err != nil {
+		return false, err
+	}
+	if attempt.Outcome != notifications.AttemptOutcomeStarted {
+		return true, nil
+	}
+
+	deliveryKey, err := notifications.DeliveryStorageKey(record.Delivery.OutboxID, record.Delivery.DeliveryID)
+	if err != nil {
+		return false, err
+	}
+	encodedDeliveryKey, _ := attributevalue.MarshalMap(map[string]string{
+		"PK": deliveryKey.PartitionKey, "SK": deliveryKey.SortKey,
+	})
+	encodedAttemptKey, _ := attributevalue.MarshalMap(map[string]string{
+		"PK": attemptKey.PartitionKey, "SK": attemptKey.SortKey,
+	})
+	deliveryValues, _ := attributevalue.MarshalMap(map[string]any{
+		":entity": "notification_delivery", ":delivery_id": record.Delivery.DeliveryID,
+		":terminal_state": string(refreshed.Delivery.State), ":terminal_revision": refreshed.Revision,
+	})
+	attemptSet := []string{
+		"#outcome = :outcome", "#completed_at = :completed_at", "#possibly_accepted = :possibly_accepted",
+	}
+	attemptValuesMap := map[string]any{
+		":entity": "notification_attempt", ":delivery_id": record.Delivery.DeliveryID,
+		":attempt_id": completion.AttemptID, ":started": string(notifications.AttemptOutcomeStarted),
+		":outcome": string(completion.Outcome), ":completed_at": fixedTime(completion.CompletedAt),
+		":possibly_accepted": completion.PossiblyAccepted || record.PossiblyAccepted,
+	}
+	if completion.ErrorCategory != "" {
+		attemptValuesMap[":error_category"] = completion.ErrorCategory
+		attemptSet = append(attemptSet, "#error_category = :error_category")
+	}
+	if completion.ProviderMessageID != "" {
+		attemptValuesMap[":provider_message_id"] = completion.ProviderMessageID
+		attemptSet = append(attemptSet, "#provider_message_id = :provider_message_id")
+	}
+	if completion.ProviderOutcome != "" {
+		attemptValuesMap[":provider_outcome"] = string(completion.ProviderOutcome)
+		attemptSet = append(attemptSet, "#provider_outcome = :provider_outcome")
+	}
+	attemptValues, err := attributevalue.MarshalMap(attemptValuesMap)
+	if err != nil {
+		return false, err
+	}
+	attemptUpdate := "SET " + strings.Join(attemptSet, ", ")
+	attemptCondition := "#entity = :entity AND #delivery_id = :delivery_id AND #attempt_id = :attempt_id AND #outcome = :started"
+	attemptNames := map[string]string{
+		"#entity": "entity_type", "#delivery_id": "delivery_id", "#attempt_id": "attempt_id",
+		"#outcome": "outcome", "#completed_at": "completed_at", "#possibly_accepted": "possibly_accepted",
+		"#error_category": "error_category", "#provider_message_id": "provider_message_id",
+		"#provider_outcome": "provider_outcome",
+	}
+	_, err = store.Client.TransactWriteItems(ctx, &awssdk.TransactWriteItemsInput{
+		TransactItems: []types.TransactWriteItem{
+			{ConditionCheck: &types.ConditionCheck{
+				TableName: aws.String(store.Table), Key: encodedDeliveryKey,
+				ConditionExpression: aws.String("#entity = :entity AND #delivery_id = :delivery_id AND #state = :terminal_state AND #revision = :terminal_revision"),
+				ExpressionAttributeNames: map[string]string{
+					"#entity": "entity_type", "#delivery_id": "delivery_id", "#state": "state", "#revision": "delivery_revision",
+				},
+				ExpressionAttributeValues: deliveryValues,
+			}},
+			{Update: &types.Update{
+				TableName: aws.String(store.Table), Key: encodedAttemptKey,
+				UpdateExpression: aws.String(attemptUpdate), ConditionExpression: aws.String(attemptCondition),
+				ExpressionAttributeNames:  usedNames(attemptNames, attemptUpdate+" "+attemptCondition),
+				ExpressionAttributeValues: attemptValues,
+			}},
+		},
+	})
+	if err == nil {
+		return true, nil
+	}
+	current, loadErr := store.loadAttemptForTerminalCompletion(ctx, attemptKey, record.Delivery.DeliveryID, completion)
+	if loadErr == nil && current.Outcome != notifications.AttemptOutcomeStarted {
+		return true, nil
+	}
+	if loadErr != nil {
+		return false, loadErr
+	}
+	return false, fmt.Errorf("finalize current attempt beside terminal delivery: %w", err)
+}
+
+func (store Store) loadAttemptForTerminalCompletion(
+	ctx context.Context,
+	key notifications.StorageKey,
+	deliveryID string,
+	completion worker.AttemptCompletion,
+) (attemptItem, error) {
+	item, err := store.getConsistent(ctx, key.PartitionKey, key.SortKey)
+	if err != nil {
+		return attemptItem{}, err
+	}
+	if len(item) == 0 {
+		return attemptItem{}, fmt.Errorf("current notification attempt is missing")
+	}
+	var attempt attemptItem
+	if err := attributevalue.UnmarshalMap(item, &attempt); err != nil {
+		return attemptItem{}, fmt.Errorf("decode current notification attempt: %w", err)
+	}
+	if attempt.PK != key.PartitionKey || attempt.SK != key.SortKey || attempt.EntityType != "notification_attempt" ||
+		attempt.DeliveryID != deliveryID || attempt.AttemptID != completion.AttemptID || attempt.Outcome.Validate() != nil {
+		return attemptItem{}, fmt.Errorf("current notification attempt identity is invalid")
+	}
+	if attempt.ProviderOutcome != "" && attempt.ProviderOutcome.Validate() != nil {
+		return attemptItem{}, fmt.Errorf("current notification attempt provider outcome is invalid")
+	}
+	if completion.ProviderMessageID != "" && attempt.ProviderMessageID != "" &&
+		completion.ProviderMessageID != attempt.ProviderMessageID {
+		return attemptItem{}, fmt.Errorf("current notification attempt provider association changed")
+	}
+	if attempt.Outcome == notifications.AttemptOutcomeStarted {
+		if attempt.CompletedAt != "" {
+			return attemptItem{}, fmt.Errorf("started notification attempt has completion time")
+		}
+		return attempt, nil
+	}
+	if _, err := parseRequiredTime("current notification attempt completed_at", attempt.CompletedAt); err != nil {
+		return attemptItem{}, err
+	}
+	return attempt, nil
 }
 
 func validateCompletion(completion worker.AttemptCompletion) error {

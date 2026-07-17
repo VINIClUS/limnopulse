@@ -91,6 +91,46 @@ func (event Event) Validate() error {
 			return err
 		}
 	}
+	return event.validateSemantics()
+}
+
+func (event Event) validateSemantics() error {
+	wantOutcome := notifications.ProviderOutcome("")
+	wantSuppression := SuppressionReason("")
+	wantAccepted := true
+	wantPermanent := false
+	switch event.SemanticType {
+	case SemanticSend:
+		wantOutcome = notifications.ProviderOutcomeAccepted
+	case SemanticDelivery:
+		wantOutcome = notifications.ProviderOutcomeDeliveredToMailServer
+	case SemanticDeliveryDelay:
+		wantOutcome = notifications.ProviderOutcomeDelayed
+	case SemanticSoftBounce:
+		wantOutcome = notifications.ProviderOutcomeSoftBounced
+	case SemanticHardBounce:
+		wantOutcome = notifications.ProviderOutcomeHardBounced
+		wantSuppression = SuppressionHardBounce
+	case SemanticComplaint:
+		wantOutcome = notifications.ProviderOutcomeComplained
+		wantSuppression = SuppressionComplaint
+	case SemanticReject:
+		wantOutcome = notifications.ProviderOutcomeRejected
+		wantAccepted = false
+		wantPermanent = true
+		if event.SuppressionReason != "" && event.SuppressionReason != SuppressionRecipientReject {
+			return fmt.Errorf("feedback rejection suppression is invalid")
+		}
+	default:
+		return fmt.Errorf("unknown feedback semantic type")
+	}
+	if event.ProviderOutcome != wantOutcome || event.AcceptedEvidence != wantAccepted ||
+		event.PermanentFailure != wantPermanent {
+		return fmt.Errorf("feedback semantic flags are inconsistent")
+	}
+	if event.SemanticType != SemanticReject && event.SuppressionReason != wantSuppression {
+		return fmt.Errorf("feedback suppression is inconsistent")
+	}
 	return nil
 }
 
