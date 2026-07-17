@@ -299,6 +299,36 @@ func (delivery *Delivery) ApplyLateAcceptance() (bool, error) {
 	}
 }
 
+// ReconcileDeliveryStateFromProvider applies feedback that can arrive before,
+// after, or out of order with the synchronous SES response. Provider outcome
+// remains a separate monotonic dimension; the delivery state only records
+// whether the provider call is now known to have completed. A cancelled
+// delivery is an authorization decision and can never be resurrected by late
+// provider feedback.
+func ReconcileDeliveryStateFromProvider(
+	current DeliveryState,
+	incoming ProviderOutcome,
+) (DeliveryState, error) {
+	if err := current.Validate(); err != nil {
+		return "", err
+	}
+	if err := incoming.Validate(); err != nil {
+		return "", err
+	}
+	switch current {
+	case DeliveryStateCancelled, DeliveryStatePermanentFailed:
+		return current, nil
+	case DeliveryStateProcessing, DeliveryStateRetryableFailed,
+		DeliveryStateSucceeded, DeliveryStateUnknown:
+		if incoming == ProviderOutcomeRejected {
+			return DeliveryStatePermanentFailed, nil
+		}
+		return DeliveryStateSucceeded, nil
+	default:
+		return "", fmt.Errorf("provider feedback cannot reconcile delivery from %q", current)
+	}
+}
+
 func (delivery Delivery) Validate() error {
 	for name, value := range map[string]string{
 		"tenant ID":        delivery.TenantID,

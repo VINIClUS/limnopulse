@@ -283,6 +283,48 @@ func TestLateAcceptanceIsExplicitAndCannotResurrectCancelled(t *testing.T) {
 	}
 }
 
+func TestProviderFeedbackReconcilesDeliveryStateWithoutResurrectingCancellation(t *testing.T) {
+	tests := []struct {
+		name     string
+		current  DeliveryState
+		incoming ProviderOutcome
+		want     DeliveryState
+	}{
+		{name: "fast send completes processing", current: DeliveryStateProcessing, incoming: ProviderOutcomeAccepted, want: DeliveryStateSucceeded},
+		{name: "delay proves provider acceptance", current: DeliveryStateRetryableFailed, incoming: ProviderOutcomeDelayed, want: DeliveryStateSucceeded},
+		{name: "late send promotes unknown", current: DeliveryStateUnknown, incoming: ProviderOutcomeAccepted, want: DeliveryStateSucceeded},
+		{name: "reject is permanent", current: DeliveryStateProcessing, incoming: ProviderOutcomeRejected, want: DeliveryStatePermanentFailed},
+		{name: "cancelled recovery stays cancelled", current: DeliveryStateCancelled, incoming: ProviderOutcomeAccepted, want: DeliveryStateCancelled},
+		{name: "terminal failure is not resurrected", current: DeliveryStatePermanentFailed, incoming: ProviderOutcomeDeliveredToMailServer, want: DeliveryStatePermanentFailed},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			got, err := ReconcileDeliveryStateFromProvider(test.current, test.incoming)
+			if err != nil {
+				t.Fatalf("ReconcileDeliveryStateFromProvider() error = %v", err)
+			}
+			if got != test.want {
+				t.Fatalf("state = %q, want %q", got, test.want)
+			}
+		})
+	}
+}
+
+func TestProviderFeedbackStateReconciliationRejectsImpossibleOrUnknownInputs(t *testing.T) {
+	for _, test := range []struct {
+		current  DeliveryState
+		incoming ProviderOutcome
+	}{
+		{current: DeliveryStatePending, incoming: ProviderOutcomeAccepted},
+		{current: "invented", incoming: ProviderOutcomeAccepted},
+		{current: DeliveryStateProcessing, incoming: "invented"},
+	} {
+		if _, err := ReconcileDeliveryStateFromProvider(test.current, test.incoming); err == nil {
+			t.Fatalf("reconciliation accepted state=%q outcome=%q", test.current, test.incoming)
+		}
+	}
+}
+
 func TestDeliverySnapshotMarshalsAndRestoresEncapsulatedState(t *testing.T) {
 	delivery := validDelivery(t, mustDeliveryID(t))
 	if changed, err := delivery.ApplyTransition(DeliveryStateQueued); err != nil || !changed {
