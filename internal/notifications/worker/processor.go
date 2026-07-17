@@ -177,6 +177,9 @@ func (processor Processor) Handle(ctx context.Context, message QueueMessage) Dec
 		}
 		return Decision{Action: ActionDelete}
 	}
+	if ctx.Err() != nil {
+		return processor.deferClaim(ctx, record, processor.Now().UTC(), "worker_context_cancelled", time.Minute)
+	}
 
 	attemptID := processor.NewAttemptID()
 	attemptStartedAt := processor.Now().UTC()
@@ -188,30 +191,16 @@ func (processor Processor) Handle(ctx context.Context, message QueueMessage) Dec
 	if err != nil {
 		return Decision{Action: ActionChangeVisibility, Visibility: time.Minute, ErrorCategory: "attempt_start_failure"}
 	}
-	providerBaseCtx := ctx
-	stopProviderGuard := func() error { return nil }
-	if processor.Guard != nil {
-		providerBaseCtx, stopProviderGuard = processor.Guard.Protect(ctx, message, record)
-	}
-	providerGuardStopped := false
-	stopProvider := func() error {
-		if providerGuardStopped {
-			return nil
-		}
-		providerGuardStopped = true
-		return stopProviderGuard()
-	}
-	defer stopProvider()
-	if providerBaseCtx.Err() != nil {
-		_ = stopProvider()
-		return processor.completePreSendCancellation(ctx, record, processor.Now().UTC())
-	}
 
 	providerTimeout := processor.ProviderTimeout
 	if providerTimeout <= 0 {
 		providerTimeout = 15 * time.Second
 	}
-	providerCtx, cancelProvider := context.WithTimeout(providerBaseCtx, providerTimeout)
+	// The limiter guard is stopped only after its in-flight renewal completes.
+	// With the configured lease/visibility headroom and bounded provider timeout,
+	// BeginAttempt can remain immediately adjacent to the single provider call.
+	// This keeps attempt_count equal to the number of EmailSender invocations.
+	providerCtx, cancelProvider := context.WithTimeout(ctx, providerTimeout)
 	processor.Metrics.ProviderCallStarted(record.PossiblyAccepted)
 	result, sendErr := processor.Sender.Send(providerCtx, SendRequest{
 		Delivery: record.Delivery, AttemptID: attemptID, AttemptNumber: record.AttemptCount,
@@ -219,57 +208,7 @@ func (processor Processor) Handle(ctx context.Context, message QueueMessage) Dec
 	processor.Metrics.ProviderCallFinished()
 	cancelProvider()
 	completedAt := processor.Now().UTC()
-	guardErr := stopProvider()
-	if guardErr != nil && sendErr == nil {
-		result = SendResult{}
-		sendErr = NewSendError(ErrorAmbiguousConnectionReset, guardErr)
-	}
 	return processor.finishAttempt(ctx, record, attemptID, completedAt, result, sendErr)
-}
-
-func (processor Processor) completePreSendCancellation(
-	ctx context.Context,
-	record DeliveryRecord,
-	now time.Time,
-) Decision {
-	completion := AttemptCompletion{
-		AttemptID: record.LastAttemptID, CompletedAt: now,
-		Outcome:       notifications.AttemptOutcomeRetryable,
-		ErrorCategory: "lease_renewal_failed",
-	}
-	decision := Decision{Action: ActionDelete}
-	if record.AttemptCount >= MaxProviderCalls {
-		if record.PossiblyAccepted {
-			delay := RetryDelay(record.AttemptCount, true, processor.JitterFraction())
-			completion.NextState = notifications.DeliveryStateRetryableFailed
-			completion.NextAttemptAt = now.Add(delay)
-			completion.PossiblyAccepted = true
-			completion.AmbiguousExhausted = true
-			decision = Decision{
-				Action: ActionChangeVisibility, Visibility: normalizedVisibility(delay),
-				ErrorCategory: "lease_renewal_failed",
-			}
-		} else {
-			completion.NextState = notifications.DeliveryStatePermanentFailed
-		}
-	} else {
-		delay := RetryDelay(record.AttemptCount, false, processor.JitterFraction())
-		completion.NextState = notifications.DeliveryStateRetryableFailed
-		completion.NextAttemptAt = now.Add(delay)
-		decision = Decision{
-			Action: ActionChangeVisibility, Visibility: normalizedVisibility(delay),
-			ErrorCategory: "lease_renewal_failed",
-		}
-	}
-	mutationCtx, cancel := mutationContext(ctx)
-	defer cancel()
-	if err := processor.Store.CompleteAttempt(mutationCtx, record, completion); err != nil {
-		if errors.Is(err, ErrConcurrentTerminal) {
-			return Decision{Action: ActionDelete}
-		}
-		return Decision{Action: ActionChangeVisibility, Visibility: time.Minute, ErrorCategory: "attempt_completion_failure"}
-	}
-	return decision
 }
 
 func (processor Processor) completeInterrupted(

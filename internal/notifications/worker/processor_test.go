@@ -51,7 +51,7 @@ func TestProcessorRenewalFailureBeforeSendNeverCallsProvider(t *testing.T) {
 	}
 }
 
-func TestProcessorRestartsRenewalGuardWithAttemptRevisionBeforeProviderCall(t *testing.T) {
+func TestProcessorStopsRenewalGuardBeforeAttemptAndPairsCountWithProviderCall(t *testing.T) {
 	store := &fakeStore{acquire: claimedRecord(t, 0), gate: GateResult{Allowed: true}}
 	sender := &fakeSender{result: SendResult{ProviderMessageID: "ses_1"}}
 	guard := &recordingGuard{}
@@ -59,11 +59,10 @@ func TestProcessorRestartsRenewalGuardWithAttemptRevisionBeforeProviderCall(t *t
 	processor.Guard = guard
 
 	decision := processor.Handle(context.Background(), validMessage(t))
-	if decision.Action != ActionDelete || len(guard.records) != 2 || guard.stopped != 2 {
+	if decision.Action != ActionDelete || len(guard.records) != 1 || guard.stopped != 1 || sender.calls != 1 {
 		t.Fatalf("decision=%#v records=%#v stopped=%d", decision, guard.records, guard.stopped)
 	}
-	if guard.records[0].Revision != 3 || guard.records[0].AttemptCount != 0 ||
-		guard.records[1].Revision != 4 || guard.records[1].AttemptCount != 1 {
+	if guard.records[0].Revision != 3 || guard.records[0].AttemptCount != 0 {
 		t.Fatalf("guard records = %#v", guard.records)
 	}
 }
@@ -100,49 +99,49 @@ func TestProcessorWaitsForCrossingLimiterRenewalBeforeBeginningAttempt(t *testin
 	}
 }
 
-func TestProcessorProviderGuardFailureAfterBeginCompletesAttemptAsAmbiguous(t *testing.T) {
+func TestProcessorDoesNotOpenSecondRenewalWindowBetweenAttemptAndProvider(t *testing.T) {
 	store := &fakeStore{acquire: claimedRecord(t, 0), gate: GateResult{Allowed: true}}
-	sender := &fakeSender{}
+	sender := &fakeSender{result: SendResult{ProviderMessageID: "ses_1"}}
 	processor := testProcessor(store, sender)
-	processor.Guard = &secondFailingGuard{}
+	guard := &secondFailingGuard{}
+	processor.Guard = guard
 
 	decision := processor.Handle(context.Background(), validMessage(t))
-	if decision.Action != ActionChangeVisibility || store.begun != 1 || store.completion == nil ||
-		store.completion.Outcome != notifications.AttemptOutcomeRetryable ||
-		store.completion.ErrorCategory != "lease_renewal_failed" ||
-		store.completion.PossiblyAccepted || sender.calls != 0 {
+	if decision.Action != ActionDelete || store.begun != 1 || store.completion == nil ||
+		store.completion.Outcome != notifications.AttemptOutcomeSucceeded ||
+		sender.calls != 1 || guard.calls != 1 {
 		t.Fatalf("decision=%#v completion=%#v sends=%d", decision, store.completion, sender.calls)
 	}
 }
 
-func TestProcessorPreSendFifthSlotPreservesHistoricalAmbiguityForFinalGrace(t *testing.T) {
+func TestProcessorFifthSlotIsConsumedByAnActualProviderCall(t *testing.T) {
 	acquired := claimedRecord(t, 4)
 	acquired.Record.PossiblyAccepted = true
 	store := &fakeStore{acquire: acquired, gate: GateResult{Allowed: true}}
-	sender := &fakeSender{}
+	sender := &fakeSender{result: SendResult{ProviderMessageID: "ses_5"}}
 	processor := testProcessor(store, sender)
-	processor.Guard = &secondFailingGuard{}
+	guard := &secondFailingGuard{}
+	processor.Guard = guard
 
 	decision := processor.Handle(context.Background(), validMessage(t))
-	if decision.Action != ActionChangeVisibility || sender.calls != 0 || store.completion == nil ||
-		store.completion.Outcome != notifications.AttemptOutcomeRetryable ||
-		store.completion.NextState != notifications.DeliveryStateRetryableFailed ||
-		!store.completion.PossiblyAccepted || !store.completion.AmbiguousExhausted ||
-		store.completion.NextAttemptAt.IsZero() {
+	if decision.Action != ActionDelete || sender.calls != 1 || sender.sawAttemptCount != 5 ||
+		store.completion == nil || store.completion.Outcome != notifications.AttemptOutcomeSucceeded ||
+		guard.calls != 1 {
 		t.Fatalf("decision=%#v completion=%#v sends=%d", decision, store.completion, sender.calls)
 	}
 }
 
-func TestProcessorProviderGuardStopFailureOverridesApparentSuccessAsAmbiguous(t *testing.T) {
+func TestProcessorDoesNotLetAnUnusedSecondGuardOverrideProviderSuccess(t *testing.T) {
 	store := &fakeStore{acquire: claimedRecord(t, 0), gate: GateResult{Allowed: true}}
 	sender := &fakeSender{result: SendResult{ProviderMessageID: "ses_maybe_accepted"}}
 	processor := testProcessor(store, sender)
-	processor.Guard = &secondStopFailingGuard{}
+	guard := &secondStopFailingGuard{}
+	processor.Guard = guard
 
 	decision := processor.Handle(context.Background(), validMessage(t))
-	if decision.Action != ActionChangeVisibility || sender.calls != 1 || store.completion == nil ||
-		store.completion.Outcome != notifications.AttemptOutcomeAmbiguous ||
-		store.completion.ProviderMessageID != "" || !store.completion.PossiblyAccepted {
+	if decision.Action != ActionDelete || sender.calls != 1 || store.completion == nil ||
+		store.completion.Outcome != notifications.AttemptOutcomeSucceeded ||
+		store.completion.ProviderMessageID != "ses_maybe_accepted" || guard.calls != 1 {
 		t.Fatalf("decision=%#v completion=%#v sends=%d", decision, store.completion, sender.calls)
 	}
 }
