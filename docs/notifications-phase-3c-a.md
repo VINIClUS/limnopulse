@@ -140,8 +140,11 @@ notifications relay \
 ```
 
 The relay owns virtual bucket `B` when `B % shard_count == shard`, queries the
-GSI with pagination, caps work at 250 by default and exits within a 45-second
-deadline. A nonzero exit, `scope_completed=false`, `cap_reached`,
+GSI with pagination, caps work at 250 by default and gives domain work a
+45-second global deadline. Final no-PII OTLP export has a separate bounded
+2-second shutdown budget, so the process hard envelope is 47 seconds and
+remains below the 60-second cadence. A nonzero exit,
+`scope_completed=false`, `cap_reached`,
 `deadline_reached`, `work_remaining` or `retry_recommended` means the external
 scheduler/operator must run it again. Overlapping invocations remain safe due
 to leases, fencing and conditional writes, but the scheduler should still avoid
