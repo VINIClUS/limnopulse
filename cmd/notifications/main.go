@@ -20,6 +20,8 @@ import (
 	relaydynamo "github.com/VINIClUS/limnopulse/internal/notifications/relay/dynamo"
 	relaysqs "github.com/VINIClUS/limnopulse/internal/notifications/relay/sqs"
 	relaytelemetry "github.com/VINIClUS/limnopulse/internal/notifications/relay/telemetry"
+	"github.com/VINIClUS/limnopulse/internal/notifications/worker"
+	workerconfig "github.com/VINIClUS/limnopulse/internal/notifications/worker/config"
 	"github.com/aws/aws-sdk-go-v2/aws"
 	awsconfig "github.com/aws/aws-sdk-go-v2/config"
 	"github.com/aws/aws-sdk-go-v2/credentials"
@@ -36,12 +38,14 @@ const (
 
 type loadDynamoFunc func(context.Context, string, string) (notificationdynamo.Client, error)
 type runRelayFunc func(context.Context, relayconfig.RunConfig) (relay.RunSummary, error)
+type runWorkerFunc func(context.Context, workerconfig.RunConfig) (worker.RunSummary, error)
 
 type dependencies struct {
 	Output     io.Writer
 	LookupEnv  func(string) (string, bool)
 	LoadDynamo loadDynamoFunc
 	RunRelay   runRelayFunc
+	RunWorker  runWorkerFunc
 }
 
 type commandResult struct {
@@ -89,6 +93,7 @@ func defaultDependencies() dependencies {
 		LookupEnv:  os.LookupEnv,
 		LoadDynamo: loadDynamo,
 		RunRelay:   executeRelay,
+		RunWorker:  executeWorker,
 	}
 }
 
@@ -97,6 +102,8 @@ func runMain(ctx context.Context, args []string, deps dependencies) int {
 		return writeFatal(deps.Output, "configuration")
 	}
 	switch args[0] {
+	case "worker":
+		return runWorkerCommand(ctx, args[1:], deps)
 	case "relay":
 		return runRelayCommand(ctx, args[1:], deps)
 	case "backfill-relay":

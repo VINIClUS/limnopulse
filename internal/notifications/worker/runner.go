@@ -1,0 +1,221 @@
+package worker
+
+import (
+	"context"
+	"sync"
+	"time"
+)
+
+type Handler interface {
+	Handle(context.Context, QueueMessage) Decision
+}
+
+type RunSummary struct {
+	Result               string          `json:"result"`
+	ExitCode             int             `json:"exit_code"`
+	Graceful             bool            `json:"graceful"`
+	Fatal                bool            `json:"fatal"`
+	DrainTimedOut        bool            `json:"drain_timed_out"`
+	MessagesReceived     int             `json:"messages_received"`
+	MessagesDeleted      int             `json:"messages_deleted"`
+	VisibilityChanged    int             `json:"visibility_changed"`
+	QueueErrors          int             `json:"queue_errors"`
+	ErrorCategories      map[string]int  `json:"error_categories,omitempty"`
+	Metrics              MetricsSnapshot `json:"metrics"`
+	TelemetryExportError string          `json:"telemetry_export_error,omitempty"`
+}
+
+type Runner struct {
+	Queue        Queue
+	Handler      Handler
+	Concurrency  int
+	ReceiveBatch int
+	ReceiveWait  time.Duration
+	Visibility   time.Duration
+	DrainTimeout time.Duration
+}
+
+type summaryCollector struct {
+	mu      sync.Mutex
+	summary RunSummary
+}
+
+func (runner Runner) Run(ctx context.Context) RunSummary {
+	collector := &summaryCollector{summary: RunSummary{ErrorCategories: map[string]int{}}}
+	if runner.Queue == nil || runner.Handler == nil || runner.Concurrency < 1 ||
+		runner.ReceiveBatch < 1 || runner.ReceiveBatch > 10 || runner.ReceiveWait < 0 || runner.Visibility <= 0 {
+		collector.addError("configuration")
+		collector.summary.Fatal = true
+		return collector.snapshot()
+	}
+	drainTimeout := runner.DrainTimeout
+	if drainTimeout <= 0 {
+		drainTimeout = 30 * time.Second
+	}
+	receiveCtx, cancelReceive := context.WithCancel(ctx)
+	defer cancelReceive()
+	processCtx, cancelProcess := context.WithCancel(context.WithoutCancel(ctx))
+	defer cancelProcess()
+	semaphore := make(chan struct{}, runner.Concurrency)
+	var inflight sync.WaitGroup
+	fatal := make(chan string, 1)
+	fatalCategory := ""
+
+receiveLoop:
+	for {
+		select {
+		case fatalCategory = <-fatal:
+			break receiveLoop
+		default:
+		}
+		messages, err := runner.Queue.Receive(receiveCtx, runner.ReceiveBatch, runner.ReceiveWait, runner.Visibility)
+		if err != nil {
+			if receiveCtx.Err() != nil {
+				select {
+				case fatalCategory = <-fatal:
+				default:
+				}
+				break receiveLoop
+			}
+			fatalCategory = "queue_receive_failure"
+			break receiveLoop
+		}
+		collector.addReceived(len(messages))
+		for _, message := range messages {
+			select {
+			case semaphore <- struct{}{}:
+			case fatalCategory = <-fatal:
+				break receiveLoop
+			case <-receiveCtx.Done():
+				select {
+				case fatalCategory = <-fatal:
+				default:
+				}
+				break receiveLoop
+			}
+			inflight.Add(1)
+			go func(message QueueMessage) {
+				defer inflight.Done()
+				defer func() { <-semaphore }()
+				decision := runner.Handler.Handle(processCtx, message)
+				if decision.Action == ActionFatal {
+					category := decision.ErrorCategory
+					if category == "" {
+						category = "fatal_worker"
+					}
+					select {
+					case fatal <- category:
+					default:
+					}
+					cancelReceive()
+				}
+				runner.applyDecision(processCtx, collector, message, decision)
+			}(message)
+		}
+	}
+	cancelReceive()
+	if fatalCategory != "" {
+		collector.addError(fatalCategory)
+		collector.setFatal()
+	}
+	drained := make(chan struct{})
+	go func() { inflight.Wait(); close(drained) }()
+	select {
+	case <-drained:
+		if fatalCategory == "" {
+			collector.setGraceful()
+		}
+	case <-time.After(drainTimeout):
+		cancelProcess()
+		collector.setDrainTimedOut()
+		collector.addError("drain_timeout")
+		collector.setFatal()
+	}
+	return collector.snapshot()
+}
+
+func (runner Runner) applyDecision(
+	ctx context.Context,
+	collector *summaryCollector,
+	message QueueMessage,
+	decision Decision,
+) {
+	switch decision.Action {
+	case ActionDelete:
+		if err := runner.Queue.Delete(ctx, message); err != nil {
+			collector.addQueueError("queue_delete_failure")
+			return
+		}
+		collector.addDeleted()
+	case ActionChangeVisibility, ActionFatal:
+		if err := runner.Queue.ChangeVisibility(ctx, message, normalizedVisibility(decision.Visibility)); err != nil {
+			collector.addQueueError("queue_visibility_failure")
+			return
+		}
+		collector.addVisibility()
+	default:
+		collector.addQueueError("invalid_decision")
+	}
+}
+
+func (collector *summaryCollector) addReceived(count int) {
+	collector.mu.Lock()
+	defer collector.mu.Unlock()
+	collector.summary.MessagesReceived += count
+}
+func (collector *summaryCollector) addDeleted() {
+	collector.mu.Lock()
+	defer collector.mu.Unlock()
+	collector.summary.MessagesDeleted++
+}
+func (collector *summaryCollector) addVisibility() {
+	collector.mu.Lock()
+	defer collector.mu.Unlock()
+	collector.summary.VisibilityChanged++
+}
+func (collector *summaryCollector) addQueueError(category string) {
+	collector.mu.Lock()
+	defer collector.mu.Unlock()
+	collector.summary.QueueErrors++
+	collector.summary.ErrorCategories[category]++
+}
+func (collector *summaryCollector) addError(category string) {
+	collector.mu.Lock()
+	defer collector.mu.Unlock()
+	if category != "" {
+		collector.summary.ErrorCategories[category]++
+	}
+}
+func (collector *summaryCollector) setFatal() {
+	collector.mu.Lock()
+	defer collector.mu.Unlock()
+	collector.summary.Fatal = true
+	collector.summary.Graceful = false
+}
+func (collector *summaryCollector) setGraceful() {
+	collector.mu.Lock()
+	defer collector.mu.Unlock()
+	collector.summary.Graceful = true
+}
+func (collector *summaryCollector) setDrainTimedOut() {
+	collector.mu.Lock()
+	defer collector.mu.Unlock()
+	collector.summary.DrainTimedOut = true
+}
+func (collector *summaryCollector) snapshot() RunSummary {
+	collector.mu.Lock()
+	defer collector.mu.Unlock()
+	snapshot := collector.summary
+	if snapshot.Fatal || !snapshot.Graceful {
+		snapshot.Result = "fatal_failure"
+		snapshot.ExitCode = 1
+	} else {
+		snapshot.Result = "success"
+		snapshot.ExitCode = 0
+	}
+	snapshot.ErrorCategories = make(map[string]int, len(collector.summary.ErrorCategories))
+	for category, count := range collector.summary.ErrorCategories {
+		snapshot.ErrorCategories[category] = count
+	}
+	return snapshot
+}

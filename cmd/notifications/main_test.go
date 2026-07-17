@@ -15,11 +15,101 @@ import (
 	notificationdynamo "github.com/VINIClUS/limnopulse/internal/notifications/dynamo"
 	"github.com/VINIClUS/limnopulse/internal/notifications/relay"
 	relayconfig "github.com/VINIClUS/limnopulse/internal/notifications/relay/config"
+	"github.com/VINIClUS/limnopulse/internal/notifications/worker"
+	workerconfig "github.com/VINIClUS/limnopulse/internal/notifications/worker/config"
 	"github.com/aws/aws-sdk-go-v2/aws"
 	"github.com/aws/aws-sdk-go-v2/feature/dynamodb/attributevalue"
 	awssdk "github.com/aws/aws-sdk-go-v2/service/dynamodb"
 	"github.com/aws/aws-sdk-go-v2/service/dynamodb/types"
 )
+
+func TestWorkerLoadsContinuousConfigAndReturnsGracefulExitWithoutPII(t *testing.T) {
+	privateQueue := "http://sqs:9324/queue/private-jobs"
+	environment := map[string]string{
+		"APP_ENV": "local", "AWS_REGION": "us-east-1", "DYNAMODB_DOMAIN_TABLE": "private-domain",
+		"DYNAMODB_ENDPOINT_URL": "http://dynamodb:8000", "SQS_NOTIFICATION_JOBS_URL": privateQueue,
+		"SQS_ENDPOINT_URL": "http://sqs:9324", "SES_FROM_EMAIL": "private-sender@example.com",
+		"SES_ENDPOINT_URL": "http://ses:8080",
+	}
+	var captured workerconfig.RunConfig
+	var output bytes.Buffer
+	exitCode := runMain(context.Background(), []string{
+		"worker", "--send-concurrency=7", "--max-send-rate=3.5", "--send-burst=2",
+	}, dependencies{
+		Output:    &output,
+		LookupEnv: func(key string) (string, bool) { value, ok := environment[key]; return value, ok },
+		RunWorker: func(_ context.Context, config workerconfig.RunConfig) (worker.RunSummary, error) {
+			captured = config
+			return worker.RunSummary{Graceful: true, Result: "success", ExitCode: 0,
+				Metrics: worker.MetricsSnapshot{ConfiguredRate: config.MaxSendRate}}, nil
+		},
+	})
+	if exitCode != 0 || captured.SendConcurrency != 7 || captured.MaxSendRate != 3.5 || captured.SendBurst != 2 ||
+		captured.ReceiveWait != 20*time.Second || captured.ReceiveBatch != 10 ||
+		captured.VisibilityTimeout != time.Minute || captured.ProcessingLease != time.Minute ||
+		captured.ProviderTimeout != 15*time.Second || captured.DrainTimeout != 30*time.Second ||
+		captured.SQSReceiveTimeout != 25*time.Second || captured.SQSRequestTimeout != 5*time.Second {
+		t.Fatalf("exit=%d config=%#v output=%s", exitCode, captured, output.String())
+	}
+	for _, private := range []string{privateQueue, "private-domain", "private-sender@example.com", "dynamodb:8000", "ses:8080"} {
+		if strings.Contains(output.String(), private) {
+			t.Fatalf("worker summary leaked %q: %s", private, output.String())
+		}
+	}
+	var summary worker.RunSummary
+	if err := json.Unmarshal(output.Bytes(), &summary); err != nil {
+		t.Fatal(err)
+	}
+	if summary.Result != "success" || summary.ExitCode != 0 || summary.Metrics.ConfiguredRate != 3.5 {
+		t.Fatalf("summary = %#v", summary)
+	}
+}
+
+func TestWorkerRejectsConfigurationBeforeAWSAndMapsFatalRun(t *testing.T) {
+	validEnv := map[string]string{
+		"APP_ENV": "test", "AWS_REGION": "us-east-1", "DYNAMODB_DOMAIN_TABLE": "domain",
+		"SQS_NOTIFICATION_JOBS_URL": "queue", "SES_FROM_EMAIL": "sender@example.com",
+	}
+	tests := []struct {
+		name                string
+		args                []string
+		env                 map[string]string
+		run                 worker.RunSummary
+		runErr              error
+		wantCalls, wantExit int
+	}{
+		{name: "missing", args: []string{"worker"}, env: map[string]string{}, wantExit: 1},
+		{name: "bad flag", args: []string{"worker", "--send-concurrency=0"}, env: validEnv, wantExit: 1},
+		{name: "positional", args: []string{"worker", "extra"}, env: validEnv, wantExit: 1},
+		{name: "fatal provider", args: []string{"worker"}, env: validEnv,
+			run: worker.RunSummary{Fatal: true, Result: "fatal_failure", ExitCode: 1}, wantCalls: 1, wantExit: 1},
+		{name: "setup error", args: []string{"worker"}, env: validEnv, runErr: errors.New("private setup"), wantCalls: 1, wantExit: 1},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			calls := 0
+			var output bytes.Buffer
+			exit := runMain(context.Background(), test.args, dependencies{
+				Output:    &output,
+				LookupEnv: func(key string) (string, bool) { value, ok := test.env[key]; return value, ok },
+				RunWorker: func(context.Context, workerconfig.RunConfig) (worker.RunSummary, error) {
+					calls++
+					return test.run, test.runErr
+				},
+			})
+			if exit != test.wantExit || calls != test.wantCalls || strings.Contains(output.String(), "private setup") {
+				t.Fatalf("exit=%d calls=%d output=%s", exit, calls, output.String())
+			}
+		})
+	}
+}
+
+func TestWorkerTelemetryInitializationFailureKeepsAggregateMetricsAvailable(t *testing.T) {
+	metrics, state := newWorkerMetrics(2.5, nil, errors.New("collector unavailable"))
+	if metrics == nil || metrics.Snapshot().ConfiguredRate != 2.5 || state != "initialization_failed" {
+		t.Fatalf("metrics=%#v state=%q", metrics, state)
+	}
+}
 
 func TestRelayLoadsValidatedOneShotConfigAndWritesNoPIISummary(t *testing.T) {
 	privateQueue := "http://sqs:9324/queue/private-jobs"
