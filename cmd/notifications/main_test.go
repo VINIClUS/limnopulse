@@ -285,6 +285,21 @@ func TestRelayRejectsMissingEnvironmentAndInvalidFlagsBeforeAWS(t *testing.T) {
 	}
 }
 
+func TestRelayTelemetryFlushGetsFreshBudgetAfterRunDeadline(t *testing.T) {
+	parent, cancelParent := context.WithCancel(context.Background())
+	cancelParent()
+
+	flushCtx, cancelFlush := newRelayTelemetryFlushContext(parent, 2*time.Second)
+	defer cancelFlush()
+	if flushCtx.Err() != nil {
+		t.Fatalf("fresh telemetry context inherited run cancellation: %v", flushCtx.Err())
+	}
+	deadline, ok := flushCtx.Deadline()
+	if !ok || time.Until(deadline) <= 0 || time.Until(deadline) > 2*time.Second {
+		t.Fatalf("telemetry deadline = %s, ok = %t", deadline, ok)
+	}
+}
+
 func relayCommandLookup(key string) (string, bool) {
 	values := map[string]string{
 		"AWS_REGION": "us-east-1", "DYNAMODB_DOMAIN_TABLE": "domain",
@@ -418,6 +433,8 @@ func TestBackfillRelayRejectsInvalidScopeAndPageSizeBeforeAWS(t *testing.T) {
 		{name: "NUL flag", args: []string{"backfill-relay", "--tenant", "private\x00tenant"}, sensitive: "private"},
 		{name: "zero page size", args: []string{"backfill-relay", "--tenant", "private_tenant", "--page-size", "0"}, sensitive: "private_tenant"},
 		{name: "oversized page", args: []string{"backfill-relay", "--tenant", "private_tenant", "--page-size", "2147483648"}, sensitive: "private_tenant"},
+		{name: "zero max rows", args: []string{"backfill-relay", "--tenant", "private_tenant", "--max-rows", "0"}, sensitive: "private_tenant"},
+		{name: "zero timeout", args: []string{"backfill-relay", "--tenant", "private_tenant", "--timeout", "0s"}, sensitive: "private_tenant"},
 		{name: "positional argument", args: []string{"backfill-relay", "--tenant", "private_tenant", "extra"}, sensitive: "private_tenant"},
 	}
 	for _, test := range tests {
@@ -449,6 +466,47 @@ func TestBackfillRelayRejectsInvalidScopeAndPageSizeBeforeAWS(t *testing.T) {
 				t.Fatalf("result = %#v", result)
 			}
 		})
+	}
+}
+
+func TestBackfillRelayReportsIncompleteScopeAtTotalRowLimit(t *testing.T) {
+	privateRows := []map[string]types.AttributeValue{
+		commandOutbox(t, map[string]any{
+			"PK": "TENANT#private_tenant", "SK": "NOTIFICATION_OUTBOX#private_1",
+			"entity_type": "notification_outbox", "tenant_id": "private_tenant", "outbox_id": "private_1",
+			"channel": "email", "status": "ready", "created_at": "2026-07-15T12:00:45.000000000Z",
+		}),
+		commandOutbox(t, map[string]any{
+			"PK": "TENANT#private_tenant", "SK": "NOTIFICATION_OUTBOX#private_2",
+			"entity_type": "notification_outbox", "tenant_id": "private_tenant", "outbox_id": "private_2",
+			"channel": "email", "status": "ready", "created_at": "2026-07-15T12:00:45.000000000Z",
+		}),
+	}
+	client := &fakeDynamo{queryOutput: &awssdk.QueryOutput{Items: privateRows}}
+	var output bytes.Buffer
+
+	exitCode := runMain(context.Background(), []string{
+		"backfill-relay", "--tenant", "private_tenant", "--max-rows", "1",
+	}, dependencies{
+		Output: &output, LookupEnv: func(string) (string, bool) { return "", false },
+		LoadDynamo: func(context.Context, string, string) (notificationdynamo.Client, error) {
+			return client, nil
+		},
+	})
+	if exitCode != exitPartial {
+		t.Fatalf("exit code = %d, output = %s", exitCode, output.String())
+	}
+	var result commandResult
+	if err := json.Unmarshal(output.Bytes(), &result); err != nil {
+		t.Fatal(err)
+	}
+	if result.Result != "partial_failure" || result.ScopeCompleted || !result.RetryRecommended ||
+		result.ErrorCategories["row_limit_reached"] != 1 || result.Summary == nil ||
+		!result.Summary.LimitReached || result.Summary.RowsQueried != 1 {
+		t.Fatalf("result = %#v", result)
+	}
+	if strings.Contains(output.String(), "private_") {
+		t.Fatalf("bounded summary leaked identifiers: %s", output.String())
 	}
 }
 

@@ -104,12 +104,15 @@ enabling either publisher or consumer.
    `--apply` and repeat the dry-run until `rows_needing_update` is zero:
 
    ```bash
-   notifications backfill-relay --tenant-file tenants.txt
-   notifications backfill-relay --tenant-file tenants.txt --apply
-   notifications backfill-relay --tenant-file tenants.txt
+   notifications backfill-relay --tenant-file tenants.txt --max-rows 10000 --timeout 5m
+   notifications backfill-relay --tenant-file tenants.txt --apply --max-rows 10000 --timeout 5m
+   notifications backfill-relay --tenant-file tenants.txt --max-rows 10000 --timeout 5m
    ```
 
-   The command never scans DynamoDB. Telegram rows are marked
+   The command never scans DynamoDB. It exits partially with
+   `scope_completed=false` and either `row_limit_reached` or `deadline_reached`
+   when a bound is reached; increase the explicit bound or narrow the tenant
+   batch, then repeat the idempotent run. Telegram rows are marked
    `deferred_unsupported_channel` and are not indexed for email relay.
 6. Validate SES: `SES_FROM_EMAIL` must be a verified identity in the same
    region, `SES_CONFIGURATION_SET_NAME` must equal the OpenTofu

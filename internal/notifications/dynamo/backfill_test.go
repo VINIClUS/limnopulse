@@ -118,6 +118,50 @@ func TestBackfillRelayDryRunQueriesTenantOutboxesAndPaginatesWithoutScan(t *test
 	}
 }
 
+func TestBackfillRelayStopsAtExplicitTotalRowLimit(t *testing.T) {
+	client := &fakeClient{queryOutputs: []*awssdk.QueryOutput{{
+		Items: []map[string]types.AttributeValue{
+			mustMarshalMap(t, legacyOutbox("outbox_1", "email", "ready")),
+			mustMarshalMap(t, legacyOutbox("outbox_2", "email", "ready")),
+		},
+	}}}
+
+	summary, err := (Store{Table: "domain", Client: client}).BackfillRelay(
+		context.Background(),
+		BackfillOptions{Tenants: []string{"tnt_1"}, PageSize: 25, MaxRows: 1},
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !summary.LimitReached || summary.DeadlineReached || summary.RowsQueried != 1 ||
+		summary.RowsNeedingUpdate != 1 || summary.WouldUpdate != 1 {
+		t.Fatalf("summary = %#v", summary)
+	}
+	if len(client.queryInputs) != 1 {
+		t.Fatalf("Query calls = %d, want 1", len(client.queryInputs))
+	}
+}
+
+func TestBackfillRelayStopsCleanlyWhenDeadlineIsAlreadyReached(t *testing.T) {
+	ctx, cancel := context.WithDeadline(context.Background(), time.Now().Add(-time.Second))
+	defer cancel()
+	client := &fakeClient{}
+
+	summary, err := (Store{Table: "domain", Client: client}).BackfillRelay(
+		ctx,
+		BackfillOptions{Tenants: []string{"tnt_1"}, PageSize: 25, MaxRows: 100},
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !summary.DeadlineReached || summary.LimitReached || summary.RowsQueried != 0 {
+		t.Fatalf("summary = %#v", summary)
+	}
+	if len(client.queryInputs) != 0 {
+		t.Fatalf("deadline run made %d Query calls", len(client.queryInputs))
+	}
+}
+
 func TestBackfillRelayApplyWritesCanonicalEmailAndTelegramFieldsIdempotently(t *testing.T) {
 	readyEmail := legacyOutbox("outbox_ready", "email", "ready")
 	blockedEmail := legacyOutbox("outbox_blocked", "email", "blocked")
@@ -348,6 +392,7 @@ func TestBackfillRelayRejectsInvalidOptionsBeforeQuery(t *testing.T) {
 		{name: "no tenants", options: BackfillOptions{PageSize: 25}},
 		{name: "zero page size", options: BackfillOptions{Tenants: []string{"tnt_1"}}},
 		{name: "negative page size", options: BackfillOptions{Tenants: []string{"tnt_1"}, PageSize: -1}},
+		{name: "negative max rows", options: BackfillOptions{Tenants: []string{"tnt_1"}, PageSize: 25, MaxRows: -1}},
 		{name: "empty tenant", options: BackfillOptions{Tenants: []string{""}, PageSize: 25}},
 		{name: "blank tenant", options: BackfillOptions{Tenants: []string{"  "}, PageSize: 25}},
 		{name: "NUL tenant", options: BackfillOptions{Tenants: []string{"tnt\x00one"}, PageSize: 25}},

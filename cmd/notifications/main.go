@@ -30,10 +30,12 @@ import (
 )
 
 const (
-	exitSuccess = 0
-	exitFatal   = 1
-	exitPartial = 2
-	maxPageSize = 1<<31 - 1
+	exitSuccess            = 0
+	exitFatal              = 1
+	exitPartial            = 2
+	maxPageSize            = 1<<31 - 1
+	defaultBackfillTimeout = 5 * time.Minute
+	maxBackfillTimeout     = 24 * time.Hour
 )
 
 type loadDynamoFunc func(context.Context, string, string) (notificationdynamo.Client, error)
@@ -136,11 +138,16 @@ func runBackfillRelay(ctx context.Context, args []string, deps dependencies) int
 	var sources []tenantSource
 	var apply bool
 	var pageSize int
+	var maxRows int
+	var timeout time.Duration
 	fs.Var(tenantSourceFlagValue{Kind: tenantSourceFlag, Sources: &sources}, "tenant", "explicit tenant ID; repeatable")
 	fs.Var(tenantSourceFlagValue{Kind: tenantSourceFile, Sources: &sources}, "tenant-file", "file containing tenant IDs; repeatable")
 	fs.BoolVar(&apply, "apply", false, "write relay fields; default is dry-run")
 	fs.IntVar(&pageSize, "page-size", 25, "DynamoDB query page size")
-	if err := fs.Parse(args); err != nil || len(fs.Args()) != 0 || pageSize < 1 || pageSize > maxPageSize {
+	fs.IntVar(&maxRows, "max-rows", notificationdynamo.DefaultBackfillMaxRows, "maximum rows queried per run")
+	fs.DurationVar(&timeout, "timeout", defaultBackfillTimeout, "total backfill deadline")
+	if err := fs.Parse(args); err != nil || len(fs.Args()) != 0 || pageSize < 1 || pageSize > maxPageSize ||
+		maxRows < 1 || timeout <= 0 || timeout > maxBackfillTimeout {
 		return writeFatal(deps.Output, "configuration")
 	}
 	tenants, err := resolveTenants(sources)
@@ -154,13 +161,17 @@ func runBackfillRelay(ctx context.Context, args []string, deps dependencies) int
 	if strings.TrimSpace(region) == "" || strings.TrimSpace(table) == "" {
 		return writeFatal(deps.Output, "configuration")
 	}
-	client, err := deps.LoadDynamo(ctx, region, endpoint)
+	runCtx, cancel := context.WithTimeout(ctx, timeout)
+	defer cancel()
+	client, err := deps.LoadDynamo(runCtx, region, endpoint)
 	if err != nil {
 		return writeFatal(deps.Output, "aws_configuration")
 	}
 	summary, err := (notificationdynamo.Store{Table: table, Client: client}).BackfillRelay(
-		ctx,
-		notificationdynamo.BackfillOptions{Tenants: tenants, Apply: apply, PageSize: pageSize},
+		runCtx,
+		notificationdynamo.BackfillOptions{
+			Tenants: tenants, Apply: apply, PageSize: pageSize, MaxRows: maxRows,
+		},
 	)
 	if err != nil {
 		writeResult(deps.Output, commandResult{
@@ -169,9 +180,10 @@ func runBackfillRelay(ctx context.Context, args []string, deps dependencies) int
 		})
 		return exitFatal
 	}
-	if summary.RowFailures > 0 {
+	incomplete := summary.LimitReached || summary.DeadlineReached
+	if summary.RowFailures > 0 || incomplete {
 		writeResult(deps.Output, commandResult{
-			Result: "partial_failure", ExitCode: exitPartial, ScopeCompleted: true,
+			Result: "partial_failure", ExitCode: exitPartial, ScopeCompleted: !incomplete,
 			RetryRecommended: true, ErrorCategories: summaryErrorCategories(summary), Summary: &summary,
 		})
 		return exitPartial
@@ -244,6 +256,12 @@ func summaryErrorCategories(summary notificationdynamo.BackfillSummary) map[stri
 		if count > 0 {
 			categories[category] = count
 		}
+	}
+	if summary.LimitReached {
+		categories["row_limit_reached"] = 1
+	}
+	if summary.DeadlineReached {
+		categories["deadline_reached"] = 1
 	}
 	return categories
 }
@@ -320,7 +338,7 @@ func executeRelay(ctx context.Context, config relayconfig.RunConfig) (relay.RunS
 		},
 	}
 	summary := runner.Run(ctx, config)
-	flushCtx, cancel := context.WithTimeout(ctx, config.OTLPFlushTimeout)
+	flushCtx, cancel := newRelayTelemetryFlushContext(ctx, config.OTLPFlushTimeout)
 	defer cancel()
 	recorder, metricsErr := relaytelemetry.New(flushCtx, config.OTLPEndpoint)
 	if metricsErr != nil {
@@ -334,4 +352,11 @@ func executeRelay(ctx context.Context, config relayconfig.RunConfig) (relay.RunS
 		}
 	}
 	return summary, nil
+}
+
+func newRelayTelemetryFlushContext(
+	ctx context.Context,
+	timeout time.Duration,
+) (context.Context, context.CancelFunc) {
+	return context.WithTimeout(context.WithoutCancel(ctx), timeout)
 }

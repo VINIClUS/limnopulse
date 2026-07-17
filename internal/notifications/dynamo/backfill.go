@@ -28,6 +28,7 @@ type BackfillOptions struct {
 	Tenants  []string
 	Apply    bool
 	PageSize int
+	MaxRows  int
 }
 
 type BackfillSummary struct {
@@ -43,9 +44,14 @@ type BackfillSummary struct {
 	DecodeFailures    int  `json:"decode_failures"`
 	UpdateFailures    int  `json:"update_failures"`
 	RowFailures       int  `json:"row_failures"`
+	LimitReached      bool `json:"limit_reached"`
+	DeadlineReached   bool `json:"deadline_reached"`
 }
 
-const fixedUTCLayout = "2006-01-02T15:04:05.000000000Z"
+const (
+	DefaultBackfillMaxRows = 10_000
+	fixedUTCLayout         = "2006-01-02T15:04:05.000000000Z"
+)
 
 type relayOutbox struct {
 	PK        string `dynamodbav:"PK"`
@@ -83,6 +89,13 @@ func (store Store) BackfillRelay(ctx context.Context, options BackfillOptions) (
 	if options.PageSize < 1 {
 		return summary, fmt.Errorf("page size must be positive")
 	}
+	maxRows := options.MaxRows
+	if maxRows == 0 {
+		maxRows = DefaultBackfillMaxRows
+	}
+	if maxRows < 0 {
+		return summary, fmt.Errorf("max rows must be positive")
+	}
 	for _, tenantID := range options.Tenants {
 		if strings.TrimSpace(tenantID) == "" || strings.ContainsRune(tenantID, '\x00') {
 			return summary, fmt.Errorf("tenant ID is invalid")
@@ -91,6 +104,13 @@ func (store Store) BackfillRelay(ctx context.Context, options BackfillOptions) (
 	for _, tenantID := range options.Tenants {
 		var lastKey map[string]types.AttributeValue
 		for {
+			if stopped, err := backfillContextStopped(ctx, &summary); stopped {
+				return summary, err
+			}
+			if summary.RowsQueried >= maxRows {
+				summary.LimitReached = true
+				return summary, nil
+			}
 			values, err := attributevalue.MarshalMap(map[string]string{
 				":pk": "TENANT#" + tenantID, ":prefix": "NOTIFICATION_OUTBOX#",
 			})
@@ -106,9 +126,23 @@ func (store Store) BackfillRelay(ctx context.Context, options BackfillOptions) (
 				ConsistentRead:            aws.Bool(true),
 			})
 			if err != nil {
+				if errors.Is(err, context.DeadlineExceeded) || errors.Is(ctx.Err(), context.DeadlineExceeded) {
+					summary.DeadlineReached = true
+					return summary, nil
+				}
+				if ctx.Err() != nil {
+					return summary, ctx.Err()
+				}
 				return summary, fmt.Errorf("query notification outboxes: %w", err)
 			}
 			for _, item := range output.Items {
+				if stopped, stopErr := backfillContextStopped(ctx, &summary); stopped {
+					return summary, stopErr
+				}
+				if summary.RowsQueried >= maxRows {
+					summary.LimitReached = true
+					return summary, nil
+				}
 				summary.RowsQueried++
 				kind, migration, err := classifyRelayOutbox(item, tenantID)
 				if err != nil {
@@ -131,6 +165,13 @@ func (store Store) BackfillRelay(ctx context.Context, options BackfillOptions) (
 					continue
 				}
 				if err := store.updateRelayOutbox(ctx, kind, migration); err != nil {
+					if errors.Is(err, context.DeadlineExceeded) || errors.Is(ctx.Err(), context.DeadlineExceeded) {
+						summary.DeadlineReached = true
+						return summary, nil
+					}
+					if ctx.Err() != nil {
+						return summary, ctx.Err()
+					}
 					if isConditionalCheckFailed(err) {
 						summary.ConcurrentChanges++
 					} else {
@@ -148,6 +189,21 @@ func (store Store) BackfillRelay(ctx context.Context, options BackfillOptions) (
 		}
 	}
 	return summary, nil
+}
+
+func backfillContextStopped(
+	ctx context.Context,
+	summary *BackfillSummary,
+) (bool, error) {
+	err := ctx.Err()
+	if err == nil {
+		return false, nil
+	}
+	if errors.Is(err, context.DeadlineExceeded) {
+		summary.DeadlineReached = true
+		return true, nil
+	}
+	return true, err
 }
 
 func isConditionalCheckFailed(err error) bool {
