@@ -6,6 +6,8 @@ import (
 	"math/rand/v2"
 	"time"
 
+	"github.com/VINIClUS/limnopulse/internal/notifications/feedback"
+	feedbackdynamo "github.com/VINIClUS/limnopulse/internal/notifications/feedback/dynamo"
 	"github.com/VINIClUS/limnopulse/internal/notifications/worker"
 	workerconfig "github.com/VINIClUS/limnopulse/internal/notifications/worker/config"
 	workerdynamo "github.com/VINIClUS/limnopulse/internal/notifications/worker/dynamo"
@@ -52,8 +54,12 @@ func executeWorker(ctx context.Context, config workerconfig.RunConfig) (worker.R
 			options.BaseEndpoint = aws.String(config.SQSEndpoint)
 		}
 	})
-	queue := workersqs.Queue{
+	jobsQueue := workersqs.Queue{
 		Client: sqsClient, QueueURL: config.SQSQueueURL,
+		ReceiveTimeout: config.SQSReceiveTimeout, MutationTimeout: config.SQSRequestTimeout,
+	}
+	feedbackQueue := workersqs.Queue{
+		Client: sqsClient, QueueURL: config.SQSFeedbackURL,
 		ReceiveTimeout: config.SQSReceiveTimeout, MutationTimeout: config.SQSRequestTimeout,
 	}
 	var sender worker.EmailSender
@@ -74,6 +80,8 @@ func executeWorker(ctx context.Context, config workerconfig.RunConfig) (worker.R
 	recorder, telemetryErr := workertelemetry.New(ctx, config.OTLPEndpoint)
 	metrics, telemetryState := newWorkerMetrics(config.MaxSendRate, recorder, telemetryErr)
 	store := workerdynamo.Store{Table: config.DynamoDBTable, Client: dynamoClient}
+	feedbackStore := feedbackdynamo.Store{Table: config.DynamoDBTable, Client: dynamoClient}
+	feedbackMetrics := feedback.NewMetrics()
 	owner := "worker_" + uuid.NewString()
 	processor := worker.Processor{
 		Store: store, Sender: sender, Limiter: limiter, Owner: owner,
@@ -83,17 +91,27 @@ func executeWorker(ctx context.Context, config workerconfig.RunConfig) (worker.R
 		JitterFraction: rand.Float64, Metrics: metrics,
 	}
 	processor.Guard = worker.RenewalGuard{
-		Store: store, Queue: queue, Interval: config.RenewalInterval,
+		Store: store, Queue: jobsQueue, Interval: config.RenewalInterval,
 		LeaseTTL: config.ProcessingLease, Visibility: config.VisibilityTimeout,
 		Now: func() time.Time { return time.Now().UTC() },
 	}
-	runner := worker.Runner{
-		Queue: queue, Handler: processor, Concurrency: config.SendConcurrency,
+	jobsRunner := worker.Runner{
+		Queue: jobsQueue, Handler: processor, Concurrency: config.SendConcurrency,
 		ReceiveBatch: config.ReceiveBatch, ReceiveWait: config.ReceiveWait,
 		Visibility: config.VisibilityTimeout, DrainTimeout: config.DrainTimeout,
 	}
-	summary := runner.Run(ctx)
+	feedbackProcessor := feedback.Processor{
+		Store: feedbackStore, Now: func() time.Time { return time.Now().UTC() },
+		InvalidVisibility: config.InvalidVisibility, Metrics: feedbackMetrics,
+	}
+	feedbackRunner := worker.Runner{
+		Queue: feedbackQueue, Handler: feedbackProcessor, Concurrency: config.FeedbackConcurrency,
+		ReceiveBatch: config.ReceiveBatch, ReceiveWait: config.ReceiveWait,
+		Visibility: config.VisibilityTimeout, DrainTimeout: config.DrainTimeout,
+	}
+	summary := (worker.Supervisor{Jobs: jobsRunner, Feedback: feedbackRunner}).Run(ctx)
 	summary.Metrics = metrics.Snapshot()
+	summary.FeedbackMetrics = feedbackMetrics.Snapshot()
 	if telemetryState != "" {
 		summary.TelemetryExportError = telemetryState
 	} else {

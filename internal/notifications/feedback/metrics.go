@@ -1,16 +1,12 @@
 package feedback
 
-import "sync/atomic"
+import (
+	"sync/atomic"
 
-type MetricsSnapshot struct {
-	Applied           int64 `json:"applied"`
-	Duplicates        int64 `json:"duplicates"`
-	Ignored           int64 `json:"ignored"`
-	Malformed         int64 `json:"malformed"`
-	AwaitingDLQ       int64 `json:"awaiting_dlq"`
-	PersistenceErrors int64 `json:"persistence_errors"`
-	Suppressed        int64 `json:"suppressed"`
-}
+	"github.com/VINIClUS/limnopulse/internal/notifications/worker"
+)
+
+type MetricsSnapshot = worker.FeedbackMetricsSnapshot
 
 type Metrics struct {
 	applied           atomic.Int64

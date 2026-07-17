@@ -14,6 +14,7 @@ import (
 	"time"
 
 	notificationdynamo "github.com/VINIClUS/limnopulse/internal/notifications/dynamo"
+	"github.com/VINIClUS/limnopulse/internal/notifications/feedback"
 	"github.com/VINIClUS/limnopulse/internal/notifications/relay"
 	relayconfig "github.com/VINIClUS/limnopulse/internal/notifications/relay/config"
 	"github.com/VINIClUS/limnopulse/internal/notifications/worker"
@@ -27,16 +28,18 @@ import (
 
 func TestWorkerLoadsContinuousConfigAndReturnsGracefulExitWithoutPII(t *testing.T) {
 	privateQueue := "http://sqs:9324/queue/private-jobs"
+	privateFeedbackQueue := "http://sqs:9324/queue/private-ses-events"
 	environment := map[string]string{
 		"APP_ENV": "local", "AWS_REGION": "us-east-1", "DYNAMODB_DOMAIN_TABLE": "private-domain",
 		"DYNAMODB_ENDPOINT_URL": "http://dynamodb:8000", "SQS_NOTIFICATION_JOBS_URL": privateQueue,
-		"SQS_ENDPOINT_URL": "http://sqs:9324", "SES_FROM_EMAIL": "private-sender@example.com",
+		"SQS_SES_EVENTS_URL": privateFeedbackQueue,
+		"SQS_ENDPOINT_URL":   "http://sqs:9324", "SES_FROM_EMAIL": "private-sender@example.com",
 		"SES_ENDPOINT_URL": "http://ses:8080",
 	}
 	var captured workerconfig.RunConfig
 	var output bytes.Buffer
 	exitCode := runMain(context.Background(), []string{
-		"worker", "--send-concurrency=7", "--max-send-rate=3.5", "--send-burst=2",
+		"worker", "--send-concurrency=7", "--feedback-concurrency=3", "--max-send-rate=3.5", "--send-burst=2",
 	}, dependencies{
 		Output:    &output,
 		LookupEnv: func(key string) (string, bool) { value, ok := environment[key]; return value, ok },
@@ -46,14 +49,15 @@ func TestWorkerLoadsContinuousConfigAndReturnsGracefulExitWithoutPII(t *testing.
 				Metrics: worker.MetricsSnapshot{ConfiguredRate: config.MaxSendRate}}, nil
 		},
 	})
-	if exitCode != 0 || captured.SendConcurrency != 7 || captured.MaxSendRate != 3.5 || captured.SendBurst != 2 ||
+	if exitCode != 0 || captured.SendConcurrency != 7 || captured.FeedbackConcurrency != 3 ||
+		captured.SQSFeedbackURL != privateFeedbackQueue || captured.MaxSendRate != 3.5 || captured.SendBurst != 2 ||
 		captured.ReceiveWait != 20*time.Second || captured.ReceiveBatch != 10 ||
 		captured.VisibilityTimeout != time.Minute || captured.ProcessingLease != time.Minute ||
 		captured.ProviderTimeout != 15*time.Second || captured.DrainTimeout != 30*time.Second ||
 		captured.SQSReceiveTimeout != 25*time.Second || captured.SQSRequestTimeout != 5*time.Second {
 		t.Fatalf("exit=%d config=%#v output=%s", exitCode, captured, output.String())
 	}
-	for _, private := range []string{privateQueue, "private-domain", "private-sender@example.com", "dynamodb:8000", "ses:8080"} {
+	for _, private := range []string{privateQueue, privateFeedbackQueue, "private-domain", "private-sender@example.com", "dynamodb:8000", "ses:8080"} {
 		if strings.Contains(output.String(), private) {
 			t.Fatalf("worker summary leaked %q: %s", private, output.String())
 		}
@@ -70,7 +74,7 @@ func TestWorkerLoadsContinuousConfigAndReturnsGracefulExitWithoutPII(t *testing.
 func TestWorkerRejectsConfigurationBeforeAWSAndMapsFatalRun(t *testing.T) {
 	validEnv := map[string]string{
 		"APP_ENV": "test", "AWS_REGION": "us-east-1", "DYNAMODB_DOMAIN_TABLE": "domain",
-		"SQS_NOTIFICATION_JOBS_URL": "queue", "SES_FROM_EMAIL": "sender@example.com",
+		"SQS_NOTIFICATION_JOBS_URL": "queue", "SQS_SES_EVENTS_URL": "feedback-queue", "SES_FROM_EMAIL": "sender@example.com",
 	}
 	tests := []struct {
 		name                string
@@ -110,6 +114,32 @@ func TestWorkerTelemetryInitializationFailureKeepsAggregateMetricsAvailable(t *t
 	metrics, state := newWorkerMetrics(2.5, nil, errors.New("collector unavailable"))
 	if metrics == nil || metrics.Snapshot().ConfiguredRate != 2.5 || state != "initialization_failed" {
 		t.Fatalf("metrics=%#v state=%q", metrics, state)
+	}
+}
+
+func TestWorkerSummaryIncludesBoundedFeedbackMetricsWithoutPII(t *testing.T) {
+	summary := worker.RunSummary{
+		FeedbackMetrics: feedback.MetricsSnapshot{
+			Applied: 1, Duplicates: 2, Ignored: 3, Malformed: 4,
+			AwaitingDLQ: 5, PersistenceErrors: 6, Suppressed: 7,
+		},
+	}
+	encoded, err := json.Marshal(summary)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var document map[string]any
+	if err := json.Unmarshal(encoded, &document); err != nil {
+		t.Fatal(err)
+	}
+	metrics, ok := document["feedback_metrics"].(map[string]any)
+	if !ok || len(metrics) != 7 || metrics["applied"] != float64(1) || metrics["suppressed"] != float64(7) {
+		t.Fatalf("feedback metrics = %#v", document["feedback_metrics"])
+	}
+	for _, forbidden := range []string{"owner@example.com", "delivery_id", "attempt_id", "provider_message_id"} {
+		if strings.Contains(string(encoded), forbidden) {
+			t.Fatalf("feedback metrics leaked %q: %s", forbidden, encoded)
+		}
 	}
 }
 
