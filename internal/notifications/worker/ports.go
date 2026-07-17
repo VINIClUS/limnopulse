@@ -116,6 +116,25 @@ type SendResult struct {
 	ProviderMessageID string
 }
 
+type SESConfigurationSetName string
+
+func (name SESConfigurationSetName) Validate() error {
+	value := string(name)
+	if len(value) < 1 || len(value) > 64 {
+		return fmt.Errorf("SES configuration set name must contain 1 to 64 characters")
+	}
+	for index := range len(value) {
+		character := value[index]
+		if (character >= 'a' && character <= 'z') ||
+			(character >= 'A' && character <= 'Z') ||
+			(character >= '0' && character <= '9') || character == '-' || character == '_' {
+			continue
+		}
+		return fmt.Errorf("SES configuration set name contains an invalid character")
+	}
+	return nil
+}
+
 type EmailSender interface {
 	Send(context.Context, SendRequest) (SendResult, error)
 }

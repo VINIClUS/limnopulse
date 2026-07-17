@@ -8,6 +8,8 @@ import (
 	"strconv"
 	"strings"
 	"time"
+
+	"github.com/VINIClUS/limnopulse/internal/notifications/worker"
 )
 
 const (
@@ -178,6 +180,9 @@ func Load(args []string, lookup LookupEnv) (RunConfig, error) {
 		if required.value == "" {
 			return RunConfig{}, fmt.Errorf("%s is required", required.name)
 		}
+	}
+	if err := (worker.SESConfigurationSetName(config.ConfigurationSet)).Validate(); err != nil {
+		return RunConfig{}, fmt.Errorf("SES_CONFIGURATION_SET_NAME is invalid: %w", err)
 	}
 	if config.SQSQueueURL == config.SQSFeedbackURL {
 		return RunConfig{}, fmt.Errorf("SQS_NOTIFICATION_JOBS_URL and SQS_SES_EVENTS_URL must be distinct")

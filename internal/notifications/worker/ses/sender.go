@@ -66,7 +66,8 @@ func WrapCredentials(provider aws.CredentialsProvider) aws.CredentialsProvider {
 
 func (sender Sender) Send(ctx context.Context, request worker.SendRequest) (worker.SendResult, error) {
 	if sender.Client == nil || strings.TrimSpace(sender.FromEmail) == "" ||
-		strings.ContainsAny(sender.FromEmail, "\r\n") || sender.ConfigurationSet != "limnopulse-notifications" ||
+		strings.ContainsAny(sender.FromEmail, "\r\n") ||
+		(worker.SESConfigurationSetName(sender.ConfigurationSet)).Validate() != nil ||
 		request.AttemptID == "" || request.AttemptNumber < 1 {
 		return worker.SendResult{}, worker.NewSendError(worker.ErrorFatalConfigurationSet, errors.New("SES sender configuration is invalid"))
 	}

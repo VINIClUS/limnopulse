@@ -123,6 +123,20 @@ func TestLoadRequiresIndependentSESFeedbackQueue(t *testing.T) {
 	}
 }
 
+func TestLoadRejectsInvalidSESConfigurationSetName(t *testing.T) {
+	base := map[string]string{
+		"APP_ENV": "local", "AWS_REGION": "sa-east-1", "DYNAMODB_DOMAIN_TABLE": "domain",
+		"SQS_NOTIFICATION_JOBS_URL": "https://sqs/jobs", "SQS_SES_EVENTS_URL": "https://sqs/events",
+		"SES_FROM_EMAIL": "alerts@example.com",
+	}
+	for _, name := range []string{"contains spaces", "contains/slash", strings.Repeat("a", 65)} {
+		base["SES_CONFIGURATION_SET_NAME"] = name
+		if _, err := Load(nil, lookup(base)); err == nil || !strings.Contains(err.Error(), "SES_CONFIGURATION_SET_NAME") {
+			t.Fatalf("configuration set %q error = %v", name, err)
+		}
+	}
+}
+
 func lookup(values map[string]string) LookupEnv {
 	return func(key string) (string, bool) {
 		value, ok := values[key]

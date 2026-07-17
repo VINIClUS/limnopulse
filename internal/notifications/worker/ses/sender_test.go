@@ -23,7 +23,7 @@ import (
 
 func TestSenderUsesImmutableDeliveryAndExactNoPIITags(t *testing.T) {
 	client := &fakeSESClient{output: &awsses.SendEmailOutput{MessageId: aws.String("ses_message_1")}}
-	sender := Sender{Client: client, FromEmail: "alerts@example.com", ConfigurationSet: "limnopulse-notifications", Timeout: 15 * time.Second}
+	sender := Sender{Client: client, FromEmail: "alerts@example.com", ConfigurationSet: "custom-notifications_1", Timeout: 15 * time.Second}
 	request := testSendRequest(t)
 	result, err := sender.Send(context.Background(), request)
 	if err != nil {
@@ -34,7 +34,7 @@ func TestSenderUsesImmutableDeliveryAndExactNoPIITags(t *testing.T) {
 	}
 	input := client.input
 	if aws.ToString(input.FromEmailAddress) != "alerts@example.com" ||
-		aws.ToString(input.ConfigurationSetName) != "limnopulse-notifications" ||
+		aws.ToString(input.ConfigurationSetName) != "custom-notifications_1" ||
 		len(input.Destination.ToAddresses) != 1 || input.Destination.ToAddresses[0] != request.Delivery.NormalizedEmail {
 		t.Fatalf("SES addressing/config = %#v", input)
 	}
