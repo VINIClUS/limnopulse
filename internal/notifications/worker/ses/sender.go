@@ -13,6 +13,7 @@ import (
 	"github.com/VINIClUS/limnopulse/internal/notifications"
 	"github.com/VINIClUS/limnopulse/internal/notifications/worker"
 	"github.com/aws/aws-sdk-go-v2/aws"
+	awssignerv4 "github.com/aws/aws-sdk-go-v2/aws/signer/v4"
 	awsses "github.com/aws/aws-sdk-go-v2/service/sesv2"
 	"github.com/aws/aws-sdk-go-v2/service/sesv2/types"
 	"github.com/aws/smithy-go"
@@ -28,9 +29,39 @@ type Client interface {
 
 type Sender struct {
 	Client           Client
+	Credentials      aws.CredentialsProvider
 	FromEmail        string
 	ConfigurationSet string
 	Timeout          time.Duration
+}
+
+type credentialRetrievalError struct{ err error }
+
+func (err *credentialRetrievalError) Error() string { return "AWS credential retrieval failed" }
+func (err *credentialRetrievalError) Unwrap() error { return err.err }
+
+type classifyingCredentialsProvider struct{ provider aws.CredentialsProvider }
+
+func (provider classifyingCredentialsProvider) Retrieve(ctx context.Context) (aws.Credentials, error) {
+	if provider.provider == nil {
+		return aws.Credentials{}, &credentialRetrievalError{err: errors.New("credentials provider is missing")}
+	}
+	credentials, err := provider.provider.Retrieve(ctx)
+	if err != nil {
+		return aws.Credentials{}, &credentialRetrievalError{err: err}
+	}
+	return credentials, nil
+}
+
+func (provider classifyingCredentialsProvider) IsCredentialsProvider(target aws.CredentialsProvider) bool {
+	return aws.IsCredentialsProvider(provider.provider, target)
+}
+
+func WrapCredentials(provider aws.CredentialsProvider) aws.CredentialsProvider {
+	if _, alreadyWrapped := provider.(classifyingCredentialsProvider); alreadyWrapped {
+		return provider
+	}
+	return classifyingCredentialsProvider{provider: provider}
 }
 
 func (sender Sender) Send(ctx context.Context, request worker.SendRequest) (worker.SendResult, error) {
@@ -51,6 +82,14 @@ func (sender Sender) Send(ctx context.Context, request worker.SendRequest) (work
 	for _, value := range tagValues {
 		if !sesTagValue.MatchString(value) {
 			return worker.SendResult{}, worker.NewSendError(worker.ErrorFatalConfigurationSet, errors.New("SES tag identity is invalid"))
+		}
+	}
+	// Retrieve through the same cache used by the SDK immediately before SendEmail.
+	// This gives credential refresh failures a typed, PII-free fatal category
+	// instead of depending on text in the SDK's operation-error wrappers.
+	if sender.Credentials != nil {
+		if _, err := sender.Credentials.Retrieve(ctx); err != nil {
+			return worker.SendResult{}, worker.NewSendError(worker.ErrorFatalCredentials, err)
 		}
 	}
 	content := request.Delivery.Content
@@ -101,6 +140,14 @@ func ClassifyError(err error) error {
 	if errors.As(err, &recipient) {
 		return worker.NewSendError(worker.ErrorPermanentRecipient, err)
 	}
+	var credentialError *credentialRetrievalError
+	if errors.As(err, &credentialError) {
+		return worker.NewSendError(worker.ErrorFatalCredentials, err)
+	}
+	var signingError *awssignerv4.SigningError
+	if errors.As(err, &signingError) {
+		return worker.NewSendError(worker.ErrorFatalCredentials, err)
+	}
 	if errors.Is(err, context.DeadlineExceeded) || errors.Is(err, context.Canceled) {
 		return worker.NewSendError(worker.ErrorAmbiguousTimeout, err)
 	}
@@ -113,15 +160,22 @@ func ClassifyError(err error) error {
 	}
 	var apiError smithy.APIError
 	if errors.As(err, &apiError) {
-		category := classifyAPICode(apiError.ErrorCode())
+		category := classifyAPIError(apiError)
 		return worker.NewSendError(category, err)
 	}
 	return worker.NewSendError(worker.ErrorRetryableUnknown, err)
 }
 
-func classifyAPICode(code string) worker.SendErrorCategory {
+func classifyAPIError(apiError smithy.APIError) worker.SendErrorCategory {
+	code := apiError.ErrorCode()
 	switch code {
-	case "TooManyRequestsException", "Throttling", "ThrottlingException":
+	case "ThrottlingException":
+		detail := strings.TrimSuffix(strings.TrimSpace(apiError.ErrorMessage()), ".")
+		if detail == "Daily message quota exceeded" {
+			return worker.ErrorRetryableQuota
+		}
+		return worker.ErrorRetryableThrottling
+	case "TooManyRequestsException", "Throttling":
 		return worker.ErrorRetryableThrottling
 	case "LimitExceededException", "AccountDailyQuotaExceeded":
 		return worker.ErrorRetryableQuota

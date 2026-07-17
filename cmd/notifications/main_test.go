@@ -5,6 +5,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"net/http"
 	"os"
 	"path/filepath"
 	"reflect"
@@ -18,6 +19,7 @@ import (
 	"github.com/VINIClUS/limnopulse/internal/notifications/worker"
 	workerconfig "github.com/VINIClUS/limnopulse/internal/notifications/worker/config"
 	"github.com/aws/aws-sdk-go-v2/aws"
+	"github.com/aws/aws-sdk-go-v2/credentials"
 	"github.com/aws/aws-sdk-go-v2/feature/dynamodb/attributevalue"
 	awssdk "github.com/aws/aws-sdk-go-v2/service/dynamodb"
 	"github.com/aws/aws-sdk-go-v2/service/dynamodb/types"
@@ -109,6 +111,54 @@ func TestWorkerTelemetryInitializationFailureKeepsAggregateMetricsAvailable(t *t
 	if metrics == nil || metrics.Snapshot().ConfiguredRate != 2.5 || state != "initialization_failed" {
 		t.Fatalf("metrics=%#v state=%q", metrics, state)
 	}
+}
+
+func TestWorkerAWSConfigsKeepRealSESOffLocalDynamoAndSQSCredentials(t *testing.T) {
+	config := workerconfig.RunConfig{
+		AWSRegion: "us-east-1", EmailSenderMode: "aws",
+		DynamoDBEndpoint: "http://dynamodb.local", SQSEndpoint: "http://sqs.local",
+	}
+	var endpoints []string
+	configs, err := loadWorkerAWSConfigs(context.Background(), config,
+		func(_ context.Context, _ string, endpoint string) (aws.Config, error) {
+			endpoints = append(endpoints, endpoint)
+			source := "real"
+			if endpoint != "" {
+				source = "local"
+			}
+			return aws.Config{Credentials: credentials.NewStaticCredentialsProvider(source, "secret", "")}, nil
+		})
+	if err != nil {
+		t.Fatal(err)
+	}
+	sesCredentials, err := configs.SES.Credentials.Retrieve(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !reflect.DeepEqual(endpoints, []string{"http://dynamodb.local", "http://sqs.local", ""}) ||
+		sesCredentials.AccessKeyID != "real" {
+		t.Fatalf("endpoints=%#v SES source=%q", endpoints, sesCredentials.AccessKeyID)
+	}
+}
+
+func TestWorkerSESCredentialStartupPreflightFailsBeforeRuntime(t *testing.T) {
+	calls := 0
+	provider := aws.CredentialsProviderFunc(func(context.Context) (aws.Credentials, error) {
+		calls++
+		return aws.Credentials{}, errors.New("credentials unavailable")
+	})
+	httpClient := &countingHTTPClient{}
+	_, err := prepareSESAWSConfig(context.Background(), aws.Config{Credentials: provider, HTTPClient: httpClient})
+	if err == nil || calls != 1 || httpClient.calls != 0 {
+		t.Fatalf("err=%v credential_calls=%d HTTP_calls=%d", err, calls, httpClient.calls)
+	}
+}
+
+type countingHTTPClient struct{ calls int }
+
+func (client *countingHTTPClient) Do(*http.Request) (*http.Response, error) {
+	client.calls++
+	return nil, errors.New("unexpected HTTP call")
 }
 
 func TestRelayLoadsValidatedOneShotConfigAndWritesNoPIISummary(t *testing.T) {

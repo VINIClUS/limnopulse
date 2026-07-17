@@ -104,22 +104,6 @@ func (processor Processor) Handle(ctx context.Context, message QueueMessage) Dec
 		return Decision{Action: ActionDelete}
 	}
 
-	gate, err := processor.Store.CheckGates(ctx, record)
-	if err != nil {
-		return processor.deferClaim(ctx, record, processor.Now().UTC(), "gate_lookup_failure", time.Minute)
-	}
-	if !gate.Allowed {
-		mutationCtx, cancel := mutationContext(ctx)
-		defer cancel()
-		if gate.CancellationReason == "" {
-			return processor.deferClaim(ctx, record, processor.Now().UTC(), "invalid_gate", time.Minute)
-		}
-		if err := processor.Store.Cancel(mutationCtx, record, gate.CancellationReason, processor.Now().UTC()); err != nil {
-			return Decision{Action: ActionChangeVisibility, Visibility: time.Minute, ErrorCategory: "cancellation_failure"}
-		}
-		return Decision{Action: ActionDelete}
-	}
-
 	limiterCtx := ctx
 	stopLimiterGuard := func() error { return nil }
 	if processor.Guard != nil {
@@ -134,6 +118,29 @@ func (processor Processor) Handle(ctx context.Context, message QueueMessage) Dec
 		return stopLimiterGuard()
 	}
 	defer stopLimiter()
+	if limiterCtx.Err() != nil {
+		_ = stopLimiter()
+		return processor.deferClaim(ctx, record, processor.Now().UTC(), "lease_renewal_failed", time.Minute)
+	}
+
+	gate, err := processor.Store.CheckGates(limiterCtx, record)
+	if err != nil {
+		_ = stopLimiter()
+		return processor.deferClaim(ctx, record, processor.Now().UTC(), "gate_lookup_failure", time.Minute)
+	}
+	if !gate.Allowed {
+		_ = stopLimiter()
+		mutationCtx, cancel := mutationContext(ctx)
+		defer cancel()
+		if gate.CancellationReason == "" {
+			return processor.deferClaim(ctx, record, processor.Now().UTC(), "invalid_gate", time.Minute)
+		}
+		if err := processor.Store.Cancel(mutationCtx, record, gate.CancellationReason, processor.Now().UTC()); err != nil {
+			return Decision{Action: ActionChangeVisibility, Visibility: time.Minute, ErrorCategory: "cancellation_failure"}
+		}
+		return Decision{Action: ActionDelete}
+	}
+
 	limiterDone := processor.Metrics.BeginLimiterWait()
 	if err := processor.Limiter.Wait(limiterCtx); err != nil {
 		limiterDone()
@@ -150,6 +157,25 @@ func (processor Processor) Handle(ctx context.Context, message QueueMessage) Dec
 	}
 	if ctx.Err() != nil {
 		return processor.deferClaim(ctx, record, processor.Now().UTC(), "worker_context_cancelled", time.Minute)
+	}
+	// The first gate check avoids spending a token for already-ineligible work.
+	// This second check closes the membership/suppression race while a token was
+	// pending. The limiter guard has left at least one renewal interval of lease
+	// and visibility headroom, and BeginAttempt is the next durable operation.
+	gate, err = processor.Store.CheckGates(ctx, record)
+	if err != nil {
+		return processor.deferClaim(ctx, record, processor.Now().UTC(), "gate_lookup_failure", time.Minute)
+	}
+	if !gate.Allowed {
+		mutationCtx, cancel := mutationContext(ctx)
+		defer cancel()
+		if gate.CancellationReason == "" {
+			return processor.deferClaim(ctx, record, processor.Now().UTC(), "invalid_gate", time.Minute)
+		}
+		if err := processor.Store.Cancel(mutationCtx, record, gate.CancellationReason, processor.Now().UTC()); err != nil {
+			return Decision{Action: ActionChangeVisibility, Visibility: time.Minute, ErrorCategory: "cancellation_failure"}
+		}
+		return Decision{Action: ActionDelete}
 	}
 
 	attemptID := processor.NewAttemptID()
@@ -356,6 +382,12 @@ func (processor Processor) finishAttempt(
 	mutationCtx, cancel := mutationContext(ctx)
 	defer cancel()
 	if err := processor.Store.CompleteAttempt(mutationCtx, record, completion); err != nil {
+		if decision.Action == ActionFatal {
+			return Decision{
+				Action: ActionFatal, Visibility: decision.Visibility,
+				ErrorCategory: "fatal_persistence_failure",
+			}
+		}
 		return Decision{Action: ActionChangeVisibility, Visibility: time.Minute, ErrorCategory: "attempt_completion_failure"}
 	}
 	if metricSucceededAfterRetry {

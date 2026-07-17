@@ -224,6 +224,26 @@ func TestProcessorMembershipAndSuppressionGatesDoNotConsumeTokenOrAttempt(t *tes
 	}
 }
 
+func TestProcessorRechecksMembershipAndSuppressionAfterLimiterBeforeAttempt(t *testing.T) {
+	for _, denied := range []GateResult{
+		{CancellationReason: notifications.CancellationReasonRecipientMembershipInactive},
+		{CancellationReason: notifications.CancellationReasonEmailSuppressed},
+	} {
+		store := &fakeStore{acquire: claimedRecord(t, 0), gate: GateResult{Allowed: true}}
+		limiter := &fakeLimiter{onWait: func() { store.gate = denied }}
+		sender := &fakeSender{}
+		processor := testProcessor(store, sender)
+		processor.Limiter = limiter
+
+		decision := processor.Handle(context.Background(), validMessage(t))
+		if decision.Action != ActionDelete || store.gateCalls != 2 || !store.cancelled ||
+			store.cancellationReason != denied.CancellationReason || store.begun != 0 ||
+			sender.calls != 0 || limiter.calls != 1 {
+			t.Fatalf("denied=%#v decision=%#v store=%#v limiter=%d sends=%d", denied, decision, store, limiter.calls, sender.calls)
+		}
+	}
+}
+
 func TestProcessorPersistsAttemptBeforeSESAndSucceeds(t *testing.T) {
 	store := &fakeStore{acquire: claimedRecord(t, 0), gate: GateResult{Allowed: true}}
 	sender := &fakeSender{result: SendResult{ProviderMessageID: "ses_message_1"}}
@@ -330,31 +350,49 @@ func TestProcessorFatalSystemicLeavesMessageAndStopsWorker(t *testing.T) {
 	}
 }
 
+func TestProcessorFatalProviderPersistenceFailureStillStopsWorker(t *testing.T) {
+	store := &fakeStore{
+		acquire: claimedRecord(t, 0), gate: GateResult{Allowed: true},
+		completeErr: errors.New("DynamoDB unavailable"),
+	}
+	sender := &fakeSender{err: NewSendError(ErrorFatalCredentials, errors.New("credentials"))}
+	decision := testProcessor(store, sender).Handle(context.Background(), validMessage(t))
+	if decision.Action != ActionFatal || decision.Visibility != 15*time.Minute ||
+		decision.ErrorCategory != "fatal_persistence_failure" {
+		t.Fatalf("decision = %#v", decision)
+	}
+}
+
 type fakeStore struct {
-	acquire         AcquireResult
-	acquireErr      error
-	gate            GateResult
-	gateErr         error
-	cancelled       bool
-	deferred        int
-	begun           int
-	unknown         bool
-	completion      *AttemptCompletion
-	sequence        string
-	beginRequest    BeginAttemptRequest
-	refreshTerminal bool
-	refreshes       int
-	beginCalled     chan struct{}
+	acquire            AcquireResult
+	acquireErr         error
+	gate               GateResult
+	gateErr            error
+	gateCalls          int
+	cancelled          bool
+	cancellationReason notifications.CancellationReason
+	deferred           int
+	begun              int
+	unknown            bool
+	completion         *AttemptCompletion
+	completeErr        error
+	sequence           string
+	beginRequest       BeginAttemptRequest
+	refreshTerminal    bool
+	refreshes          int
+	beginCalled        chan struct{}
 }
 
 func (store *fakeStore) Acquire(context.Context, notifications.JobEnvelope, ClaimRequest) (AcquireResult, error) {
 	return store.acquire, store.acquireErr
 }
 func (store *fakeStore) CheckGates(context.Context, DeliveryRecord) (GateResult, error) {
+	store.gateCalls++
 	return store.gate, store.gateErr
 }
-func (store *fakeStore) Cancel(_ context.Context, _ DeliveryRecord, _ notifications.CancellationReason, _ time.Time) error {
+func (store *fakeStore) Cancel(_ context.Context, _ DeliveryRecord, reason notifications.CancellationReason, _ time.Time) error {
 	store.cancelled = true
+	store.cancellationReason = reason
 	return nil
 }
 func (store *fakeStore) Defer(_ context.Context, _ DeliveryRecord, _ DeferRequest) error {
@@ -380,7 +418,7 @@ func (store *fakeStore) Refresh(_ context.Context, record DeliveryRecord) (Deliv
 func (store *fakeStore) CompleteAttempt(_ context.Context, _ DeliveryRecord, completion AttemptCompletion) error {
 	store.sequence = appendSequence(store.sequence, "complete")
 	store.completion = &completion
-	return nil
+	return store.completeErr
 }
 func (store *fakeStore) FinalizeUnknown(context.Context, DeliveryRecord, time.Time) error {
 	store.unknown = true
@@ -406,12 +444,16 @@ func (sender *fakeSender) Send(_ context.Context, request SendRequest) (SendResu
 }
 
 type fakeLimiter struct {
-	calls int
-	err   error
+	calls  int
+	err    error
+	onWait func()
 }
 
 func (limiter *fakeLimiter) Wait(context.Context) error {
 	limiter.calls++
+	if limiter.onWait != nil {
+		limiter.onWait()
+	}
 	return limiter.err
 }
 

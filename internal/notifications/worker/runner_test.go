@@ -30,6 +30,32 @@ func TestRunnerStopsReceivingAndGracefullyDrainsInflightWork(t *testing.T) {
 	}
 }
 
+func TestRunnerFatalProducedDuringSignalDrainCannotExitSuccessfully(t *testing.T) {
+	queue := newRunnerQueue([]QueueMessage{{MessageID: "m1", ReceiptHandle: "r1"}})
+	queue.receiveCancelled = make(chan struct{})
+	started := make(chan struct{})
+	release := make(chan struct{})
+	handler := handlerFunc(func(context.Context, QueueMessage) Decision {
+		close(started)
+		<-release
+		return Decision{Action: ActionFatal, Visibility: 15 * time.Minute, ErrorCategory: "fatal_credentials"}
+	})
+	runner := Runner{Queue: queue, Handler: handler, Concurrency: 1, ReceiveBatch: 10,
+		ReceiveWait: 20 * time.Second, Visibility: time.Minute, DrainTimeout: 100 * time.Millisecond}
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan RunSummary, 1)
+	go func() { done <- runner.Run(ctx) }()
+	<-started
+	cancel()
+	<-queue.receiveCancelled
+	close(release)
+	summary := <-done
+	if !summary.Fatal || summary.Graceful || summary.ExitCode != 1 ||
+		summary.ErrorCategories["fatal_credentials"] != 1 {
+		t.Fatalf("summary = %#v", summary)
+	}
+}
+
 func TestRunnerFatalStopsReceivesAfterVisibilityAndDrains(t *testing.T) {
 	queue := newRunnerQueue([]QueueMessage{{MessageID: "m1", ReceiptHandle: "r1"}})
 	handler := handlerFunc(func(context.Context, QueueMessage) Decision {
@@ -187,15 +213,16 @@ func (handler *countingHandler) Handle(ctx context.Context, _ QueueMessage) Deci
 }
 
 type runnerQueue struct {
-	mu           sync.Mutex
-	initial      []QueueMessage
-	delivered    bool
-	receives     atomic.Int32
-	changes      atomic.Int32
-	deletes      atomic.Int32
-	receiveError error
-	deleteError  error
-	changeError  error
+	mu               sync.Mutex
+	initial          []QueueMessage
+	delivered        bool
+	receives         atomic.Int32
+	changes          atomic.Int32
+	deletes          atomic.Int32
+	receiveError     error
+	deleteError      error
+	changeError      error
+	receiveCancelled chan struct{}
 }
 
 func newRunnerQueue(messages []QueueMessage) *runnerQueue { return &runnerQueue{initial: messages} }
@@ -210,6 +237,9 @@ func (queue *runnerQueue) Receive(ctx context.Context, _ int, _ time.Duration, _
 	}
 	queue.mu.Unlock()
 	<-ctx.Done()
+	if queue.receiveCancelled != nil {
+		close(queue.receiveCancelled)
+	}
 	return nil, ctx.Err()
 }
 func (queue *runnerQueue) Delete(context.Context, QueueMessage) error {

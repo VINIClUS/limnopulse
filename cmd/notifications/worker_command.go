@@ -2,8 +2,8 @@ package main
 
 import (
 	"context"
+	"fmt"
 	"math/rand/v2"
-	"strings"
 	"time"
 
 	"github.com/VINIClUS/limnopulse/internal/notifications/worker"
@@ -32,17 +32,22 @@ func runWorkerCommand(ctx context.Context, args []string, deps dependencies) int
 }
 
 func executeWorker(ctx context.Context, config workerconfig.RunConfig) (worker.RunSummary, error) {
-	credentialEndpoint := firstEndpoint(config.DynamoDBEndpoint, config.SQSEndpoint, config.SESEndpoint)
-	awsConfig, err := loadAWSConfig(ctx, config.AWSRegion, credentialEndpoint)
+	awsConfigs, err := loadWorkerAWSConfigs(ctx, config, loadAWSConfig)
 	if err != nil {
 		return worker.RunSummary{}, err
 	}
-	dynamoClient := awssdk.NewFromConfig(awsConfig, func(options *awssdk.Options) {
+	if config.EmailSenderMode == "aws" {
+		awsConfigs.SES, err = prepareSESAWSConfig(ctx, awsConfigs.SES)
+		if err != nil {
+			return worker.RunSummary{}, err
+		}
+	}
+	dynamoClient := awssdk.NewFromConfig(awsConfigs.DynamoDB, func(options *awssdk.Options) {
 		if config.DynamoDBEndpoint != "" {
 			options.BaseEndpoint = aws.String(config.DynamoDBEndpoint)
 		}
 	})
-	sqsClient := awssqs.NewFromConfig(awsConfig, func(options *awssqs.Options) {
+	sqsClient := awssqs.NewFromConfig(awsConfigs.SQS, func(options *awssqs.Options) {
 		if config.SQSEndpoint != "" {
 			options.BaseEndpoint = aws.String(config.SQSEndpoint)
 		}
@@ -54,8 +59,9 @@ func executeWorker(ctx context.Context, config workerconfig.RunConfig) (worker.R
 	var sender worker.EmailSender
 	if config.EmailSenderMode == "aws" {
 		sender = workerses.Sender{
-			Client:    workerses.NewClient(awsConfig, config.SESEndpoint),
-			FromEmail: config.SESFromEmail, ConfigurationSet: config.ConfigurationSet,
+			Client:      workerses.NewClient(awsConfigs.SES, config.SESEndpoint),
+			Credentials: awsConfigs.SES.Credentials,
+			FromEmail:   config.SESFromEmail, ConfigurationSet: config.ConfigurationSet,
 			Timeout: config.ProviderTimeout,
 		}
 	} else {
@@ -100,6 +106,58 @@ func executeWorker(ctx context.Context, config workerconfig.RunConfig) (worker.R
 	return summary, nil
 }
 
+func prepareSESAWSConfig(ctx context.Context, config aws.Config) (aws.Config, error) {
+	config.Credentials = workerses.WrapCredentials(config.Credentials)
+	if err := preflightAWSCredentials(ctx, config.Credentials); err != nil {
+		return aws.Config{}, err
+	}
+	return config, nil
+}
+
+type workerAWSConfigLoader func(context.Context, string, string) (aws.Config, error)
+
+type workerAWSConfigs struct {
+	DynamoDB aws.Config
+	SQS      aws.Config
+	SES      aws.Config
+}
+
+func loadWorkerAWSConfigs(
+	ctx context.Context,
+	config workerconfig.RunConfig,
+	load workerAWSConfigLoader,
+) (workerAWSConfigs, error) {
+	if load == nil {
+		return workerAWSConfigs{}, fmt.Errorf("AWS config loader is required")
+	}
+	dynamoConfig, err := load(ctx, config.AWSRegion, config.DynamoDBEndpoint)
+	if err != nil {
+		return workerAWSConfigs{}, fmt.Errorf("load DynamoDB AWS config: %w", err)
+	}
+	sqsConfig, err := load(ctx, config.AWSRegion, config.SQSEndpoint)
+	if err != nil {
+		return workerAWSConfigs{}, fmt.Errorf("load SQS AWS config: %w", err)
+	}
+	configs := workerAWSConfigs{DynamoDB: dynamoConfig, SQS: sqsConfig}
+	if config.EmailSenderMode == "aws" {
+		configs.SES, err = load(ctx, config.AWSRegion, config.SESEndpoint)
+		if err != nil {
+			return workerAWSConfigs{}, fmt.Errorf("load SES AWS config: %w", err)
+		}
+	}
+	return configs, nil
+}
+
+func preflightAWSCredentials(ctx context.Context, provider aws.CredentialsProvider) error {
+	if provider == nil {
+		return fmt.Errorf("AWS credentials provider is required")
+	}
+	if _, err := provider.Retrieve(ctx); err != nil {
+		return fmt.Errorf("retrieve AWS credentials: %w", err)
+	}
+	return nil
+}
+
 func newWorkerMetrics(
 	rate float64,
 	observer worker.MetricsObserver,
@@ -109,13 +167,4 @@ func newWorkerMetrics(
 		return worker.NewMetrics(rate), "initialization_failed"
 	}
 	return worker.NewMetricsWithObserver(rate, observer), ""
-}
-
-func firstEndpoint(values ...string) string {
-	for _, value := range values {
-		if strings.TrimSpace(value) != "" {
-			return strings.TrimSpace(value)
-		}
-	}
-	return ""
 }

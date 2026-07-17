@@ -3,6 +3,7 @@ package ses
 import (
 	"context"
 	"errors"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -14,6 +15,7 @@ import (
 	"github.com/VINIClUS/limnopulse/internal/notifications"
 	"github.com/VINIClUS/limnopulse/internal/notifications/worker"
 	"github.com/aws/aws-sdk-go-v2/aws"
+	awssignerv4 "github.com/aws/aws-sdk-go-v2/aws/signer/v4"
 	"github.com/aws/aws-sdk-go-v2/credentials"
 	awsses "github.com/aws/aws-sdk-go-v2/service/sesv2"
 	"github.com/aws/smithy-go"
@@ -74,6 +76,31 @@ func TestSenderUsesImmutableDeliveryAndExactNoPIITags(t *testing.T) {
 	}
 }
 
+func TestSenderCredentialPreflightFailureIsFatalAndNeverCallsSES(t *testing.T) {
+	client := &fakeSESClient{output: &awsses.SendEmailOutput{MessageId: aws.String("must_not_send")}}
+	provider := &failingCredentialsProvider{err: errors.New("credential refresh unavailable")}
+	sender := Sender{
+		Client: client, Credentials: provider, FromEmail: "alerts@example.com",
+		ConfigurationSet: "limnopulse-notifications", Timeout: 15 * time.Second,
+	}
+	_, err := sender.Send(context.Background(), testSendRequest(t))
+	var sendErr *worker.SendError
+	if !errors.As(err, &sendErr) || sendErr.Category != worker.ErrorFatalCredentials ||
+		provider.calls.Load() != 1 || client.calls.Load() != 0 {
+		t.Fatalf("err=%#v credential_calls=%d SES_calls=%d", err, provider.calls.Load(), client.calls.Load())
+	}
+}
+
+func TestWrappedCredentialProviderFailureRemainsTypedThroughOperationErrors(t *testing.T) {
+	provider := WrapCredentials(&failingCredentialsProvider{err: errors.New("refresh failed")})
+	_, err := provider.Retrieve(context.Background())
+	classified := ClassifyError(fmt.Errorf("SES operation: %w", err))
+	var sendErr *worker.SendError
+	if !errors.As(classified, &sendErr) || sendErr.Category != worker.ErrorFatalCredentials {
+		t.Fatalf("classified = %#v", classified)
+	}
+}
+
 func TestClassifyErrorConservativelyMapsSESAndTransportFailures(t *testing.T) {
 	tests := []struct {
 		name string
@@ -83,12 +110,16 @@ func TestClassifyErrorConservativelyMapsSESAndTransportFailures(t *testing.T) {
 		{"recipient marker", RecipientError{Err: errors.New("bad recipient")}, worker.ErrorPermanentRecipient},
 		{"generic rejection is not recipient permanent", &smithy.GenericAPIError{Code: "MessageRejected", Message: "rejected"}, worker.ErrorRetryableUnknown},
 		{"throttling", &smithy.GenericAPIError{Code: "TooManyRequestsException", Message: "slow"}, worker.ErrorRetryableThrottling},
+		{"SES daily quota throttling", &smithy.GenericAPIError{Code: "ThrottlingException", Message: "Daily message quota exceeded"}, worker.ErrorRetryableQuota},
+		{"SES maximum rate throttling", &smithy.GenericAPIError{Code: "ThrottlingException", Message: "Maximum sending rate exceeded"}, worker.ErrorRetryableThrottling},
+		{"SES unknown throttle detail", &smithy.GenericAPIError{Code: "ThrottlingException", Message: "unrecognized provider detail"}, worker.ErrorRetryableThrottling},
 		{"quota", &smithy.GenericAPIError{Code: "LimitExceededException", Message: "quota"}, worker.ErrorRetryableQuota},
 		{"service", &smithy.GenericAPIError{Code: "ServiceUnavailableException", Message: "down"}, worker.ErrorRetryableService},
 		{"account", &smithy.GenericAPIError{Code: "AccountSuspendedException", Message: "suspended"}, worker.ErrorFatalAccountSuspended},
 		{"identity", &smithy.GenericAPIError{Code: "MailFromDomainNotVerifiedException", Message: "identity"}, worker.ErrorFatalFromIdentity},
 		{"config set", &smithy.GenericAPIError{Code: "NotFoundException", Message: "config"}, worker.ErrorFatalConfigurationSet},
 		{"credentials", &smithy.GenericAPIError{Code: "InvalidClientTokenId", Message: "credentials"}, worker.ErrorFatalCredentials},
+		{"wrapped signing credentials", fmt.Errorf("operation: %w", &awssignerv4.SigningError{Err: errors.New("provider failed")}), worker.ErrorFatalCredentials},
 		{"timeout", context.DeadlineExceeded, worker.ErrorAmbiguousTimeout},
 		{"reset", syscall.ECONNRESET, worker.ErrorAmbiguousConnectionReset},
 	}
@@ -98,6 +129,10 @@ func TestClassifyErrorConservativelyMapsSESAndTransportFailures(t *testing.T) {
 			var sendErr *worker.SendError
 			if !errors.As(classified, &sendErr) || sendErr.Category != test.want {
 				t.Fatalf("ClassifyError(%T) = %#v, want %q", test.err, classified, test.want)
+			}
+			if strings.Contains(classified.Error(), "Daily message quota exceeded") ||
+				strings.Contains(classified.Error(), "Maximum sending rate exceeded") {
+				t.Fatalf("classified error leaked provider message: %v", classified)
 			}
 		})
 	}
@@ -161,14 +196,26 @@ type fakeSESClient struct {
 	err               error
 	deadlineSet       bool
 	deadlineRemaining time.Duration
+	calls             atomic.Int32
 }
 
 func (client *fakeSESClient) SendEmail(ctx context.Context, input *awsses.SendEmailInput, _ ...func(*awsses.Options)) (*awsses.SendEmailOutput, error) {
+	client.calls.Add(1)
 	client.input = input
 	deadline, ok := ctx.Deadline()
 	client.deadlineSet = ok
 	client.deadlineRemaining = time.Until(deadline)
 	return client.output, client.err
+}
+
+type failingCredentialsProvider struct {
+	err   error
+	calls atomic.Int32
+}
+
+func (provider *failingCredentialsProvider) Retrieve(context.Context) (aws.Credentials, error) {
+	provider.calls.Add(1)
+	return aws.Credentials{}, provider.err
 }
 
 func testSendRequest(t *testing.T) worker.SendRequest {

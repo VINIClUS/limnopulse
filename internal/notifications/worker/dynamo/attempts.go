@@ -53,10 +53,11 @@ func (store Store) BeginAttempt(
 		{Update: &types.Update{
 			TableName: aws.String(store.Table), Key: encodedDeliveryKey,
 			UpdateExpression:    aws.String("SET #attempt_count = :next_attempt_count, #last_attempt_id = :attempt_id, #last_attempt_started_at = :started_at, #updated_at = :started_at, #revision = :next_revision"),
-			ConditionExpression: aws.String("#state = :processing AND #revision = :revision AND #lease_owner = :owner AND #lease_epoch = :epoch AND (attribute_not_exists(#attempt_count) OR #attempt_count = :attempt_count)"),
+			ConditionExpression: aws.String("#state = :processing AND #revision = :revision AND #lease_owner = :owner AND #lease_epoch = :epoch AND #lease_expires > :started_at AND (attribute_not_exists(#attempt_count) OR #attempt_count = :attempt_count)"),
 			ExpressionAttributeNames: map[string]string{
 				"#state": "state", "#revision": "delivery_revision", "#lease_owner": "delivery_lease_owner",
-				"#lease_epoch": "delivery_lease_epoch", "#attempt_count": "attempt_count",
+				"#lease_epoch": "delivery_lease_epoch", "#lease_expires": "delivery_lease_expires_at",
+				"#attempt_count":   "attempt_count",
 				"#last_attempt_id": "last_attempt_id", "#last_attempt_started_at": "last_attempt_started_at",
 				"#updated_at": "updated_at",
 			}, ExpressionAttributeValues: values,

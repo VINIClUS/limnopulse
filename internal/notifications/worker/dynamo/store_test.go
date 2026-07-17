@@ -235,6 +235,9 @@ func TestAttemptTransactionsFenceLeaseAndNeverCopyRenderedContentOrEmail(t *test
 		t.Fatalf("begin transactions = %#v", client.transactions)
 	}
 	begin := client.transactions[0]
+	if condition := *begin.TransactItems[0].Update.ConditionExpression; !strings.Contains(condition, "#lease_expires > :started_at") {
+		t.Fatalf("begin condition does not fence an expired claim: %s", condition)
+	}
 	serialized := transactionText(begin)
 	for _, required := range []string{"delivery_lease_owner", "delivery_lease_epoch", "delivery_revision", "attempt_count", "content_hash"} {
 		if !strings.Contains(serialized, required) {

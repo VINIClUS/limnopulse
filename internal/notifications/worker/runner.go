@@ -40,6 +40,33 @@ type summaryCollector struct {
 	summary RunSummary
 }
 
+type runFatalState struct {
+	once     sync.Once
+	mu       sync.RWMutex
+	category string
+	signal   chan struct{}
+}
+
+func newRunFatalState() *runFatalState { return &runFatalState{signal: make(chan struct{})} }
+
+func (state *runFatalState) record(category string) {
+	if category == "" {
+		category = "fatal_worker"
+	}
+	state.once.Do(func() {
+		state.mu.Lock()
+		state.category = category
+		state.mu.Unlock()
+		close(state.signal)
+	})
+}
+
+func (state *runFatalState) current() string {
+	state.mu.RLock()
+	defer state.mu.RUnlock()
+	return state.category
+}
+
 func (runner Runner) Run(ctx context.Context) RunSummary {
 	collector := &summaryCollector{summary: RunSummary{ErrorCategories: map[string]int{}}}
 	if runner.Queue == nil || runner.Handler == nil || runner.Concurrency < 1 ||
@@ -58,39 +85,30 @@ func (runner Runner) Run(ctx context.Context) RunSummary {
 	defer cancelProcess()
 	semaphore := make(chan struct{}, runner.Concurrency)
 	var inflight sync.WaitGroup
-	fatal := make(chan string, 1)
-	fatalCategory := ""
+	fatal := newRunFatalState()
 
 receiveLoop:
 	for {
 		select {
-		case fatalCategory = <-fatal:
+		case <-fatal.signal:
 			break receiveLoop
 		default:
 		}
 		messages, err := runner.Queue.Receive(receiveCtx, runner.ReceiveBatch, runner.ReceiveWait, runner.Visibility)
 		if err != nil {
 			if receiveCtx.Err() != nil {
-				select {
-				case fatalCategory = <-fatal:
-				default:
-				}
 				break receiveLoop
 			}
-			fatalCategory = "queue_receive_failure"
+			fatal.record("queue_receive_failure")
 			break receiveLoop
 		}
 		collector.addReceived(len(messages))
 		for _, message := range messages {
 			select {
 			case semaphore <- struct{}{}:
-			case fatalCategory = <-fatal:
+			case <-fatal.signal:
 				break receiveLoop
 			case <-receiveCtx.Done():
-				select {
-				case fatalCategory = <-fatal:
-				default:
-				}
 				break receiveLoop
 			}
 			inflight.Add(1)
@@ -99,14 +117,7 @@ receiveLoop:
 				defer func() { <-semaphore }()
 				decision := runner.Handler.Handle(processCtx, message)
 				if decision.Action == ActionFatal {
-					category := decision.ErrorCategory
-					if category == "" {
-						category = "fatal_worker"
-					}
-					select {
-					case fatal <- category:
-					default:
-					}
+					fatal.record(decision.ErrorCategory)
 					cancelReceive()
 				}
 				runner.applyDecision(processCtx, collector, message, decision)
@@ -114,19 +125,21 @@ receiveLoop:
 		}
 	}
 	cancelReceive()
-	if fatalCategory != "" {
-		collector.addError(fatalCategory)
-		collector.setFatal()
-	}
 	drained := make(chan struct{})
 	go func() { inflight.Wait(); close(drained) }()
 	select {
 	case <-drained:
-		if fatalCategory == "" {
+		if fatalCategory := fatal.current(); fatalCategory != "" {
+			collector.addError(fatalCategory)
+			collector.setFatal()
+		} else {
 			collector.setGraceful()
 		}
 	case <-time.After(drainTimeout):
 		cancelProcess()
+		if fatalCategory := fatal.current(); fatalCategory != "" {
+			collector.addError(fatalCategory)
+		}
 		collector.setDrainTimedOut()
 		collector.addError("drain_timeout")
 		collector.setFatal()
