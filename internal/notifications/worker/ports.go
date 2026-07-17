@@ -63,8 +63,9 @@ type DeferRequest struct {
 }
 
 type BeginAttemptRequest struct {
-	AttemptID string
-	StartedAt time.Time
+	AttemptID          string
+	StartedAt          time.Time
+	LeaseRequiredUntil time.Time
 }
 
 type AttemptCompletion struct {

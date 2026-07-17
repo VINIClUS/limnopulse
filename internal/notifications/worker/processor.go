@@ -9,6 +9,8 @@ import (
 	"github.com/VINIClUS/limnopulse/internal/notifications"
 )
 
+const durableMutationTimeout = 5 * time.Second
+
 type DecisionAction uint8
 
 const (
@@ -152,21 +154,19 @@ func (processor Processor) Handle(ctx context.Context, message QueueMessage) Dec
 		_ = stopLimiter()
 		return processor.deferClaim(ctx, record, processor.Now().UTC(), "lease_renewal_failed", time.Minute)
 	}
-	if err := stopLimiter(); err != nil {
-		return processor.deferClaim(ctx, record, processor.Now().UTC(), "lease_renewal_failed", time.Minute)
-	}
-	if ctx.Err() != nil {
-		return processor.deferClaim(ctx, record, processor.Now().UTC(), "worker_context_cancelled", time.Minute)
-	}
 	// The first gate check avoids spending a token for already-ineligible work.
 	// This second check closes the membership/suppression race while a token was
-	// pending. The limiter guard has left at least one renewal interval of lease
-	// and visibility headroom, and BeginAttempt is the next durable operation.
-	gate, err = processor.Store.CheckGates(ctx, record)
+	// pending. Keep the revision-N renewal guard active through this final read,
+	// then stop it immediately before BeginAttempt mutates the revision.
+	gate, err = processor.Store.CheckGates(limiterCtx, record)
 	if err != nil {
+		_ = stopLimiter()
 		return processor.deferClaim(ctx, record, processor.Now().UTC(), "gate_lookup_failure", time.Minute)
 	}
 	if !gate.Allowed {
+		if err := stopLimiter(); err != nil {
+			return processor.deferClaim(ctx, record, processor.Now().UTC(), "lease_renewal_failed", time.Minute)
+		}
 		mutationCtx, cancel := mutationContext(ctx)
 		defer cancel()
 		if gate.CancellationReason == "" {
@@ -177,28 +177,37 @@ func (processor Processor) Handle(ctx context.Context, message QueueMessage) Dec
 		}
 		return Decision{Action: ActionDelete}
 	}
+	if limiterCtx.Err() != nil {
+		_ = stopLimiter()
+		return processor.deferClaim(ctx, record, processor.Now().UTC(), "lease_renewal_failed", time.Minute)
+	}
+	if err := stopLimiter(); err != nil {
+		return processor.deferClaim(ctx, record, processor.Now().UTC(), "lease_renewal_failed", time.Minute)
+	}
 	if ctx.Err() != nil {
 		return processor.deferClaim(ctx, record, processor.Now().UTC(), "worker_context_cancelled", time.Minute)
-	}
-
-	attemptID := processor.NewAttemptID()
-	attemptStartedAt := processor.Now().UTC()
-	mutationCtx, cancelMutation := mutationContext(ctx)
-	record, err = processor.Store.BeginAttempt(mutationCtx, record, BeginAttemptRequest{
-		AttemptID: attemptID, StartedAt: attemptStartedAt,
-	})
-	cancelMutation()
-	if err != nil {
-		return Decision{Action: ActionChangeVisibility, Visibility: time.Minute, ErrorCategory: "attempt_start_failure"}
 	}
 
 	providerTimeout := processor.ProviderTimeout
 	if providerTimeout <= 0 {
 		providerTimeout = 15 * time.Second
 	}
+	attemptID := processor.NewAttemptID()
+	attemptStartedAt := processor.Now().UTC()
+	mutationCtx, cancelMutation := mutationContext(ctx)
+	record, err = processor.Store.BeginAttempt(mutationCtx, record, BeginAttemptRequest{
+		AttemptID: attemptID, StartedAt: attemptStartedAt,
+		LeaseRequiredUntil: attemptStartedAt.Add(providerTimeout + 2*durableMutationTimeout),
+	})
+	cancelMutation()
+	if err != nil {
+		return Decision{Action: ActionChangeVisibility, Visibility: time.Minute, ErrorCategory: "attempt_start_failure"}
+	}
+
 	// The limiter guard is stopped only after its in-flight renewal completes.
-	// With the configured lease/visibility headroom and bounded provider timeout,
-	// BeginAttempt can remain immediately adjacent to the single provider call.
+	// BeginAttempt conditionally reserves enough durable lease headroom for its
+	// own transaction, the bounded provider call, and the completion write, while
+	// remaining immediately adjacent to the single provider call.
 	// This keeps attempt_count equal to the number of EmailSender invocations.
 	providerCtx, cancelProvider := context.WithTimeout(ctx, providerTimeout)
 	processor.Metrics.ProviderCallStarted(record.PossiblyAccepted)
@@ -379,5 +388,5 @@ func normalizedVisibility(delay time.Duration) time.Duration {
 }
 
 func mutationContext(ctx context.Context) (context.Context, context.CancelFunc) {
-	return context.WithTimeout(context.WithoutCancel(ctx), 5*time.Second)
+	return context.WithTimeout(context.WithoutCancel(ctx), durableMutationTimeout)
 }

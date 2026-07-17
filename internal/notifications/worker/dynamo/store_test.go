@@ -224,7 +224,7 @@ func TestAttemptTransactionsFenceLeaseAndNeverCopyRenderedContentOrEmail(t *test
 	client := &fakeClient{}
 	store := Store{Table: "domain", Client: client}
 	started, err := store.BeginAttempt(context.Background(), record, worker.BeginAttemptRequest{
-		AttemptID: "att_1", StartedAt: testNow(),
+		AttemptID: "att_1", StartedAt: testNow(), LeaseRequiredUntil: testNow().Add(20 * time.Second),
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -236,8 +236,12 @@ func TestAttemptTransactionsFenceLeaseAndNeverCopyRenderedContentOrEmail(t *test
 		t.Fatalf("begin transactions = %#v", client.transactions)
 	}
 	begin := client.transactions[0]
-	if condition := *begin.TransactItems[0].Update.ConditionExpression; !strings.Contains(condition, "#lease_expires > :started_at") {
+	if condition := *begin.TransactItems[0].Update.ConditionExpression; !strings.Contains(condition, "#lease_expires >= :lease_required_until") {
 		t.Fatalf("begin condition does not fence an expired claim: %s", condition)
+	}
+	values := decodeExpressionValues(t, begin.TransactItems[0].Update.ExpressionAttributeValues)
+	if values[":lease_required_until"] != fixedTime(testNow().Add(20*time.Second)) {
+		t.Fatalf("lease headroom value = %#v", values[":lease_required_until"])
 	}
 	serialized := transactionText(begin)
 	for _, required := range []string{"delivery_lease_owner", "delivery_lease_epoch", "delivery_revision", "attempt_count", "content_hash"} {

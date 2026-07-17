@@ -19,7 +19,8 @@ func (store Store) BeginAttempt(
 	request worker.BeginAttemptRequest,
 ) (worker.DeliveryRecord, error) {
 	if record.Delivery.State != notifications.DeliveryStateProcessing || request.AttemptID == "" ||
-		request.StartedAt.IsZero() || record.AttemptCount < 0 || record.AttemptCount >= worker.MaxProviderCalls {
+		request.StartedAt.IsZero() || !request.LeaseRequiredUntil.After(request.StartedAt) ||
+		record.AttemptCount < 0 || record.AttemptCount >= worker.MaxProviderCalls {
 		return worker.DeliveryRecord{}, fmt.Errorf("invalid attempt start")
 	}
 	deliveryKey, err := notifications.DeliveryStorageKey(record.Delivery.OutboxID, record.Delivery.DeliveryID)
@@ -48,12 +49,13 @@ func (store Store) BeginAttempt(
 		":next_revision": record.Revision + 1, ":owner": record.LeaseOwner, ":epoch": record.LeaseEpoch,
 		":attempt_count": record.AttemptCount, ":next_attempt_count": record.AttemptCount + 1,
 		":attempt_id": request.AttemptID, ":started_at": fixedTime(request.StartedAt),
+		":lease_required_until": fixedTime(request.LeaseRequiredUntil),
 	})
 	_, err = store.Client.TransactWriteItems(ctx, &awssdk.TransactWriteItemsInput{TransactItems: []types.TransactWriteItem{
 		{Update: &types.Update{
 			TableName: aws.String(store.Table), Key: encodedDeliveryKey,
 			UpdateExpression:    aws.String("SET #attempt_count = :next_attempt_count, #last_attempt_id = :attempt_id, #last_attempt_started_at = :started_at, #updated_at = :started_at, #revision = :next_revision"),
-			ConditionExpression: aws.String("#state = :processing AND #revision = :revision AND #lease_owner = :owner AND #lease_epoch = :epoch AND #lease_expires > :started_at AND (attribute_not_exists(#attempt_count) OR #attempt_count = :attempt_count)"),
+			ConditionExpression: aws.String("#state = :processing AND #revision = :revision AND #lease_owner = :owner AND #lease_epoch = :epoch AND #lease_expires >= :lease_required_until AND (attribute_not_exists(#attempt_count) OR #attempt_count = :attempt_count)"),
 			ExpressionAttributeNames: map[string]string{
 				"#state": "state", "#revision": "delivery_revision", "#lease_owner": "delivery_lease_owner",
 				"#lease_epoch": "delivery_lease_epoch", "#lease_expires": "delivery_lease_expires_at",

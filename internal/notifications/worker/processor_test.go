@@ -67,6 +67,23 @@ func TestProcessorStopsRenewalGuardBeforeAttemptAndPairsCountWithProviderCall(t 
 	}
 }
 
+func TestProcessorKeepsRenewalGuardThroughSecondGateCheck(t *testing.T) {
+	guard := &recordingGuard{}
+	store := &fakeStore{acquire: claimedRecord(t, 0), gate: GateResult{Allowed: true}}
+	store.gateCheck = func(call int) {
+		if call == 2 && guard.stopped != 0 {
+			t.Fatal("renewal guard stopped before the final gate check")
+		}
+	}
+	processor := testProcessor(store, &fakeSender{result: SendResult{ProviderMessageID: "ses_1"}})
+	processor.Guard = guard
+
+	decision := processor.Handle(context.Background(), validMessage(t))
+	if decision.Action != ActionDelete || store.gateCalls != 2 || guard.stopped != 1 {
+		t.Fatalf("decision=%#v gate_calls=%d guard_stops=%d", decision, store.gateCalls, guard.stopped)
+	}
+}
+
 func TestProcessorWaitsForCrossingLimiterRenewalBeforeBeginningAttempt(t *testing.T) {
 	beginCalled := make(chan struct{})
 	store := &fakeStore{
@@ -173,6 +190,7 @@ func TestProcessorCapturesAttemptAndCompletionTimesAroundProviderCall(t *testing
 	}
 	decision := processor.Handle(context.Background(), validMessage(t))
 	if decision.Action != ActionDelete || !store.beginRequest.StartedAt.Equal(time.Date(2026, 7, 16, 15, 0, 7, 0, time.UTC)) ||
+		!store.beginRequest.LeaseRequiredUntil.Equal(time.Date(2026, 7, 16, 15, 0, 32, 0, time.UTC)) ||
 		store.completion == nil || !store.completion.CompletedAt.Equal(time.Date(2026, 7, 16, 15, 0, 19, 0, time.UTC)) {
 		t.Fatalf("clock decision=%#v begin=%#v completion=%#v", decision, store.beginRequest, store.completion)
 	}
@@ -397,6 +415,7 @@ type fakeStore struct {
 	gate               GateResult
 	gateErr            error
 	gateCalls          int
+	gateCheck          func(int)
 	cancelled          bool
 	cancellationReason notifications.CancellationReason
 	deferred           int
@@ -416,6 +435,9 @@ func (store *fakeStore) Acquire(context.Context, notifications.JobEnvelope, Clai
 }
 func (store *fakeStore) CheckGates(context.Context, DeliveryRecord) (GateResult, error) {
 	store.gateCalls++
+	if store.gateCheck != nil {
+		store.gateCheck(store.gateCalls)
+	}
 	return store.gate, store.gateErr
 }
 func (store *fakeStore) Cancel(_ context.Context, _ DeliveryRecord, reason notifications.CancellationReason, _ time.Time) error {
