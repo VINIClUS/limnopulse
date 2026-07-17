@@ -720,6 +720,36 @@ def test_retry_ambiguous_confirmation_and_no_feedback_unknown(runtime: Runtime) 
     finally:
         _stop_worker(ambiguous_worker)
 
+    delayed_event = "evt_delayed"
+    delayed = (
+        "outbox_delayed",
+        _delivery_id(delayed_event, "opening", recipient),
+        delayed_event,
+    )
+    _put_direct_delivery(
+        runtime,
+        tenant_id=tenant,
+        outbox_id=delayed[0],
+        delivery_id=delayed[1],
+        event_id=delayed[2],
+        recipient_id=recipient,
+        email="delayed@example.test",
+        now=now,
+    )
+    _send_job(runtime, tenant, *delayed)
+    delayed_worker = _start_worker(runtime, "ambiguous_timeout")
+    try:
+        delayed_uncertain = _wait_delivery(
+            runtime,
+            delayed[0],
+            delayed[1],
+            "retryable_failed",
+        )
+        assert delayed_uncertain["possibly_accepted"] is True
+        assert delayed_uncertain["attempt_count"] == 1
+    finally:
+        _stop_worker(delayed_worker)
+
     unknown_event = "evt_unknown"
     unknown = (
         "outbox_unknown",
@@ -754,8 +784,54 @@ def test_retry_ambiguous_confirmation_and_no_feedback_unknown(runtime: Runtime) 
                 event_id="evt_ambiguous_confirmation",
             ),
         )
+        publish_event(
+            client=runtime.sqs,
+            queue_url=runtime.events_url,
+            event=build_ses_event(
+                event_type="DeliveryDelay",
+                delivery_id=delayed[1],
+                attempt_id=delayed_uncertain["last_attempt_id"],
+                provider_message_id="provider_delayed_confirmation",
+                event_id="evt_delayed_confirmation",
+            ),
+        )
         confirmed = _wait_delivery(runtime, ambiguous[0], ambiguous[1], "succeeded")
         assert confirmed["provider_outcome"] == "accepted"
+        delayed_confirmed = _wait_for(
+            lambda: _read_item(
+                runtime,
+                f"NOTIFICATION_OUTBOX#{delayed[0]}",
+                f"DELIVERY#{delayed[1]}",
+            ),
+            lambda item: item.get("provider_outcome") == "delayed",
+        )
+        assert delayed_confirmed["state"] == "retryable_failed"
+        assert delayed_confirmed["attempt_count"] == 1
+        runtime.table.update_item(
+            Key={
+                "PK": f"NOTIFICATION_OUTBOX#{delayed[0]}",
+                "SK": f"DELIVERY#{delayed[1]}",
+            },
+            UpdateExpression="SET next_attempt_at = :due",
+            ConditionExpression=(
+                "#state = :retryable AND provider_outcome = :delayed "
+                "AND attempt_count = :one"
+            ),
+            ExpressionAttributeNames={"#state": "state"},
+            ExpressionAttributeValues={
+                ":due": _fixed(datetime.now(UTC) - timedelta(seconds=1)),
+                ":retryable": "retryable_failed",
+                ":delayed": "delayed",
+                ":one": 1,
+            },
+        )
+        # The original SQS copy remains under its ambiguous-send visibility
+        # delay. This duplicate makes the already-due durable work visible and
+        # proves at-least-once delivery cannot trigger another provider call.
+        _send_job(runtime, tenant, *delayed)
+        delayed_unknown = _wait_delivery(runtime, delayed[0], delayed[1], "unknown")
+        assert delayed_unknown["attempt_count"] == 1
+        assert delayed_unknown["provider_outcome"] == "delayed"
         no_feedback = _wait_delivery(runtime, unknown[0], unknown[1], "unknown")
         assert no_feedback["possibly_accepted"] is True
         assert "ambiguous_exhausted" not in no_feedback

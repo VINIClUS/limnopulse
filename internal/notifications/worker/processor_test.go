@@ -174,6 +174,19 @@ func TestProcessorAmbiguousRefreshAlreadyTerminalIsNoop(t *testing.T) {
 	}
 }
 
+func TestProcessorFinalizesDelayedProviderOwnershipWithoutDuplicateSend(t *testing.T) {
+	acquired := claimedRecord(t, 1)
+	acquired.Record.ProviderOutcome = notifications.ProviderOutcomeDelayed
+	store := &fakeStore{acquire: acquired, gate: GateResult{Allowed: true}}
+	sender := &fakeSender{}
+
+	decision := testProcessor(store, sender).Handle(context.Background(), validMessage(t))
+	if decision.Action != ActionDelete || store.refreshes != 1 || !store.unknown ||
+		store.begun != 0 || sender.calls != 0 {
+		t.Fatalf("decision=%#v refreshes=%d unknown=%t begun=%d sends=%d", decision, store.refreshes, store.unknown, store.begun, sender.calls)
+	}
+}
+
 func TestProcessorCapturesAttemptAndCompletionTimesAroundProviderCall(t *testing.T) {
 	store := &fakeStore{acquire: claimedRecord(t, 0), gate: GateResult{Allowed: true}}
 	sender := &fakeSender{result: SendResult{ProviderMessageID: "ses_1"}}

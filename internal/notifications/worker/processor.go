@@ -86,7 +86,8 @@ func (processor Processor) Handle(ctx context.Context, message QueueMessage) Dec
 	if record.StartedAttemptID != "" {
 		return processor.completeInterrupted(ctx, record, claimTime)
 	}
-	if record.PossiblyAccepted || record.AmbiguousExhausted {
+	if record.PossiblyAccepted || record.AmbiguousExhausted ||
+		record.ProviderOutcome == notifications.ProviderOutcomeDelayed {
 		refreshed, terminal, refreshErr := processor.Store.Refresh(ctx, record)
 		if refreshErr != nil {
 			return processor.deferClaim(ctx, record, processor.Now().UTC(), "reconciliation_failure", time.Minute)
@@ -95,6 +96,13 @@ func (processor Processor) Handle(ctx context.Context, message QueueMessage) Dec
 			return Decision{Action: ActionDelete}
 		}
 		record = refreshed
+	}
+	if record.ProviderOutcome == notifications.ProviderOutcomeDelayed {
+		// DeliveryDelay proves that SES owns the original message, but it does
+		// not prove final mailbox delivery. Once the existing retry/grace becomes
+		// due, preserve that uncertainty as unknown instead of issuing a duplicate.
+		record.PossiblyAccepted = true
+		record.AmbiguousExhausted = true
 	}
 	if record.AmbiguousExhausted {
 		mutationCtx, cancel := mutationContext(ctx)
