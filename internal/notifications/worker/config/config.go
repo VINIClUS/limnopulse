@@ -166,6 +166,9 @@ func Load(args []string, lookup LookupEnv) (RunConfig, error) {
 			return RunConfig{}, fmt.Errorf("%s is required", required.name)
 		}
 	}
+	if config.SQSQueueURL == config.SQSFeedbackURL {
+		return RunConfig{}, fmt.Errorf("SQS_NOTIFICATION_JOBS_URL and SQS_SES_EVENTS_URL must be distinct")
+	}
 	if config.SendConcurrency < 1 || config.FeedbackConcurrency < 1 || config.MaxSendRate <= 0 || math.IsNaN(config.MaxSendRate) ||
 		math.IsInf(config.MaxSendRate, 0) || config.SendBurst < 1 {
 		return RunConfig{}, fmt.Errorf("send concurrency, rate and burst must be positive")

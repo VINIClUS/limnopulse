@@ -84,6 +84,10 @@ func TestLoadRequiresIndependentSESFeedbackQueue(t *testing.T) {
 	if loaded.SQSFeedbackURL != "https://sqs/ses-events" || loaded.FeedbackConcurrency != 3 {
 		t.Fatalf("feedback config = %#v", loaded)
 	}
+	base["SQS_SES_EVENTS_URL"] = base["SQS_NOTIFICATION_JOBS_URL"]
+	if _, err := Load(nil, lookup(base)); err == nil || !strings.Contains(err.Error(), "distinct") {
+		t.Fatalf("shared jobs and feedback queue error = %v", err)
+	}
 }
 
 func lookup(values map[string]string) LookupEnv {
