@@ -61,6 +61,7 @@ func TestParseEventBridgeSESRejectsMalformedIdentityAndUnknownEvents(t *testing.
 	tests := []string{
 		"{}",
 		strings.Replace(valid, `"id":"evt_1"`, `"id":""`, 1),
+		strings.Replace(valid, `"detail-type":"Email Send"`, `"detail-type":""`, 1),
 		strings.Replace(valid, `"source":"aws.ses"`, `"source":"other"`, 1),
 		strings.Replace(valid, `"messageId":"ses_message_1"`, `"messageId":""`, 1),
 		strings.Replace(valid, `"delivery_id":["del_1"]`, `"delivery_id":[]`, 1),

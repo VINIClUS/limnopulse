@@ -1,7 +1,6 @@
 package dynamo
 
 import (
-	"fmt"
 	"strings"
 	"time"
 
@@ -12,6 +11,12 @@ import (
 	awssdk "github.com/aws/aws-sdk-go-v2/service/dynamodb"
 	"github.com/aws/aws-sdk-go-v2/service/dynamodb/types"
 )
+
+type providerMetadata struct {
+	Outcome   notifications.ProviderOutcome
+	MessageID string
+	Accepted  bool
+}
 
 func (store Store) reconcileTransaction(
 	event feedback.Event,
@@ -107,21 +112,21 @@ func (store Store) attemptUpdate(
 	event feedback.Event,
 	now time.Time,
 ) (*types.Update, error) {
-	providerOutcome, err := notifications.ReconcileProviderOutcome(current.ProviderOutcome, event.ProviderOutcome)
+	provider, err := reconcileProviderMetadata(
+		current.ProviderOutcome,
+		current.ProviderMessageID,
+		current.ProviderAccepted,
+		event,
+	)
 	if err != nil {
 		return nil, err
 	}
-	providerMessageID := current.ProviderMessageID
-	if providerMessageID == "" {
-		providerMessageID = event.ProviderMessageID
-	}
-	accepted := current.ProviderAccepted || event.AcceptedEvidence
 	nextOutcome := nextAttemptOutcome(current.Outcome, event)
 	valuesMap := map[string]any{
 		":entity": "notification_attempt", ":delivery_id": current.DeliveryID, ":attempt_id": current.AttemptID,
 		":current_outcome": string(current.Outcome), ":next_outcome": string(nextOutcome),
-		":provider_outcome": string(providerOutcome), ":provider_message_id": providerMessageID,
-		":provider_accepted": accepted, ":now": fixedTime(now),
+		":provider_outcome": string(provider.Outcome), ":provider_message_id": provider.MessageID,
+		":provider_accepted": provider.Accepted, ":now": fixedTime(now),
 	}
 	condition := "#entity = :entity AND #delivery_id = :delivery_id AND #attempt_id = :attempt_id AND #outcome = :current_outcome"
 	condition = addCurrentCondition(condition, valuesMap, "#current_provider_outcome", ":current_provider_outcome", string(current.ProviderOutcome))
@@ -162,25 +167,25 @@ func (store Store) deliveryUpdate(
 	event feedback.Event,
 	now time.Time,
 ) (*types.Update, error) {
-	providerOutcome, err := notifications.ReconcileProviderOutcome(current.ProviderOutcome, event.ProviderOutcome)
+	provider, err := reconcileProviderMetadata(
+		current.ProviderOutcome,
+		current.ProviderMessageID,
+		current.ProviderAccepted,
+		event,
+	)
 	if err != nil {
 		return nil, err
 	}
-	nextState, err := notifications.ReconcileDeliveryStateFromProvider(current.State, providerOutcome)
+	nextState, err := notifications.ReconcileDeliveryStateFromProvider(current.State, provider.Outcome)
 	if err != nil {
 		return nil, err
 	}
-	providerMessageID := current.ProviderMessageID
-	if providerMessageID == "" {
-		providerMessageID = event.ProviderMessageID
-	}
-	accepted := current.ProviderAccepted || event.AcceptedEvidence
 	valuesMap := map[string]any{
 		":entity": "notification_delivery", ":outbox_id": current.OutboxID, ":delivery_id": current.DeliveryID,
 		":current_state": string(current.State), ":next_state": string(nextState),
 		":current_revision": current.Revision, ":next_revision": current.Revision + 1,
-		":provider_outcome": string(providerOutcome), ":provider_message_id": providerMessageID,
-		":provider_accepted": accepted, ":now": fixedTime(now),
+		":provider_outcome": string(provider.Outcome), ":provider_message_id": provider.MessageID,
+		":provider_accepted": provider.Accepted, ":now": fixedTime(now),
 	}
 	condition := "#entity = :entity AND #outbox_id = :outbox_id AND #delivery_id = :delivery_id AND #state = :current_state AND #revision = :current_revision"
 	condition = addCurrentCondition(condition, valuesMap, "#current_provider_outcome", ":current_provider_outcome", string(current.ProviderOutcome))
@@ -281,9 +286,22 @@ func usedNames(names map[string]string, expression string) map[string]string {
 	return used
 }
 
-func validateNoAddress(value string) error {
-	if strings.Contains(value, "@") {
-		return fmt.Errorf("SES feedback transaction must not persist an email address")
+func reconcileProviderMetadata(
+	currentOutcome notifications.ProviderOutcome,
+	currentMessageID string,
+	currentAccepted bool,
+	event feedback.Event,
+) (providerMetadata, error) {
+	outcome, err := notifications.ReconcileProviderOutcome(currentOutcome, event.ProviderOutcome)
+	if err != nil {
+		return providerMetadata{}, err
 	}
-	return nil
+	messageID := currentMessageID
+	if messageID == "" {
+		messageID = event.ProviderMessageID
+	}
+	return providerMetadata{
+		Outcome: outcome, MessageID: messageID,
+		Accepted: currentAccepted || event.AcceptedEvidence,
+	}, nil
 }

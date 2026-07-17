@@ -191,7 +191,9 @@ func ParseEvent(body []byte) (ParseResult, error) {
 		return fail()
 	}
 	if envelope.Version != "0" || envelope.Source != "aws.ses" ||
-		envelope.ID == "" || strings.ContainsRune(envelope.ID, '\x00') || envelope.Detail.EventType == "" {
+		envelope.ID == "" || strings.ContainsRune(envelope.ID, '\x00') ||
+		envelope.DetailType == "" || strings.ContainsRune(envelope.DetailType, '\x00') ||
+		envelope.Detail.EventType == "" {
 		return fail()
 	}
 	if envelope.Detail.EventType == "Open" || envelope.Detail.EventType == "Click" {
