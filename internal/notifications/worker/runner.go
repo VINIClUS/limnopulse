@@ -33,6 +33,9 @@ type Runner struct {
 	ReceiveWait  time.Duration
 	Visibility   time.Duration
 	DrainTimeout time.Duration
+
+	// afterSlotAcquired is a deterministic admission seam for package tests.
+	afterSlotAcquired func(QueueMessage)
 }
 
 type summaryCollector struct {
@@ -104,11 +107,21 @@ receiveLoop:
 		}
 		collector.addReceived(len(messages))
 		for _, message := range messages {
+			if admissionStopped(receiveCtx, fatal.signal) {
+				break receiveLoop
+			}
 			select {
 			case semaphore <- struct{}{}:
 			case <-fatal.signal:
 				break receiveLoop
 			case <-receiveCtx.Done():
+				break receiveLoop
+			}
+			if runner.afterSlotAcquired != nil {
+				runner.afterSlotAcquired(message)
+			}
+			if admissionStopped(receiveCtx, fatal.signal) {
+				<-semaphore
 				break receiveLoop
 			}
 			inflight.Add(1)
@@ -145,6 +158,20 @@ receiveLoop:
 		collector.setFatal()
 	}
 	return collector.snapshot()
+}
+
+func admissionStopped(ctx context.Context, fatal <-chan struct{}) bool {
+	select {
+	case <-fatal:
+		return true
+	default:
+	}
+	select {
+	case <-ctx.Done():
+		return true
+	default:
+		return false
+	}
 }
 
 func (runner Runner) applyDecision(
