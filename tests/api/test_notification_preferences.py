@@ -218,12 +218,13 @@ def test_get_does_not_require_cognito_verifier_dependency() -> None:
     assert response.json()["configured"] is False
 
 
-def test_get_masks_email_and_exposes_suppression() -> None:
+@pytest.mark.parametrize("suppression_reason", ["complaint", "hard_bounce"])
+def test_get_masks_email_and_exposes_suppression(suppression_reason: str) -> None:
     repository = InMemoryNotificationPreferenceRepository(
         make_preference(),
         EmailDeliverabilityRecord(
             deliverability=EmailDeliverability.SUPPRESSED,
-            suppression_reason="complaint",
+            suppression_reason=suppression_reason,
         ),
     )
 
@@ -235,7 +236,7 @@ def test_get_masks_email_and_exposes_suppression() -> None:
         "address": "v***d@example.com",
         "verified": True,
         "deliverability": "suppressed",
-        "suppression_reason": "complaint",
+        "suppression_reason": suppression_reason,
         "effective_enabled": False,
     }
 
