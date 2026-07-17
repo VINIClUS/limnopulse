@@ -41,3 +41,28 @@ func TestEachRelayBucketHasExactlyOneOwner(t *testing.T) {
 		}
 	}
 }
+
+func TestClassifyOutboxRelayWorkCentralizesCanonicalPairs(t *testing.T) {
+	if RelaySchemaVersion != 1 {
+		t.Fatalf("relay schema version = %d, want 1", RelaySchemaVersion)
+	}
+	tests := []struct {
+		kind   NotificationKind
+		status OutboxStatus
+		want   WorkKind
+		valid  bool
+	}{
+		{kind: NotificationKindOpening, status: OutboxStatusReady, want: WorkKindIntent, valid: true},
+		{kind: NotificationKindRecovery, status: OutboxStatusBlocked, want: WorkKindDependency, valid: true},
+		{kind: NotificationKindOpening, status: OutboxStatusBlocked},
+		{kind: NotificationKindRecovery, status: OutboxStatusReady},
+		{kind: "invented", status: OutboxStatusReady},
+		{kind: NotificationKindOpening, status: "invented"},
+	}
+	for _, test := range tests {
+		got, err := ClassifyOutboxRelayWork(test.kind, test.status)
+		if (err == nil) != test.valid || got != test.want {
+			t.Fatalf("ClassifyOutboxRelayWork(%q, %q) = %q, %v", test.kind, test.status, got, err)
+		}
+	}
+}

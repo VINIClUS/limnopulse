@@ -75,7 +75,7 @@ func decodeDelivery(item map[string]types.AttributeValue) (deliveryItem, worker.
 	if err := attributevalue.UnmarshalMap(item, &stored); err != nil {
 		return deliveryItem{}, worker.DeliveryRecord{}, fmt.Errorf("decode notification delivery: %w", err)
 	}
-	if stored.EntityType != "notification_delivery" || stored.RelaySchemaVersion != 1 ||
+	if stored.EntityType != "notification_delivery" || stored.RelaySchemaVersion != notifications.RelaySchemaVersion ||
 		stored.PK != "NOTIFICATION_OUTBOX#"+stored.OutboxID || stored.SK != "DELIVERY#"+stored.DeliveryID ||
 		stored.DeliveryRevision < 1 || stored.AttemptCount < 0 || stored.AttemptCount > worker.MaxProviderCalls ||
 		stored.DeliveryLeaseEpoch < 0 {

@@ -62,7 +62,7 @@ func (store Store) deliveryMutation(
 		return nil, err
 	}
 	values := map[string]any{
-		":entity_type": "notification_delivery", ":relay_schema": int64(1),
+		":entity_type": "notification_delivery", ":relay_schema": notifications.RelaySchemaVersion,
 		":tenant_id": snapshot.TenantID, ":outbox_id": snapshot.OutboxID,
 		":delivery_id": snapshot.DeliveryID, ":event_id": snapshot.EventID,
 		":rule_id": snapshot.RuleID, ":kind": string(snapshot.Kind), ":channel": string(snapshot.Channel),

@@ -74,7 +74,7 @@ func (store Store) Reload(
 		item.RelayPK != candidate.RelayPK || item.RelaySK != candidate.RelaySK {
 		return relay.Work{}, false, nil
 	}
-	if item.RelaySchemaVersion != 1 {
+	if item.RelaySchemaVersion != notifications.RelaySchemaVersion {
 		return relay.Work{}, false, fmt.Errorf("unsupported relay schema version")
 	}
 	_, markerExists := output.Item["relay_work_kind"]

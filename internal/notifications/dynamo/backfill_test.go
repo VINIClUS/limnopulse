@@ -353,6 +353,8 @@ func TestBackfillRelayContinuesAfterIsolatedDecodeConditionalAndUpdateFailures(t
 	conditional := legacyOutbox("outbox_concurrent", "email", "ready")
 	updateFailure := legacyOutbox("outbox_update_failure", "telegram", "ready")
 	success := legacyOutbox("outbox_success", "email", "blocked")
+	success["kind"] = "recovery"
+	success["depends_on_outbox_id"] = "outbox_opening"
 
 	client := &fakeClient{
 		queryOutputs: []*awssdk.QueryOutput{{Items: []map[string]types.AttributeValue{

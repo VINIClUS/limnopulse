@@ -33,7 +33,7 @@ func (store Store) Claim(
 		return relay.Work{}, false, fmt.Errorf("marshal relay lease key: %w", err)
 	}
 	values := map[string]any{
-		":schema": int64(1), ":relay_work_kind": string(work.Kind),
+		":schema": notifications.RelaySchemaVersion, ":relay_work_kind": string(work.Kind),
 		":relay_pk": work.RelayPK, ":relay_sk": work.RelaySK,
 		":due": lease.DueThrough.UTC().Format(fixedUTCLayout), ":state": work.State,
 		":revision": work.Revision, ":owner": lease.Owner,

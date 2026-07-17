@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"strconv"
 	"strings"
 	"time"
 
@@ -54,13 +55,14 @@ const (
 )
 
 type relayOutbox struct {
-	PK        string `dynamodbav:"PK"`
-	SK        string `dynamodbav:"SK"`
-	TenantID  string `dynamodbav:"tenant_id"`
-	OutboxID  string `dynamodbav:"outbox_id"`
-	Channel   string `dynamodbav:"channel"`
-	Status    string `dynamodbav:"status"`
-	CreatedAt string `dynamodbav:"created_at"`
+	PK        string                         `dynamodbav:"PK"`
+	SK        string                         `dynamodbav:"SK"`
+	TenantID  string                         `dynamodbav:"tenant_id"`
+	OutboxID  string                         `dynamodbav:"outbox_id"`
+	Channel   string                         `dynamodbav:"channel"`
+	Kind      notifications.NotificationKind `dynamodbav:"kind"`
+	Status    string                         `dynamodbav:"status"`
+	CreatedAt string                         `dynamodbav:"created_at"`
 }
 
 type migrationKind uint8
@@ -228,7 +230,7 @@ func classifyRelayOutbox(
 	migration := relayMigration{Outbox: outbox}
 	hasRelay := hasAnyRelayField(item)
 	if _, exists := item["relay_schema_version"]; exists &&
-		!numberAttributeEquals(item, "relay_schema_version", "1") {
+		!numberAttributeEquals(item, "relay_schema_version", notifications.RelaySchemaVersion) {
 		return migrationSchemaConflict, migration, nil
 	}
 	if outbox.Channel == "telegram" {
@@ -248,16 +250,15 @@ func classifyRelayOutbox(
 		return migrationNoop, relayMigration{}, fmt.Errorf("notification outbox channel is unsupported")
 	}
 
-	workKind := notifications.WorkKindIntent
-	switch outbox.Status {
-	case "ready":
-	case "blocked":
-		workKind = notifications.WorkKindDependency
-	default:
+	workKind, err := notifications.ClassifyOutboxRelayWork(
+		outbox.Kind,
+		notifications.OutboxStatus(outbox.Status),
+	)
+	if err != nil {
 		if hasRelay {
 			return migrationSchemaConflict, migration, nil
 		}
-		return migrationNoop, relayMigration{}, fmt.Errorf("notification outbox status is unsupported")
+		return migrationNoop, relayMigration{}, fmt.Errorf("notification outbox kind or status is unsupported")
 	}
 	createdAt, err := time.Parse(fixedUTCLayout, outbox.CreatedAt)
 	if err != nil || createdAt.UTC().Format(fixedUTCLayout) != outbox.CreatedAt {
@@ -303,7 +304,7 @@ func hasAnyRelayField(item map[string]types.AttributeValue) bool {
 }
 
 func isCanonicalEmail(item map[string]types.AttributeValue, migration relayMigration) bool {
-	return numberAttributeEquals(item, "relay_schema_version", "1") &&
+	return numberAttributeEquals(item, "relay_schema_version", notifications.RelaySchemaVersion) &&
 		stringAttributeEquals(item, "expansion_status", migration.Expansion) &&
 		stringAttributeEquals(item, "available_at", migration.AvailableAt) &&
 		stringAttributeEquals(item, "relay_work_kind", string(migration.WorkKind)) &&
@@ -318,7 +319,7 @@ func isCanonicalEmailWithoutWorkKind(
 	if _, exists := item["relay_work_kind"]; exists {
 		return false
 	}
-	return numberAttributeEquals(item, "relay_schema_version", "1") &&
+	return numberAttributeEquals(item, "relay_schema_version", notifications.RelaySchemaVersion) &&
 		stringAttributeEquals(item, "expansion_status", migration.Expansion) &&
 		stringAttributeEquals(item, "available_at", migration.AvailableAt) &&
 		stringAttributeEquals(item, "relay_gsi_pk", migration.RelayIndexKey.PartitionKey) &&
@@ -337,9 +338,9 @@ func isCanonicalTelegram(item map[string]types.AttributeValue) bool {
 	return true
 }
 
-func numberAttributeEquals(item map[string]types.AttributeValue, name, want string) bool {
+func numberAttributeEquals(item map[string]types.AttributeValue, name string, want int64) bool {
 	value, ok := item[name].(*types.AttributeValueMemberN)
-	return ok && value.Value == want
+	return ok && value.Value == strconv.FormatInt(want, 10)
 }
 
 func stringAttributeEquals(item map[string]types.AttributeValue, name, want string) bool {
@@ -373,7 +374,7 @@ func (store Store) updateRelayOutbox(
 		"attribute_not_exists(#available_at) AND attribute_not_exists(#relay_work_kind) AND " +
 		"attribute_not_exists(#relay_gsi_pk) AND attribute_not_exists(#relay_gsi_sk)"
 	if kind == migrationUpdateEmail {
-		valueMap[":relay_schema_version"] = 1
+		valueMap[":relay_schema_version"] = notifications.RelaySchemaVersion
 		valueMap[":available_at"] = migration.AvailableAt
 		valueMap[":relay_work_kind"] = string(migration.WorkKind)
 		valueMap[":relay_gsi_pk"] = migration.RelayIndexKey.PartitionKey
@@ -384,7 +385,7 @@ func (store Store) updateRelayOutbox(
 	} else if kind == migrationUpdateWorkKind {
 		delete(valueMap, ":expansion_status")
 		valueMap[":relay_work_kind"] = string(migration.WorkKind)
-		valueMap[":expected_relay_schema_version"] = 1
+		valueMap[":expected_relay_schema_version"] = notifications.RelaySchemaVersion
 		valueMap[":expected_expansion_status"] = migration.Expansion
 		valueMap[":expected_available_at"] = migration.AvailableAt
 		valueMap[":expected_relay_gsi_pk"] = migration.RelayIndexKey.PartitionKey

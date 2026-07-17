@@ -329,9 +329,12 @@ func (store Store) outboxPut(request alertevaluator.CommitRequest, outbox alerte
 		"depends_on_outbox_id": outbox.DependsOnOutboxID, "created_at": createdAt,
 	}
 	if outbox.Channel == alertevaluator.ChannelEmail {
-		workKind := notifications.WorkKindIntent
-		if outbox.Status == alertevaluator.OutboxBlocked {
-			workKind = notifications.WorkKindDependency
+		workKind, err := notifications.ClassifyOutboxRelayWork(
+			notifications.NotificationKind(outbox.Kind),
+			notifications.OutboxStatus(outbox.Status),
+		)
+		if err != nil {
+			return nil, fmt.Errorf("classify notification relay work: %w", err)
 		}
 		relayKey, err := notifications.BuildRelayIndexKey(
 			workKind,
@@ -342,7 +345,7 @@ func (store Store) outboxPut(request alertevaluator.CommitRequest, outbox alerte
 		if err != nil {
 			return nil, fmt.Errorf("build notification relay index key: %w", err)
 		}
-		values["relay_schema_version"] = 1
+		values["relay_schema_version"] = notifications.RelaySchemaVersion
 		values["expansion_status"] = "pending"
 		values["available_at"] = createdAt
 		values["relay_work_kind"] = string(workKind)
