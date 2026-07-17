@@ -18,12 +18,19 @@ const (
 	FakeConnectionReset  FakeMode = "connection_reset"
 )
 
-type FakeSender struct{ Mode FakeMode }
+type FakeSender struct {
+	Mode      FakeMode
+	MessageID string
+}
 
 func (sender FakeSender) Send(_ context.Context, request worker.SendRequest) (worker.SendResult, error) {
 	switch sender.Mode {
 	case "", FakeSuccess:
-		return worker.SendResult{ProviderMessageID: "fake_message_" + request.AttemptID}, nil
+		messageID := sender.MessageID
+		if messageID == "" {
+			messageID = "fake_message_" + request.AttemptID
+		}
+		return worker.SendResult{ProviderMessageID: messageID}, nil
 	case FakeRetryable:
 		return worker.SendResult{}, worker.NewSendError(worker.ErrorRetryableService, errors.New("fake service unavailable"))
 	case FakePermanent:

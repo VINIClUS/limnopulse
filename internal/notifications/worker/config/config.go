@@ -59,6 +59,7 @@ type RunConfig struct {
 	SESEndpoint         string
 	OTLPEndpoint        string
 	EmailSenderMode     string
+	FakeMessageID       string
 }
 
 func Load(args []string, lookup LookupEnv) (RunConfig, error) {
@@ -88,6 +89,7 @@ func Load(args []string, lookup LookupEnv) (RunConfig, error) {
 		"SES_FROM_EMAIL":            &config.SESFromEmail, "SES_ENDPOINT_URL": &config.SESEndpoint,
 		"OTEL_EXPORTER_OTLP_ENDPOINT":    &config.OTLPEndpoint,
 		"NOTIFICATION_EMAIL_SENDER_MODE": &config.EmailSenderMode,
+		"NOTIFICATION_FAKE_MESSAGE_ID":   &config.FakeMessageID,
 	} {
 		if value, ok := lookup(key); ok {
 			*target = strings.TrimSpace(value)
@@ -156,6 +158,12 @@ func Load(args []string, lookup LookupEnv) (RunConfig, error) {
 		}
 	default:
 		return RunConfig{}, fmt.Errorf("NOTIFICATION_EMAIL_SENDER_MODE is invalid")
+	}
+	if strings.ContainsRune(config.FakeMessageID, '\x00') {
+		return RunConfig{}, fmt.Errorf("NOTIFICATION_FAKE_MESSAGE_ID is invalid")
+	}
+	if config.FakeMessageID != "" && config.EmailSenderMode == "aws" {
+		return RunConfig{}, fmt.Errorf("fake message ID requires a fake email sender")
 	}
 	for _, required := range []struct{ name, value string }{
 		{"AWS_REGION", config.AWSRegion}, {"DYNAMODB_DOMAIN_TABLE", config.DynamoDBTable},

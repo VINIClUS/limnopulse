@@ -71,7 +71,9 @@ func executeWorker(ctx context.Context, config workerconfig.RunConfig) (worker.R
 			Timeout: config.ProviderTimeout,
 		}
 	} else {
-		sender = workerses.FakeSender{Mode: workerses.FakeMode(config.EmailSenderMode)}
+		sender = workerses.FakeSender{
+			Mode: workerses.FakeMode(config.EmailSenderMode), MessageID: config.FakeMessageID,
+		}
 	}
 	limiter, err := worker.NewTokenLimiter(config.MaxSendRate, config.SendBurst)
 	if err != nil {

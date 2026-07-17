@@ -190,6 +190,16 @@ func TestFakeSenderModesAreDeterministic(t *testing.T) {
 	}
 }
 
+func TestFakeSenderCanUseConfiguredProviderMessageID(t *testing.T) {
+	request := testSendRequest(t)
+	result, err := (FakeSender{Mode: FakeSuccess, MessageID: "provider_message_replay_1"}).Send(
+		context.Background(), request,
+	)
+	if err != nil || result.ProviderMessageID != "provider_message_replay_1" {
+		t.Fatalf("result=%#v err=%v", result, err)
+	}
+}
+
 type fakeSESClient struct {
 	input             *awsses.SendEmailInput
 	output            *awsses.SendEmailOutput
