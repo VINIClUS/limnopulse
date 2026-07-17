@@ -113,6 +113,10 @@ func (store Store) BackfillRelay(ctx context.Context, options BackfillOptions) (
 				summary.LimitReached = true
 				return summary, nil
 			}
+			queryLimit := options.PageSize
+			if remaining := maxRows - summary.RowsQueried; remaining < queryLimit {
+				queryLimit = remaining
+			}
 			values, err := attributevalue.MarshalMap(map[string]string{
 				":pk": "TENANT#" + tenantID, ":prefix": "NOTIFICATION_OUTBOX#",
 			})
@@ -124,7 +128,7 @@ func (store Store) BackfillRelay(ctx context.Context, options BackfillOptions) (
 				KeyConditionExpression:    aws.String("PK = :pk AND begins_with(SK, :prefix)"),
 				ExpressionAttributeValues: values,
 				ExclusiveStartKey:         lastKey,
-				Limit:                     aws.Int32(int32(options.PageSize)),
+				Limit:                     aws.Int32(int32(queryLimit)),
 				ConsistentRead:            aws.Bool(true),
 			})
 			if err != nil {

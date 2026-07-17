@@ -140,6 +140,9 @@ func TestBackfillRelayStopsAtExplicitTotalRowLimit(t *testing.T) {
 	if len(client.queryInputs) != 1 {
 		t.Fatalf("Query calls = %d, want 1", len(client.queryInputs))
 	}
+	if client.queryInputs[0].Limit == nil || *client.queryInputs[0].Limit != 1 {
+		t.Fatalf("bounded Query limit = %#v, want 1", client.queryInputs[0].Limit)
+	}
 }
 
 func TestBackfillRelayStopsCleanlyWhenDeadlineIsAlreadyReached(t *testing.T) {
