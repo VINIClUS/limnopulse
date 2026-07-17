@@ -221,6 +221,7 @@ def _base_environment(runtime: Runtime, mode: str) -> dict[str, str]:
             "SQS_NOTIFICATION_JOBS_URL": runtime.jobs_url,
             "SQS_SES_EVENTS_URL": runtime.events_url,
             "SES_FROM_EMAIL": "alerts@example.test",
+            "SES_CONFIGURATION_SET_NAME": "limnopulse-notifications",
             "NOTIFICATION_EMAIL_SENDER_MODE": mode,
             "NOTIFICATION_MAX_SEND_RATE": "100",
         }

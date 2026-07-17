@@ -64,7 +64,7 @@ output "ses_events_routing_dlq_url" {
 }
 
 output "ses_configuration_set_name" {
-  description = "SES configuration set name used by the email worker."
+  description = "SES_CONFIGURATION_SET_NAME"
   value       = aws_sesv2_configuration_set.notifications.configuration_set_name
 }
 

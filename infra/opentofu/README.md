@@ -42,7 +42,9 @@ NotificationOutboxes need the explicit tenant-scoped `notifications
 backfill-relay` migration, and the index must be `ACTIVE` before the relay runs.
 Do not enable the one-shot relay or continuous worker in the same infrastructure
 apply that first introduces the GSI. Verify SES identity/production access and
-start one worker before enabling the external relay schedule.
+map the `ses_configuration_set_name` output to
+`SES_CONFIGURATION_SET_NAME` on the worker. Start one worker before enabling the
+external relay schedule.
 
 The full order, rollback, DLQ handling and PII constraints are documented in
 [Phase 3C-A notification operations](../../docs/notifications-phase-3c-a.md).

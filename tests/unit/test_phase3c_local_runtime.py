@@ -23,17 +23,12 @@ class FakeSQS:
 def test_elasticmq_defines_notification_queues_and_redrive_deterministically() -> None:
     compose = yaml.safe_load((ROOT / "compose.yaml").read_text(encoding="utf-8"))
     service = compose["services"]["elasticmq"]
-    config = (ROOT / "infra" / "elasticmq" / "elasticmq.conf").read_text(
-        encoding="utf-8"
-    )
+    config = (ROOT / "infra" / "elasticmq" / "elasticmq.conf").read_text(encoding="utf-8")
 
     assert service["image"].startswith("softwaremill/elasticmq-native:")
     assert not service["image"].endswith(":latest")
     assert service["ports"] == ["127.0.0.1:9324:9324"]
-    assert (
-        "./infra/elasticmq/elasticmq.conf:/opt/elasticmq.conf:ro"
-        in service["volumes"]
-    )
+    assert "./infra/elasticmq/elasticmq.conf:/opt/elasticmq.conf:ro" in service["volumes"]
     assert "healthcheck" in service
     assert "Action=ListQueues" in " ".join(service["healthcheck"]["test"])
     for queue in (
@@ -60,13 +55,13 @@ def test_notification_compose_processes_use_real_sdk_endpoints_and_safe_fake_sen
     assert worker["init"] is True
     assert worker["stop_grace_period"] == "45s"
     assert worker["environment"]["NOTIFICATION_EMAIL_SENDER_MODE"] == "success"
+    assert worker["environment"]["NOTIFICATION_FAKE_MESSAGE_ID"] == "provider_message_local_compose"
+    assert worker["environment"]["SES_CONFIGURATION_SET_NAME"] == "limnopulse-notifications"
     assert worker["environment"]["SQS_ENDPOINT_URL"] == "http://elasticmq:9324"
     assert worker["environment"]["SQS_NOTIFICATION_JOBS_URL"].endswith(
         "/limnopulse-notification-jobs"
     )
-    assert worker["environment"]["SQS_SES_EVENTS_URL"].endswith(
-        "/limnopulse-ses-events"
-    )
+    assert worker["environment"]["SQS_SES_EVENTS_URL"].endswith("/limnopulse-ses-events")
     assert "SES_ENDPOINT_URL" not in worker["environment"]
 
 
@@ -144,7 +139,9 @@ def test_environment_example_exposes_notification_local_contract_without_real_em
         "SQS_NOTIFICATION_JOBS_URL",
         "SQS_SES_EVENTS_URL",
         "SES_FROM_EMAIL",
+        "SES_CONFIGURATION_SET_NAME",
         "NOTIFICATION_EMAIL_SENDER_MODE",
+        "NOTIFICATION_FAKE_MESSAGE_ID",
     ):
         assert f"{key}=" in environment
     assert "NOTIFICATION_EMAIL_SENDER_MODE=success" in environment

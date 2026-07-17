@@ -1,3 +1,4 @@
+from copy import deepcopy
 from typing import Any
 
 import pytest
@@ -217,6 +218,27 @@ def test_existing_creating_index_is_awaited(
     assert client.indexes["AlertEvaluationByDue"] == "ACTIVE"
     assert client.indexes["NotificationRelayByAvailableAt"] == "ACTIVE"
     assert client.index_describe_calls >= 2
+
+
+def test_existing_relay_index_with_old_projection_fails_closed() -> None:
+    class OldRelayProjectionClient(IndexLifecycleClient):
+        def describe_table(self, **kwargs: Any) -> dict[str, Any]:
+            indexes = []
+            for expected in init_dynamodb.ALERT_INDEXES:
+                actual = deepcopy(expected)
+                actual["IndexStatus"] = "ACTIVE"
+                if actual["IndexName"] == "NotificationRelayByAvailableAt":
+                    actual["Projection"] = {"ProjectionType": "KEYS_ONLY"}
+                indexes.append(actual)
+            return {"Table": {"GlobalSecondaryIndexes": indexes}}
+
+    client = OldRelayProjectionClient()
+
+    with pytest.raises(
+        RuntimeError,
+        match="NotificationRelayByAvailableAt.*incompatible.*recreate",
+    ):
+        ensure_table(client, "LimnopulseDomain", include_alert_indexes=True)
 
 
 def test_index_wait_times_out_with_index_name(

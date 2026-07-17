@@ -98,6 +98,7 @@ def ensure_alert_indexes(client: boto3.client, table_name: str) -> None:
         description = client.describe_table(TableName=table_name)["Table"]
         status = index_status(description, index_name)
         if status == "ACTIVE":
+            validate_index_definition(description, index, table_name)
             continue
         if status is None:
             client.update_table(
@@ -109,6 +110,8 @@ def ensure_alert_indexes(client: boto3.client, table_name: str) -> None:
                 GlobalSecondaryIndexUpdates=[{"Create": index}],
             )
         wait_for_index_active(client, table_name, index_name)
+        description = client.describe_table(TableName=table_name)["Table"]
+        validate_index_definition(description, index, table_name)
         print(f"Index {index_name} is ACTIVE on {table_name}")
 
 
@@ -139,6 +142,38 @@ def index_status(description: dict[str, Any], index_name: str) -> str | None:
         ),
         None,
     )
+
+
+def validate_index_definition(
+    description: dict[str, Any],
+    expected: dict[str, Any],
+    table_name: str,
+) -> None:
+    actual = next(
+        (
+            index
+            for index in description.get("GlobalSecondaryIndexes", [])
+            if index["IndexName"] == expected["IndexName"]
+        ),
+        None,
+    )
+    # Lightweight unit-test fakes may model lifecycle status only. Real
+    # DescribeTable responses always carry both fields.
+    if actual is None or "KeySchema" not in actual or "Projection" not in actual:
+        return
+    actual_projection = actual["Projection"]
+    expected_projection = expected["Projection"]
+    compatible = (
+        actual["KeySchema"] == expected["KeySchema"]
+        and actual_projection.get("ProjectionType") == expected_projection.get("ProjectionType")
+        and sorted(actual_projection.get("NonKeyAttributes", []))
+        == sorted(expected_projection.get("NonKeyAttributes", []))
+    )
+    if not compatible:
+        raise RuntimeError(
+            f"Index {expected['IndexName']} on {table_name} has an incompatible "
+            "key/projection definition; recreate the local table"
+        )
 
 
 def ensure_ttl(client: boto3.client, table_name: str) -> None:

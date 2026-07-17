@@ -181,6 +181,7 @@ def test_notification_outputs_expose_runtime_queue_contract() -> None:
         assert f'output "{output}"' in outputs
     assert 'description = "SQS_NOTIFICATION_JOBS_URL"' in outputs
     assert 'description = "SQS_SES_EVENTS_URL"' in outputs
+    assert 'description = "SES_CONFIGURATION_SET_NAME"' in outputs
 
 
 def test_opentofu_examples_and_gitignore_do_not_commit_state_or_secrets() -> None:

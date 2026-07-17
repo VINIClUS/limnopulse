@@ -112,10 +112,10 @@ enabling either publisher or consumer.
    The command never scans DynamoDB. Telegram rows are marked
    `deferred_unsupported_channel` and are not indexed for email relay.
 6. Validate SES: `SES_FROM_EMAIL` must be a verified identity in the same
-   region, the worker must use the provisioned `limnopulse-notifications`
-   configuration set, and the account must have the intended production-access
-   or sandbox recipient coverage. Confirm the EventBridge rule can write both
-   the SES events queue and routing DLQ.
+   region, `SES_CONFIGURATION_SET_NAME` must equal the OpenTofu
+   `ses_configuration_set_name` output, and the account must have the intended
+   production-access or sandbox recipient coverage. Confirm the EventBridge rule
+   can write both the SES events queue and routing DLQ.
 7. Start one worker replica with explicit `NOTIFICATION_MAX_SEND_RATE`, monitor
    credentials, quota and throttling, and confirm a controlled notification plus
    feedback reaches durable terminal state before increasing concurrency.

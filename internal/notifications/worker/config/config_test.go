@@ -17,6 +17,7 @@ func TestLoadDefaultsAndWorkerEnvironment(t *testing.T) {
 		"SQS_SES_EVENTS_URL":             "http://sqs:9324/queue/ses-events",
 		"SQS_ENDPOINT_URL":               "http://sqs:9324",
 		"SES_FROM_EMAIL":                 "alerts@example.com",
+		"SES_CONFIGURATION_SET_NAME":     "custom-notifications",
 		"SES_ENDPOINT_URL":               "http://ses:8080",
 		"OTEL_EXPORTER_OTLP_ENDPOINT":    "http://otel:4318",
 		"NOTIFICATION_EMAIL_SENDER_MODE": "success",
@@ -33,7 +34,7 @@ func TestLoadDefaultsAndWorkerEnvironment(t *testing.T) {
 		loaded.ProviderTimeout != 15*time.Second || loaded.DrainTimeout != 30*time.Second {
 		t.Fatalf("lifecycle defaults = %#v", loaded)
 	}
-	if loaded.ConfigurationSet != "limnopulse-notifications" {
+	if loaded.ConfigurationSet != "custom-notifications" {
 		t.Fatalf("configuration set = %q", loaded.ConfigurationSet)
 	}
 	if loaded.SESFromEmail != "alerts@example.com" || loaded.SESEndpoint != "http://ses:8080" ||

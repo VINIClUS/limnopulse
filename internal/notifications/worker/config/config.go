@@ -87,6 +87,7 @@ func Load(args []string, lookup LookupEnv) (RunConfig, error) {
 		"SQS_SES_EVENTS_URL":        &config.SQSFeedbackURL,
 		"SQS_ENDPOINT_URL":          &config.SQSEndpoint,
 		"SES_FROM_EMAIL":            &config.SESFromEmail, "SES_ENDPOINT_URL": &config.SESEndpoint,
+		"SES_CONFIGURATION_SET_NAME":     &config.ConfigurationSet,
 		"OTEL_EXPORTER_OTLP_ENDPOINT":    &config.OTLPEndpoint,
 		"NOTIFICATION_EMAIL_SENDER_MODE": &config.EmailSenderMode,
 		"NOTIFICATION_FAKE_MESSAGE_ID":   &config.FakeMessageID,
@@ -172,7 +173,7 @@ func Load(args []string, lookup LookupEnv) (RunConfig, error) {
 	for _, required := range []struct{ name, value string }{
 		{"AWS_REGION", config.AWSRegion}, {"DYNAMODB_DOMAIN_TABLE", config.DynamoDBTable},
 		{"SQS_NOTIFICATION_JOBS_URL", config.SQSQueueURL}, {"SES_FROM_EMAIL", config.SESFromEmail},
-		{"SQS_SES_EVENTS_URL", config.SQSFeedbackURL},
+		{"SQS_SES_EVENTS_URL", config.SQSFeedbackURL}, {"SES_CONFIGURATION_SET_NAME", config.ConfigurationSet},
 	} {
 		if required.value == "" {
 			return RunConfig{}, fmt.Errorf("%s is required", required.name)

@@ -34,6 +34,7 @@ func TestWorkerLoadsContinuousConfigAndReturnsGracefulExitWithoutPII(t *testing.
 		"DYNAMODB_ENDPOINT_URL": "http://dynamodb:8000", "SQS_NOTIFICATION_JOBS_URL": privateQueue,
 		"SQS_SES_EVENTS_URL": privateFeedbackQueue,
 		"SQS_ENDPOINT_URL":   "http://sqs:9324", "SES_FROM_EMAIL": "private-sender@example.com",
+		"SES_CONFIGURATION_SET_NAME":     "private-configuration-set",
 		"SES_ENDPOINT_URL":               "http://ses:8080",
 		"NOTIFICATION_EMAIL_SENDER_MODE": "success",
 		"NOTIFICATION_FAKE_MESSAGE_ID":   "private-provider-message-id",
@@ -59,10 +60,11 @@ func TestWorkerLoadsContinuousConfigAndReturnsGracefulExitWithoutPII(t *testing.
 		captured.SQSReceiveTimeout != 25*time.Second || captured.SQSRequestTimeout != 5*time.Second {
 		t.Fatalf("exit=%d config=%#v output=%s", exitCode, captured, output.String())
 	}
-	if captured.FakeMessageID != "private-provider-message-id" {
-		t.Fatalf("fake message ID = %q", captured.FakeMessageID)
+	if captured.FakeMessageID != "private-provider-message-id" ||
+		captured.ConfigurationSet != "private-configuration-set" {
+		t.Fatalf("fake message ID or configuration set = %#v", captured)
 	}
-	for _, private := range []string{privateQueue, privateFeedbackQueue, "private-domain", "private-sender@example.com", "private-provider-message-id", "dynamodb:8000", "ses:8080"} {
+	for _, private := range []string{privateQueue, privateFeedbackQueue, "private-domain", "private-sender@example.com", "private-provider-message-id", "private-configuration-set", "dynamodb:8000", "ses:8080"} {
 		if strings.Contains(output.String(), private) {
 			t.Fatalf("worker summary leaked %q: %s", private, output.String())
 		}
