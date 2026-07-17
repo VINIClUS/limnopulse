@@ -52,8 +52,7 @@ func (store Store) reconcileTransaction(
 		items = append(items, types.TransactWriteItem{Put: put})
 	}
 	return &awssdk.TransactWriteItemsInput{
-		ClientRequestToken: aws.String(clientRequestToken(event.EventBridgeID)),
-		TransactItems:      items,
+		TransactItems: items,
 	}, nil
 }
 
@@ -117,9 +116,10 @@ func (store Store) attemptUpdate(
 		providerMessageID = event.ProviderMessageID
 	}
 	accepted := current.ProviderAccepted || event.AcceptedEvidence
+	nextOutcome := nextAttemptOutcome(current.Outcome, event)
 	valuesMap := map[string]any{
 		":entity": "notification_attempt", ":delivery_id": current.DeliveryID, ":attempt_id": current.AttemptID,
-		":current_outcome": string(current.Outcome), ":next_outcome": string(nextAttemptOutcome(current.Outcome, event)),
+		":current_outcome": string(current.Outcome), ":next_outcome": string(nextOutcome),
 		":provider_outcome": string(providerOutcome), ":provider_message_id": providerMessageID,
 		":provider_accepted": accepted, ":now": fixedTime(now),
 	}
@@ -127,15 +127,23 @@ func (store Store) attemptUpdate(
 	condition = addCurrentCondition(condition, valuesMap, "#current_provider_outcome", ":current_provider_outcome", string(current.ProviderOutcome))
 	condition = addCurrentCondition(condition, valuesMap, "#current_provider_message_id", ":current_provider_message_id", current.ProviderMessageID)
 	update := "SET #outcome = :next_outcome, #provider_outcome = :provider_outcome, #provider_message_id = :provider_message_id, #provider_accepted = :provider_accepted, #feedback_updated_at = :now"
+	if nextOutcome != current.Outcome {
+		update += ", #completed_at = if_not_exists(#completed_at, :now)"
+	}
 	if event.AcceptedEvidence {
 		update += ", #provider_accepted_at = if_not_exists(#provider_accepted_at, :now)"
+	}
+	if nextOutcome == notifications.AttemptOutcomePermanentFailed {
+		valuesMap[":feedback_error"] = "provider_rejected"
+		update += ", #error_category = if_not_exists(#error_category, :feedback_error)"
 	}
 	names := map[string]string{
 		"#entity": "entity_type", "#delivery_id": "delivery_id", "#attempt_id": "attempt_id", "#outcome": "outcome",
 		"#provider_outcome": "provider_outcome", "#provider_message_id": "provider_message_id",
 		"#provider_accepted": "provider_accepted", "#feedback_updated_at": "feedback_updated_at",
 		"#provider_accepted_at": "provider_accepted_at", "#current_provider_outcome": "provider_outcome",
-		"#current_provider_message_id": "provider_message_id",
+		"#current_provider_message_id": "provider_message_id", "#completed_at": "completed_at",
+		"#error_category": "error_category",
 	}
 	values, err := attributevalue.MarshalMap(valuesMap)
 	if err != nil {

@@ -2,6 +2,7 @@ package dynamo
 
 import (
 	"fmt"
+	"time"
 
 	"github.com/VINIClUS/limnopulse/internal/notifications"
 	"github.com/VINIClUS/limnopulse/internal/notifications/feedback"
@@ -10,16 +11,22 @@ import (
 )
 
 type attemptRecord struct {
-	PK                string                        `dynamodbav:"PK"`
-	SK                string                        `dynamodbav:"SK"`
-	EntityType        string                        `dynamodbav:"entity_type"`
-	DeliveryID        string                        `dynamodbav:"delivery_id"`
-	AttemptID         string                        `dynamodbav:"attempt_id"`
-	OutboxID          string                        `dynamodbav:"outbox_id"`
-	Outcome           notifications.AttemptOutcome  `dynamodbav:"outcome"`
-	ProviderOutcome   notifications.ProviderOutcome `dynamodbav:"provider_outcome"`
-	ProviderMessageID string                        `dynamodbav:"provider_message_id"`
-	ProviderAccepted  bool                          `dynamodbav:"provider_accepted"`
+	PK                string                         `dynamodbav:"PK"`
+	SK                string                         `dynamodbav:"SK"`
+	EntityType        string                         `dynamodbav:"entity_type"`
+	TenantID          string                         `dynamodbav:"tenant_id"`
+	OutboxID          string                         `dynamodbav:"outbox_id"`
+	DeliveryID        string                         `dynamodbav:"delivery_id"`
+	AttemptID         string                         `dynamodbav:"attempt_id"`
+	EventID           string                         `dynamodbav:"event_id"`
+	Kind              notifications.NotificationKind `dynamodbav:"notification_kind"`
+	Channel           notifications.Channel          `dynamodbav:"channel"`
+	Outcome           notifications.AttemptOutcome   `dynamodbav:"outcome"`
+	StartedAt         string                         `dynamodbav:"started_at"`
+	CompletedAt       string                         `dynamodbav:"completed_at"`
+	ProviderOutcome   notifications.ProviderOutcome  `dynamodbav:"provider_outcome"`
+	ProviderMessageID string                         `dynamodbav:"provider_message_id"`
+	ProviderAccepted  bool                           `dynamodbav:"provider_accepted"`
 }
 
 type deliveryRecord struct {
@@ -58,9 +65,24 @@ func decodeAttempt(
 		return attemptRecord{}, err
 	}
 	if stored.PK != key.PartitionKey || stored.SK != key.SortKey || stored.EntityType != "notification_attempt" ||
-		stored.DeliveryID != event.DeliveryID || stored.AttemptID != event.AttemptID || stored.OutboxID == "" ||
-		stored.Outcome.Validate() != nil {
+		stored.DeliveryID != event.DeliveryID || stored.AttemptID != event.AttemptID || stored.TenantID == "" ||
+		stored.OutboxID == "" || stored.EventID == "" || stored.Kind.Validate() != nil ||
+		stored.Channel != notifications.ChannelEmail || stored.Outcome.Validate() != nil {
 		return attemptRecord{}, fmt.Errorf("notification attempt association is invalid")
+	}
+	startedAt, err := time.Parse(time.RFC3339Nano, stored.StartedAt)
+	if err != nil || startedAt.IsZero() {
+		return attemptRecord{}, fmt.Errorf("notification attempt start time is invalid")
+	}
+	if stored.Outcome == notifications.AttemptOutcomeStarted {
+		if stored.CompletedAt != "" {
+			return attemptRecord{}, fmt.Errorf("started notification attempt is already completed")
+		}
+	} else {
+		completedAt, completedErr := time.Parse(time.RFC3339Nano, stored.CompletedAt)
+		if completedErr != nil || completedAt.Before(startedAt) {
+			return attemptRecord{}, fmt.Errorf("notification attempt completion time is invalid")
+		}
 	}
 	if stored.ProviderOutcome != "" && stored.ProviderOutcome.Validate() != nil {
 		return attemptRecord{}, fmt.Errorf("notification attempt provider outcome is invalid")
@@ -75,17 +97,21 @@ func decodeDelivery(
 	item map[string]types.AttributeValue,
 	key notifications.StorageKey,
 	event feedback.Event,
-	outboxID string,
+	attempt attemptRecord,
 ) (deliveryRecord, error) {
 	var stored deliveryRecord
 	if err := attributevalue.UnmarshalMap(item, &stored); err != nil {
 		return deliveryRecord{}, err
 	}
 	if stored.PK != key.PartitionKey || stored.SK != key.SortKey || stored.EntityType != "notification_delivery" ||
-		stored.OutboxID != outboxID || stored.DeliveryID != event.DeliveryID || stored.TenantID == "" ||
+		stored.OutboxID != attempt.OutboxID || stored.DeliveryID != event.DeliveryID || stored.TenantID != attempt.TenantID ||
 		stored.EventID == "" || stored.NormalizedEmail == "" || stored.Revision < 1 ||
-		stored.Kind.Validate() != nil || stored.Channel.Validate() != nil || stored.State.Validate() != nil {
+		stored.EventID != attempt.EventID || stored.Kind != attempt.Kind || stored.Channel != notifications.ChannelEmail ||
+		stored.Channel != attempt.Channel || stored.State.Validate() != nil {
 		return deliveryRecord{}, fmt.Errorf("notification delivery association is invalid")
+	}
+	if _, err := notifications.DeliverabilityStorageKey(stored.NormalizedEmail); err != nil {
+		return deliveryRecord{}, fmt.Errorf("notification delivery email snapshot is invalid")
 	}
 	if stored.ProviderOutcome != "" && stored.ProviderOutcome.Validate() != nil {
 		return deliveryRecord{}, fmt.Errorf("notification delivery provider outcome is invalid")

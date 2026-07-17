@@ -2,8 +2,6 @@ package dynamo
 
 import (
 	"context"
-	"crypto/sha256"
-	"encoding/hex"
 	"errors"
 	"fmt"
 	"strings"
@@ -67,7 +65,7 @@ func (store Store) reconcileOnce(
 		return feedback.ReconcileResult{}, false, err
 	}
 	if len(transport) != 0 {
-		if !validDedupeItem(transport, transportKey, "ses_feedback_transport_dedupe") {
+		if !validTransportDedupe(transport, transportKey) {
 			return feedback.ReconcileResult{Disposition: feedback.ReconcileAwaitDLQ}, false, nil
 		}
 		return feedback.ReconcileResult{Disposition: feedback.ReconcileDuplicate}, false, nil
@@ -78,7 +76,7 @@ func (store Store) reconcileOnce(
 		return feedback.ReconcileResult{}, false, err
 	}
 	if len(semantic) != 0 {
-		if !validDedupeItem(semantic, semanticKey, "ses_provider_event") {
+		if !validSemanticDedupe(semantic, semanticKey, event) {
 			return feedback.ReconcileResult{Disposition: feedback.ReconcileAwaitDLQ}, false, nil
 		}
 		if err := store.persistTransportDuplicate(ctx, transportKey, event, now); err != nil {
@@ -111,7 +109,7 @@ func (store Store) reconcileOnce(
 	if len(deliveryItem) == 0 {
 		return feedback.ReconcileResult{Disposition: feedback.ReconcileAwaitDLQ}, false, nil
 	}
-	delivery, err := decodeDelivery(deliveryItem, deliveryKey, event, attempt.OutboxID)
+	delivery, err := decodeDelivery(deliveryItem, deliveryKey, event, attempt)
 	if err != nil {
 		return feedback.ReconcileResult{Disposition: feedback.ReconcileAwaitDLQ}, false, nil
 	}
@@ -151,7 +149,7 @@ func (store Store) reconcileOnce(
 	if !isTransactionCanceled(err) {
 		return feedback.ReconcileResult{}, false, fmt.Errorf("persist SES feedback reconciliation: %w", err)
 	}
-	duplicate, lookupErr := store.dedupeNowExists(ctx, transportKey, semanticKey)
+	duplicate, lookupErr := store.dedupeNowExists(ctx, transportKey, semanticKey, event)
 	if lookupErr != nil {
 		return feedback.ReconcileResult{}, false, lookupErr
 	}
@@ -195,56 +193,97 @@ func (store Store) persistTransportDuplicate(
 		return err
 	}
 	_, err = store.Client.TransactWriteItems(ctx, &awssdk.TransactWriteItemsInput{
-		ClientRequestToken: aws.String(clientRequestToken(event.EventBridgeID)),
-		TransactItems:      []types.TransactWriteItem{{Put: put}},
+		TransactItems: []types.TransactWriteItem{{Put: put}},
 	})
-	if err == nil || isTransactionCanceled(err) {
+	if err == nil {
 		return nil
 	}
-	return fmt.Errorf("persist SES feedback transport dedupe: %w", err)
+	if !isTransactionCanceled(err) {
+		return fmt.Errorf("persist SES feedback transport dedupe: %w", err)
+	}
+	marker, readErr := store.getConsistent(ctx, key)
+	if readErr != nil {
+		return readErr
+	}
+	if !validTransportDedupe(marker, key) {
+		return fmt.Errorf("SES feedback transport dedupe conflict did not persist a canonical marker")
+	}
+	return nil
 }
 
 func (store Store) dedupeNowExists(
 	ctx context.Context,
 	transportKey notifications.StorageKey,
 	semanticKey notifications.StorageKey,
+	event feedback.Event,
 ) (bool, error) {
 	transport, err := store.getConsistent(ctx, transportKey)
 	if err != nil {
 		return false, err
 	}
 	if len(transport) != 0 {
+		if !validTransportDedupe(transport, transportKey) {
+			return false, fmt.Errorf("SES feedback transport dedupe row is corrupt")
+		}
 		return true, nil
 	}
 	semantic, err := store.getConsistent(ctx, semanticKey)
 	if err != nil {
 		return false, err
 	}
-	return len(semantic) != 0, nil
+	if len(semantic) == 0 {
+		return false, nil
+	}
+	if !validSemanticDedupe(semantic, semanticKey, event) {
+		return false, fmt.Errorf("SES feedback semantic dedupe row is corrupt")
+	}
+	return true, nil
 }
 
-func validDedupeItem(
+func validTransportDedupe(
 	item map[string]types.AttributeValue,
 	key notifications.StorageKey,
-	entityType string,
 ) bool {
 	var stored struct {
-		PK         string `dynamodbav:"PK"`
-		SK         string `dynamodbav:"SK"`
-		EntityType string `dynamodbav:"entity_type"`
+		PK                string `dynamodbav:"PK"`
+		SK                string `dynamodbav:"SK"`
+		EntityType        string `dynamodbav:"entity_type"`
+		SchemaVersion     int64  `dynamodbav:"schema_version"`
+		EventBridgeIDHash string `dynamodbav:"event_bridge_id_hash"`
+		CreatedAt         string `dynamodbav:"created_at"`
+		ExpiresAt         int64  `dynamodbav:"expires_at"`
 	}
 	return attributevalue.UnmarshalMap(item, &stored) == nil && stored.PK == key.PartitionKey &&
-		stored.SK == key.SortKey && stored.EntityType == entityType
+		stored.SK == key.SortKey && stored.EntityType == "ses_feedback_transport_dedupe" && stored.SchemaVersion == 1 &&
+		stored.EventBridgeIDHash == strings.TrimPrefix(key.PartitionKey, "SES_FEEDBACK_TRANSPORT#") &&
+		stored.CreatedAt != "" && stored.ExpiresAt > 0
+}
+
+func validSemanticDedupe(
+	item map[string]types.AttributeValue,
+	key notifications.StorageKey,
+	event feedback.Event,
+) bool {
+	var stored struct {
+		PK                string                `dynamodbav:"PK"`
+		SK                string                `dynamodbav:"SK"`
+		EntityType        string                `dynamodbav:"entity_type"`
+		SchemaVersion     int64                 `dynamodbav:"schema_version"`
+		ProviderMessageID string                `dynamodbav:"provider_message_id"`
+		SemanticType      feedback.SemanticType `dynamodbav:"semantic_type"`
+		DeliveryID        string                `dynamodbav:"delivery_id"`
+		AttemptID         string                `dynamodbav:"attempt_id"`
+		ObservedAt        string                `dynamodbav:"observed_at"`
+	}
+	return attributevalue.UnmarshalMap(item, &stored) == nil && stored.PK == key.PartitionKey &&
+		stored.SK == key.SortKey && stored.EntityType == "ses_provider_event" && stored.SchemaVersion == 1 &&
+		stored.ProviderMessageID == event.ProviderMessageID && stored.SemanticType == event.SemanticType &&
+		stored.DeliveryID == event.DeliveryID && stored.AttemptID == event.AttemptID && stored.ObservedAt != ""
 }
 
 func isTransactionCanceled(err error) bool {
 	var cancelled *types.TransactionCanceledException
 	return errors.As(err, &cancelled)
-}
-
-func clientRequestToken(identity string) string {
-	digest := sha256.Sum256([]byte(identity))
-	return "sesfb_" + hex.EncodeToString(digest[:15])
 }
 
 func fixedTime(value time.Time) string {
