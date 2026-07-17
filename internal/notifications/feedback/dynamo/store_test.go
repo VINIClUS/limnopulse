@@ -68,15 +68,16 @@ func TestReconcileMapsEveryFeedbackOutcomeAndCompletesFastAttempts(t *testing.T)
 		wantOutcome     notifications.ProviderOutcome
 		wantState       notifications.DeliveryState
 		wantAttempt     notifications.AttemptOutcome
+		wantCompleted   bool
 		wantSuppression bool
 	}{
-		{name: "send", event: testEvent(feedback.SemanticSend), wantOutcome: notifications.ProviderOutcomeAccepted, wantState: notifications.DeliveryStateSucceeded, wantAttempt: notifications.AttemptOutcomeSucceeded},
-		{name: "delivery", event: testEvent(feedback.SemanticDelivery), wantOutcome: notifications.ProviderOutcomeDeliveredToMailServer, wantState: notifications.DeliveryStateSucceeded, wantAttempt: notifications.AttemptOutcomeSucceeded},
-		{name: "delay", event: testEvent(feedback.SemanticDeliveryDelay), wantOutcome: notifications.ProviderOutcomeDelayed, wantState: notifications.DeliveryStateSucceeded, wantAttempt: notifications.AttemptOutcomeSucceeded},
-		{name: "soft bounce", event: testEvent(feedback.SemanticSoftBounce), wantOutcome: notifications.ProviderOutcomeSoftBounced, wantState: notifications.DeliveryStateSucceeded, wantAttempt: notifications.AttemptOutcomeSucceeded},
-		{name: "hard bounce", event: testEvent(feedback.SemanticHardBounce), wantOutcome: notifications.ProviderOutcomeHardBounced, wantState: notifications.DeliveryStateSucceeded, wantAttempt: notifications.AttemptOutcomeSucceeded, wantSuppression: true},
-		{name: "complaint", event: testEvent(feedback.SemanticComplaint), wantOutcome: notifications.ProviderOutcomeComplained, wantState: notifications.DeliveryStateSucceeded, wantAttempt: notifications.AttemptOutcomeSucceeded, wantSuppression: true},
-		{name: "reject", event: testEvent(feedback.SemanticReject), wantOutcome: notifications.ProviderOutcomeRejected, wantState: notifications.DeliveryStatePermanentFailed, wantAttempt: notifications.AttemptOutcomePermanentFailed},
+		{name: "send", event: testEvent(feedback.SemanticSend), wantOutcome: notifications.ProviderOutcomeAccepted, wantState: notifications.DeliveryStateSucceeded, wantAttempt: notifications.AttemptOutcomeSucceeded, wantCompleted: true},
+		{name: "delivery", event: testEvent(feedback.SemanticDelivery), wantOutcome: notifications.ProviderOutcomeDeliveredToMailServer, wantState: notifications.DeliveryStateSucceeded, wantAttempt: notifications.AttemptOutcomeSucceeded, wantCompleted: true},
+		{name: "delay", event: testEvent(feedback.SemanticDeliveryDelay), wantOutcome: notifications.ProviderOutcomeDelayed, wantState: notifications.DeliveryStateProcessing, wantAttempt: notifications.AttemptOutcomeStarted},
+		{name: "soft bounce", event: testEvent(feedback.SemanticSoftBounce), wantOutcome: notifications.ProviderOutcomeSoftBounced, wantState: notifications.DeliveryStateSucceeded, wantAttempt: notifications.AttemptOutcomeSucceeded, wantCompleted: true},
+		{name: "hard bounce", event: testEvent(feedback.SemanticHardBounce), wantOutcome: notifications.ProviderOutcomeHardBounced, wantState: notifications.DeliveryStateSucceeded, wantAttempt: notifications.AttemptOutcomeSucceeded, wantCompleted: true, wantSuppression: true},
+		{name: "complaint", event: testEvent(feedback.SemanticComplaint), wantOutcome: notifications.ProviderOutcomeComplained, wantState: notifications.DeliveryStateSucceeded, wantAttempt: notifications.AttemptOutcomeSucceeded, wantCompleted: true, wantSuppression: true},
+		{name: "reject", event: testEvent(feedback.SemanticReject), wantOutcome: notifications.ProviderOutcomeRejected, wantState: notifications.DeliveryStatePermanentFailed, wantAttempt: notifications.AttemptOutcomePermanentFailed, wantCompleted: true},
 	}
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
@@ -98,8 +99,9 @@ func TestReconcileMapsEveryFeedbackOutcomeAndCompletesFastAttempts(t *testing.T)
 				deliveryValues[":provider_outcome"] != string(test.wantOutcome) {
 				t.Fatalf("attempt=%#v delivery=%#v", attemptValues, deliveryValues)
 			}
-			if !strings.Contains(*attemptUpdate.UpdateExpression, "#completed_at") {
-				t.Fatalf("fast feedback did not complete Attempt: %s", *attemptUpdate.UpdateExpression)
+			completed := strings.Contains(*attemptUpdate.UpdateExpression, "#completed_at")
+			if completed != test.wantCompleted {
+				t.Fatalf("completed=%t, want %t: %s", completed, test.wantCompleted, *attemptUpdate.UpdateExpression)
 			}
 		})
 	}

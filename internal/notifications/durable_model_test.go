@@ -291,7 +291,8 @@ func TestProviderFeedbackReconcilesDeliveryStateWithoutResurrectingCancellation(
 		want     DeliveryState
 	}{
 		{name: "fast send completes processing", current: DeliveryStateProcessing, incoming: ProviderOutcomeAccepted, want: DeliveryStateSucceeded},
-		{name: "delay proves provider acceptance", current: DeliveryStateRetryableFailed, incoming: ProviderOutcomeDelayed, want: DeliveryStateSucceeded},
+		{name: "delay remains nonterminal", current: DeliveryStateRetryableFailed, incoming: ProviderOutcomeDelayed, want: DeliveryStateRetryableFailed},
+		{name: "delay does not complete processing", current: DeliveryStateProcessing, incoming: ProviderOutcomeDelayed, want: DeliveryStateProcessing},
 		{name: "late send promotes unknown", current: DeliveryStateUnknown, incoming: ProviderOutcomeAccepted, want: DeliveryStateSucceeded},
 		{name: "reject is permanent", current: DeliveryStateProcessing, incoming: ProviderOutcomeRejected, want: DeliveryStatePermanentFailed},
 		{name: "cancelled recovery stays cancelled", current: DeliveryStateCancelled, incoming: ProviderOutcomeAccepted, want: DeliveryStateCancelled},

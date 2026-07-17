@@ -168,7 +168,7 @@ func nextAttemptOutcome(current notifications.AttemptOutcome, event feedback.Eve
 		if event.PermanentFailure {
 			return notifications.AttemptOutcomePermanentFailed
 		}
-		if event.AcceptedEvidence {
+		if event.AcceptedEvidence && event.CompletesAttempt() {
 			return notifications.AttemptOutcomeSucceeded
 		}
 	}

@@ -22,14 +22,63 @@ const (
 	SemanticReject        SemanticType = "reject"
 )
 
-func (eventType SemanticType) Validate() error {
+type semanticDescriptor struct {
+	providerOutcome   notifications.ProviderOutcome
+	suppressionReason SuppressionReason
+	permanentFailure  bool
+	acceptedEvidence  bool
+	completesAttempt  bool
+}
+
+func describeSemantic(eventType SemanticType) (semanticDescriptor, bool) {
 	switch eventType {
-	case SemanticSend, SemanticDelivery, SemanticDeliveryDelay, SemanticSoftBounce,
-		SemanticHardBounce, SemanticComplaint, SemanticReject:
-		return nil
+	case SemanticSend:
+		return semanticDescriptor{
+			providerOutcome:  notifications.ProviderOutcomeAccepted,
+			acceptedEvidence: true, completesAttempt: true,
+		}, true
+	case SemanticDelivery:
+		return semanticDescriptor{
+			providerOutcome:  notifications.ProviderOutcomeDeliveredToMailServer,
+			acceptedEvidence: true, completesAttempt: true,
+		}, true
+	case SemanticDeliveryDelay:
+		return semanticDescriptor{
+			providerOutcome:  notifications.ProviderOutcomeDelayed,
+			acceptedEvidence: true,
+		}, true
+	case SemanticSoftBounce:
+		return semanticDescriptor{
+			providerOutcome:  notifications.ProviderOutcomeSoftBounced,
+			acceptedEvidence: true, completesAttempt: true,
+		}, true
+	case SemanticHardBounce:
+		return semanticDescriptor{
+			providerOutcome:   notifications.ProviderOutcomeHardBounced,
+			suppressionReason: SuppressionHardBounce,
+			acceptedEvidence:  true, completesAttempt: true,
+		}, true
+	case SemanticComplaint:
+		return semanticDescriptor{
+			providerOutcome:   notifications.ProviderOutcomeComplained,
+			suppressionReason: SuppressionComplaint,
+			acceptedEvidence:  true, completesAttempt: true,
+		}, true
+	case SemanticReject:
+		return semanticDescriptor{
+			providerOutcome:  notifications.ProviderOutcomeRejected,
+			permanentFailure: true, completesAttempt: true,
+		}, true
 	default:
+		return semanticDescriptor{}, false
+	}
+}
+
+func (eventType SemanticType) Validate() error {
+	if _, ok := describeSemantic(eventType); !ok {
 		return fmt.Errorf("unknown feedback semantic type")
 	}
+	return nil
 }
 
 type SuppressionReason string
@@ -95,43 +144,41 @@ func (event Event) Validate() error {
 }
 
 func (event Event) validateSemantics() error {
-	wantOutcome := notifications.ProviderOutcome("")
-	wantSuppression := SuppressionReason("")
-	wantAccepted := true
-	wantPermanent := false
-	switch event.SemanticType {
-	case SemanticSend:
-		wantOutcome = notifications.ProviderOutcomeAccepted
-	case SemanticDelivery:
-		wantOutcome = notifications.ProviderOutcomeDeliveredToMailServer
-	case SemanticDeliveryDelay:
-		wantOutcome = notifications.ProviderOutcomeDelayed
-	case SemanticSoftBounce:
-		wantOutcome = notifications.ProviderOutcomeSoftBounced
-	case SemanticHardBounce:
-		wantOutcome = notifications.ProviderOutcomeHardBounced
-		wantSuppression = SuppressionHardBounce
-	case SemanticComplaint:
-		wantOutcome = notifications.ProviderOutcomeComplained
-		wantSuppression = SuppressionComplaint
-	case SemanticReject:
-		wantOutcome = notifications.ProviderOutcomeRejected
-		wantAccepted = false
-		wantPermanent = true
+	descriptor, ok := describeSemantic(event.SemanticType)
+	if !ok {
+		return fmt.Errorf("unknown feedback semantic type")
+	}
+	if event.ProviderOutcome != descriptor.providerOutcome ||
+		event.AcceptedEvidence != descriptor.acceptedEvidence ||
+		event.PermanentFailure != descriptor.permanentFailure {
+		return fmt.Errorf("feedback semantic flags are inconsistent")
+	}
+	if event.SemanticType == SemanticReject {
 		if event.SuppressionReason != "" && event.SuppressionReason != SuppressionRecipientReject {
 			return fmt.Errorf("feedback rejection suppression is invalid")
 		}
-	default:
-		return fmt.Errorf("unknown feedback semantic type")
-	}
-	if event.ProviderOutcome != wantOutcome || event.AcceptedEvidence != wantAccepted ||
-		event.PermanentFailure != wantPermanent {
-		return fmt.Errorf("feedback semantic flags are inconsistent")
-	}
-	if event.SemanticType != SemanticReject && event.SuppressionReason != wantSuppression {
+	} else if event.SuppressionReason != descriptor.suppressionReason {
 		return fmt.Errorf("feedback suppression is inconsistent")
 	}
 	return nil
+}
+
+func (event Event) CompletesAttempt() bool {
+	descriptor, ok := describeSemantic(event.SemanticType)
+	return ok && descriptor.completesAttempt
+}
+
+func (event *Event) applySemantic(eventType SemanticType) bool {
+	descriptor, ok := describeSemantic(eventType)
+	if !ok {
+		return false
+	}
+	event.SemanticType = eventType
+	event.ProviderOutcome = descriptor.providerOutcome
+	event.SuppressionReason = descriptor.suppressionReason
+	event.PermanentFailure = descriptor.permanentFailure
+	event.AcceptedEvidence = descriptor.acceptedEvidence
+	return true
 }
 
 type ParseDisposition uint8
@@ -211,36 +258,27 @@ func ParseEvent(body []byte) (ParseResult, error) {
 		EventBridgeID: envelope.ID, ProviderMessageID: envelope.Detail.Mail.MessageID,
 		DeliveryID: deliveryID, AttemptID: attemptID,
 	}
+	semantic := SemanticType("")
+	recipientReject := false
 	switch envelope.Detail.EventType {
 	case "Send":
-		event.SemanticType = SemanticSend
-		event.ProviderOutcome = notifications.ProviderOutcomeAccepted
-		event.AcceptedEvidence = true
+		semantic = SemanticSend
 	case "Delivery":
-		event.SemanticType = SemanticDelivery
-		event.ProviderOutcome = notifications.ProviderOutcomeDeliveredToMailServer
-		event.AcceptedEvidence = true
+		semantic = SemanticDelivery
 	case "DeliveryDelay":
 		if envelope.Detail.DeliveryDelay == nil {
 			return fail()
 		}
-		event.SemanticType = SemanticDeliveryDelay
-		event.ProviderOutcome = notifications.ProviderOutcomeDelayed
-		event.AcceptedEvidence = true
+		semantic = SemanticDeliveryDelay
 	case "Bounce":
 		if envelope.Detail.Bounce == nil {
 			return fail()
 		}
 		switch envelope.Detail.Bounce.BounceType {
 		case "Transient":
-			event.SemanticType = SemanticSoftBounce
-			event.ProviderOutcome = notifications.ProviderOutcomeSoftBounced
-			event.AcceptedEvidence = true
+			semantic = SemanticSoftBounce
 		case "Permanent":
-			event.SemanticType = SemanticHardBounce
-			event.ProviderOutcome = notifications.ProviderOutcomeHardBounced
-			event.SuppressionReason = SuppressionHardBounce
-			event.AcceptedEvidence = true
+			semantic = SemanticHardBounce
 		default:
 			return fail()
 		}
@@ -248,22 +286,21 @@ func ParseEvent(body []byte) (ParseResult, error) {
 		if envelope.Detail.Complaint == nil {
 			return fail()
 		}
-		event.SemanticType = SemanticComplaint
-		event.ProviderOutcome = notifications.ProviderOutcomeComplained
-		event.SuppressionReason = SuppressionComplaint
-		event.AcceptedEvidence = true
+		semantic = SemanticComplaint
 	case "Reject":
 		if envelope.Detail.Reject == nil || strings.TrimSpace(envelope.Detail.Reject.Reason) == "" {
 			return fail()
 		}
-		event.SemanticType = SemanticReject
-		event.ProviderOutcome = notifications.ProviderOutcomeRejected
-		event.PermanentFailure = true
-		if recipientSpecificReject(envelope.Detail.Reject.Reason) {
-			event.SuppressionReason = SuppressionRecipientReject
-		}
+		semantic = SemanticReject
+		recipientReject = recipientSpecificReject(envelope.Detail.Reject.Reason)
 	default:
 		return fail()
+	}
+	if !event.applySemantic(semantic) {
+		return fail()
+	}
+	if recipientReject {
+		event.SuppressionReason = SuppressionRecipientReject
 	}
 	if err := event.Validate(); err != nil {
 		return fail()

@@ -323,6 +323,9 @@ func ReconcileDeliveryStateFromProvider(
 		if incoming == ProviderOutcomeRejected {
 			return DeliveryStatePermanentFailed, nil
 		}
+		if incoming == ProviderOutcomeDelayed {
+			return current, nil
+		}
 		return DeliveryStateSucceeded, nil
 	default:
 		return "", fmt.Errorf("provider feedback cannot reconcile delivery from %q", current)

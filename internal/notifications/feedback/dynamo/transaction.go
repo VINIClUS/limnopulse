@@ -176,7 +176,7 @@ func (store Store) deliveryUpdate(
 	if err != nil {
 		return nil, err
 	}
-	nextState, err := notifications.ReconcileDeliveryStateFromProvider(current.State, provider.Outcome)
+	nextState, err := notifications.ReconcileDeliveryStateFromProvider(current.State, event.ProviderOutcome)
 	if err != nil {
 		return nil, err
 	}
