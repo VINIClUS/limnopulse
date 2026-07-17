@@ -2,6 +2,8 @@ package notifications
 
 import (
 	"encoding/json"
+	"os"
+	"path/filepath"
 	"reflect"
 	"testing"
 )
@@ -30,6 +32,11 @@ func TestNotificationEnumsExposeOnlyContractValues(t *testing.T) {
 			name: "channels",
 			got:  stringsOf(Channels()),
 			want: []string{"email"},
+		},
+		{
+			name: "email deliverability",
+			got:  stringsOf(EmailDeliverabilities()),
+			want: []string{"unknown", "deliverable", "suppressed"},
 		},
 		{
 			name: "delivery states",
@@ -64,6 +71,7 @@ func TestNotificationEnumsRejectUnknownAndNULValues(t *testing.T) {
 		{name: "work kind", value: WorkKind("OTHER")},
 		{name: "notification kind", value: NotificationKind("opening\x00")},
 		{name: "channel", value: Channel("sms")},
+		{name: "email deliverability", value: EmailDeliverability("blocked")},
 		{name: "delivery state", value: DeliveryState("finished")},
 		{name: "attempt outcome", value: AttemptOutcome("failed")},
 		{name: "provider outcome", value: ProviderOutcome("bounce")},
@@ -85,6 +93,7 @@ func TestNotificationEnumsRejectUnknownJSON(t *testing.T) {
 		{name: "work kind", target: new(WorkKind)},
 		{name: "notification kind", target: new(NotificationKind)},
 		{name: "channel", target: new(Channel)},
+		{name: "email deliverability", target: new(EmailDeliverability)},
 		{name: "delivery state", target: new(DeliveryState)},
 		{name: "attempt outcome", target: new(AttemptOutcome)},
 		{name: "provider outcome", target: new(ProviderOutcome)},
@@ -97,6 +106,22 @@ func TestNotificationEnumsRejectUnknownJSON(t *testing.T) {
 				}
 			}
 		})
+	}
+}
+
+func TestEmailDeliverabilityMatchesSharedPythonContract(t *testing.T) {
+	data, err := os.ReadFile(filepath.Join("..", "..", "testdata", "email_deliverability_values.json"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	var fixture struct {
+		Values []string `json:"values"`
+	}
+	if err := json.Unmarshal(data, &fixture); err != nil {
+		t.Fatal(err)
+	}
+	if got := stringsOf(EmailDeliverabilities()); !reflect.DeepEqual(got, fixture.Values) {
+		t.Fatalf("Go values = %v, shared values = %v", got, fixture.Values)
 	}
 }
 

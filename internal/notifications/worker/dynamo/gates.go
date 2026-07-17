@@ -51,17 +51,19 @@ func (store Store) CheckGates(ctx context.Context, record worker.DeliveryRecord)
 		return worker.GateResult{Allowed: true}, nil
 	}
 	var deliverability struct {
-		State string `dynamodbav:"deliverability"`
+		State notifications.EmailDeliverability `dynamodbav:"deliverability"`
 	}
 	if err := attributevalue.UnmarshalMap(deliverabilityItem, &deliverability); err != nil {
 		return worker.GateResult{}, fmt.Errorf("decode current deliverability: %w", err)
 	}
-	switch deliverability.State {
-	case "unknown", "deliverable":
-		return worker.GateResult{Allowed: true}, nil
-	case "suppressed":
-		return worker.GateResult{CancellationReason: notifications.CancellationReasonEmailSuppressed}, nil
-	default:
+	if err := deliverability.State.Validate(); err != nil {
 		return worker.GateResult{}, fmt.Errorf("current deliverability is malformed")
 	}
+	switch deliverability.State {
+	case notifications.EmailDeliverabilityUnknown, notifications.EmailDeliverabilityDeliverable:
+		return worker.GateResult{Allowed: true}, nil
+	case notifications.EmailDeliverabilitySuppressed:
+		return worker.GateResult{CancellationReason: notifications.CancellationReasonEmailSuppressed}, nil
+	}
+	return worker.GateResult{}, fmt.Errorf("current deliverability is malformed")
 }

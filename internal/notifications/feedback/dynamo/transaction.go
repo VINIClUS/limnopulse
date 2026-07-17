@@ -230,7 +230,7 @@ func (store Store) suppressionPut(
 	}
 	item, err := attributevalue.MarshalMap(map[string]any{
 		"PK": key.PartitionKey, "SK": key.SortKey, "entity_type": "email_deliverability",
-		"schema_version": int64(1), "deliverability": "suppressed",
+		"schema_version": int64(1), "deliverability": notifications.EmailDeliverabilitySuppressed,
 		"suppression_reason": string(event.SuppressionReason), "suppression_rank": int64(event.SuppressionReason.Rank()),
 		"source_delivery_id": delivery.DeliveryID, "source_attempt_id": event.AttemptID,
 		"source_provider_message_id": event.ProviderMessageID, "suppressed_at": fixedTime(now), "updated_at": fixedTime(now),

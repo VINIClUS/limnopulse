@@ -50,7 +50,7 @@ type deliveryRecord struct {
 type suppressionRecord struct {
 	Exists         bool
 	Key            notifications.StorageKey
-	Deliverability string
+	Deliverability notifications.EmailDeliverability
 	Reason         feedback.SuppressionReason
 	Rank           int
 }
@@ -127,12 +127,12 @@ func decodeSuppression(
 		return suppressionRecord{Key: key}, nil
 	}
 	var stored struct {
-		PK             string                     `dynamodbav:"PK"`
-		SK             string                     `dynamodbav:"SK"`
-		EntityType     string                     `dynamodbav:"entity_type"`
-		Deliverability string                     `dynamodbav:"deliverability"`
-		Reason         feedback.SuppressionReason `dynamodbav:"suppression_reason"`
-		Rank           int                        `dynamodbav:"suppression_rank"`
+		PK             string                            `dynamodbav:"PK"`
+		SK             string                            `dynamodbav:"SK"`
+		EntityType     string                            `dynamodbav:"entity_type"`
+		Deliverability notifications.EmailDeliverability `dynamodbav:"deliverability"`
+		Reason         feedback.SuppressionReason        `dynamodbav:"suppression_reason"`
+		Rank           int                               `dynamodbav:"suppression_rank"`
 	}
 	if err := attributevalue.UnmarshalMap(item, &stored); err != nil {
 		return suppressionRecord{}, err
@@ -144,20 +144,21 @@ func decodeSuppression(
 		Exists: true, Key: key, Deliverability: stored.Deliverability,
 		Reason: stored.Reason, Rank: stored.Rank,
 	}
+	if err := stored.Deliverability.Validate(); err != nil {
+		return suppressionRecord{}, fmt.Errorf("email deliverability is invalid")
+	}
 	switch stored.Deliverability {
-	case "unknown", "deliverable":
+	case notifications.EmailDeliverabilityUnknown, notifications.EmailDeliverabilityDeliverable:
 		if stored.Reason != "" || stored.Rank != 0 {
 			return suppressionRecord{}, fmt.Errorf("email deliverability is invalid")
 		}
-	case "suppressed":
+	case notifications.EmailDeliverabilitySuppressed:
 		if stored.EntityType != "" && stored.EntityType != "email_deliverability" {
 			return suppressionRecord{}, fmt.Errorf("email deliverability entity is invalid")
 		}
 		if stored.Reason.Validate() != nil || stored.Rank != stored.Reason.Rank() {
 			return suppressionRecord{}, fmt.Errorf("email deliverability suppression is invalid")
 		}
-	default:
-		return suppressionRecord{}, fmt.Errorf("email deliverability is invalid")
 	}
 	return record, nil
 }

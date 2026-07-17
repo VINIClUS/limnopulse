@@ -85,6 +85,41 @@ func Channels() []Channel {
 	return []Channel{ChannelEmail}
 }
 
+type EmailDeliverability string
+
+const (
+	EmailDeliverabilityUnknown     EmailDeliverability = "unknown"
+	EmailDeliverabilityDeliverable EmailDeliverability = "deliverable"
+	EmailDeliverabilitySuppressed  EmailDeliverability = "suppressed"
+)
+
+func (deliverability EmailDeliverability) Validate() error {
+	switch deliverability {
+	case EmailDeliverabilityUnknown,
+		EmailDeliverabilityDeliverable,
+		EmailDeliverabilitySuppressed:
+		return nil
+	default:
+		return fmt.Errorf("unknown email deliverability %q", deliverability)
+	}
+}
+
+func (deliverability *EmailDeliverability) UnmarshalText(text []byte) error {
+	return assignEnum(deliverability, text, EmailDeliverability.Validate)
+}
+
+func (deliverability *EmailDeliverability) UnmarshalJSON(data []byte) error {
+	return unmarshalEnumJSON(deliverability, data, EmailDeliverability.Validate)
+}
+
+func EmailDeliverabilities() []EmailDeliverability {
+	return []EmailDeliverability{
+		EmailDeliverabilityUnknown,
+		EmailDeliverabilityDeliverable,
+		EmailDeliverabilitySuppressed,
+	}
+}
+
 type DeliveryState string
 
 const (

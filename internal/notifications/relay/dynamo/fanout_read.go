@@ -179,19 +179,21 @@ func (store Store) addressSuppressed(ctx context.Context, address string) (bool,
 		return false, err
 	}
 	var record struct {
-		Deliverability string `dynamodbav:"deliverability"`
+		Deliverability notifications.EmailDeliverability `dynamodbav:"deliverability"`
 	}
 	if err := attributevalue.UnmarshalMap(item, &record); err != nil {
 		return false, fmt.Errorf("decode email deliverability: %w", err)
 	}
-	switch record.Deliverability {
-	case "unknown", "deliverable":
-		return false, nil
-	case "suppressed":
-		return true, nil
-	default:
+	if err := record.Deliverability.Validate(); err != nil {
 		return false, fmt.Errorf("email deliverability is invalid")
 	}
+	switch record.Deliverability {
+	case notifications.EmailDeliverabilityUnknown, notifications.EmailDeliverabilityDeliverable:
+		return false, nil
+	case notifications.EmailDeliverabilitySuppressed:
+		return true, nil
+	}
+	return false, fmt.Errorf("email deliverability is invalid")
 }
 
 func (store Store) getConsistent(

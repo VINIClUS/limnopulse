@@ -1,4 +1,5 @@
 from datetime import UTC, datetime
+import json
 from pathlib import Path
 import tomllib
 
@@ -17,6 +18,17 @@ from limnopulse_api.domain.notification_preferences import (
 
 
 NOW = datetime(2026, 7, 16, 12, 0, tzinfo=UTC)
+
+
+def test_email_deliverability_matches_shared_go_contract() -> None:
+    fixture_path = (
+        Path(__file__).resolve().parents[2]
+        / "testdata"
+        / "email_deliverability_values.json"
+    )
+    values = json.loads(fixture_path.read_text())["values"]
+
+    assert values == [deliverability.value for deliverability in EmailDeliverability]
 
 
 def test_project_declares_email_validator_dependency() -> None:
