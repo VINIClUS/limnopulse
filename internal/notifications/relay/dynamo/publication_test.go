@@ -30,7 +30,8 @@ func TestMarkQueuedFencesPendingDeliveryAndRemovesRelayLease(t *testing.T) {
 	condition := aws.ToString(input.ConditionExpression)
 	for _, fragment := range []string{
 		"#state = :pending", "#revision = :revision", "#lease_owner = :lease_owner",
-		"#lease_epoch = :lease_epoch", "#relay_pk = :relay_pk", "#relay_sk = :relay_sk",
+		"#lease_epoch = :lease_epoch", "#relay_work_kind = :relay_work_kind",
+		"#relay_pk = :relay_pk", "#relay_sk = :relay_sk",
 	} {
 		if !strings.Contains(condition, fragment) {
 			t.Fatalf("queued condition missing %q: %s", fragment, condition)
@@ -65,7 +66,8 @@ func TestRescheduleReindexesPendingDeliveryWithoutChangingDeliveryStateOrContent
 	condition := aws.ToString(input.ConditionExpression)
 	for _, fragment := range []string{
 		"#state = :state", "#revision = :revision", "#lease_owner = :lease_owner",
-		"#lease_epoch = :lease_epoch", "#relay_pk = :relay_pk", "#relay_sk = :relay_sk",
+		"#lease_epoch = :lease_epoch", "#relay_work_kind = :relay_work_kind",
+		"#relay_pk = :relay_pk", "#relay_sk = :relay_sk",
 	} {
 		if !strings.Contains(condition, fragment) {
 			t.Fatalf("reschedule condition missing %q: %s", fragment, condition)
@@ -88,8 +90,13 @@ func TestRescheduleReindexesPendingDeliveryWithoutChangingDeliveryStateOrContent
 		t.Fatal(err)
 	}
 	if values[":next_available_at"] != next.Format(fixedUTCLayout) ||
+		values[":relay_work_kind"] != string(notifications.WorkKindDelivery) ||
 		values[":next_relay_pk"] != wantIndex.PartitionKey || values[":next_relay_sk"] != wantIndex.SortKey {
 		t.Fatalf("reschedule values = %#v", values)
+	}
+	if !strings.Contains(update, "#relay_work_kind = :relay_work_kind") ||
+		input.ExpressionAttributeNames["#relay_work_kind"] != "relay_work_kind" {
+		t.Fatalf("reschedule marker update = %s, names = %#v", update, input.ExpressionAttributeNames)
 	}
 }
 

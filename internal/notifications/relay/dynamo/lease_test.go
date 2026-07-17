@@ -41,7 +41,8 @@ func TestClaimConditionsCurrentIndexStateRevisionCursorAndFencesLease(t *testing
 		"kind": "opening", "channel": "email", "expansion_status": work.State,
 		"expansion_revision": work.Revision, "expansion_cursor": work.Cursor,
 		"available_at": available.Format(fixedUTCLayout), "relay_schema_version": int64(1),
-		"relay_gsi_pk": work.RelayPK, "relay_gsi_sk": work.RelaySK,
+		"relay_work_kind": string(notifications.WorkKindIntent),
+		"relay_gsi_pk":    work.RelayPK, "relay_gsi_sk": work.RelaySK,
 		"relay_lease_owner": "run_1", "relay_lease_epoch": int64(4),
 		"relay_lease_expires_at": now.Add(20 * time.Second).Format(fixedUTCLayout),
 	}
@@ -69,7 +70,8 @@ func TestClaimConditionsCurrentIndexStateRevisionCursorAndFencesLease(t *testing
 		t.Fatalf("nonzero revision was not fenced exactly: %s", condition)
 	}
 	for _, fragment := range []string{
-		"#relay_schema = :schema", "#relay_pk = :relay_pk", "#relay_sk = :relay_sk",
+		"#relay_schema = :schema", "#relay_work_kind = :relay_work_kind",
+		"#relay_pk = :relay_pk", "#relay_sk = :relay_sk",
 		"#available_at <= :due", "#state = :state", "#revision = :revision",
 		"#cursor = :cursor", "attribute_not_exists(#lease_expires)",
 		"#lease_expires <= :now", "#lease_owner = :owner",
@@ -97,7 +99,8 @@ func TestClaimConditionsCurrentIndexStateRevisionCursorAndFencesLease(t *testing
 		t.Fatal(err)
 	}
 	if values[":owner"] != "run_1" || values[":cursor"] != "cursor_1" ||
-		values[":state"] != "pending" || fmt.Sprint(values[":revision"]) != "3" {
+		values[":state"] != "pending" || values[":relay_work_kind"] != string(notifications.WorkKindIntent) ||
+		fmt.Sprint(values[":revision"]) != "3" {
 		t.Fatalf("condition values = %#v", values)
 	}
 }

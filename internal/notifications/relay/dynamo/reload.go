@@ -37,6 +37,7 @@ type relayItem struct {
 	DeliveryRevision    int64                          `dynamodbav:"delivery_revision"`
 	AvailableAt         string                         `dynamodbav:"available_at"`
 	RelaySchemaVersion  int64                          `dynamodbav:"relay_schema_version"`
+	RelayWorkKind       notifications.WorkKind         `dynamodbav:"relay_work_kind"`
 	RelayPK             string                         `dynamodbav:"relay_gsi_pk"`
 	RelaySK             string                         `dynamodbav:"relay_gsi_sk"`
 	RelayLeaseOwner     string                         `dynamodbav:"relay_lease_owner"`
@@ -75,6 +76,12 @@ func (store Store) Reload(
 	}
 	if item.RelaySchemaVersion != 1 {
 		return relay.Work{}, false, fmt.Errorf("unsupported relay schema version")
+	}
+	if item.RelayWorkKind != candidate.Kind {
+		return relay.Work{}, false, fmt.Errorf(
+			"relay base work kind %q does not match candidate %q",
+			item.RelayWorkKind, candidate.Kind,
+		)
 	}
 	availableAt, err := time.Parse(fixedUTCLayout, item.AvailableAt)
 	if err != nil {

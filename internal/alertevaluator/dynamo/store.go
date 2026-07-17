@@ -345,6 +345,7 @@ func (store Store) outboxPut(request alertevaluator.CommitRequest, outbox alerte
 		values["relay_schema_version"] = 1
 		values["expansion_status"] = "pending"
 		values["available_at"] = createdAt
+		values["relay_work_kind"] = string(workKind)
 		values["relay_gsi_pk"] = relayKey.PartitionKey
 		values["relay_gsi_sk"] = relayKey.SortKey
 	}

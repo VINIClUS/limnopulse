@@ -104,13 +104,14 @@ func (runner Runner) Run(parent context.Context, config relayconfig.RunConfig) R
 		return finishSummary(summary, ExitFatal, budgetStartedAt, clock().UTC())
 	}
 	buckets = rotateBuckets(buckets, relayTime)
-	candidates, complete, err := runner.discover(ctx, buckets, config, relayTime, softDeadline, clock)
+	discovery, err := runner.discover(ctx, buckets, config, relayTime, softDeadline, clock)
 	if err != nil {
 		summary.ScopeCompleted = false
 		summary.RetryRecommended = true
 		summary.ErrorCategories["discovery"]++
 		return finishSummary(summary, ExitFatal, budgetStartedAt, clock().UTC())
 	}
+	candidates := discovery.candidates
 	summary.Backlog = len(candidates)
 	for _, candidate := range candidates {
 		age := relayTime.Sub(candidate.AvailableAt)
@@ -118,14 +119,19 @@ func (runner Runner) Run(parent context.Context, config relayconfig.RunConfig) R
 			summary.OldestBacklogAgeSeconds = seconds
 		}
 	}
-	if !complete {
+	ordered := prioritizeCandidates(candidates)
+	if len(ordered) > config.MaxWork {
+		ordered = ordered[:config.MaxWork]
+		discovery.complete = false
+		discovery.capReached = true
+	}
+	if !discovery.complete {
 		summary.ScopeCompleted = false
 		summary.RetryRecommended = true
-		summary.CapReached = len(candidates) >= config.MaxWork
-		summary.DeadlineReached = !clock().Before(softDeadline)
+		summary.CapReached = discovery.capReached
+		summary.DeadlineReached = discovery.deadlineReached
 		summary.WorkRemaining = 1
 	}
-	ordered := prioritizeCandidates(candidates)
 	results := make(chan candidateResult, len(ordered))
 	jobs := make(chan Candidate, len(ordered))
 	workerCount := min(config.WorkParallelism, len(ordered))
@@ -187,7 +193,38 @@ func (runner Runner) discover(
 	relayTime time.Time,
 	softDeadline time.Time,
 	clock func() time.Time,
-) ([]Candidate, bool, error) {
+) (discoveryResult, error) {
+	result := discoveryResult{complete: true, candidates: make([]Candidate, 0, 3*config.MaxWork)}
+	for _, kind := range []notifications.WorkKind{
+		notifications.WorkKindDelivery,
+		notifications.WorkKindIntent,
+		notifications.WorkKindDependency,
+	} {
+		lane, err := runner.discoverLane(
+			ctx, buckets, kind, config, relayTime, softDeadline, clock,
+		)
+		if err != nil {
+			return discoveryResult{}, err
+		}
+		result.candidates = append(result.candidates, lane.candidates...)
+		if !lane.complete {
+			result.complete = false
+		}
+		result.capReached = result.capReached || lane.capReached
+		result.deadlineReached = result.deadlineReached || lane.deadlineReached
+	}
+	return result, nil
+}
+
+func (runner Runner) discoverLane(
+	ctx context.Context,
+	buckets []int,
+	kind notifications.WorkKind,
+	config relayconfig.RunConfig,
+	relayTime time.Time,
+	softDeadline time.Time,
+	clock func() time.Time,
+) (laneDiscoveryResult, error) {
 	tokens := make(map[int]string, len(buckets))
 	done := make(map[int]bool, len(buckets))
 	candidates := make([]Candidate, 0, config.MaxWork)
@@ -199,8 +236,13 @@ func (runner Runner) discover(
 			}
 		}
 		for offset := 0; offset < len(pending); offset += config.QueryParallelism {
-			if len(candidates) >= config.MaxWork || !clock().Before(softDeadline) {
-				return candidates, false, nil
+			if !clock().Before(softDeadline) {
+				return laneDiscoveryResult{
+					candidates: candidates, deadlineReached: true,
+				}, nil
+			}
+			if len(candidates) >= config.MaxWork {
+				return laneDiscoveryResult{candidates: candidates, capReached: true}, nil
 			}
 			end := min(offset+config.QueryParallelism, len(pending))
 			results := make([]dueQueryResult, end-offset)
@@ -211,34 +253,54 @@ func (runner Runner) discover(
 					defer queries.Done()
 					results[index].bucket = bucket
 					results[index].page, results[index].err = runner.Store.QueryDue(ctx, DueRequest{
-						Bucket: bucket, DueThrough: relayTime,
+						Bucket: bucket, Kind: kind, DueThrough: relayTime,
 						PageSize: discoveryPageSize(config.MaxWork, len(buckets)), NextToken: tokens[bucket],
 					})
 				}(index, bucket)
 			}
 			queries.Wait()
+			truncated := false
 			for _, result := range results {
 				if result.err != nil {
-					return nil, false, result.err
+					return laneDiscoveryResult{}, result.err
 				}
 				remaining := config.MaxWork - len(candidates)
 				if len(result.page.Candidates) > remaining {
 					candidates = append(candidates, result.page.Candidates[:remaining]...)
-					return candidates, false, nil
+					truncated = true
+				} else {
+					candidates = append(candidates, result.page.Candidates...)
 				}
-				candidates = append(candidates, result.page.Candidates...)
 				if result.page.NextToken == "" {
 					done[result.bucket] = true
 					continue
 				}
 				if result.page.NextToken == tokens[result.bucket] {
-					return nil, false, context.Canceled
+					return laneDiscoveryResult{}, context.Canceled
 				}
 				tokens[result.bucket] = result.page.NextToken
 			}
+			if truncated || (len(candidates) >= config.MaxWork &&
+				(end < len(pending) || len(done) < len(buckets))) {
+				return laneDiscoveryResult{candidates: candidates, capReached: true}, nil
+			}
 		}
 	}
-	return candidates, true, nil
+	return laneDiscoveryResult{candidates: candidates, complete: true}, nil
+}
+
+type discoveryResult struct {
+	candidates      []Candidate
+	complete        bool
+	capReached      bool
+	deadlineReached bool
+}
+
+type laneDiscoveryResult struct {
+	candidates      []Candidate
+	complete        bool
+	capReached      bool
+	deadlineReached bool
 }
 
 type candidateResult struct {

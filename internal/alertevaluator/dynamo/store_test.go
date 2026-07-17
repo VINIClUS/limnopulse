@@ -203,6 +203,7 @@ func TestCommitOpeningAtomicallyWritesEventTransitionAndOutboxes(t *testing.T) {
 	if fmt.Sprint(email["relay_schema_version"]) != "1" ||
 		email["expansion_status"] != "pending" ||
 		email["available_at"] != alertevaluator.FixedUTCTimestamp(slot) ||
+		email["relay_work_kind"] != string(notifications.WorkKindIntent) ||
 		email["relay_gsi_pk"] != wantRelay.PartitionKey ||
 		email["relay_gsi_sk"] != wantRelay.SortKey {
 		t.Fatalf("email outbox relay fields = %#v", email)
@@ -210,14 +211,14 @@ func TestCommitOpeningAtomicallyWritesEventTransitionAndOutboxes(t *testing.T) {
 	if email["channel"] != "email" || email["kind"] != "opening" || email["status"] != "ready" {
 		t.Fatalf("email outbox legacy fields changed = %#v", email)
 	}
-	if len(email) != 17 || email["outbox_id"] != decision.Outboxes[0].OutboxID ||
+	if len(email) != 18 || email["outbox_id"] != decision.Outboxes[0].OutboxID ||
 		email["event_id"] != decision.EventID || email["rule_id"] != work.Rule.RuleID ||
 		email["created_at"] != alertevaluator.FixedUTCTimestamp(slot) {
 		t.Fatalf("email outbox identity or field set changed = %#v", email)
 	}
 
 	telegram := unmarshalItem(t, items[5].Put.Item)
-	for _, field := range []string{"relay_schema_version", "expansion_status", "available_at", "relay_gsi_pk", "relay_gsi_sk"} {
+	for _, field := range []string{"relay_schema_version", "expansion_status", "available_at", "relay_work_kind", "relay_gsi_pk", "relay_gsi_sk"} {
 		if _, exists := telegram[field]; exists {
 			t.Fatalf("telegram outbox unexpectedly has %s: %#v", field, telegram)
 		}
@@ -277,16 +278,17 @@ func TestCommitRecoveryAddsDependencyRelayIndexOnlyToEmailOutbox(t *testing.T) {
 	if email["status"] != "blocked" || email["depends_on_outbox_id"] != "outbox_open_email" ||
 		fmt.Sprint(email["relay_schema_version"]) != "1" || email["expansion_status"] != "pending" ||
 		email["available_at"] != alertevaluator.FixedUTCTimestamp(slot) ||
+		email["relay_work_kind"] != string(notifications.WorkKindDependency) ||
 		email["relay_gsi_pk"] != wantRelay.PartitionKey || email["relay_gsi_sk"] != wantRelay.SortKey {
 		t.Fatalf("email recovery outbox = %#v", email)
 	}
-	if len(email) != 17 || email["outbox_id"] != decision.Outboxes[0].OutboxID ||
+	if len(email) != 18 || email["outbox_id"] != decision.Outboxes[0].OutboxID ||
 		email["event_id"] != decision.ResolvedEventID || email["kind"] != "recovery" {
 		t.Fatalf("email recovery identity or field set changed = %#v", email)
 	}
 
 	telegram := unmarshalItem(t, items[5].Put.Item)
-	for _, field := range []string{"relay_schema_version", "expansion_status", "available_at", "relay_gsi_pk", "relay_gsi_sk"} {
+	for _, field := range []string{"relay_schema_version", "expansion_status", "available_at", "relay_work_kind", "relay_gsi_pk", "relay_gsi_sk"} {
 		if _, exists := telegram[field]; exists {
 			t.Fatalf("telegram recovery unexpectedly has %s: %#v", field, telegram)
 		}

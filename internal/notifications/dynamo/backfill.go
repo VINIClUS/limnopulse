@@ -70,6 +70,7 @@ type relayMigration struct {
 	Outbox        relayOutbox
 	Expansion     string
 	AvailableAt   string
+	WorkKind      notifications.WorkKind
 	RelayIndexKey notifications.RelayIndexKey
 }
 
@@ -210,6 +211,7 @@ func classifyRelayOutbox(
 	}
 	migration.Expansion = "pending"
 	migration.AvailableAt = outbox.CreatedAt
+	migration.WorkKind = workKind
 	migration.RelayIndexKey, err = notifications.BuildRelayIndexKey(
 		workKind,
 		outbox.TenantID,
@@ -230,7 +232,8 @@ func classifyRelayOutbox(
 
 func hasAnyRelayField(item map[string]types.AttributeValue) bool {
 	for _, name := range []string{
-		"relay_schema_version", "expansion_status", "available_at", "relay_gsi_pk", "relay_gsi_sk",
+		"relay_schema_version", "expansion_status", "available_at", "relay_work_kind",
+		"relay_gsi_pk", "relay_gsi_sk",
 	} {
 		if _, exists := item[name]; exists {
 			return true
@@ -243,6 +246,7 @@ func isCanonicalEmail(item map[string]types.AttributeValue, migration relayMigra
 	return numberAttributeEquals(item, "relay_schema_version", "1") &&
 		stringAttributeEquals(item, "expansion_status", migration.Expansion) &&
 		stringAttributeEquals(item, "available_at", migration.AvailableAt) &&
+		stringAttributeEquals(item, "relay_work_kind", string(migration.WorkKind)) &&
 		stringAttributeEquals(item, "relay_gsi_pk", migration.RelayIndexKey.PartitionKey) &&
 		stringAttributeEquals(item, "relay_gsi_sk", migration.RelayIndexKey.SortKey)
 }
@@ -251,7 +255,7 @@ func isCanonicalTelegram(item map[string]types.AttributeValue) bool {
 	if !stringAttributeEquals(item, "expansion_status", "deferred_unsupported_channel") {
 		return false
 	}
-	for _, name := range []string{"relay_schema_version", "available_at", "relay_gsi_pk", "relay_gsi_sk"} {
+	for _, name := range []string{"relay_schema_version", "available_at", "relay_work_kind", "relay_gsi_pk", "relay_gsi_sk"} {
 		if _, exists := item[name]; exists {
 			return false
 		}
@@ -292,10 +296,12 @@ func (store Store) updateRelayOutbox(
 	if kind == migrationUpdateEmail {
 		valueMap[":relay_schema_version"] = 1
 		valueMap[":available_at"] = migration.AvailableAt
+		valueMap[":relay_work_kind"] = string(migration.WorkKind)
 		valueMap[":relay_gsi_pk"] = migration.RelayIndexKey.PartitionKey
 		valueMap[":relay_gsi_sk"] = migration.RelayIndexKey.SortKey
 		updateExpression = "SET #relay_schema_version = :relay_schema_version, #expansion_status = :expansion_status, " +
-			"#available_at = :available_at, #relay_gsi_pk = :relay_gsi_pk, #relay_gsi_sk = :relay_gsi_sk"
+			"#available_at = :available_at, #relay_work_kind = :relay_work_kind, " +
+			"#relay_gsi_pk = :relay_gsi_pk, #relay_gsi_sk = :relay_gsi_sk"
 	}
 	values, err := attributevalue.MarshalMap(valueMap)
 	if err != nil {
@@ -309,13 +315,15 @@ func (store Store) updateRelayOutbox(
 			"#tenant_id = :expected_tenant_id AND #outbox_id = :expected_outbox_id AND " +
 				"#channel = :expected_channel AND #status = :expected_status AND #created_at = :expected_created_at AND " +
 				"attribute_not_exists(#relay_schema_version) AND attribute_not_exists(#expansion_status) AND " +
-				"attribute_not_exists(#available_at) AND attribute_not_exists(#relay_gsi_pk) AND attribute_not_exists(#relay_gsi_sk)",
+				"attribute_not_exists(#available_at) AND attribute_not_exists(#relay_work_kind) AND " +
+				"attribute_not_exists(#relay_gsi_pk) AND attribute_not_exists(#relay_gsi_sk)",
 		),
 		ExpressionAttributeNames: map[string]string{
 			"#tenant_id": "tenant_id", "#outbox_id": "outbox_id", "#channel": "channel",
 			"#status": "status", "#created_at": "created_at", "#relay_schema_version": "relay_schema_version",
 			"#expansion_status": "expansion_status", "#available_at": "available_at",
-			"#relay_gsi_pk": "relay_gsi_pk", "#relay_gsi_sk": "relay_gsi_sk",
+			"#relay_work_kind": "relay_work_kind",
+			"#relay_gsi_pk":    "relay_gsi_pk", "#relay_gsi_sk": "relay_gsi_sk",
 		},
 		ExpressionAttributeValues: values,
 	})

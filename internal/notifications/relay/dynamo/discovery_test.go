@@ -79,6 +79,7 @@ func TestQueryDueUsesRelayGSIAndRoundTripsPaginationToken(t *testing.T) {
 	item := marshalMap(t, map[string]any{
 		"PK": "TENANT#tnt_1", "SK": "NOTIFICATION_OUTBOX#outbox_1",
 		"relay_gsi_pk": indexKey.PartitionKey, "relay_gsi_sk": indexKey.SortKey,
+		"relay_work_kind": string(notifications.WorkKindIntent),
 	})
 	lastKey := map[string]types.AttributeValue{
 		"PK": item["PK"], "SK": item["SK"],
@@ -91,7 +92,8 @@ func TestQueryDueUsesRelayGSIAndRoundTripsPaginationToken(t *testing.T) {
 	store := Store{Table: "domain", Client: client}
 
 	page, err := store.QueryDue(context.Background(), relay.DueRequest{
-		Bucket: indexKey.Bucket, DueThrough: due, PageSize: 25,
+		Bucket: indexKey.Bucket, Kind: notifications.WorkKindIntent,
+		DueThrough: due, PageSize: 25,
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -108,28 +110,59 @@ func TestQueryDueUsesRelayGSIAndRoundTripsPaginationToken(t *testing.T) {
 	input := client.queryInputs[0]
 	if aws.ToString(input.IndexName) != RelayIndex ||
 		aws.ToString(input.KeyConditionExpression) != "#relay_pk = :pk AND #relay_sk <= :due" ||
+		aws.ToString(input.FilterExpression) != "#relay_work_kind = :relay_work_kind" ||
 		aws.ToInt32(input.Limit) != 25 || aws.ToBool(input.ConsistentRead) {
 		t.Fatalf("query input = %#v", input)
 	}
 	if input.ExpressionAttributeNames["#relay_pk"] != "relay_gsi_pk" ||
-		input.ExpressionAttributeNames["#relay_sk"] != "relay_gsi_sk" {
+		input.ExpressionAttributeNames["#relay_sk"] != "relay_gsi_sk" ||
+		input.ExpressionAttributeNames["#relay_work_kind"] != "relay_work_kind" {
 		t.Fatalf("query names = %#v", input.ExpressionAttributeNames)
 	}
 	var values map[string]string
 	if err := attributevalue.UnmarshalMap(input.ExpressionAttributeValues, &values); err != nil {
 		t.Fatal(err)
 	}
-	if values[":pk"] != indexKey.PartitionKey || values[":due"] != "2026-07-16T12:30:00.000000000Z#~" {
+	if values[":pk"] != indexKey.PartitionKey || values[":due"] != "2026-07-16T12:30:00.000000000Z#~" ||
+		values[":relay_work_kind"] != string(notifications.WorkKindIntent) {
 		t.Fatalf("query values = %#v", values)
 	}
 
 	if _, err := store.QueryDue(context.Background(), relay.DueRequest{
-		Bucket: indexKey.Bucket, DueThrough: due, PageSize: 25, NextToken: page.NextToken,
+		Bucket: indexKey.Bucket, Kind: notifications.WorkKindIntent,
+		DueThrough: due, PageSize: 25, NextToken: page.NextToken,
 	}); err != nil {
 		t.Fatal(err)
 	}
 	if !reflect.DeepEqual(client.queryInputs[1].ExclusiveStartKey, lastKey) {
 		t.Fatalf("exclusive start key = %#v, want %#v", client.queryInputs[1].ExclusiveStartKey, lastKey)
+	}
+}
+
+func TestQueryDueReturnsTokenForEmptyFilteredPage(t *testing.T) {
+	due := time.Date(2026, 7, 16, 12, 30, 0, 0, time.UTC)
+	indexKey, err := notifications.BuildRelayIndexKey(
+		notifications.WorkKindDelivery, "tnt_1", "delivery_1", due.Add(-time.Minute),
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	lastKey := marshalMap(t, map[string]any{
+		"PK": "NOTIFICATION_OUTBOX#outbox_1", "SK": "DELIVERY#delivery_1",
+		"relay_gsi_pk": indexKey.PartitionKey, "relay_gsi_sk": indexKey.SortKey,
+	})
+	client := &fakeClient{queryOutputs: []*awssdk.QueryOutput{{LastEvaluatedKey: lastKey}}}
+	store := Store{Table: "domain", Client: client}
+
+	page, err := store.QueryDue(context.Background(), relay.DueRequest{
+		Bucket: indexKey.Bucket, Kind: notifications.WorkKindDelivery,
+		DueThrough: due, PageSize: 1,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(page.Candidates) != 0 || page.NextToken == "" {
+		t.Fatalf("page = %#v", page)
 	}
 }
 
@@ -153,7 +186,8 @@ func TestReloadReadsBaseConsistentlyAndSkipsMissingOrIndexDivergentRows(t *testi
 		"kind": "opening", "channel": "email", "expansion_status": "pending",
 		"expansion_revision": int64(3), "expansion_cursor": "cursor_1",
 		"available_at": available.Format(fixedUTCLayout), "relay_schema_version": int64(1),
-		"relay_gsi_pk": indexKey.PartitionKey, "relay_gsi_sk": indexKey.SortKey,
+		"relay_work_kind": string(notifications.WorkKindIntent),
+		"relay_gsi_pk":    indexKey.PartitionKey, "relay_gsi_sk": indexKey.SortKey,
 	}
 	divergent := make(map[string]any, len(base))
 	for key, value := range base {
@@ -165,10 +199,16 @@ func TestReloadReadsBaseConsistentlyAndSkipsMissingOrIndexDivergentRows(t *testi
 		terminal[key] = value
 	}
 	terminal["expansion_status"] = "expanded"
+	mismatchedLane := make(map[string]any, len(base))
+	for key, value := range base {
+		mismatchedLane[key] = value
+	}
+	mismatchedLane["relay_work_kind"] = string(notifications.WorkKindDependency)
 	client := &fakeClient{getOutputs: []*awssdk.GetItemOutput{
 		{},
 		{Item: marshalMap(t, divergent)},
 		{Item: marshalMap(t, terminal)},
+		{Item: marshalMap(t, mismatchedLane)},
 		{Item: marshalMap(t, base)},
 	}}
 	store := Store{Table: "domain", Client: client}
@@ -182,6 +222,9 @@ func TestReloadReadsBaseConsistentlyAndSkipsMissingOrIndexDivergentRows(t *testi
 	if work, current, err := store.Reload(context.Background(), candidate, relayTime); err != nil || current || work != (relay.Work{}) {
 		t.Fatalf("terminal stale reload = %#v, %t, %v", work, current, err)
 	}
+	if work, current, err := store.Reload(context.Background(), candidate, relayTime); err == nil || current || work != (relay.Work{}) {
+		t.Fatalf("mismatched lane reload = %#v, %t, %v", work, current, err)
+	}
 	work, current, err := store.Reload(context.Background(), candidate, relayTime)
 	if err != nil {
 		t.Fatal(err)
@@ -193,7 +236,7 @@ func TestReloadReadsBaseConsistentlyAndSkipsMissingOrIndexDivergentRows(t *testi
 		work.Revision != 3 || work.Cursor != "cursor_1" {
 		t.Fatalf("work = %#v", work)
 	}
-	if len(client.getInputs) != 4 {
+	if len(client.getInputs) != 5 {
 		t.Fatalf("GetItem calls = %d", len(client.getInputs))
 	}
 	for _, input := range client.getInputs {
@@ -229,7 +272,8 @@ func TestReloadRejectsNoncanonicalBaseStorageKey(t *testing.T) {
 		"tenant_id": "tnt_1", "outbox_id": "outbox_1", "event_id": "event_1", "rule_id": "rule_1",
 		"kind": "opening", "channel": "email", "expansion_status": "pending",
 		"available_at": available.Format(fixedUTCLayout), "relay_schema_version": int64(1),
-		"relay_gsi_pk": indexKey.PartitionKey, "relay_gsi_sk": indexKey.SortKey,
+		"relay_work_kind": string(notifications.WorkKindIntent),
+		"relay_gsi_pk":    indexKey.PartitionKey, "relay_gsi_sk": indexKey.SortKey,
 	}
 	store := Store{Table: "domain", Client: &fakeClient{
 		getOutputs: []*awssdk.GetItemOutput{{Item: marshalMap(t, base)}},
@@ -260,7 +304,8 @@ func TestReloadRejectsIndexedTelegramWorkBeforeFanout(t *testing.T) {
 		"tenant_id": "tnt_1", "outbox_id": "outbox_1", "event_id": "event_1", "rule_id": "rule_1",
 		"kind": "opening", "channel": "telegram", "expansion_status": "pending",
 		"available_at": available.Format(fixedUTCLayout), "relay_schema_version": int64(1),
-		"relay_gsi_pk": indexKey.PartitionKey, "relay_gsi_sk": indexKey.SortKey,
+		"relay_work_kind": string(notifications.WorkKindIntent),
+		"relay_gsi_pk":    indexKey.PartitionKey, "relay_gsi_sk": indexKey.SortKey,
 	}
 	store := Store{Table: "domain", Client: &fakeClient{
 		getOutputs: []*awssdk.GetItemOutput{{Item: marshalMap(t, base)}},

@@ -15,19 +15,20 @@ import (
 type fakeStore struct {
 	mu      sync.Mutex
 	queries []DueRequest
-	pages   map[int][]DuePage
+	pages   map[lanePageKey][]DuePage
 }
 
 func (store *fakeStore) QueryDue(_ context.Context, request DueRequest) (DuePage, error) {
 	store.mu.Lock()
 	defer store.mu.Unlock()
 	store.queries = append(store.queries, request)
-	pages := store.pages[request.Bucket]
+	key := lanePageKey{kind: request.Kind, bucket: request.Bucket}
+	pages := store.pages[key]
 	if len(pages) == 0 {
 		return DuePage{}, nil
 	}
 	page := pages[0]
-	store.pages[request.Bucket] = pages[1:]
+	store.pages[key] = pages[1:]
 	return page, nil
 }
 
@@ -57,8 +58,232 @@ func (fakePublisher) Publish(context.Context, PublishRequest) (string, error) {
 	return "message-id", nil
 }
 
+type lanePageKey struct {
+	kind   notifications.WorkKind
+	bucket int
+}
+
+type laneStore struct {
+	mu             sync.Mutex
+	pages          map[lanePageKey][]DuePage
+	processedKinds []notifications.WorkKind
+}
+
+func (store *laneStore) QueryDue(_ context.Context, request DueRequest) (DuePage, error) {
+	store.mu.Lock()
+	defer store.mu.Unlock()
+	key := lanePageKey{kind: request.Kind, bucket: request.Bucket}
+	pages := store.pages[key]
+	if len(pages) == 0 {
+		return DuePage{}, nil
+	}
+	page := pages[0]
+	store.pages[key] = pages[1:]
+	return page, nil
+}
+
+func (store *laneStore) Reload(_ context.Context, candidate Candidate, _ time.Time) (Work, bool, error) {
+	work := Work{
+		Candidate: candidate, TenantID: "tnt_1", ItemID: candidate.SK,
+		OutboxID: "outbox_1", EventID: "event_1", RuleID: "rule_1",
+		NotificationKind: notifications.NotificationKindOpening,
+		Channel:          notifications.ChannelEmail, State: "pending", Revision: 1,
+	}
+	switch candidate.Kind {
+	case notifications.WorkKindIntent:
+		work.OutboxID = candidate.SK
+	case notifications.WorkKindDependency:
+		work.OutboxID = candidate.SK
+		work.DependsOnOutboxID = "opening_outbox"
+		work.NotificationKind = notifications.NotificationKindRecovery
+	case notifications.WorkKindDelivery:
+		work.DeliveryID = candidate.SK
+	}
+	return work, true, nil
+}
+
+func (*laneStore) Claim(_ context.Context, work Work, lease LeaseRequest) (Work, bool, error) {
+	work.LeaseOwner = lease.Owner
+	work.LeaseEpoch++
+	return work, true, nil
+}
+
+func (store *laneStore) ExpandIntent(_ context.Context, work Work, _ ExpandRequest) (WorkResult, error) {
+	store.recordProcessed(work.Kind)
+	return WorkResult{}, nil
+}
+
+func (store *laneStore) ExpandDependency(_ context.Context, work Work, _ ExpandRequest) (WorkResult, error) {
+	store.recordProcessed(work.Kind)
+	return WorkResult{}, nil
+}
+
+func (store *laneStore) MarkQueued(_ context.Context, work Work, _ QueuedResult) error {
+	store.recordProcessed(work.Kind)
+	return nil
+}
+
+func (*laneStore) Reschedule(context.Context, Work, time.Time) error { return nil }
+
+func (store *laneStore) recordProcessed(kind notifications.WorkKind) {
+	store.mu.Lock()
+	defer store.mu.Unlock()
+	store.processedKinds = append(store.processedKinds, kind)
+}
+
+func laneCandidate(t *testing.T, kind notifications.WorkKind, itemID string, availableAt time.Time) Candidate {
+	t.Helper()
+	index, err := notifications.BuildRelayIndexKey(kind, "tnt_1", itemID, availableAt)
+	if err != nil {
+		t.Fatal(err)
+	}
+	pk := "TENANT#tnt_1"
+	sk := itemID
+	if kind == notifications.WorkKindDelivery {
+		pk = "NOTIFICATION_OUTBOX#outbox_1"
+	}
+	return Candidate{
+		PK: pk, SK: sk, RelayPK: index.PartitionKey, RelaySK: index.SortKey,
+		Kind: kind, AvailableAt: availableAt,
+	}
+}
+
+func TestRunFindsDeliveryLaneAfterOlderIntentLaneReachesMaxWork(t *testing.T) {
+	start := time.Date(2026, 7, 16, 13, 0, 0, 0, time.UTC)
+	delivery := laneCandidate(t, notifications.WorkKindDelivery, "delivery_1", start.Add(-time.Minute))
+	intent1 := laneCandidate(t, notifications.WorkKindIntent, "intent_1", start.Add(-3*time.Minute))
+	intent2 := laneCandidate(t, notifications.WorkKindIntent, "intent_2", start.Add(-2*time.Minute))
+	store := &laneStore{pages: map[lanePageKey][]DuePage{
+		{kind: notifications.WorkKindDelivery, bucket: deliveryBucket(delivery)}: {
+			{NextToken: "delivery_page_2"},
+			{Candidates: []Candidate{delivery}},
+		},
+		{kind: notifications.WorkKindIntent, bucket: deliveryBucket(intent1)}: {
+			{Candidates: []Candidate{intent1, intent2}},
+		},
+	}}
+	runner := Runner{
+		Store: store, Publisher: fakePublisher{}, Clock: func() time.Time { return start },
+		IDFactory: func() string { return "run_test" },
+	}
+	config := relayconfig.RunConfig{
+		ShardCount: 1, QueryParallelism: 4, WorkParallelism: 1, MaxWork: 2,
+		FanoutPageSize: 20, GlobalDeadline: 45 * time.Second,
+		SoftDeadline: 40 * time.Second, ItemTimeout: 10 * time.Second, LeaseTTL: 20 * time.Second,
+	}
+
+	summary := runner.Run(context.Background(), config)
+	if summary.WorkProcessed != 2 || summary.DeliveriesProcessed != 1 || summary.IntentsProcessed != 1 ||
+		!summary.CapReached || summary.ScopeCompleted || summary.WorkRemaining != 1 {
+		t.Fatalf("summary = %#v", summary)
+	}
+	want := []notifications.WorkKind{notifications.WorkKindDelivery, notifications.WorkKindIntent}
+	if len(store.processedKinds) != len(want) {
+		t.Fatalf("processed kinds = %#v", store.processedKinds)
+	}
+	for index, kind := range want {
+		if store.processedKinds[index] != kind {
+			t.Fatalf("processed kinds = %#v, want %#v", store.processedKinds, want)
+		}
+	}
+}
+
+func TestRunAppliesWeightedGlobalCapAcrossLaneBacklogs(t *testing.T) {
+	start := time.Date(2026, 7, 16, 13, 0, 0, 0, time.UTC)
+	store := &laneStore{pages: make(map[lanePageKey][]DuePage)}
+	for index := range 6 {
+		addLaneCandidate(t, store, laneCandidate(
+			t, notifications.WorkKindDelivery, "delivery_"+string(rune('a'+index)),
+			start.Add(-time.Duration(index+1)*time.Minute),
+		))
+	}
+	for index, kind := range []notifications.WorkKind{
+		notifications.WorkKindIntent, notifications.WorkKindIntent,
+		notifications.WorkKindDependency, notifications.WorkKindDependency,
+	} {
+		addLaneCandidate(t, store, laneCandidate(
+			t, kind, "outbox_"+string(rune('a'+index)), start.Add(-time.Minute),
+		))
+	}
+	runner := Runner{
+		Store: store, Publisher: fakePublisher{}, Clock: func() time.Time { return start },
+		IDFactory: func() string { return "run_weighted" },
+	}
+	config := relayconfig.RunConfig{
+		ShardCount: 1, QueryParallelism: 4, WorkParallelism: 1, MaxWork: 6,
+		FanoutPageSize: 20, GlobalDeadline: 45 * time.Second,
+		SoftDeadline: 40 * time.Second, ItemTimeout: 10 * time.Second, LeaseTTL: 20 * time.Second,
+	}
+
+	summary := runner.Run(context.Background(), config)
+	want := []notifications.WorkKind{
+		notifications.WorkKindDelivery, notifications.WorkKindDelivery,
+		notifications.WorkKindIntent, notifications.WorkKindDelivery,
+		notifications.WorkKindDelivery, notifications.WorkKindDependency,
+	}
+	if summary.WorkProcessed != config.MaxWork || summary.DeliveriesProcessed != 4 ||
+		summary.IntentsProcessed != 1 || summary.DependenciesProcessed != 1 ||
+		!summary.CapReached || summary.ScopeCompleted || summary.WorkRemaining != 1 {
+		t.Fatalf("summary = %#v", summary)
+	}
+	if len(store.processedKinds) != len(want) {
+		t.Fatalf("processed kinds = %#v", store.processedKinds)
+	}
+	for index, kind := range want {
+		if store.processedKinds[index] != kind {
+			t.Fatalf("processed kinds = %#v, want %#v", store.processedKinds, want)
+		}
+	}
+}
+
+func TestRunUsesGlobalCapacityWhenWeightedLanesAreSparse(t *testing.T) {
+	start := time.Date(2026, 7, 16, 13, 0, 0, 0, time.UTC)
+	store := &laneStore{pages: make(map[lanePageKey][]DuePage)}
+	addLaneCandidate(t, store, laneCandidate(
+		t, notifications.WorkKindDelivery, "delivery_1", start.Add(-time.Minute),
+	))
+	for index := range 5 {
+		addLaneCandidate(t, store, laneCandidate(
+			t, notifications.WorkKindIntent, "intent_"+string(rune('a'+index)), start.Add(-time.Minute),
+		))
+	}
+	runner := Runner{
+		Store: store, Publisher: fakePublisher{}, Clock: func() time.Time { return start },
+		IDFactory: func() string { return "run_sparse" },
+	}
+	config := relayconfig.RunConfig{
+		ShardCount: 1, QueryParallelism: 4, WorkParallelism: 1, MaxWork: 6,
+		FanoutPageSize: 20, GlobalDeadline: 45 * time.Second,
+		SoftDeadline: 40 * time.Second, ItemTimeout: 10 * time.Second, LeaseTTL: 20 * time.Second,
+	}
+
+	summary := runner.Run(context.Background(), config)
+	if summary.ExitCode != ExitSuccess || summary.WorkProcessed != config.MaxWork ||
+		summary.DeliveriesProcessed != 1 || summary.IntentsProcessed != 5 ||
+		summary.DependenciesProcessed != 0 || summary.CapReached ||
+		!summary.ScopeCompleted || summary.WorkRemaining != 0 {
+		t.Fatalf("summary = %#v", summary)
+	}
+}
+
+func addLaneCandidate(t *testing.T, store *laneStore, candidate Candidate) {
+	t.Helper()
+	key := lanePageKey{kind: candidate.Kind, bucket: deliveryBucket(candidate)}
+	pages := store.pages[key]
+	if len(pages) == 0 {
+		pages = []DuePage{{}}
+	}
+	pages[0].Candidates = append(pages[0].Candidates, candidate)
+	store.pages[key] = pages
+}
+
+func deliveryBucket(candidate Candidate) int {
+	return int(candidate.RelayPK[len(candidate.RelayPK)-2]-'0')*10 +
+		int(candidate.RelayPK[len(candidate.RelayPK)-1]-'0')
+}
+
 func TestRunQueriesEachOwnedBucketOnceAndTerminatesWithoutPolling(t *testing.T) {
-	store := &fakeStore{pages: make(map[int][]DuePage)}
+	store := &fakeStore{pages: make(map[lanePageKey][]DuePage)}
 	start := time.Date(2026, 7, 16, 12, 34, 56, 0, time.UTC)
 	runner := Runner{
 		Store:     store,
@@ -81,19 +306,26 @@ func TestRunQueriesEachOwnedBucketOnceAndTerminatesWithoutPolling(t *testing.T) 
 	if !summary.RelayTime.Equal(start) || summary.RunID != "run_test" {
 		t.Fatalf("captured run identity = %#v", summary)
 	}
-	if len(store.queries) != 64 {
-		t.Fatalf("QueryDue calls = %d, want exactly one per owned bucket", len(store.queries))
+	if len(store.queries) != 3*notifications.RelayBucketCount {
+		t.Fatalf("QueryDue calls = %d, want exactly one per owned bucket and lane", len(store.queries))
 	}
-	seen := make(map[int]int)
+	seen := make(map[lanePageKey]int)
 	for _, request := range store.queries {
-		seen[request.Bucket]++
+		seen[lanePageKey{kind: request.Kind, bucket: request.Bucket}]++
 		if !request.DueThrough.Equal(start) || request.PageSize < 1 || request.NextToken != "" {
 			t.Fatalf("query request = %#v", request)
 		}
 	}
-	for bucket := 0; bucket < 64; bucket++ {
-		if seen[bucket] != 1 {
-			t.Fatalf("bucket %d query count = %d", bucket, seen[bucket])
+	for _, kind := range []notifications.WorkKind{
+		notifications.WorkKindDelivery,
+		notifications.WorkKindIntent,
+		notifications.WorkKindDependency,
+	} {
+		for bucket := 0; bucket < notifications.RelayBucketCount; bucket++ {
+			key := lanePageKey{kind: kind, bucket: bucket}
+			if seen[key] != 1 {
+				t.Fatalf("lane %s bucket %d query count = %d", kind, bucket, seen[key])
+			}
 		}
 	}
 }
@@ -101,7 +333,7 @@ func TestRunQueriesEachOwnedBucketOnceAndTerminatesWithoutPolling(t *testing.T) 
 func TestRunConsumesSetupTimeFromGlobalAndSoftDeadlineBudgets(t *testing.T) {
 	start := time.Date(2026, 7, 16, 12, 34, 56, 0, time.UTC)
 	budgetStartedAt := start.Add(-40 * time.Second)
-	store := &fakeStore{pages: make(map[int][]DuePage)}
+	store := &fakeStore{pages: make(map[lanePageKey][]DuePage)}
 	runner := Runner{
 		Store: store, Publisher: fakePublisher{}, Clock: func() time.Time { return start },
 		IDFactory: func() string { return "run_test" },
@@ -144,7 +376,7 @@ func (store *publicationStore) QueryDue(_ context.Context, request DueRequest) (
 	if store.onQuery != nil {
 		store.onQuery(store.queryCount)
 	}
-	if request.Bucket == store.candidateBucket() && !store.served {
+	if request.Kind == store.candidate.Kind && request.Bucket == store.candidateBucket() && !store.served {
 		store.served = true
 		return DuePage{Candidates: []Candidate{store.candidate}}, nil
 	}
@@ -158,8 +390,8 @@ func TestRunPaginatesBucketsAndRotatesTheFirstBucketDeterministically(t *testing
 		t.Fatal(err)
 	}
 	first := rotateBuckets(buckets, start)[0]
-	store := &fakeStore{pages: map[int][]DuePage{
-		first: {{NextToken: "page_2"}, {}},
+	store := &fakeStore{pages: map[lanePageKey][]DuePage{
+		{kind: notifications.WorkKindDelivery, bucket: first}: {{NextToken: "page_2"}, {}},
 	}}
 	runner := Runner{
 		Store: store, Publisher: fakePublisher{}, Clock: func() time.Time { return start },
@@ -175,9 +407,12 @@ func TestRunPaginatesBucketsAndRotatesTheFirstBucketDeterministically(t *testing
 	if summary.ExitCode != ExitSuccess {
 		t.Fatalf("summary = %#v", summary)
 	}
-	if len(store.queries) != 65 || store.queries[0].Bucket != first ||
+	if len(store.queries) != 3*notifications.RelayBucketCount+1 ||
+		store.queries[0].Kind != notifications.WorkKindDelivery || store.queries[0].Bucket != first ||
 		store.queries[0].NextToken != "" || store.queries[64].Bucket != first ||
-		store.queries[64].NextToken != "page_2" {
+		store.queries[64].Kind != notifications.WorkKindDelivery || store.queries[64].NextToken != "page_2" ||
+		store.queries[65].Kind != notifications.WorkKindIntent ||
+		store.queries[129].Kind != notifications.WorkKindDependency {
 		t.Fatalf("paginated query order = %#v", store.queries)
 	}
 }
@@ -204,7 +439,7 @@ func TestRunStopsBeforeReloadOrLeaseAtSoftDeadline(t *testing.T) {
 	var deadline atomic.Bool
 	store := &publicationStore{candidate: candidate, work: Work{Candidate: candidate}}
 	store.onQuery = func(count int) {
-		if count == notifications.RelayBucketCount {
+		if count == 3*notifications.RelayBucketCount {
 			deadline.Store(true)
 		}
 	}
@@ -250,7 +485,7 @@ func TestRunNeverClaimsWithLeaseTimestampAtOrAfterSoftDeadline(t *testing.T) {
 	store := &publicationStore{candidate: candidate, work: Work{Candidate: candidate}}
 	var clockCalls atomic.Int32
 	clock := func() time.Time {
-		if clockCalls.Add(1) >= 5 {
+		if clockCalls.Add(1) >= 7 {
 			return start.Add(40 * time.Second)
 		}
 		return start

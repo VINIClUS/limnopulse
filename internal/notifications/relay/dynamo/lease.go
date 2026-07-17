@@ -33,7 +33,8 @@ func (store Store) Claim(
 		return relay.Work{}, false, fmt.Errorf("marshal relay lease key: %w", err)
 	}
 	values := map[string]any{
-		":schema": int64(1), ":relay_pk": work.RelayPK, ":relay_sk": work.RelaySK,
+		":schema": int64(1), ":relay_work_kind": string(work.Kind),
+		":relay_pk": work.RelayPK, ":relay_sk": work.RelaySK,
 		":due": lease.DueThrough.UTC().Format(fixedUTCLayout), ":state": work.State,
 		":revision": work.Revision, ":owner": lease.Owner,
 		":now":     lease.Now.UTC().Format(fixedUTCLayout),
@@ -41,13 +42,15 @@ func (store Store) Claim(
 		":zero":    int64(0), ":one": int64(1),
 	}
 	names := map[string]string{
-		"#relay_schema": "relay_schema_version", "#relay_pk": "relay_gsi_pk",
+		"#relay_schema": "relay_schema_version", "#relay_work_kind": "relay_work_kind",
+		"#relay_pk": "relay_gsi_pk",
 		"#relay_sk": "relay_gsi_sk", "#available_at": "available_at",
 		"#state": stateName, "#revision": revisionName,
 		"#lease_owner": "relay_lease_owner", "#lease_epoch": "relay_lease_epoch",
 		"#lease_expires": "relay_lease_expires_at",
 	}
-	condition := "#relay_schema = :schema AND #relay_pk = :relay_pk AND #relay_sk = :relay_sk " +
+	condition := "#relay_schema = :schema AND #relay_work_kind = :relay_work_kind " +
+		"AND #relay_pk = :relay_pk AND #relay_sk = :relay_sk " +
 		"AND #available_at <= :due AND #state = :state "
 	if work.Revision == 0 {
 		condition += "AND (attribute_not_exists(#revision) OR #revision = :revision) "

@@ -120,6 +120,7 @@ func TestExpandIntentCreatesRenderedPendingDeliveryAndCompletesPageAtomically(t 
 		t.Fatal(err)
 	}
 	if deliveryValues[":state"] != "pending" || deliveryValues[":email"] != "owner@example.com" ||
+		deliveryValues[":relay_work_kind"] != string(notifications.WorkKindDelivery) ||
 		deliveryValues[":relay_pk"] == "" || deliveryValues[":relay_sk"] == "" {
 		t.Fatalf("delivery values = %#v", deliveryValues)
 	}
@@ -131,14 +132,22 @@ func TestExpandIntentCreatesRenderedPendingDeliveryAndCompletesPageAtomically(t 
 	outboxUpdate := transaction.TransactItems[1].Update
 	if !strings.Contains(aws.ToString(outboxUpdate.ConditionExpression), "#lease_epoch = :lease_epoch") ||
 		!strings.Contains(aws.ToString(outboxUpdate.ConditionExpression), "#revision = :revision") ||
+		!strings.Contains(aws.ToString(outboxUpdate.ConditionExpression), "#relay_work_kind = :relay_work_kind") ||
 		!strings.Contains(aws.ToString(outboxUpdate.ConditionExpression), "attribute_not_exists(#cursor)") {
 		t.Fatalf("outbox condition = %s", aws.ToString(outboxUpdate.ConditionExpression))
 	}
 	updateExpression := aws.ToString(outboxUpdate.UpdateExpression)
-	for _, fragment := range []string{"#status = :expanded", "#expanded_at = :relay_time", "REMOVE", "#relay_pk", "#lease_owner"} {
+	for _, fragment := range []string{"#status = :expanded", "#expanded_at = :relay_time", "#relay_work_kind = :relay_work_kind", "REMOVE", "#relay_pk", "#lease_owner"} {
 		if !strings.Contains(updateExpression, fragment) {
 			t.Fatalf("outbox update missing %q: %s", fragment, updateExpression)
 		}
+	}
+	var outboxValues map[string]any
+	if err := attributevalue.UnmarshalMap(outboxUpdate.ExpressionAttributeValues, &outboxValues); err != nil {
+		t.Fatal(err)
+	}
+	if outboxValues[":relay_work_kind"] != string(notifications.WorkKindIntent) {
+		t.Fatalf("outbox values = %#v", outboxValues)
 	}
 }
 

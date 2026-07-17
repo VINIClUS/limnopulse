@@ -114,11 +114,13 @@ func (store Store) deliveryMutation(
 			return nil, indexErr
 		}
 		values[":available_at"] = availableAt.UTC().Format(fixedUTCLayout)
+		values[":relay_work_kind"] = string(notifications.WorkKindDelivery)
 		values[":relay_pk"] = index.PartitionKey
 		values[":relay_sk"] = index.SortKey
 		fields = append(fields,
 			struct{ name, value string }{"content", ":content"},
 			struct{ name, value string }{"available_at", ":available_at"},
+			struct{ name, value string }{"relay_work_kind", ":relay_work_kind"},
 			struct{ name, value string }{"relay_gsi_pk", ":relay_pk"},
 			struct{ name, value string }{"relay_gsi_sk", ":relay_sk"},
 		)
@@ -145,6 +147,9 @@ func (store Store) deliveryMutation(
 		"#recipient_id = :recipient_id", "#normalized_email = :email",
 		"#membership_snapshot = :membership", "#state = :state",
 		"#delivery_revision = :revision", "#created_at = :created_at", "#updated_at = :updated_at",
+	}
+	if snapshot.State == notifications.DeliveryStatePending {
+		existingConditions = append(existingConditions, "#relay_work_kind = :relay_work_kind")
 	}
 	existingConditions = append(existingConditions, dependencyConditions...)
 	existingConditions = append(existingConditions, payloadCondition)
@@ -175,7 +180,7 @@ func (store Store) outboxMutation(
 	values := map[string]any{
 		":state": work.State, ":revision": work.Revision, ":cursor": work.Cursor,
 		":lease_owner": work.LeaseOwner, ":lease_epoch": work.LeaseEpoch,
-		":relay_pk": work.RelayPK, ":relay_sk": work.RelaySK,
+		":relay_work_kind": string(work.Kind), ":relay_pk": work.RelayPK, ":relay_sk": work.RelaySK,
 		":started_at":           startedAt.UTC().Format(fixedUTCLayout),
 		":next_revision":        work.Revision + 1,
 		":recipients_examined":  work.RecipientsExamined + page.RecipientsExamined,
@@ -188,7 +193,8 @@ func (store Store) outboxMutation(
 		"#status": "expansion_status", "#revision": "expansion_revision",
 		"#cursor": "expansion_cursor", "#lease_owner": "relay_lease_owner",
 		"#lease_epoch": "relay_lease_epoch", "#lease_expires": "relay_lease_expires_at",
-		"#relay_pk": "relay_gsi_pk", "#relay_sk": "relay_gsi_sk", "#available_at": "available_at",
+		"#relay_work_kind": "relay_work_kind", "#relay_pk": "relay_gsi_pk",
+		"#relay_sk": "relay_gsi_sk", "#available_at": "available_at",
 		"#started_at": "expansion_started_at", "#expanded_at": "expanded_at",
 		"#recipients_examined": "recipients_examined", "#deliveries_created": "deliveries_created",
 		"#deliveries_cancelled": "deliveries_cancelled", "#recipients_filtered": "recipients_filtered",
@@ -205,8 +211,9 @@ func (store Store) outboxMutation(
 		condition += "AND #cursor = :cursor "
 	}
 	condition += "AND #lease_owner = :lease_owner AND #lease_epoch = :lease_epoch " +
-		"AND #relay_pk = :relay_pk AND #relay_sk = :relay_sk"
+		"AND #relay_work_kind = :relay_work_kind AND #relay_pk = :relay_pk AND #relay_sk = :relay_sk"
 	set := []string{
+		"#relay_work_kind = :relay_work_kind",
 		"#started_at = if_not_exists(#started_at, :started_at)", "#revision = :next_revision",
 		"#recipients_examined = :recipients_examined", "#deliveries_created = :deliveries_created",
 		"#deliveries_cancelled = :deliveries_cancelled", "#recipients_filtered = :recipients_filtered",

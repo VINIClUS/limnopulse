@@ -26,9 +26,13 @@ func (store Store) QueryDue(ctx context.Context, request relay.DueRequest) (rela
 		request.DueThrough.IsZero() || request.PageSize < 1 {
 		return relay.DuePage{}, fmt.Errorf("invalid relay due query")
 	}
+	if err := request.Kind.Validate(); err != nil {
+		return relay.DuePage{}, fmt.Errorf("invalid relay due query: %w", err)
+	}
 	values, err := attributevalue.MarshalMap(map[string]string{
-		":pk":  fmt.Sprintf("NOTIFICATION_RELAY#V1#BUCKET#%02d", request.Bucket),
-		":due": request.DueThrough.UTC().Format(fixedUTCLayout) + "#~",
+		":pk":              fmt.Sprintf("NOTIFICATION_RELAY#V1#BUCKET#%02d", request.Bucket),
+		":due":             request.DueThrough.UTC().Format(fixedUTCLayout) + "#~",
+		":relay_work_kind": string(request.Kind),
 	})
 	if err != nil {
 		return relay.DuePage{}, fmt.Errorf("marshal relay query: %w", err)
@@ -37,9 +41,11 @@ func (store Store) QueryDue(ctx context.Context, request relay.DueRequest) (rela
 		TableName:              aws.String(store.Table),
 		IndexName:              aws.String(RelayIndex),
 		KeyConditionExpression: aws.String("#relay_pk = :pk AND #relay_sk <= :due"),
+		FilterExpression:       aws.String("#relay_work_kind = :relay_work_kind"),
 		ExpressionAttributeNames: map[string]string{
-			"#relay_pk": "relay_gsi_pk",
-			"#relay_sk": "relay_gsi_sk",
+			"#relay_pk":        "relay_gsi_pk",
+			"#relay_sk":        "relay_gsi_sk",
+			"#relay_work_kind": "relay_work_kind",
 		},
 		ExpressionAttributeValues: values,
 		Limit:                     aws.Int32(int32(request.PageSize)),
@@ -60,6 +66,12 @@ func (store Store) QueryDue(ctx context.Context, request relay.DueRequest) (rela
 		candidate, decodeErr := candidateFromItem(item)
 		if decodeErr != nil {
 			return relay.DuePage{}, fmt.Errorf("decode relay candidate: %w", decodeErr)
+		}
+		if candidate.Kind != request.Kind {
+			return relay.DuePage{}, fmt.Errorf(
+				"decode relay candidate: work kind %q does not match lane %q",
+				candidate.Kind, request.Kind,
+			)
 		}
 		page.Candidates = append(page.Candidates, candidate)
 	}

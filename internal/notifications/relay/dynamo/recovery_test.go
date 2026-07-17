@@ -70,6 +70,7 @@ func TestExpandDependencyChainsSucceededOpeningWithoutRecheckingPreference(t *te
 		t.Fatal(err)
 	}
 	if values[":state"] != "pending" || values[":kind"] != "recovery" ||
+		values[":relay_work_kind"] != string(notifications.WorkKindDelivery) ||
 		values[":email"] != "opening-snapshot@example.com" ||
 		values[":depends_on_outbox_id"] != "opening_outbox" ||
 		values[":depends_on_delivery_id"] != openingID {

@@ -30,7 +30,8 @@ func (store Store) MarkQueued(
 	values, err := attributevalue.MarshalMap(map[string]any{
 		":pending": work.State, ":queued": "queued", ":revision": work.Revision,
 		":next_revision": work.Revision + 1, ":lease_owner": work.LeaseOwner,
-		":lease_epoch": work.LeaseEpoch, ":relay_pk": work.RelayPK, ":relay_sk": work.RelaySK,
+		":lease_epoch": work.LeaseEpoch, ":relay_work_kind": string(work.Kind),
+		":relay_pk": work.RelayPK, ":relay_sk": work.RelaySK,
 		":queued_at": result.QueuedAt.UTC().Format(fixedUTCLayout), ":message_id": result.MessageID,
 	})
 	if err != nil {
@@ -39,7 +40,8 @@ func (store Store) MarkQueued(
 	names := map[string]string{
 		"#state": "state", "#revision": "delivery_revision",
 		"#lease_owner": "relay_lease_owner", "#lease_epoch": "relay_lease_epoch",
-		"#lease_expires": "relay_lease_expires_at", "#relay_pk": "relay_gsi_pk",
+		"#lease_expires": "relay_lease_expires_at", "#relay_work_kind": "relay_work_kind",
+		"#relay_pk": "relay_gsi_pk",
 		"#relay_sk": "relay_gsi_sk", "#available_at": "available_at",
 		"#queued_at": "queued_at", "#message_id": "sqs_message_id",
 	}
@@ -52,7 +54,8 @@ func (store Store) MarkQueued(
 		),
 		ConditionExpression: aws.String(
 			"#state = :pending AND #revision = :revision AND #lease_owner = :lease_owner " +
-				"AND #lease_epoch = :lease_epoch AND #relay_pk = :relay_pk AND #relay_sk = :relay_sk",
+				"AND #lease_epoch = :lease_epoch AND #relay_work_kind = :relay_work_kind " +
+				"AND #relay_pk = :relay_pk AND #relay_sk = :relay_sk",
 		),
 		ExpressionAttributeNames: names, ExpressionAttributeValues: values,
 	})
@@ -81,14 +84,15 @@ func (store Store) Reschedule(ctx context.Context, work relay.Work, next time.Ti
 	valueMap := map[string]any{
 		":state": work.State, ":revision": work.Revision, ":next_revision": work.Revision + 1,
 		":lease_owner": work.LeaseOwner, ":lease_epoch": work.LeaseEpoch,
-		":relay_pk": work.RelayPK, ":relay_sk": work.RelaySK,
+		":relay_work_kind": string(work.Kind), ":relay_pk": work.RelayPK, ":relay_sk": work.RelaySK,
 		":next_available_at": next.UTC().Format(fixedUTCLayout),
 		":next_relay_pk":     index.PartitionKey, ":next_relay_sk": index.SortKey,
 	}
 	names := map[string]string{
 		"#state": stateName, "#revision": revisionName,
 		"#lease_owner": "relay_lease_owner", "#lease_epoch": "relay_lease_epoch",
-		"#lease_expires": "relay_lease_expires_at", "#relay_pk": "relay_gsi_pk",
+		"#lease_expires": "relay_lease_expires_at", "#relay_work_kind": "relay_work_kind",
+		"#relay_pk": "relay_gsi_pk",
 		"#relay_sk": "relay_gsi_sk", "#available_at": "available_at",
 	}
 	condition := "#state = :state "
@@ -98,7 +102,7 @@ func (store Store) Reschedule(ctx context.Context, work relay.Work, next time.Ti
 		condition += "AND #revision = :revision "
 	}
 	condition += "AND #lease_owner = :lease_owner AND #lease_epoch = :lease_epoch " +
-		"AND #relay_pk = :relay_pk AND #relay_sk = :relay_sk"
+		"AND #relay_work_kind = :relay_work_kind AND #relay_pk = :relay_pk AND #relay_sk = :relay_sk"
 	if cursorName != "" {
 		names["#cursor"] = cursorName
 		valueMap[":cursor"] = work.Cursor
@@ -115,7 +119,7 @@ func (store Store) Reschedule(ctx context.Context, work relay.Work, next time.Ti
 	_, err = store.Client.UpdateItem(ctx, &awssdk.UpdateItemInput{
 		TableName: aws.String(store.Table), Key: key,
 		UpdateExpression: aws.String(
-			"SET #available_at = :next_available_at, #relay_pk = :next_relay_pk, " +
+			"SET #relay_work_kind = :relay_work_kind, #available_at = :next_available_at, #relay_pk = :next_relay_pk, " +
 				"#relay_sk = :next_relay_sk, #revision = :next_revision " +
 				"REMOVE #lease_owner, #lease_epoch, #lease_expires",
 		),

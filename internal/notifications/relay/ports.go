@@ -18,6 +18,7 @@ type Candidate struct {
 
 type DueRequest struct {
 	Bucket     int
+	Kind       notifications.WorkKind
 	DueThrough time.Time
 	PageSize   int
 	NextToken  string

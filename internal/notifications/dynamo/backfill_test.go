@@ -161,6 +161,7 @@ func TestBackfillRelayApplyWritesCanonicalEmailAndTelegramFieldsIdempotently(t *
 		if fmt.Sprint(values[":relay_schema_version"]) != "1" ||
 			values[":expansion_status"] != "pending" ||
 			values[":available_at"] != readyEmail["created_at"] ||
+			values[":relay_work_kind"] != string(wantKind) ||
 			values[":relay_gsi_pk"] != wantKey.PartitionKey ||
 			values[":relay_gsi_sk"] != wantKey.SortKey {
 			t.Fatalf("email update %d values = %#v", index, values)
@@ -177,7 +178,7 @@ func TestBackfillRelayApplyWritesCanonicalEmailAndTelegramFieldsIdempotently(t *
 	if telegramValues[":expansion_status"] != "deferred_unsupported_channel" {
 		t.Fatalf("telegram update values = %#v", telegramValues)
 	}
-	for _, field := range []string{"#relay_schema_version", "#available_at", "#relay_gsi_pk", "#relay_gsi_sk"} {
+	for _, field := range []string{"#relay_schema_version", "#available_at", "#relay_work_kind", "#relay_gsi_pk", "#relay_gsi_sk"} {
 		if strings.Contains(*telegramUpdate.UpdateExpression, field+" =") {
 			t.Fatalf("telegram update writes %s: %s", field, *telegramUpdate.UpdateExpression)
 		}
@@ -354,6 +355,7 @@ func canonicalEmailOutbox(t *testing.T, item map[string]any, workKind notificati
 	canonical["relay_schema_version"] = 1
 	canonical["expansion_status"] = "pending"
 	canonical["available_at"] = item["created_at"]
+	canonical["relay_work_kind"] = string(workKind)
 	canonical["relay_gsi_pk"] = relayKey.PartitionKey
 	canonical["relay_gsi_sk"] = relayKey.SortKey
 	return canonical
