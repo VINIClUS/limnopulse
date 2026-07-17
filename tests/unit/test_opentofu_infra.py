@@ -81,10 +81,13 @@ def test_cloud_dynamodb_tables_match_domain_contract() -> None:
     assert len(re.findall(r"ttl\s*\{[^}]*enabled\s+=\s+true", dynamodb, re.DOTALL)) == 2
     assert re.search(r'name\s+=\s+"AlertEvaluationByDue"', dynamodb)
     assert re.search(r'name\s+=\s+"AlertEventsByTenantTime"', dynamodb)
+    assert re.search(r'name\s+=\s+"NotificationRelayByAvailableAt"', dynamodb)
     assert 'hash_key        = "GSI1PK"' in dynamodb
     assert 'range_key       = "GSI1SK"' in dynamodb
     assert 'hash_key        = "GSI2PK"' in dynamodb
     assert 'range_key       = "GSI2SK"' in dynamodb
+    assert 'hash_key        = "relay_gsi_pk"' in dynamodb
+    assert 'range_key       = "relay_gsi_sk"' in dynamodb
     assert 'projection_type = "KEYS_ONLY"' in dynamodb
     assert 'projection_type = "ALL"' in dynamodb
 
@@ -109,22 +112,75 @@ def test_cognito_resources_export_application_environment_contract() -> None:
     assert "Cloud InfluxDB endpoint placeholder only" in outputs
 
 
-def test_sqs_dlq_and_optional_ses_scaffold_are_safe_by_default() -> None:
+def test_notification_queues_and_ses_eventbridge_boundary_are_safe_by_default() -> None:
     queues = _read("queues.tf")
     ses = _read("ses.tf")
     variables = _read("variables.tf")
     tfvars = _read("env/cloud.tfvars.example")
 
-    assert 'resource "aws_sqs_queue" "alerts_dlq"' in queues
-    assert 'resource "aws_sqs_queue" "alerts"' in queues
-    assert "redrive_policy = jsonencode" in queues
-    assert "deadLetterTargetArn" in queues
-    assert "maxReceiveCount" in queues
-    assert 'resource "aws_sqs_queue_redrive_allow_policy" "alerts_dlq"' in queues
-    assert 'resource "aws_ses_email_identity" "notifications"' in ses
-    assert 'count = var.ses_email_identity == "" ? 0 : 1' in ses
-    assert 'variable "ses_email_identity"' in variables
-    assert 'ses_email_identity = ""' in tfvars
+    for resource in (
+        "notification_jobs",
+        "notification_jobs_dlq",
+        "ses_events",
+        "ses_events_dlq",
+        "ses_events_routing_dlq",
+    ):
+        assert f'resource "aws_sqs_queue" "{resource}"' in queues
+    assert len(re.findall(r"sqs_managed_sse_enabled\s+=\s+true", queues)) == 5
+    assert len(re.findall(r"maxReceiveCount\s+=\s+8", queues)) == 2
+    assert 'resource "aws_sqs_queue_redrive_allow_policy" "notification_jobs_dlq"' in queues
+    assert 'resource "aws_sqs_queue_redrive_allow_policy" "ses_events_dlq"' in queues
+    assert 'resource "aws_sqs_queue_policy" "ses_events"' in queues
+    assert 'resource "aws_sqs_queue_policy" "ses_events_routing_dlq"' in queues
+
+    assert 'resource "aws_sesv2_configuration_set" "notifications"' in ses
+    assert 'resource "aws_sesv2_configuration_set_event_destination" "eventbridge"' in ses
+    assert 'resource "aws_cloudwatch_event_rule" "ses_notifications"' in ses
+    assert 'resource "aws_cloudwatch_event_target" "ses_events"' in ses
+    for event_type in ("SEND", "DELIVERY", "DELIVERY_DELAY", "BOUNCE", "COMPLAINT", "REJECT"):
+        assert f'"{event_type}"' in ses
+    assert "dead_letter_config" in ses
+    assert "retry_policy" in ses
+    assert "aws_ses_email_identity" not in ses
+    assert "aws_iam_role" not in ses
+    assert "aws_scheduler" not in ses
+
+    for variable in (
+        "notification_jobs_queue_name",
+        "notification_jobs_dlq_name",
+        "ses_events_queue_name",
+        "ses_events_dlq_name",
+        "ses_events_routing_dlq_name",
+        "ses_configuration_set_name",
+    ):
+        assert f'variable "{variable}"' in variables
+        assert re.search(rf"^{variable}\s+=", tfvars, re.MULTILINE)
+    assert re.search(
+        r'^notification_jobs_queue_name\s+=\s+"limnopulse-notification-jobs"$',
+        tfvars,
+        re.MULTILINE,
+    )
+    assert re.search(
+        r'^ses_events_queue_name\s+=\s+"limnopulse-ses-events"$', tfvars, re.MULTILINE
+    )
+
+
+def test_notification_outputs_expose_runtime_queue_contract() -> None:
+    outputs = _read("outputs.tf")
+
+    for output in (
+        "notification_jobs_queue_url",
+        "notification_jobs_queue_arn",
+        "notification_jobs_dlq_url",
+        "ses_events_queue_url",
+        "ses_events_queue_arn",
+        "ses_events_dlq_url",
+        "ses_events_routing_dlq_url",
+        "ses_configuration_set_name",
+    ):
+        assert f'output "{output}"' in outputs
+    assert 'description = "SQS_NOTIFICATION_JOBS_URL"' in outputs
+    assert 'description = "SQS_SES_EVENTS_URL"' in outputs
 
 
 def test_opentofu_examples_and_gitignore_do_not_commit_state_or_secrets() -> None:

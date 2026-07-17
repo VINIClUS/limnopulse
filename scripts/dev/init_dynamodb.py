@@ -25,6 +25,14 @@ ALERT_INDEXES = (
         ],
         "Projection": {"ProjectionType": "ALL"},
     },
+    {
+        "IndexName": "NotificationRelayByAvailableAt",
+        "KeySchema": [
+            {"AttributeName": "relay_gsi_pk", "KeyType": "HASH"},
+            {"AttributeName": "relay_gsi_sk", "KeyType": "RANGE"},
+        ],
+        "Projection": {"ProjectionType": "KEYS_ONLY"},
+    },
 )
 GSI_WAIT_DELAY_SECONDS = 20
 GSI_WAIT_MAX_ATTEMPTS = 30
@@ -49,7 +57,14 @@ def ensure_table(
         if include_alert_indexes:
             definitions.extend(
                 {"AttributeName": name, "AttributeType": "S"}
-                for name in ("GSI1PK", "GSI1SK", "GSI2PK", "GSI2SK")
+                for name in (
+                    "GSI1PK",
+                    "GSI1SK",
+                    "GSI2PK",
+                    "GSI2SK",
+                    "relay_gsi_pk",
+                    "relay_gsi_sk",
+                )
             )
         request = {
             "TableName": table_name,
