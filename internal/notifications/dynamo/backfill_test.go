@@ -122,7 +122,7 @@ func TestBackfillRelayDryRunQueriesTenantOutboxesAndPaginatesWithoutScan(t *test
 	}
 }
 
-func TestBackfillRelayStopsAtExplicitTotalRowLimit(t *testing.T) {
+func TestBackfillRelayStopsAtExplicitMigrationCandidateLimit(t *testing.T) {
 	client := &fakeClient{queryOutputs: []*awssdk.QueryOutput{{
 		Items: []map[string]types.AttributeValue{
 			mustMarshalMap(t, legacyOutbox("outbox_1", "email", "ready")),
@@ -144,8 +144,31 @@ func TestBackfillRelayStopsAtExplicitTotalRowLimit(t *testing.T) {
 	if len(client.queryInputs) != 1 {
 		t.Fatalf("Query calls = %d, want 1", len(client.queryInputs))
 	}
-	if client.queryInputs[0].Limit == nil || *client.queryInputs[0].Limit != 1 {
-		t.Fatalf("bounded Query limit = %#v, want 1", client.queryInputs[0].Limit)
+	if client.queryInputs[0].Limit == nil || *client.queryInputs[0].Limit != 25 {
+		t.Fatalf("Query page limit = %#v, want 25", client.queryInputs[0].Limit)
+	}
+}
+
+func TestBackfillRelayLimitAdvancesPastCanonicalRows(t *testing.T) {
+	canonical := canonicalEmailOutbox(
+		t, legacyOutbox("outbox_canonical", "email", "ready"), notifications.WorkKindIntent,
+	)
+	legacy := legacyOutbox("outbox_legacy", "email", "ready")
+	client := &fakeClient{queryOutputs: []*awssdk.QueryOutput{
+		{Items: []map[string]types.AttributeValue{mustMarshalMap(t, canonical), mustMarshalMap(t, legacy)}},
+		{},
+		{},
+	}}
+
+	summary, err := (Store{Table: "domain", Client: client}).BackfillRelay(
+		context.Background(), BackfillOptions{Tenants: []string{"tnt_1"}, PageSize: 25, MaxRows: 1},
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !summary.LimitReached || summary.RowsQueried != 2 || summary.Noop != 1 ||
+		summary.RowsNeedingUpdate != 1 || summary.WouldUpdate != 1 || summary.RowFailures != 0 {
+		t.Fatalf("summary = %#v", summary)
 	}
 }
 

@@ -307,6 +307,17 @@ func TestCheckGatesCancelsWhenCurrentPreferenceNoLongerQualifiesDelivery(t *test
 			t.Fatalf("gate=%#v err=%v", gate, err)
 		}
 	})
+	t.Run("verified address changed after fanout", func(t *testing.T) {
+		preference := currentPreference(record, true, "warning")
+		preference["email_address"] = "new-owner@example.com"
+		client := &fakeClient{getItems: []map[string]types.AttributeValue{
+			marshal(t, active), marshal(t, preference),
+		}}
+		gate, err := (Store{Table: "domain", Client: client}).CheckGates(context.Background(), record)
+		if err != nil || gate.Allowed || gate.CancellationReason != notifications.CancellationReasonCancelled {
+			t.Fatalf("gate=%#v err=%v", gate, err)
+		}
+	})
 }
 
 func TestCompletePreflightFailureFencesClaimWithoutCreatingAttemptAndTreatsTerminalRaceAsSafe(t *testing.T) {

@@ -142,8 +142,10 @@ enabling either publisher or consumer.
    ```
 
    The command never scans DynamoDB: after each email outbox Query it paginates
-   that outbox's `DELIVERY#` partition, so the row bound counts both outboxes
-   and deliveries. It exits partially with
+   that outbox's `DELIVERY#` partition. `--max-rows` bounds migration
+   candidates, so already-canonical outboxes and deliveries do not consume the
+   budget; `rows_queried` still records every row read and `--timeout` bounds
+   that read work. It exits partially with
    `scope_completed=false` and either `row_limit_reached` or `deadline_reached`
    when a bound is reached; increase the explicit bound or narrow the tenant
    batch, then repeat the idempotent run. Telegram rows are marked

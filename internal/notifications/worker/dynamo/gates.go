@@ -75,7 +75,8 @@ func (store Store) CheckGates(ctx context.Context, record worker.DeliveryRecord)
 	if err != nil {
 		return worker.GateResult{}, fmt.Errorf("current notification preference severity is invalid: %w", err)
 	}
-	if !preference.EmailEnabled || !preference.EmailVerified {
+	if !preference.EmailEnabled || !preference.EmailVerified ||
+		!strings.EqualFold(preference.EmailAddress, snapshot.NormalizedEmail) {
 		return worker.GateResult{CancellationReason: notifications.CancellationReasonCancelled}, nil
 	}
 	eventItem, err := store.getConsistent(ctx, "TENANT#"+snapshot.TenantID, "ALERT_EVENT#"+snapshot.EventID)

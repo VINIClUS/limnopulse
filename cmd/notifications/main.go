@@ -144,7 +144,7 @@ func runBackfillRelay(ctx context.Context, args []string, deps dependencies) int
 	fs.Var(tenantSourceFlagValue{Kind: tenantSourceFile, Sources: &sources}, "tenant-file", "file containing tenant IDs; repeatable")
 	fs.BoolVar(&apply, "apply", false, "write relay fields; default is dry-run")
 	fs.IntVar(&pageSize, "page-size", 25, "DynamoDB query page size")
-	fs.IntVar(&maxRows, "max-rows", notificationdynamo.DefaultBackfillMaxRows, "maximum rows queried per run")
+	fs.IntVar(&maxRows, "max-rows", notificationdynamo.DefaultBackfillMaxRows, "maximum migration candidates per run")
 	fs.DurationVar(&timeout, "timeout", defaultBackfillTimeout, "total backfill deadline")
 	if err := fs.Parse(args); err != nil || len(fs.Args()) != 0 || pageSize < 1 || pageSize > maxPageSize ||
 		maxRows < 1 || timeout <= 0 || timeout > maxBackfillTimeout {

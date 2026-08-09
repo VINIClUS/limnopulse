@@ -132,13 +132,9 @@ func (store Store) BackfillRelay(ctx context.Context, options BackfillOptions) (
 			if stopped, err := backfillContextStopped(ctx, &summary); stopped {
 				return summary, err
 			}
-			if summary.RowsQueried >= maxRows {
+			if summary.RowsNeedingUpdate >= maxRows {
 				summary.LimitReached = true
 				return summary, nil
-			}
-			queryLimit := options.PageSize
-			if remaining := maxRows - summary.RowsQueried; remaining < queryLimit {
-				queryLimit = remaining
 			}
 			values, err := attributevalue.MarshalMap(map[string]string{
 				":pk": "TENANT#" + tenantID, ":prefix": "NOTIFICATION_OUTBOX#",
@@ -151,7 +147,7 @@ func (store Store) BackfillRelay(ctx context.Context, options BackfillOptions) (
 				KeyConditionExpression:    aws.String("PK = :pk AND begins_with(SK, :prefix)"),
 				ExpressionAttributeValues: values,
 				ExclusiveStartKey:         lastKey,
-				Limit:                     aws.Int32(int32(queryLimit)),
+				Limit:                     aws.Int32(int32(options.PageSize)),
 				ConsistentRead:            aws.Bool(true),
 			})
 			if err != nil {
@@ -168,7 +164,7 @@ func (store Store) BackfillRelay(ctx context.Context, options BackfillOptions) (
 				if stopped, stopErr := backfillContextStopped(ctx, &summary); stopped {
 					return summary, stopErr
 				}
-				if summary.RowsQueried >= maxRows {
+				if summary.RowsNeedingUpdate >= maxRows {
 					summary.LimitReached = true
 					return summary, nil
 				}
@@ -237,13 +233,9 @@ func (store Store) backfillRelayDeliveries(
 		if stopped, err := backfillContextStopped(ctx, summary); stopped {
 			return true, err
 		}
-		if summary.RowsQueried >= maxRows {
+		if summary.RowsNeedingUpdate >= maxRows {
 			summary.LimitReached = true
 			return true, nil
-		}
-		queryLimit := pageSize
-		if remaining := maxRows - summary.RowsQueried; remaining < queryLimit {
-			queryLimit = remaining
 		}
 		values, err := attributevalue.MarshalMap(map[string]string{
 			":pk": "NOTIFICATION_OUTBOX#" + outbox.OutboxID, ":prefix": "DELIVERY#",
@@ -256,7 +248,7 @@ func (store Store) backfillRelayDeliveries(
 			KeyConditionExpression:    aws.String("PK = :pk AND begins_with(SK, :prefix)"),
 			ExpressionAttributeValues: values,
 			ExclusiveStartKey:         lastKey,
-			Limit:                     aws.Int32(int32(queryLimit)),
+			Limit:                     aws.Int32(int32(pageSize)),
 			ConsistentRead:            aws.Bool(true),
 		})
 		if err != nil {
@@ -273,7 +265,7 @@ func (store Store) backfillRelayDeliveries(
 			if stopped, err := backfillContextStopped(ctx, summary); stopped {
 				return true, err
 			}
-			if summary.RowsQueried >= maxRows {
+			if summary.RowsNeedingUpdate >= maxRows {
 				summary.LimitReached = true
 				return true, nil
 			}
