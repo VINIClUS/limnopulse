@@ -208,6 +208,18 @@ def test_notification_queues_and_ses_eventbridge_boundary_are_safe_by_default() 
     assert re.search(r'^ses_events_queue_name\s+=\s+"limnopulse-ses-events"$', tfvars, re.MULTILINE)
 
 
+def test_ses_eventbridge_rules_match_only_the_notifications_configuration_set() -> None:
+    ses = _read("ses.tf")
+    for rule in ("ses_notifications", "ses_notifications_bounce", "ses_notifications_reject"):
+        match = re.search(
+            rf'resource "aws_cloudwatch_event_rule" "{rule}"\s*\{{(?P<body>.*?)(?=\nresource |\Z)',
+            ses,
+            re.DOTALL,
+        )
+        assert match is not None
+        assert '"ses:configuration-set" = [var.ses_configuration_set_name]' in match.group("body")
+
+
 def test_ses_eventbridge_targets_emit_only_parseable_non_pii_feedback() -> None:
     ses = _read("ses.tf")
     transformers = _eventbridge_transformers(ses)

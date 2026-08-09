@@ -43,6 +43,11 @@ resource "aws_cloudwatch_event_rule" "ses_notifications" {
     source = ["aws.ses"]
     detail = {
       eventType = ["Send", "Delivery", "DeliveryDelay", "Complaint"]
+      mail = {
+        tags = {
+          "ses:configuration-set" = [var.ses_configuration_set_name]
+        }
+      }
     }
   })
 }
@@ -55,6 +60,11 @@ resource "aws_cloudwatch_event_rule" "ses_notifications_bounce" {
     source = ["aws.ses"]
     detail = {
       eventType = ["Bounce"]
+      mail = {
+        tags = {
+          "ses:configuration-set" = [var.ses_configuration_set_name]
+        }
+      }
     }
   })
 }
@@ -67,6 +77,11 @@ resource "aws_cloudwatch_event_rule" "ses_notifications_reject" {
     source = ["aws.ses"]
     detail = {
       eventType = ["Reject"]
+      mail = {
+        tags = {
+          "ses:configuration-set" = [var.ses_configuration_set_name]
+        }
+      }
     }
   })
 }

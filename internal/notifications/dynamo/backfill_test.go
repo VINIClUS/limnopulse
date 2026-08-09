@@ -380,6 +380,33 @@ func TestBackfillRelayMigratesPreviousRelaySortKeyLayoutForPendingDelivery(t *te
 	}
 }
 
+func TestBackfillRelayTreatsExpandedEmailOutboxAsNoopWhileMigratingPendingDelivery(t *testing.T) {
+	outbox := canonicalEmailOutbox(
+		t, legacyOutbox("outbox_expanded", "email", "ready"), notifications.WorkKindIntent,
+	)
+	outbox["expansion_status"] = "expanded"
+	delete(outbox, "available_at")
+	delete(outbox, "relay_gsi_pk")
+	delete(outbox, "relay_gsi_sk")
+	delivery := legacyPendingDelivery(t, "outbox_expanded", "delivery_pending")
+	client := &fakeClient{queryOutputs: []*awssdk.QueryOutput{
+		{Items: []map[string]types.AttributeValue{mustMarshalMap(t, outbox)}},
+		{Items: []map[string]types.AttributeValue{mustMarshalMap(t, delivery)}},
+	}}
+
+	summary, err := (Store{Table: "domain", Client: client}).BackfillRelay(
+		context.Background(), BackfillOptions{Tenants: []string{"tnt_1"}, Apply: true, PageSize: 25},
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if summary.RowsQueried != 2 || summary.Noop != 1 || summary.Updated != 1 ||
+		summary.RowsNeedingUpdate != 1 || summary.RowFailures != 0 || summary.SchemaConflicts != 0 ||
+		len(client.updateInputs) != 1 {
+		t.Fatalf("summary=%#v updates=%#v", summary, client.updateInputs)
+	}
+}
+
 func TestBackfillRelayClassifiesVersionMismatchAndDivergentRelayFieldsAsSchemaConflicts(t *testing.T) {
 	wrongVersion := legacyOutbox("outbox_wrong_version", "email", "ready")
 	wrongVersion["relay_schema_version"] = 2

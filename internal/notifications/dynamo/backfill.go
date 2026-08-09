@@ -390,6 +390,9 @@ func classifyRelayOutbox(
 		}
 		return migrationNoop, relayMigration{}, fmt.Errorf("notification outbox kind or status is unsupported")
 	}
+	if isExpandedEmail(item, workKind) {
+		return migrationNoop, migration, nil
+	}
 	createdAt, err := time.Parse(fixedUTCLayout, outbox.CreatedAt)
 	if err != nil || createdAt.UTC().Format(fixedUTCLayout) != outbox.CreatedAt {
 		if hasRelay {
@@ -443,6 +446,20 @@ func isCanonicalEmail(item map[string]types.AttributeValue, migration relayMigra
 		stringAttributeEquals(item, "relay_work_kind", string(migration.WorkKind)) &&
 		stringAttributeEquals(item, "relay_gsi_pk", migration.RelayIndexKey.PartitionKey) &&
 		stringAttributeEquals(item, "relay_gsi_sk", migration.RelayIndexKey.SortKey)
+}
+
+func isExpandedEmail(item map[string]types.AttributeValue, workKind notifications.WorkKind) bool {
+	if !numberAttributeEquals(item, "relay_schema_version", notifications.RelaySchemaVersion) ||
+		!stringAttributeEquals(item, "expansion_status", "expanded") ||
+		!stringAttributeEquals(item, "relay_work_kind", string(workKind)) {
+		return false
+	}
+	for _, name := range []string{"available_at", "relay_gsi_pk", "relay_gsi_sk"} {
+		if _, exists := item[name]; exists {
+			return false
+		}
+	}
+	return true
 }
 
 func isCanonicalEmailWithoutWorkKind(
