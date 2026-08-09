@@ -3,6 +3,7 @@ package dynamo
 import (
 	"context"
 	"fmt"
+	"strings"
 
 	"github.com/VINIClUS/limnopulse/internal/notifications"
 	"github.com/VINIClUS/limnopulse/internal/notifications/worker"
@@ -39,6 +40,75 @@ func (store Store) CheckGates(ctx context.Context, record worker.DeliveryRecord)
 	if membership.Status != "active" {
 		return worker.GateResult{CancellationReason: notifications.CancellationReasonRecipientMembershipInactive}, nil
 	}
+	preferenceItem, err := store.getConsistent(
+		ctx, "TENANT#"+snapshot.TenantID, "NOTIFICATION_PREFERENCE#USER#"+snapshot.RecipientID,
+	)
+	if err != nil {
+		return worker.GateResult{}, err
+	}
+	if len(preferenceItem) == 0 {
+		return worker.GateResult{CancellationReason: notifications.CancellationReasonCancelled}, nil
+	}
+	var preference struct {
+		PK              string `dynamodbav:"PK"`
+		SK              string `dynamodbav:"SK"`
+		EntityType      string `dynamodbav:"entity_type"`
+		TenantID        string `dynamodbav:"tenant_id"`
+		RecipientID     string `dynamodbav:"cognito_sub"`
+		Version         int64  `dynamodbav:"version"`
+		EmailEnabled    bool   `dynamodbav:"email_enabled"`
+		EmailAddress    string `dynamodbav:"email_address"`
+		EmailVerified   bool   `dynamodbav:"email_verified"`
+		MinimumSeverity string `dynamodbav:"minimum_severity"`
+	}
+	if err := attributevalue.UnmarshalMap(preferenceItem, &preference); err != nil {
+		return worker.GateResult{}, fmt.Errorf("decode current notification preference: %w", err)
+	}
+	if preference.PK != "TENANT#"+snapshot.TenantID ||
+		preference.SK != "NOTIFICATION_PREFERENCE#USER#"+snapshot.RecipientID ||
+		preference.EntityType != "notification_preference" || preference.TenantID != snapshot.TenantID ||
+		preference.RecipientID != snapshot.RecipientID || preference.Version < 1 ||
+		preference.EmailAddress == "" || !isASCII(preference.EmailAddress) {
+		return worker.GateResult{}, fmt.Errorf("current notification preference is malformed")
+	}
+	minimumSeverity, err := severityRank(preference.MinimumSeverity)
+	if err != nil {
+		return worker.GateResult{}, fmt.Errorf("current notification preference severity is invalid: %w", err)
+	}
+	if !preference.EmailEnabled || !preference.EmailVerified {
+		return worker.GateResult{CancellationReason: notifications.CancellationReasonCancelled}, nil
+	}
+	eventItem, err := store.getConsistent(ctx, "TENANT#"+snapshot.TenantID, "ALERT_EVENT#"+snapshot.EventID)
+	if err != nil {
+		return worker.GateResult{}, err
+	}
+	if len(eventItem) == 0 {
+		return worker.GateResult{}, fmt.Errorf("current alert event is missing")
+	}
+	var event struct {
+		PK         string `dynamodbav:"PK"`
+		SK         string `dynamodbav:"SK"`
+		EntityType string `dynamodbav:"entity_type"`
+		TenantID   string `dynamodbav:"tenant_id"`
+		EventID    string `dynamodbav:"event_id"`
+		RuleID     string `dynamodbav:"rule_id"`
+		Severity   string `dynamodbav:"severity"`
+	}
+	if err := attributevalue.UnmarshalMap(eventItem, &event); err != nil {
+		return worker.GateResult{}, fmt.Errorf("decode current alert event: %w", err)
+	}
+	if event.PK != "TENANT#"+snapshot.TenantID || event.SK != "ALERT_EVENT#"+snapshot.EventID ||
+		event.EntityType != "alert_event" || event.TenantID != snapshot.TenantID ||
+		event.EventID != snapshot.EventID || event.RuleID != snapshot.RuleID {
+		return worker.GateResult{}, fmt.Errorf("current alert event is malformed")
+	}
+	eventSeverity, err := severityRank(event.Severity)
+	if err != nil {
+		return worker.GateResult{}, fmt.Errorf("current alert event severity is invalid: %w", err)
+	}
+	if eventSeverity < minimumSeverity {
+		return worker.GateResult{CancellationReason: notifications.CancellationReasonCancelled}, nil
+	}
 	deliverabilityKey, err := notifications.DeliverabilityStorageKey(snapshot.NormalizedEmail)
 	if err != nil {
 		return worker.GateResult{}, err
@@ -66,4 +136,19 @@ func (store Store) CheckGates(ctx context.Context, record worker.DeliveryRecord)
 		return worker.GateResult{CancellationReason: notifications.CancellationReasonEmailSuppressed}, nil
 	}
 	return worker.GateResult{}, fmt.Errorf("current deliverability is malformed")
+}
+
+func severityRank(value string) (int, error) {
+	switch value {
+	case "warning":
+		return 1, nil
+	case "critical":
+		return 2, nil
+	default:
+		return 0, fmt.Errorf("alert severity is unsupported")
+	}
+}
+
+func isASCII(value string) bool {
+	return !strings.ContainsFunc(value, func(char rune) bool { return char > 127 })
 }

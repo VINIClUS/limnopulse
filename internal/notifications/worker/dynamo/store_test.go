@@ -259,9 +259,13 @@ func TestAcquireMalformedProviderOutcomeAwaitsDLQWithoutClaim(t *testing.T) {
 
 func TestCheckGatesRevalidatesMembershipAndAddressDeliverability(t *testing.T) {
 	record := testRecord(t)
-	active := map[string]any{"PK": "TENANT#tnt_1", "SK": "MEMBER#user_1", "entity_type": "tenant_member", "tenant_id": "tnt_1", "cognito_sub": "user_1", "status": "active", "role": "owner", "version": int64(2)}
+	active := currentMembership(record)
+	preference := currentPreference(record, true, "warning")
+	event := currentAlertEvent(record, "critical")
 	suppressed := map[string]any{"deliverability": "suppressed"}
-	client := &fakeClient{getItems: []map[string]types.AttributeValue{marshal(t, active), marshal(t, suppressed)}}
+	client := &fakeClient{getItems: []map[string]types.AttributeValue{
+		marshal(t, active), marshal(t, preference), marshal(t, event), marshal(t, suppressed),
+	}}
 	gate, err := (Store{Table: "domain", Client: client}).CheckGates(context.Background(), record)
 	if err != nil {
 		t.Fatal(err)
@@ -269,7 +273,8 @@ func TestCheckGatesRevalidatesMembershipAndAddressDeliverability(t *testing.T) {
 	if gate.Allowed || gate.CancellationReason != notifications.CancellationReasonEmailSuppressed {
 		t.Fatalf("suppressed gate = %#v", gate)
 	}
-	if len(client.gets) != 2 || !*client.gets[0].ConsistentRead || !*client.gets[1].ConsistentRead {
+	if len(client.gets) != 4 || !*client.gets[0].ConsistentRead || !*client.gets[1].ConsistentRead ||
+		!*client.gets[2].ConsistentRead || !*client.gets[3].ConsistentRead {
 		t.Fatal("gates were not read consistently")
 	}
 
@@ -278,6 +283,30 @@ func TestCheckGatesRevalidatesMembershipAndAddressDeliverability(t *testing.T) {
 	if err != nil || gate.CancellationReason != notifications.CancellationReasonRecipientMembershipInactive {
 		t.Fatalf("missing membership gate=%#v err=%v", gate, err)
 	}
+}
+
+func TestCheckGatesCancelsWhenCurrentPreferenceNoLongerQualifiesDelivery(t *testing.T) {
+	record := testRecord(t)
+	active := currentMembership(record)
+	t.Run("email disabled after fanout", func(t *testing.T) {
+		client := &fakeClient{getItems: []map[string]types.AttributeValue{
+			marshal(t, active), marshal(t, currentPreference(record, false, "warning")),
+		}}
+		gate, err := (Store{Table: "domain", Client: client}).CheckGates(context.Background(), record)
+		if err != nil || gate.Allowed || gate.CancellationReason != notifications.CancellationReasonCancelled {
+			t.Fatalf("gate=%#v err=%v", gate, err)
+		}
+	})
+	t.Run("minimum severity raised after fanout", func(t *testing.T) {
+		client := &fakeClient{getItems: []map[string]types.AttributeValue{
+			marshal(t, active), marshal(t, currentPreference(record, true, "critical")),
+			marshal(t, currentAlertEvent(record, "warning")),
+		}}
+		gate, err := (Store{Table: "domain", Client: client}).CheckGates(context.Background(), record)
+		if err != nil || gate.Allowed || gate.CancellationReason != notifications.CancellationReasonCancelled {
+			t.Fatalf("gate=%#v err=%v", gate, err)
+		}
+	})
 }
 
 func TestCompletePreflightFailureFencesClaimWithoutCreatingAttemptAndTreatsTerminalRaceAsSafe(t *testing.T) {
@@ -833,6 +862,33 @@ func testDeliveryItem(t *testing.T, state notifications.DeliveryState) map[strin
 			"text": snapshot.Content.Text, "html": snapshot.Content.HTML, "content_hash": snapshot.Content.ContentHash,
 		},
 		"created_at": snapshot.CreatedAt.Format(time.RFC3339Nano), "updated_at": snapshot.UpdatedAt.Format(time.RFC3339Nano),
+	}
+}
+
+func currentMembership(record worker.DeliveryRecord) map[string]any {
+	return map[string]any{
+		"PK": "TENANT#" + record.Delivery.TenantID, "SK": "MEMBER#" + record.Delivery.RecipientID,
+		"entity_type": "tenant_member", "tenant_id": record.Delivery.TenantID,
+		"cognito_sub": record.Delivery.RecipientID, "status": "active", "role": "owner", "version": int64(2),
+	}
+}
+
+func currentPreference(record worker.DeliveryRecord, emailEnabled bool, minimumSeverity string) map[string]any {
+	return map[string]any{
+		"PK":          "TENANT#" + record.Delivery.TenantID,
+		"SK":          "NOTIFICATION_PREFERENCE#USER#" + record.Delivery.RecipientID,
+		"entity_type": "notification_preference", "tenant_id": record.Delivery.TenantID,
+		"cognito_sub": record.Delivery.RecipientID, "version": int64(2),
+		"email_enabled": emailEnabled, "email_address": record.Delivery.NormalizedEmail,
+		"email_verified": true, "minimum_severity": minimumSeverity,
+	}
+}
+
+func currentAlertEvent(record worker.DeliveryRecord, severity string) map[string]any {
+	return map[string]any{
+		"PK": "TENANT#" + record.Delivery.TenantID, "SK": "ALERT_EVENT#" + record.Delivery.EventID,
+		"entity_type": "alert_event", "tenant_id": record.Delivery.TenantID,
+		"event_id": record.Delivery.EventID, "rule_id": record.Delivery.RuleID, "severity": severity,
 	}
 }
 
