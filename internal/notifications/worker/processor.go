@@ -150,6 +150,16 @@ func (processor Processor) Handle(ctx context.Context, message QueueMessage) Dec
 		}
 		return Decision{Action: ActionDelete}
 	}
+	attemptID := processor.NewAttemptID()
+	sendRequest := SendRequest{
+		Delivery: record.Delivery, AttemptID: attemptID, AttemptNumber: record.AttemptCount + 1,
+	}
+	if preflightErr := processor.Sender.Preflight(sendRequest); preflightErr != nil {
+		if err := stopLimiter(); err != nil {
+			return processor.deferClaim(ctx, record, processor.Now().UTC(), "lease_renewal_failed", time.Minute)
+		}
+		return processor.completePreflightFailure(ctx, record, processor.Now().UTC(), preflightErr)
+	}
 
 	limiterDone := processor.Metrics.BeginLimiterWait()
 	if err := processor.Limiter.Wait(limiterCtx); err != nil {
@@ -200,7 +210,6 @@ func (processor Processor) Handle(ctx context.Context, message QueueMessage) Dec
 	if providerTimeout <= 0 {
 		providerTimeout = 15 * time.Second
 	}
-	attemptID := processor.NewAttemptID()
 	attemptStartedAt := processor.Now().UTC()
 	mutationCtx, cancelMutation := mutationContext(ctx)
 	record, err = processor.Store.BeginAttempt(mutationCtx, record, BeginAttemptRequest{
@@ -216,16 +225,56 @@ func (processor Processor) Handle(ctx context.Context, message QueueMessage) Dec
 	// BeginAttempt conditionally reserves enough durable lease headroom for its
 	// own transaction, the bounded provider call, and the completion write, while
 	// remaining immediately adjacent to the single provider call.
-	// This keeps attempt_count equal to the number of EmailSender invocations.
+	// This keeps attempt_count equal to the number of EmailSender.Send invocations.
 	providerCtx, cancelProvider := context.WithTimeout(ctx, providerTimeout)
 	processor.Metrics.ProviderCallStarted(record.PossiblyAccepted)
-	result, sendErr := processor.Sender.Send(providerCtx, SendRequest{
-		Delivery: record.Delivery, AttemptID: attemptID, AttemptNumber: record.AttemptCount,
-	})
+	result, sendErr := processor.Sender.Send(providerCtx, sendRequest)
 	processor.Metrics.ProviderCallFinished()
 	cancelProvider()
 	completedAt := processor.Now().UTC()
 	return processor.finishAttempt(ctx, record, attemptID, completedAt, result, sendErr)
+}
+
+func (processor Processor) completePreflightFailure(
+	ctx context.Context,
+	record DeliveryRecord,
+	now time.Time,
+	preflightErr error,
+) Decision {
+	var senderErr *SendError
+	if !errors.As(preflightErr, &senderErr) {
+		senderErr = NewSendError(ErrorRetryableUnknown, preflightErr)
+	}
+	if disposition := senderErr.Category.disposition(); disposition != sendPermanent && disposition != sendFatal {
+		senderErr = NewSendError(ErrorFatalConfigurationSet, senderErr)
+	}
+	plan, ok := processor.planDefinitiveFailure(record, senderErr.Category, now)
+	if !ok {
+		return processor.deferClaim(ctx, record, now, "invalid_sender_preflight", time.Minute)
+	}
+	completion := PreflightFailureCompletion{
+		CompletedAt: now, ErrorCategory: string(senderErr.Category), NextState: plan.NextState,
+		NextAttemptAt: plan.NextAttemptAt, PossiblyAccepted: plan.PossiblyAccepted,
+		AmbiguousExhausted: plan.AmbiguousExhausted, AwaitingIntervention: plan.AwaitingIntervention,
+	}
+	decision := Decision{
+		Action: plan.Action, Visibility: plan.Visibility, ErrorCategory: string(senderErr.Category),
+	}
+	mutationCtx, cancel := mutationContext(ctx)
+	defer cancel()
+	if err := processor.Store.CompletePreflightFailure(mutationCtx, record, completion); err != nil {
+		if errors.Is(err, ErrConcurrentTerminal) {
+			if decision.Action == ActionFatal {
+				return decision
+			}
+			return Decision{Action: ActionDelete}
+		}
+		if decision.Action == ActionFatal {
+			return Decision{Action: ActionFatal, Visibility: decision.Visibility, ErrorCategory: "fatal_persistence_failure"}
+		}
+		return Decision{Action: ActionChangeVisibility, Visibility: time.Minute, ErrorCategory: "preflight_completion_failure"}
+	}
+	return decision
 }
 
 func (processor Processor) completeInterrupted(
@@ -289,18 +338,22 @@ func (processor Processor) finishAttempt(
 		}
 		completion.ErrorCategory = string(providerErr.Category)
 		switch providerErr.Category.disposition() {
-		case sendPermanent:
-			completion.Outcome = notifications.AttemptOutcomePermanentFailed
-			if record.PossiblyAccepted {
-				delay := RetryDelay(record.AttemptCount, true, processor.JitterFraction())
-				completion.NextState = notifications.DeliveryStateRetryableFailed
-				completion.NextAttemptAt = now.Add(delay)
-				completion.PossiblyAccepted = true
-				completion.AmbiguousExhausted = true
-				decision = Decision{Action: ActionChangeVisibility, Visibility: normalizedVisibility(delay), ErrorCategory: string(providerErr.Category)}
+		case sendPermanent, sendFatal:
+			if providerErr.Category.disposition() == sendPermanent {
+				completion.Outcome = notifications.AttemptOutcomePermanentFailed
 			} else {
-				completion.NextState = notifications.DeliveryStatePermanentFailed
-				decision.Action = ActionDelete
+				completion.Outcome = notifications.AttemptOutcomeRetryable
+			}
+			plan, _ := processor.planDefinitiveFailure(record, providerErr.Category, now)
+			completion.NextState = plan.NextState
+			completion.NextAttemptAt = plan.NextAttemptAt
+			completion.PossiblyAccepted = plan.PossiblyAccepted
+			completion.AmbiguousExhausted = plan.AmbiguousExhausted
+			completion.AwaitingIntervention = plan.AwaitingIntervention
+			decision.Action = plan.Action
+			decision.Visibility = plan.Visibility
+			if plan.Action != ActionDelete {
+				decision.ErrorCategory = string(providerErr.Category)
 			}
 		case sendRetryable:
 			metricRetryCategory = providerErr.Category
@@ -333,12 +386,6 @@ func (processor Processor) finishAttempt(
 			completion.PossiblyAccepted = true
 			completion.AmbiguousExhausted = record.AttemptCount >= MaxProviderCalls
 			decision = Decision{Action: ActionChangeVisibility, Visibility: normalizedVisibility(delay), ErrorCategory: string(providerErr.Category)}
-		case sendFatal:
-			completion.Outcome = notifications.AttemptOutcomeRetryable
-			completion.NextState = notifications.DeliveryStateRetryableFailed
-			completion.NextAttemptAt = now.Add(15 * time.Minute)
-			completion.AwaitingIntervention = true
-			decision = Decision{Action: ActionFatal, Visibility: 15 * time.Minute, ErrorCategory: string(providerErr.Category)}
 		}
 	}
 	mutationCtx, cancel := mutationContext(ctx)

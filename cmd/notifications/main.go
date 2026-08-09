@@ -181,9 +181,16 @@ func runBackfillRelay(ctx context.Context, args []string, deps dependencies) int
 		return exitFatal
 	}
 	incomplete := summary.LimitReached || summary.DeadlineReached
-	if summary.RowFailures > 0 || incomplete {
+	if incomplete {
 		writeResult(deps.Output, commandResult{
-			Result: "partial_failure", ExitCode: exitPartial, ScopeCompleted: !incomplete,
+			Result: "incomplete", ExitCode: exitFatal, ScopeCompleted: false,
+			RetryRecommended: true, ErrorCategories: summaryErrorCategories(summary), Summary: &summary,
+		})
+		return exitFatal
+	}
+	if summary.RowFailures > 0 {
+		writeResult(deps.Output, commandResult{
+			Result: "partial_failure", ExitCode: exitPartial, ScopeCompleted: true,
 			RetryRecommended: true, ErrorCategories: summaryErrorCategories(summary), Summary: &summary,
 		})
 		return exitPartial

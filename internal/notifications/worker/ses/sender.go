@@ -5,6 +5,7 @@ import (
 	"errors"
 	"io"
 	"net"
+	"net/mail"
 	"regexp"
 	"strings"
 	"syscall"
@@ -64,27 +65,41 @@ func WrapCredentials(provider aws.CredentialsProvider) aws.CredentialsProvider {
 	return classifyingCredentialsProvider{provider: provider}
 }
 
-func (sender Sender) Send(ctx context.Context, request worker.SendRequest) (worker.SendResult, error) {
+func (sender Sender) Preflight(request worker.SendRequest) error {
 	if sender.Client == nil || strings.TrimSpace(sender.FromEmail) == "" ||
 		strings.ContainsAny(sender.FromEmail, "\r\n") ||
 		(worker.SESConfigurationSetName(sender.ConfigurationSet)).Validate() != nil ||
 		request.AttemptID == "" || request.AttemptNumber < 1 {
-		return worker.SendResult{}, worker.NewSendError(worker.ErrorFatalConfigurationSet, errors.New("SES sender configuration is invalid"))
+		return worker.NewSendError(worker.ErrorFatalConfigurationSet, errors.New("SES sender configuration is invalid"))
 	}
 	if _, err := notifications.RestoreDelivery(request.Delivery); err != nil ||
 		request.Delivery.State != notifications.DeliveryStateProcessing || request.Delivery.Channel != notifications.ChannelEmail {
-		return worker.SendResult{}, worker.NewSendError(worker.ErrorRetryableUnknown, errors.New("delivery snapshot is invalid"))
+		return worker.NewSendError(worker.ErrorFatalConfigurationSet, errors.New("delivery snapshot is invalid"))
 	}
-	tagValues := map[string]string{
+	if err := validateRecipient(request.Delivery.NormalizedEmail); err != nil {
+		return ClassifyError(RecipientError{Err: err})
+	}
+	for _, value := range requestTagValues(request) {
+		if !sesTagValue.MatchString(value) {
+			return worker.NewSendError(worker.ErrorFatalConfigurationSet, errors.New("SES tag identity is invalid"))
+		}
+	}
+	return nil
+}
+
+func requestTagValues(request worker.SendRequest) map[string]string {
+	return map[string]string{
 		"delivery_id": request.Delivery.DeliveryID, "attempt_id": request.AttemptID,
 		"event_id": request.Delivery.EventID, "notification_kind": string(request.Delivery.Kind),
 		"channel": string(request.Delivery.Channel),
 	}
-	for _, value := range tagValues {
-		if !sesTagValue.MatchString(value) {
-			return worker.SendResult{}, worker.NewSendError(worker.ErrorFatalConfigurationSet, errors.New("SES tag identity is invalid"))
-		}
+}
+
+func (sender Sender) Send(ctx context.Context, request worker.SendRequest) (worker.SendResult, error) {
+	if err := sender.Preflight(request); err != nil {
+		return worker.SendResult{}, err
 	}
+	tagValues := requestTagValues(request)
 	// Retrieve through the same cache used by the SDK immediately before SendEmail.
 	// This gives credential refresh failures a typed, PII-free fatal category
 	// instead of depending on text in the SDK's operation-error wrappers.
@@ -132,6 +147,30 @@ type RecipientError struct{ Err error }
 
 func (err RecipientError) Error() string { return "provider rejected a definite recipient" }
 func (err RecipientError) Unwrap() error { return err.Err }
+
+func validateRecipient(value string) error {
+	if value != strings.TrimSpace(value) || strings.ContainsAny(value, "\r\n") {
+		return errors.New("SES recipient is invalid")
+	}
+	for index := 0; index < len(value); index++ {
+		if value[index] > 0x7f {
+			return errors.New("SES recipient is invalid")
+		}
+	}
+	parsed, err := mail.ParseAddress(value)
+	if err != nil || parsed.Name != "" || parsed.Address != value {
+		return errors.New("SES recipient is invalid")
+	}
+	at := strings.LastIndexByte(value, '@')
+	if at < 1 || at == len(value)-1 {
+		return errors.New("SES recipient is invalid")
+	}
+	domain := value[at+1:]
+	if !strings.ContainsRune(domain, '.') || strings.HasPrefix(domain, ".") || strings.HasSuffix(domain, ".") {
+		return errors.New("SES recipient is invalid")
+	}
+	return nil
+}
 
 func ClassifyError(err error) error {
 	if err == nil {

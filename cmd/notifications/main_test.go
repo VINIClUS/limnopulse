@@ -495,20 +495,46 @@ func TestBackfillRelayReportsIncompleteScopeAtTotalRowLimit(t *testing.T) {
 			return client, nil
 		},
 	})
-	if exitCode != exitPartial {
+	if exitCode != exitFatal {
 		t.Fatalf("exit code = %d, output = %s", exitCode, output.String())
 	}
 	var result commandResult
 	if err := json.Unmarshal(output.Bytes(), &result); err != nil {
 		t.Fatal(err)
 	}
-	if result.Result != "partial_failure" || result.ScopeCompleted || !result.RetryRecommended ||
+	if result.Result != "incomplete" || result.ScopeCompleted || !result.RetryRecommended ||
 		result.ErrorCategories["row_limit_reached"] != 1 || result.Summary == nil ||
 		!result.Summary.LimitReached || result.Summary.RowsQueried != 1 {
 		t.Fatalf("result = %#v", result)
 	}
 	if strings.Contains(output.String(), "private_") {
 		t.Fatalf("bounded summary leaked identifiers: %s", output.String())
+	}
+}
+
+func TestBackfillRelayReportsIncompleteScopeAtDeadline(t *testing.T) {
+	client := &fakeDynamo{queryError: context.DeadlineExceeded}
+	var output bytes.Buffer
+
+	exitCode := runMain(context.Background(), []string{
+		"backfill-relay", "--tenant", "private_tenant",
+	}, dependencies{
+		Output: &output, LookupEnv: func(string) (string, bool) { return "", false },
+		LoadDynamo: func(context.Context, string, string) (notificationdynamo.Client, error) {
+			return client, nil
+		},
+	})
+	if exitCode != exitFatal {
+		t.Fatalf("exit code = %d, output = %s", exitCode, output.String())
+	}
+	var result commandResult
+	if err := json.Unmarshal(output.Bytes(), &result); err != nil {
+		t.Fatal(err)
+	}
+	if result.Result != "incomplete" || result.ScopeCompleted || !result.RetryRecommended ||
+		result.ErrorCategories["deadline_reached"] != 1 || result.Summary == nil ||
+		!result.Summary.DeadlineReached || result.Summary.RowFailures != 0 {
+		t.Fatalf("result = %#v", result)
 	}
 }
 

@@ -82,11 +82,22 @@ type AttemptCompletion struct {
 	AwaitingIntervention bool
 }
 
+type PreflightFailureCompletion struct {
+	CompletedAt          time.Time
+	ErrorCategory        string
+	NextState            notifications.DeliveryState
+	NextAttemptAt        time.Time
+	PossiblyAccepted     bool
+	AmbiguousExhausted   bool
+	AwaitingIntervention bool
+}
+
 type Store interface {
 	Acquire(context.Context, notifications.JobEnvelope, ClaimRequest) (AcquireResult, error)
 	CheckGates(context.Context, DeliveryRecord) (GateResult, error)
 	Cancel(context.Context, DeliveryRecord, notifications.CancellationReason, time.Time) error
 	Defer(context.Context, DeliveryRecord, DeferRequest) error
+	CompletePreflightFailure(context.Context, DeliveryRecord, PreflightFailureCompletion) error
 	BeginAttempt(context.Context, DeliveryRecord, BeginAttemptRequest) (DeliveryRecord, error)
 	Refresh(context.Context, DeliveryRecord) (DeliveryRecord, bool, error)
 	CompleteAttempt(context.Context, DeliveryRecord, AttemptCompletion) error
@@ -137,6 +148,7 @@ func (name SESConfigurationSetName) Validate() error {
 }
 
 type EmailSender interface {
+	Preflight(SendRequest) error
 	Send(context.Context, SendRequest) (SendResult, error)
 }
 

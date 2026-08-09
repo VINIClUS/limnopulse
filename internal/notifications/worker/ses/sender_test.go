@@ -18,6 +18,7 @@ import (
 	awssignerv4 "github.com/aws/aws-sdk-go-v2/aws/signer/v4"
 	"github.com/aws/aws-sdk-go-v2/credentials"
 	awsses "github.com/aws/aws-sdk-go-v2/service/sesv2"
+	sestypes "github.com/aws/aws-sdk-go-v2/service/sesv2/types"
 	"github.com/aws/smithy-go"
 )
 
@@ -74,6 +75,49 @@ func TestSenderUsesImmutableDeliveryAndExactNoPIITags(t *testing.T) {
 	if !client.deadlineSet || client.deadlineRemaining > 15*time.Second || client.deadlineRemaining < 14*time.Second {
 		t.Fatalf("provider deadline set=%t remaining=%s", client.deadlineSet, client.deadlineRemaining)
 	}
+}
+
+func TestSenderClassifiesOnlyDefinitelyInvalidRecipientAsPermanent(t *testing.T) {
+	t.Run("locally invalid recipient is permanent before AWS", func(t *testing.T) {
+		client := &fakeSESClient{output: &awsses.SendEmailOutput{MessageId: aws.String("must_not_send")}}
+		request := testSendRequest(t)
+		request.Delivery.NormalizedEmail = "missing-at-sign"
+
+		_, err := (Sender{
+			Client: client, FromEmail: "alerts@example.com",
+			ConfigurationSet: "limnopulse-notifications", Timeout: 15 * time.Second,
+		}).Send(context.Background(), request)
+		var sendErr *worker.SendError
+		if !errors.As(err, &sendErr) || sendErr.Category != worker.ErrorPermanentRecipient || client.calls.Load() != 0 {
+			t.Fatalf("err=%#v SES_calls=%d", err, client.calls.Load())
+		}
+	})
+
+	t.Run("AWS content rejection is not recipient permanent", func(t *testing.T) {
+		client := &fakeSESClient{err: &sestypes.MessageRejected{Message: aws.String("invalid content")}}
+		_, err := (Sender{
+			Client: client, FromEmail: "alerts@example.com",
+			ConfigurationSet: "limnopulse-notifications", Timeout: 15 * time.Second,
+		}).Send(context.Background(), testSendRequest(t))
+		var sendErr *worker.SendError
+		if !errors.As(err, &sendErr) || sendErr.Category != worker.ErrorRetryableUnknown || client.calls.Load() != 1 {
+			t.Fatalf("err=%#v SES_calls=%d", err, client.calls.Load())
+		}
+	})
+
+	t.Run("deterministically invalid delivery is fatal before AWS", func(t *testing.T) {
+		client := &fakeSESClient{output: &awsses.SendEmailOutput{MessageId: aws.String("must_not_send")}}
+		request := testSendRequest(t)
+		request.Delivery.State = notifications.DeliveryStateQueued
+		_, err := (Sender{
+			Client: client, FromEmail: "alerts@example.com",
+			ConfigurationSet: "limnopulse-notifications", Timeout: 15 * time.Second,
+		}).Send(context.Background(), request)
+		var sendErr *worker.SendError
+		if !errors.As(err, &sendErr) || sendErr.Category != worker.ErrorFatalConfigurationSet || client.calls.Load() != 0 {
+			t.Fatalf("err=%#v SES_calls=%d", err, client.calls.Load())
+		}
+	})
 }
 
 func TestSenderCredentialPreflightFailureIsFatalAndNeverCallsSES(t *testing.T) {

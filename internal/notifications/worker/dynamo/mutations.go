@@ -41,6 +41,64 @@ func (store Store) Defer(ctx context.Context, record worker.DeliveryRecord, requ
 	)
 }
 
+func (store Store) CompletePreflightFailure(
+	ctx context.Context,
+	record worker.DeliveryRecord,
+	completion worker.PreflightFailureCompletion,
+) error {
+	if completion.CompletedAt.IsZero() || completion.ErrorCategory == "" ||
+		validateTransition(record.Delivery, completion.NextState) != nil ||
+		(record.PossiblyAccepted && !completion.PossiblyAccepted) {
+		return fmt.Errorf("invalid preflight failure completion")
+	}
+	switch completion.NextState {
+	case notifications.DeliveryStatePermanentFailed:
+		if !completion.NextAttemptAt.IsZero() || completion.PossiblyAccepted ||
+			completion.AmbiguousExhausted || completion.AwaitingIntervention {
+			return fmt.Errorf("invalid permanent preflight failure completion")
+		}
+	case notifications.DeliveryStateRetryableFailed:
+		if completion.NextAttemptAt.Before(completion.CompletedAt) ||
+			(!completion.AmbiguousExhausted && !completion.AwaitingIntervention) {
+			return fmt.Errorf("invalid retryable preflight failure completion")
+		}
+	default:
+		return fmt.Errorf("invalid preflight failure state")
+	}
+	update := "SET #state = :next_state, #last_error_category = :error_category, #possibly_accepted = :possibly_accepted, #ambiguous_exhausted = :ambiguous_exhausted, #awaiting_intervention = :awaiting_intervention, #updated_at = :now, #revision = :next_revision"
+	if completion.NextAttemptAt.IsZero() {
+		update += " REMOVE #lease_owner, #lease_expires, #next_attempt_at"
+	} else {
+		update += ", #next_attempt_at = :next_attempt_at REMOVE #lease_owner, #lease_expires"
+	}
+	values := map[string]any{
+		":next_state": string(completion.NextState), ":error_category": completion.ErrorCategory,
+		":possibly_accepted": completion.PossiblyAccepted, ":ambiguous_exhausted": completion.AmbiguousExhausted,
+		":awaiting_intervention": completion.AwaitingIntervention, ":now": fixedTime(completion.CompletedAt),
+	}
+	if !completion.NextAttemptAt.IsZero() {
+		values[":next_attempt_at"] = fixedTime(completion.NextAttemptAt)
+	}
+	err := store.transitionProcessing(ctx, record, update,
+		map[string]string{
+			"#last_error_category": "last_error_category", "#possibly_accepted": "possibly_accepted",
+			"#ambiguous_exhausted": "ambiguous_exhausted", "#awaiting_intervention": "awaiting_intervention",
+		},
+		values,
+	)
+	if err == nil {
+		return nil
+	}
+	_, terminal, refreshErr := store.Refresh(ctx, record)
+	if refreshErr == nil && terminal {
+		return worker.ErrConcurrentTerminal
+	}
+	if refreshErr != nil {
+		return fmt.Errorf("persist preflight failure after terminal race: %w", refreshErr)
+	}
+	return fmt.Errorf("persist preflight failure: %w", err)
+}
+
 func (store Store) FinalizeUnknown(ctx context.Context, record worker.DeliveryRecord, now time.Time) error {
 	if now.IsZero() || !record.AmbiguousExhausted || !record.PossiblyAccepted ||
 		validateTransition(record.Delivery, notifications.DeliveryStateUnknown) != nil {

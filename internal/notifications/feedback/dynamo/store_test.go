@@ -272,12 +272,16 @@ func TestReconcileStaleAttemptRejectDoesNotDowngradeLaterAcceptedAttempt(t *test
 		attemptValues[":provider_message_id"] != "ses_older" {
 		t.Fatalf("older Attempt was not reconciled: %#v", attemptValues)
 	}
-	deliveryValues := decodeValues(t, client.transactions[0].TransactItems[3].Update.ExpressionAttributeValues)
-	if deliveryValues[":next_state"] != "succeeded" ||
-		deliveryValues[":provider_outcome"] != "accepted" ||
-		deliveryValues[":provider_message_id"] != "ses_later" ||
-		deliveryValues[":provider_attempt_id"] != "att_later" {
-		t.Fatalf("later accepted aggregate was downgraded: %#v", deliveryValues)
+	deliveryOperation := client.transactions[0].TransactItems[3]
+	if deliveryOperation.ConditionCheck == nil || deliveryOperation.Update != nil {
+		t.Fatalf("stale feedback mutated later accepted aggregate: %#v", deliveryOperation)
+	}
+	deliveryValues := decodeValues(t, deliveryOperation.ConditionCheck.ExpressionAttributeValues)
+	if numericInt64(deliveryValues[":current_revision"]) != 12 ||
+		deliveryValues[":current_provider_outcome"] != "accepted" ||
+		deliveryValues[":current_provider_message_id"] != "ses_later" ||
+		deliveryValues[":current_provider_attempt_id"] != "att_later" {
+		t.Fatalf("later accepted aggregate fence = %#v", deliveryValues)
 	}
 }
 
@@ -307,11 +311,15 @@ func TestReconcileStaleAttemptHardBounceStillSuppressesWithoutDowngradingOwner(t
 	if len(transaction.TransactItems) != 5 || transaction.TransactItems[4].Put == nil {
 		t.Fatalf("stale hard bounce did not preserve global suppression: %#v", transaction.TransactItems)
 	}
-	deliveryValues := decodeValues(t, transaction.TransactItems[3].Update.ExpressionAttributeValues)
-	if deliveryValues[":next_state"] != "succeeded" ||
-		deliveryValues[":provider_outcome"] != "accepted" ||
-		deliveryValues[":provider_attempt_id"] != "att_later" {
-		t.Fatalf("stale hard bounce downgraded aggregate owner: %#v", deliveryValues)
+	deliveryOperation := transaction.TransactItems[3]
+	if deliveryOperation.ConditionCheck == nil || deliveryOperation.Update != nil {
+		t.Fatalf("stale hard bounce mutated aggregate owner: %#v", deliveryOperation)
+	}
+	deliveryValues := decodeValues(t, deliveryOperation.ConditionCheck.ExpressionAttributeValues)
+	if numericInt64(deliveryValues[":current_revision"]) != 12 ||
+		deliveryValues[":current_provider_outcome"] != "accepted" ||
+		deliveryValues[":current_provider_attempt_id"] != "att_later" {
+		t.Fatalf("stale hard bounce aggregate fence = %#v", deliveryValues)
 	}
 }
 
@@ -403,10 +411,10 @@ func TestReconcileLegacyStaleFeedbackDoesNotPersistEmptyOwnershipAndAllowsLatest
 	if err != nil || result.Disposition != feedback.ReconcileApplied {
 		t.Fatalf("stale result=%#v err=%v", result, err)
 	}
-	staleUpdate := client.transactions[0].TransactItems[3].Update
-	if strings.Contains(*staleUpdate.UpdateExpression, "#provider_attempt_id = :provider_attempt_id") ||
-		!strings.Contains(*staleUpdate.UpdateExpression, "#provider_attempt_id") {
-		t.Fatalf("stale legacy ownership update = %s", *staleUpdate.UpdateExpression)
+	staleOperation := client.transactions[0].TransactItems[3]
+	if staleOperation.ConditionCheck == nil || staleOperation.Update != nil ||
+		!strings.Contains(*staleOperation.ConditionCheck.ConditionExpression, "attribute_not_exists(#current_provider_attempt_id)") {
+		t.Fatalf("stale legacy ownership operation = %#v", staleOperation)
 	}
 
 	latest := testEvent(feedback.SemanticSend)

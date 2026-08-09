@@ -23,7 +23,19 @@ type FakeSender struct {
 	MessageID string
 }
 
+func (sender FakeSender) Preflight(worker.SendRequest) error {
+	switch sender.Mode {
+	case "", FakeSuccess, FakeRetryable, FakePermanent, FakeAmbiguousTimeout, FakeConnectionReset:
+		return nil
+	default:
+		return worker.NewSendError(worker.ErrorFatalConfigurationSet, errors.New("fake sender mode is invalid"))
+	}
+}
+
 func (sender FakeSender) Send(_ context.Context, request worker.SendRequest) (worker.SendResult, error) {
+	if err := sender.Preflight(request); err != nil {
+		return worker.SendResult{}, err
+	}
 	switch sender.Mode {
 	case "", FakeSuccess:
 		messageID := sender.MessageID

@@ -221,6 +221,53 @@ func TestCheckGatesRevalidatesMembershipAndAddressDeliverability(t *testing.T) {
 	}
 }
 
+func TestCompletePreflightFailureFencesClaimWithoutCreatingAttemptAndTreatsTerminalRaceAsSafe(t *testing.T) {
+	t.Run("permanent recipient", func(t *testing.T) {
+		record := testRecord(t)
+		client := &fakeClient{}
+		err := (Store{Table: "domain", Client: client}).CompletePreflightFailure(
+			context.Background(), record, worker.PreflightFailureCompletion{
+				CompletedAt: testNow(), ErrorCategory: string(worker.ErrorPermanentRecipient),
+				NextState: notifications.DeliveryStatePermanentFailed,
+			},
+		)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if len(client.updates) != 1 || len(client.transactions) != 0 {
+			t.Fatalf("updates=%d transactions=%d", len(client.updates), len(client.transactions))
+		}
+		update := client.updates[0]
+		for _, required := range []string{"#state = :next_state", "#revision = :next_revision", "#last_error_category = :error_category", "#lease_owner = :owner", "#lease_epoch = :epoch"} {
+			if !strings.Contains(*update.UpdateExpression+*update.ConditionExpression, required) {
+				t.Errorf("preflight mutation missing %q: update=%s condition=%s", required, *update.UpdateExpression, *update.ConditionExpression)
+			}
+		}
+		if text := *update.UpdateExpression; strings.Contains(text, "attempt_count") || strings.Contains(text, "last_attempt_id") {
+			t.Fatalf("preflight mutation touched Attempt accounting: %s", text)
+		}
+	})
+
+	t.Run("concurrent terminal", func(t *testing.T) {
+		record := testRecord(t)
+		terminal := testDeliveryItem(t, notifications.DeliveryStateSucceeded)
+		terminal["delivery_revision"] = record.Revision + 1
+		client := &fakeClient{
+			getItems:     []map[string]types.AttributeValue{marshal(t, terminal)},
+			updateErrors: []error{&types.ConditionalCheckFailedException{}},
+		}
+		err := (Store{Table: "domain", Client: client}).CompletePreflightFailure(
+			context.Background(), record, worker.PreflightFailureCompletion{
+				CompletedAt: testNow(), ErrorCategory: string(worker.ErrorPermanentRecipient),
+				NextState: notifications.DeliveryStatePermanentFailed,
+			},
+		)
+		if !errors.Is(err, worker.ErrConcurrentTerminal) || len(client.updates) != 1 || len(client.gets) != 1 {
+			t.Fatalf("error=%v updates=%d gets=%d", err, len(client.updates), len(client.gets))
+		}
+	})
+}
+
 func TestAttemptTransactionsFenceLeaseAndNeverCopyRenderedContentOrEmail(t *testing.T) {
 	record := testRecord(t)
 	client := &fakeClient{}
@@ -478,6 +525,7 @@ func TestCompleteAttemptFinalizesCurrentStartedAttemptWhenOlderFeedbackTerminali
 type fakeClient struct {
 	getItems          []map[string]types.AttributeValue
 	updateItems       []map[string]types.AttributeValue
+	updateErrors      []error
 	gets              []*awssdk.GetItemInput
 	updates           []*awssdk.UpdateItemInput
 	transactions      []*awssdk.TransactWriteItemsInput
@@ -494,6 +542,13 @@ func (client *fakeClient) GetItem(_ context.Context, input *awssdk.GetItemInput,
 }
 func (client *fakeClient) UpdateItem(_ context.Context, input *awssdk.UpdateItemInput, _ ...func(*awssdk.Options)) (*awssdk.UpdateItemOutput, error) {
 	client.updates = append(client.updates, input)
+	if len(client.updateErrors) != 0 {
+		err := client.updateErrors[0]
+		client.updateErrors = client.updateErrors[1:]
+		if err != nil {
+			return nil, err
+		}
+	}
 	var item map[string]types.AttributeValue
 	if len(client.updateItems) > 0 {
 		item, client.updateItems = client.updateItems[0], client.updateItems[1:]

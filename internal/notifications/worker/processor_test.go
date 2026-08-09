@@ -51,6 +51,149 @@ func TestProcessorRenewalFailureBeforeSendNeverCallsProvider(t *testing.T) {
 	}
 }
 
+func TestProcessorCompletesPermanentRecipientPreflightWithoutAttemptOrProviderCall(t *testing.T) {
+	store := &fakeStore{acquire: claimedRecord(t, 0), gate: GateResult{Allowed: true}}
+	sender := &fakeSender{preflightErr: NewSendError(ErrorPermanentRecipient, errors.New("invalid recipient"))}
+	limiter := &fakeLimiter{}
+	processor := testProcessor(store, sender)
+	processor.Limiter = limiter
+
+	decision := processor.Handle(context.Background(), validMessage(t))
+	if decision.Action != ActionDelete || decision.ErrorCategory != string(ErrorPermanentRecipient) {
+		t.Fatalf("decision = %#v", decision)
+	}
+	if sender.preflightCalls != 1 || sender.calls != 0 || limiter.calls != 0 || store.begun != 0 ||
+		store.preflightFailures != 1 || store.preflightState != notifications.DeliveryStatePermanentFailed ||
+		store.preflightCategory != string(ErrorPermanentRecipient) {
+		t.Fatalf("sender=%#v limiter=%#v store=%#v", sender, limiter, store)
+	}
+}
+
+func TestProcessorPreflightPreservesPossibleAcceptanceAndFatalSemantics(t *testing.T) {
+	t.Run("permanent recipient after ambiguous call", func(t *testing.T) {
+		acquired := claimedRecord(t, 1)
+		acquired.Record.PossiblyAccepted = true
+		store := &fakeStore{acquire: acquired, gate: GateResult{Allowed: true}}
+		sender := &fakeSender{preflightErr: NewSendError(ErrorPermanentRecipient, errors.New("invalid recipient"))}
+		limiter := &fakeLimiter{}
+		processor := testProcessor(store, sender)
+		processor.Limiter = limiter
+
+		decision := processor.Handle(context.Background(), validMessage(t))
+		if decision.Action != ActionChangeVisibility || decision.ErrorCategory != string(ErrorPermanentRecipient) ||
+			decision.Visibility <= 0 || store.preflightState != notifications.DeliveryStateRetryableFailed ||
+			!store.preflightPossiblyAccepted || !store.preflightAmbiguousExhausted || store.preflightAwaitingIntervention ||
+			store.begun != 0 || sender.calls != 0 || limiter.calls != 0 {
+			t.Fatalf("decision=%#v sender=%#v limiter=%#v store=%#v", decision, sender, limiter, store)
+		}
+	})
+
+	t.Run("fatal configuration", func(t *testing.T) {
+		store := &fakeStore{acquire: claimedRecord(t, 0), gate: GateResult{Allowed: true}}
+		sender := &fakeSender{preflightErr: NewSendError(ErrorFatalConfigurationSet, errors.New("invalid configuration"))}
+		limiter := &fakeLimiter{}
+		processor := testProcessor(store, sender)
+		processor.Limiter = limiter
+
+		decision := processor.Handle(context.Background(), validMessage(t))
+		if decision.Action != ActionFatal || decision.ErrorCategory != string(ErrorFatalConfigurationSet) ||
+			decision.Visibility != 15*time.Minute || store.preflightState != notifications.DeliveryStateRetryableFailed ||
+			!store.preflightAwaitingIntervention || store.begun != 0 || sender.calls != 0 || limiter.calls != 0 {
+			t.Fatalf("decision=%#v sender=%#v limiter=%#v store=%#v", decision, sender, limiter, store)
+		}
+	})
+
+	t.Run("unexpected retryable preflight is promoted to fatal configuration", func(t *testing.T) {
+		store := &fakeStore{acquire: claimedRecord(t, 0), gate: GateResult{Allowed: true}}
+		sender := &fakeSender{preflightErr: NewSendError(ErrorRetryableUnknown, errors.New("invalid deterministic input"))}
+		limiter := &fakeLimiter{}
+		processor := testProcessor(store, sender)
+		processor.Limiter = limiter
+
+		decision := processor.Handle(context.Background(), validMessage(t))
+		if decision.Action != ActionFatal || decision.ErrorCategory != string(ErrorFatalConfigurationSet) ||
+			store.preflightCategory != string(ErrorFatalConfigurationSet) || !store.preflightAwaitingIntervention ||
+			store.begun != 0 || sender.calls != 0 || limiter.calls != 0 {
+			t.Fatalf("decision=%#v sender=%#v limiter=%#v store=%#v", decision, sender, limiter, store)
+		}
+	})
+
+	t.Run("concurrent terminal", func(t *testing.T) {
+		store := &fakeStore{
+			acquire: claimedRecord(t, 0), gate: GateResult{Allowed: true}, preflightErr: ErrConcurrentTerminal,
+		}
+		sender := &fakeSender{preflightErr: NewSendError(ErrorPermanentRecipient, errors.New("invalid recipient"))}
+		decision := testProcessor(store, sender).Handle(context.Background(), validMessage(t))
+		if decision.Action != ActionDelete || store.preflightFailures != 1 || store.begun != 0 || sender.calls != 0 {
+			t.Fatalf("decision=%#v sender=%#v store=%#v", decision, sender, store)
+		}
+	})
+}
+
+func TestDefinitiveFailureTransitionPolicy(t *testing.T) {
+	now := time.Date(2026, 7, 16, 15, 0, 0, 0, time.UTC)
+	tests := []struct {
+		name                 string
+		category             SendErrorCategory
+		possiblyAccepted     bool
+		wantState            notifications.DeliveryState
+		wantNextAttemptAt    time.Time
+		wantPossiblyAccepted bool
+		wantAmbiguous        bool
+		wantIntervention     bool
+		wantAction           DecisionAction
+		wantVisibility       time.Duration
+	}{
+		{
+			name: "permanent normal", category: ErrorPermanentRecipient,
+			wantState: notifications.DeliveryStatePermanentFailed, wantAction: ActionDelete,
+		},
+		{
+			name: "permanent possibly accepted", category: ErrorPermanentRecipient, possiblyAccepted: true,
+			wantState: notifications.DeliveryStateRetryableFailed, wantNextAttemptAt: now.Add(2*time.Minute + 30*time.Second),
+			wantPossiblyAccepted: true, wantAmbiguous: true, wantAction: ActionChangeVisibility,
+			wantVisibility: 2*time.Minute + 30*time.Second,
+		},
+		{
+			name: "fatal", category: ErrorFatalCredentials,
+			wantState: notifications.DeliveryStateRetryableFailed, wantNextAttemptAt: now.Add(15 * time.Minute),
+			wantIntervention: true, wantAction: ActionFatal, wantVisibility: 15 * time.Minute,
+		},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			record := DeliveryRecord{AttemptCount: 2, PossiblyAccepted: test.possiblyAccepted}
+			plan, ok := planDefinitiveFailure(record, test.category, now, 0.5)
+			if !ok || plan.NextState != test.wantState || !plan.NextAttemptAt.Equal(test.wantNextAttemptAt) ||
+				plan.PossiblyAccepted != test.wantPossiblyAccepted || plan.AmbiguousExhausted != test.wantAmbiguous ||
+				plan.AwaitingIntervention != test.wantIntervention || plan.Action != test.wantAction ||
+				plan.Visibility != test.wantVisibility {
+				t.Fatalf("plan = %#v", plan)
+			}
+		})
+	}
+}
+
+func TestProcessorDefinitiveFailurePlanConsumesJitterOnlyForAmbiguousPermanentFailure(t *testing.T) {
+	calls := 0
+	processor := Processor{JitterFraction: func() float64 {
+		calls++
+		return 0.5
+	}}
+	now := time.Date(2026, 7, 16, 15, 0, 0, 0, time.UTC)
+	_, _ = processor.planDefinitiveFailure(DeliveryRecord{}, ErrorFatalCredentials, now)
+	_, _ = processor.planDefinitiveFailure(DeliveryRecord{}, ErrorPermanentRecipient, now)
+	if calls != 0 {
+		t.Fatalf("jitter calls before ambiguous permanent = %d", calls)
+	}
+	_, _ = processor.planDefinitiveFailure(
+		DeliveryRecord{PossiblyAccepted: true}, ErrorPermanentRecipient, now,
+	)
+	if calls != 1 {
+		t.Fatalf("jitter calls = %d, want 1", calls)
+	}
+}
+
 func TestProcessorStopsRenewalGuardBeforeAttemptAndPairsCountWithProviderCall(t *testing.T) {
 	store := &fakeStore{acquire: claimedRecord(t, 0), gate: GateResult{Allowed: true}}
 	sender := &fakeSender{result: SendResult{ProviderMessageID: "ses_1"}}
@@ -423,24 +566,31 @@ func TestProcessorPreservesFatalSystemicDecisionWhenFeedbackWinsCompletionRace(t
 }
 
 type fakeStore struct {
-	acquire            AcquireResult
-	acquireErr         error
-	gate               GateResult
-	gateErr            error
-	gateCalls          int
-	gateCheck          func(int)
-	cancelled          bool
-	cancellationReason notifications.CancellationReason
-	deferred           int
-	begun              int
-	unknown            bool
-	completion         *AttemptCompletion
-	completeErr        error
-	sequence           string
-	beginRequest       BeginAttemptRequest
-	refreshTerminal    bool
-	refreshes          int
-	beginCalled        chan struct{}
+	acquire                       AcquireResult
+	acquireErr                    error
+	gate                          GateResult
+	gateErr                       error
+	gateCalls                     int
+	gateCheck                     func(int)
+	cancelled                     bool
+	cancellationReason            notifications.CancellationReason
+	deferred                      int
+	begun                         int
+	unknown                       bool
+	completion                    *AttemptCompletion
+	completeErr                   error
+	preflightFailures             int
+	preflightState                notifications.DeliveryState
+	preflightCategory             string
+	preflightPossiblyAccepted     bool
+	preflightAmbiguousExhausted   bool
+	preflightAwaitingIntervention bool
+	preflightErr                  error
+	sequence                      string
+	beginRequest                  BeginAttemptRequest
+	refreshTerminal               bool
+	refreshes                     int
+	beginCalled                   chan struct{}
 }
 
 func (store *fakeStore) Acquire(context.Context, notifications.JobEnvelope, ClaimRequest) (AcquireResult, error) {
@@ -461,6 +611,15 @@ func (store *fakeStore) Cancel(_ context.Context, _ DeliveryRecord, reason notif
 func (store *fakeStore) Defer(_ context.Context, _ DeliveryRecord, _ DeferRequest) error {
 	store.deferred++
 	return nil
+}
+func (store *fakeStore) CompletePreflightFailure(_ context.Context, _ DeliveryRecord, completion PreflightFailureCompletion) error {
+	store.preflightFailures++
+	store.preflightState = completion.NextState
+	store.preflightCategory = completion.ErrorCategory
+	store.preflightPossiblyAccepted = completion.PossiblyAccepted
+	store.preflightAmbiguousExhausted = completion.AmbiguousExhausted
+	store.preflightAwaitingIntervention = completion.AwaitingIntervention
+	return store.preflightErr
 }
 func (store *fakeStore) BeginAttempt(_ context.Context, record DeliveryRecord, request BeginAttemptRequest) (DeliveryRecord, error) {
 	if store.beginCalled != nil {
@@ -492,9 +651,16 @@ func (store *fakeStore) Renew(context.Context, DeliveryRecord, time.Time) error 
 type fakeSender struct {
 	result          SendResult
 	err             error
+	preflightErr    error
+	preflightCalls  int
 	calls           int
 	sawAttemptCount int
 	store           *fakeStore
+}
+
+func (sender *fakeSender) Preflight(SendRequest) error {
+	sender.preflightCalls++
+	return sender.preflightErr
 }
 
 func (sender *fakeSender) Send(_ context.Context, request SendRequest) (SendResult, error) {
