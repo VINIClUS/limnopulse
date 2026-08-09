@@ -49,12 +49,26 @@ func (store Store) reconcileTransaction(
 	if err != nil {
 		return nil, err
 	}
-	deliveryUpdate, err := store.deliveryUpdate(deliveryKey, delivery, event, now)
+	decision, err := reconcileDeliveryProviderMetadata(delivery, event)
 	if err != nil {
 		return nil, err
 	}
+	var deliveryOperation types.TransactWriteItem
+	if decision.OwnsAggregate {
+		deliveryUpdate, updateErr := store.deliveryUpdate(deliveryKey, delivery, event, now, decision)
+		if updateErr != nil {
+			return nil, updateErr
+		}
+		deliveryOperation.Update = deliveryUpdate
+	} else {
+		deliveryCheck, checkErr := store.deliveryConditionCheck(deliveryKey, delivery)
+		if checkErr != nil {
+			return nil, checkErr
+		}
+		deliveryOperation.ConditionCheck = deliveryCheck
+	}
 	items := []types.TransactWriteItem{
-		{Put: transport}, {Put: semantic}, {Update: attemptUpdate}, {Update: deliveryUpdate},
+		{Put: transport}, {Put: semantic}, {Update: attemptUpdate}, deliveryOperation,
 	}
 	if writeSuppression {
 		put, putErr := store.suppressionPut(event, delivery, suppression, now)
@@ -173,21 +187,17 @@ func (store Store) deliveryUpdate(
 	current deliveryRecord,
 	event feedback.Event,
 	now time.Time,
+	decision deliveryProviderDecision,
 ) (*types.Update, error) {
-	decision, err := reconcileDeliveryProviderMetadata(current, event)
+	nextState := current.State
+	incomingStateOutcome := event.ProviderOutcome
+	if event.PermanentFailure && decision.AcceptedByAnotherAttempt {
+		incomingStateOutcome = notifications.ProviderOutcomeAccepted
+	}
+	var err error
+	nextState, err = notifications.ReconcileDeliveryStateFromProvider(current.State, incomingStateOutcome)
 	if err != nil {
 		return nil, err
-	}
-	nextState := current.State
-	if decision.OwnsAggregate {
-		incomingStateOutcome := event.ProviderOutcome
-		if event.PermanentFailure && decision.AcceptedByAnotherAttempt {
-			incomingStateOutcome = notifications.ProviderOutcomeAccepted
-		}
-		nextState, err = notifications.ReconcileDeliveryStateFromProvider(current.State, incomingStateOutcome)
-		if err != nil {
-			return nil, err
-		}
 	}
 	valuesMap := map[string]any{
 		":entity": "notification_delivery", ":outbox_id": current.OutboxID, ":delivery_id": current.DeliveryID,
@@ -252,6 +262,33 @@ func (store Store) deliveryUpdate(
 		TableName: aws.String(store.Table), Key: marshalKey(key), UpdateExpression: aws.String(update),
 		ConditionExpression: aws.String(condition), ExpressionAttributeNames: usedNames(names, update+condition),
 		ExpressionAttributeValues: values,
+	}, nil
+}
+
+func (store Store) deliveryConditionCheck(
+	key notifications.StorageKey,
+	current deliveryRecord,
+) (*types.ConditionCheck, error) {
+	valuesMap := map[string]any{
+		":entity": "notification_delivery", ":outbox_id": current.OutboxID, ":delivery_id": current.DeliveryID,
+		":current_state": string(current.State), ":current_revision": current.Revision,
+	}
+	condition := "#entity = :entity AND #outbox_id = :outbox_id AND #delivery_id = :delivery_id AND #state = :current_state AND #revision = :current_revision"
+	condition = addOptionalStringCondition(condition, valuesMap, "#current_provider_outcome", ":current_provider_outcome", string(current.ProviderOutcome))
+	condition = addOptionalStringCondition(condition, valuesMap, "#current_provider_message_id", ":current_provider_message_id", current.ProviderMessageID)
+	condition = addOptionalStringCondition(condition, valuesMap, "#current_provider_attempt_id", ":current_provider_attempt_id", current.ProviderAttemptID)
+	names := map[string]string{
+		"#entity": "entity_type", "#outbox_id": "outbox_id", "#delivery_id": "delivery_id", "#state": "state",
+		"#revision": "delivery_revision", "#current_provider_outcome": "provider_outcome",
+		"#current_provider_message_id": "provider_message_id", "#current_provider_attempt_id": "provider_attempt_id",
+	}
+	values, err := attributevalue.MarshalMap(valuesMap)
+	if err != nil {
+		return nil, err
+	}
+	return &types.ConditionCheck{
+		TableName: aws.String(store.Table), Key: marshalKey(key), ConditionExpression: aws.String(condition),
+		ExpressionAttributeNames: usedNames(names, condition), ExpressionAttributeValues: values,
 	}, nil
 }
 

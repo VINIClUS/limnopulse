@@ -9,6 +9,8 @@ import (
 	"time"
 
 	"github.com/VINIClUS/limnopulse/internal/notifications"
+	"github.com/VINIClUS/limnopulse/internal/notifications/feedback"
+	feedbackdynamo "github.com/VINIClUS/limnopulse/internal/notifications/feedback/dynamo"
 	"github.com/VINIClUS/limnopulse/internal/notifications/worker"
 	"github.com/aws/aws-sdk-go-v2/feature/dynamodb/attributevalue"
 	awssdk "github.com/aws/aws-sdk-go-v2/service/dynamodb"
@@ -309,6 +311,108 @@ func TestCompleteAttemptReportsConcurrentTerminalFeedbackAsSafeNoOp(t *testing.T
 		client.gets[0].ConsistentRead == nil || !*client.gets[0].ConsistentRead ||
 		client.gets[1].ConsistentRead == nil || !*client.gets[1].ConsistentRead {
 		t.Fatalf("terminal reconciliation reads = %#v", client.gets)
+	}
+}
+
+func TestStaleFeedbackCommitDoesNotRaceSuccessfulCurrentAttemptCompletion(t *testing.T) {
+	tests := []struct {
+		name            string
+		event           feedback.Event
+		wantSuppression bool
+	}{
+		{
+			name: "Reject",
+			event: feedback.Event{
+				EventBridgeID: "evt_stale_reject", ProviderMessageID: "ses_attempt_a",
+				SemanticType: feedback.SemanticReject, ProviderOutcome: notifications.ProviderOutcomeRejected,
+				PermanentFailure: true,
+			},
+		},
+		{
+			name: "hard bounce suppression",
+			event: feedback.Event{
+				EventBridgeID: "evt_stale_bounce", ProviderMessageID: "ses_attempt_a",
+				SemanticType: feedback.SemanticHardBounce, ProviderOutcome: notifications.ProviderOutcomeHardBounced,
+				SuppressionReason: feedback.SuppressionHardBounce, AcceptedEvidence: true,
+			},
+			wantSuppression: true,
+		},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			record := testRecord(t)
+			record.AttemptCount = 2
+			record.LastAttemptID = "att_b"
+			test.event.DeliveryID = record.Delivery.DeliveryID
+			test.event.AttemptID = "att_a"
+
+			attemptA := map[string]any{
+				"PK": "NOTIFICATION_DELIVERY#" + record.Delivery.DeliveryID, "SK": "ATTEMPT#att_a",
+				"entity_type": "notification_attempt", "tenant_id": record.Delivery.TenantID,
+				"outbox_id": record.Delivery.OutboxID, "delivery_id": record.Delivery.DeliveryID,
+				"attempt_id": "att_a", "event_id": record.Delivery.EventID,
+				"notification_kind": string(record.Delivery.Kind), "channel": string(record.Delivery.Channel),
+				"outcome": "ambiguous", "started_at": testNow().Add(-time.Minute).Format(time.RFC3339Nano),
+				"completed_at": testNow().Add(-30 * time.Second).Format(time.RFC3339Nano),
+			}
+			delivery := testDeliveryItem(t, notifications.DeliveryStateProcessing)
+			delivery["delivery_revision"] = record.Revision
+			delivery["attempt_count"] = int64(record.AttemptCount)
+			delivery["last_attempt_id"] = record.LastAttemptID
+			delivery["delivery_lease_owner"] = record.LeaseOwner
+			delivery["delivery_lease_epoch"] = record.LeaseEpoch
+			delivery["delivery_lease_expires_at"] = record.LeaseExpiresAt.Format(time.RFC3339Nano)
+			delivery["provider_attempt_id"] = record.LastAttemptID
+			delivery["provider_message_id"] = "ses_attempt_b_feedback"
+			delivery["provider_outcome"] = "delayed"
+			delivery["provider_accepted"] = true
+			gets := []map[string]types.AttributeValue{nil, nil, marshal(t, attemptA), marshal(t, delivery)}
+			if test.wantSuppression {
+				gets = append(gets, nil)
+			}
+			client := &fakeClient{getItems: gets}
+
+			// Attempt B has returned successfully from SES but has not yet committed
+			// CompleteAttempt. Stale feedback for A commits first.
+			result, err := (feedbackdynamo.Store{Table: "domain", Client: client}).Reconcile(
+				context.Background(), test.event, testNow(),
+			)
+			if err != nil || result.Disposition != feedback.ReconcileApplied || result.Suppressed != test.wantSuppression {
+				t.Fatalf("stale feedback result=%#v err=%v", result, err)
+			}
+			feedbackTransaction := client.transactions[0]
+			wantItems := 4
+			if test.wantSuppression {
+				wantItems = 5
+			}
+			if len(feedbackTransaction.TransactItems) != wantItems ||
+				feedbackTransaction.TransactItems[3].ConditionCheck == nil ||
+				feedbackTransaction.TransactItems[3].Update != nil {
+				t.Fatalf("non-owner Delivery operation = %#v", feedbackTransaction.TransactItems)
+			}
+			if test.wantSuppression && feedbackTransaction.TransactItems[4].Put == nil {
+				t.Fatalf("stale suppression missing from feedback transaction: %#v", feedbackTransaction.TransactItems)
+			}
+
+			// Because A only fenced the observed Delivery, B still owns the original
+			// processing revision and can durably commit its successful SES response.
+			err = (Store{Table: "domain", Client: client}).CompleteAttempt(
+				context.Background(), record, worker.AttemptCompletion{
+					AttemptID: "att_b", CompletedAt: testNow().Add(time.Second),
+					Outcome: notifications.AttemptOutcomeSucceeded, NextState: notifications.DeliveryStateSucceeded,
+					ProviderOutcome: notifications.ProviderOutcomeAccepted, ProviderMessageID: "ses_attempt_b",
+				},
+			)
+			if err != nil || len(client.transactions) != 2 {
+				t.Fatalf("Attempt B completion error=%v transactions=%d", err, len(client.transactions))
+			}
+			completionValues := decodeExpressionValues(
+				t, client.transactions[1].TransactItems[1].Update.ExpressionAttributeValues,
+			)
+			if fmt.Sprint(completionValues[":revision"]) != fmt.Sprint(record.Revision) || completionValues[":attempt_id"] != "att_b" {
+				t.Fatalf("Attempt B completion fence = %#v", completionValues)
+			}
+		})
 	}
 }
 
