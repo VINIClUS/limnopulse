@@ -29,7 +29,8 @@ runner query one work lane with a DynamoDB key range from `WORK_KIND#` through
 `WORK_KIND#due_time#~`. Discovery never uses a DynamoDB `FilterExpression` for
 work kind: a delivery backlog therefore cannot starve opening intent or recovery
 dependency discovery within the same bucket. The one-time relay backfill writes
-this canonical index shape for existing rows. It also conditionally migrates
+this canonical index shape for existing outbox and pending delivery rows. It
+also conditionally migrates
 the short-lived predecessor layout
 `available_at#WORK_KIND#tenant_id_base64url#item_id_base64url`, so deploy the
 current backfill before turning on the lane-keyed relay query.
@@ -140,7 +141,9 @@ enabling either publisher or consumer.
    notifications backfill-relay --tenant-file tenants.txt --max-rows 10000 --timeout 5m
    ```
 
-   The command never scans DynamoDB. It exits partially with
+   The command never scans DynamoDB: after each email outbox Query it paginates
+   that outbox's `DELIVERY#` partition, so the row bound counts both outboxes
+   and deliveries. It exits partially with
    `scope_completed=false` and either `row_limit_reached` or `deadline_reached`
    when a bound is reached; increase the explicit bound or narrow the tenant
    batch, then repeat the idempotent run. Telegram rows are marked

@@ -66,6 +66,22 @@ type relayOutbox struct {
 	CreatedAt string                         `dynamodbav:"created_at"`
 }
 
+type relayDelivery struct {
+	PK                 string                      `dynamodbav:"PK"`
+	SK                 string                      `dynamodbav:"SK"`
+	EntityType         string                      `dynamodbav:"entity_type"`
+	TenantID           string                      `dynamodbav:"tenant_id"`
+	OutboxID           string                      `dynamodbav:"outbox_id"`
+	DeliveryID         string                      `dynamodbav:"delivery_id"`
+	State              notifications.DeliveryState `dynamodbav:"state"`
+	Revision           int64                       `dynamodbav:"delivery_revision"`
+	RelaySchemaVersion int64                       `dynamodbav:"relay_schema_version"`
+	AvailableAt        string                      `dynamodbav:"available_at"`
+	WorkKind           notifications.WorkKind      `dynamodbav:"relay_work_kind"`
+	RelayPK            string                      `dynamodbav:"relay_gsi_pk"`
+	RelaySK            string                      `dynamodbav:"relay_gsi_sk"`
+}
+
 type migrationKind uint8
 
 const (
@@ -82,6 +98,11 @@ type relayMigration struct {
 	Expansion     string
 	AvailableAt   string
 	WorkKind      notifications.WorkKind
+	RelayIndexKey notifications.RelayIndexKey
+}
+
+type relayDeliveryMigration struct {
+	Delivery      relayDelivery
 	RelayIndexKey notifications.RelayIndexKey
 }
 
@@ -161,34 +182,36 @@ func (store Store) BackfillRelay(ctx context.Context, options BackfillOptions) (
 				switch kind {
 				case migrationNoop:
 					summary.Noop++
-					continue
 				case migrationSchemaConflict:
 					summary.SchemaConflicts++
 					summary.RowFailures++
-					continue
-				}
-				summary.RowsNeedingUpdate++
-				if !options.Apply {
-					summary.WouldUpdate++
-					continue
-				}
-				if err := store.updateRelayOutbox(ctx, kind, migration); err != nil {
-					if errors.Is(err, context.DeadlineExceeded) || errors.Is(ctx.Err(), context.DeadlineExceeded) {
-						summary.DeadlineReached = true
-						return summary, nil
-					}
-					if ctx.Err() != nil {
-						return summary, ctx.Err()
-					}
-					if isConditionalCheckFailed(err) {
-						summary.ConcurrentChanges++
+				default:
+					summary.RowsNeedingUpdate++
+					if !options.Apply {
+						summary.WouldUpdate++
+					} else if err := store.updateRelayOutbox(ctx, kind, migration); err != nil {
+						if errors.Is(err, context.DeadlineExceeded) || errors.Is(ctx.Err(), context.DeadlineExceeded) {
+							summary.DeadlineReached = true
+							return summary, nil
+						}
+						if ctx.Err() != nil {
+							return summary, ctx.Err()
+						}
+						if isConditionalCheckFailed(err) {
+							summary.ConcurrentChanges++
+						} else {
+							summary.UpdateFailures++
+						}
+						summary.RowFailures++
 					} else {
-						summary.UpdateFailures++
+						summary.Updated++
 					}
-					summary.RowFailures++
-					continue
 				}
-				summary.Updated++
+				if stopped, deliveryErr := store.backfillRelayDeliveries(
+					ctx, options.PageSize, maxRows, &summary, migration.Outbox,
+				); stopped {
+					return summary, deliveryErr
+				}
 			}
 			lastKey = output.LastEvaluatedKey
 			if len(lastKey) == 0 {
@@ -197,6 +220,107 @@ func (store Store) BackfillRelay(ctx context.Context, options BackfillOptions) (
 		}
 	}
 	return summary, nil
+}
+
+func (store Store) backfillRelayDeliveries(
+	ctx context.Context,
+	pageSize int,
+	maxRows int,
+	summary *BackfillSummary,
+	outbox relayOutbox,
+) (bool, error) {
+	if outbox.Channel != "email" {
+		return false, nil
+	}
+	var lastKey map[string]types.AttributeValue
+	for {
+		if stopped, err := backfillContextStopped(ctx, summary); stopped {
+			return true, err
+		}
+		if summary.RowsQueried >= maxRows {
+			summary.LimitReached = true
+			return true, nil
+		}
+		queryLimit := pageSize
+		if remaining := maxRows - summary.RowsQueried; remaining < queryLimit {
+			queryLimit = remaining
+		}
+		values, err := attributevalue.MarshalMap(map[string]string{
+			":pk": "NOTIFICATION_OUTBOX#" + outbox.OutboxID, ":prefix": "DELIVERY#",
+		})
+		if err != nil {
+			return true, fmt.Errorf("encode relay delivery backfill query: %w", err)
+		}
+		output, err := store.Client.Query(ctx, &awssdk.QueryInput{
+			TableName:                 aws.String(store.Table),
+			KeyConditionExpression:    aws.String("PK = :pk AND begins_with(SK, :prefix)"),
+			ExpressionAttributeValues: values,
+			ExclusiveStartKey:         lastKey,
+			Limit:                     aws.Int32(int32(queryLimit)),
+			ConsistentRead:            aws.Bool(true),
+		})
+		if err != nil {
+			if errors.Is(err, context.DeadlineExceeded) || errors.Is(ctx.Err(), context.DeadlineExceeded) {
+				summary.DeadlineReached = true
+				return true, nil
+			}
+			if ctx.Err() != nil {
+				return true, ctx.Err()
+			}
+			return true, fmt.Errorf("query notification deliveries: %w", err)
+		}
+		for _, item := range output.Items {
+			if stopped, err := backfillContextStopped(ctx, summary); stopped {
+				return true, err
+			}
+			if summary.RowsQueried >= maxRows {
+				summary.LimitReached = true
+				return true, nil
+			}
+			summary.RowsQueried++
+			kind, migration, classifyErr := classifyRelayDelivery(item, outbox)
+			if classifyErr != nil {
+				summary.DecodeFailures++
+				summary.RowFailures++
+				continue
+			}
+			switch kind {
+			case migrationNoop:
+				summary.Noop++
+				continue
+			case migrationSchemaConflict:
+				summary.SchemaConflicts++
+				summary.RowFailures++
+				continue
+			}
+			summary.RowsNeedingUpdate++
+			if summary.DryRun {
+				summary.WouldUpdate++
+				continue
+			}
+			if updateErr := store.updateRelayDelivery(ctx, kind, migration); updateErr != nil {
+				if errors.Is(updateErr, context.DeadlineExceeded) || errors.Is(ctx.Err(), context.DeadlineExceeded) {
+					summary.DeadlineReached = true
+					return true, nil
+				}
+				if ctx.Err() != nil {
+					return true, ctx.Err()
+				}
+				if isConditionalCheckFailed(updateErr) {
+					summary.ConcurrentChanges++
+				} else {
+					summary.UpdateFailures++
+				}
+				summary.RowFailures++
+				continue
+			}
+			summary.Updated++
+		}
+		lastKey = output.LastEvaluatedKey
+		if len(lastKey) == 0 {
+			return false, nil
+		}
+	}
 }
 
 func backfillContextStopped(
@@ -336,19 +460,68 @@ func isCanonicalEmailWithoutWorkKind(
 }
 
 func isPreviousEmailLayout(item map[string]types.AttributeValue, migration relayMigration) bool {
-	previousSortKey := fmt.Sprintf(
-		"%s#%s#%s#%s",
-		migration.AvailableAt,
-		migration.WorkKind,
-		base64.RawURLEncoding.EncodeToString([]byte(migration.Outbox.TenantID)),
-		base64.RawURLEncoding.EncodeToString([]byte(migration.Outbox.OutboxID)),
-	)
 	return numberAttributeEquals(item, "relay_schema_version", notifications.RelaySchemaVersion) &&
 		stringAttributeEquals(item, "expansion_status", migration.Expansion) &&
 		stringAttributeEquals(item, "available_at", migration.AvailableAt) &&
 		stringAttributeEquals(item, "relay_work_kind", string(migration.WorkKind)) &&
 		stringAttributeEquals(item, "relay_gsi_pk", migration.RelayIndexKey.PartitionKey) &&
-		stringAttributeEquals(item, "relay_gsi_sk", previousSortKey)
+		stringAttributeEquals(item, "relay_gsi_sk", previousRelaySortKey(
+			migration.AvailableAt, migration.WorkKind, migration.Outbox.TenantID, migration.Outbox.OutboxID,
+		))
+}
+
+func classifyRelayDelivery(
+	item map[string]types.AttributeValue,
+	outbox relayOutbox,
+) (migrationKind, relayDeliveryMigration, error) {
+	var delivery relayDelivery
+	if err := attributevalue.UnmarshalMap(item, &delivery); err != nil {
+		return migrationNoop, relayDeliveryMigration{}, fmt.Errorf("decode notification delivery: %w", err)
+	}
+	if delivery.PK != "NOTIFICATION_OUTBOX#"+outbox.OutboxID ||
+		delivery.SK != "DELIVERY#"+delivery.DeliveryID || delivery.DeliveryID == "" ||
+		delivery.EntityType != "notification_delivery" || delivery.TenantID != outbox.TenantID ||
+		delivery.OutboxID != outbox.OutboxID || strings.ContainsRune(delivery.DeliveryID, '\x00') {
+		return migrationNoop, relayDeliveryMigration{}, fmt.Errorf("notification delivery identity is invalid")
+	}
+	if delivery.State != notifications.DeliveryStatePending {
+		return migrationNoop, relayDeliveryMigration{}, nil
+	}
+	availableAt, err := time.Parse(fixedUTCLayout, delivery.AvailableAt)
+	if err != nil || availableAt.UTC().Format(fixedUTCLayout) != delivery.AvailableAt {
+		return migrationNoop, relayDeliveryMigration{}, fmt.Errorf("notification delivery available_at is not canonical")
+	}
+	index, err := notifications.BuildRelayIndexKey(
+		notifications.WorkKindDelivery, delivery.TenantID, delivery.DeliveryID, availableAt,
+	)
+	if err != nil {
+		return migrationNoop, relayDeliveryMigration{}, fmt.Errorf("build delivery relay index key: %w", err)
+	}
+	migration := relayDeliveryMigration{Delivery: delivery, RelayIndexKey: index}
+	if delivery.RelaySchemaVersion != notifications.RelaySchemaVersion ||
+		delivery.WorkKind != notifications.WorkKindDelivery || delivery.RelayPK != index.PartitionKey ||
+		delivery.Revision < 1 {
+		return migrationSchemaConflict, migration, nil
+	}
+	if delivery.RelaySK == index.SortKey {
+		return migrationNoop, migration, nil
+	}
+	if delivery.RelaySK == previousRelaySortKey(
+		delivery.AvailableAt, notifications.WorkKindDelivery, delivery.TenantID, delivery.DeliveryID,
+	) {
+		return migrationUpdateRelayIndex, migration, nil
+	}
+	return migrationSchemaConflict, migration, nil
+}
+
+func previousRelaySortKey(availableAt string, workKind notifications.WorkKind, tenantID, itemID string) string {
+	return fmt.Sprintf(
+		"%s#%s#%s#%s",
+		availableAt,
+		workKind,
+		base64.RawURLEncoding.EncodeToString([]byte(tenantID)),
+		base64.RawURLEncoding.EncodeToString([]byte(itemID)),
+	)
 }
 
 func isCanonicalTelegram(item map[string]types.AttributeValue) bool {
@@ -429,12 +602,8 @@ func (store Store) updateRelayOutbox(
 		valueMap[":expected_available_at"] = migration.AvailableAt
 		valueMap[":expected_relay_work_kind"] = string(migration.WorkKind)
 		valueMap[":expected_relay_gsi_pk"] = migration.RelayIndexKey.PartitionKey
-		valueMap[":expected_relay_gsi_sk"] = fmt.Sprintf(
-			"%s#%s#%s#%s",
-			migration.AvailableAt,
-			migration.WorkKind,
-			base64.RawURLEncoding.EncodeToString([]byte(migration.Outbox.TenantID)),
-			base64.RawURLEncoding.EncodeToString([]byte(migration.Outbox.OutboxID)),
+		valueMap[":expected_relay_gsi_sk"] = previousRelaySortKey(
+			migration.AvailableAt, migration.WorkKind, migration.Outbox.TenantID, migration.Outbox.OutboxID,
 		)
 		valueMap[":relay_gsi_sk"] = migration.RelayIndexKey.SortKey
 		updateExpression = "SET #relay_gsi_sk = :relay_gsi_sk"
@@ -465,6 +634,69 @@ func (store Store) updateRelayOutbox(
 	})
 	if err != nil {
 		return fmt.Errorf("update notification relay fields: %w", err)
+	}
+	return nil
+}
+
+func (store Store) updateRelayDelivery(
+	ctx context.Context,
+	kind migrationKind,
+	migration relayDeliveryMigration,
+) error {
+	if kind != migrationUpdateRelayIndex {
+		return fmt.Errorf("unsupported notification delivery migration")
+	}
+	key, err := attributevalue.MarshalMap(map[string]string{
+		"PK": migration.Delivery.PK, "SK": migration.Delivery.SK,
+	})
+	if err != nil {
+		return fmt.Errorf("encode notification delivery key: %w", err)
+	}
+	values, err := attributevalue.MarshalMap(map[string]any{
+		":expected_entity_type":          "notification_delivery",
+		":expected_tenant_id":            migration.Delivery.TenantID,
+		":expected_outbox_id":            migration.Delivery.OutboxID,
+		":expected_delivery_id":          migration.Delivery.DeliveryID,
+		":expected_state":                string(notifications.DeliveryStatePending),
+		":expected_revision":             migration.Delivery.Revision,
+		":expected_relay_schema_version": notifications.RelaySchemaVersion,
+		":expected_available_at":         migration.Delivery.AvailableAt,
+		":expected_relay_work_kind":      string(notifications.WorkKindDelivery),
+		":expected_relay_gsi_pk":         migration.RelayIndexKey.PartitionKey,
+		":expected_relay_gsi_sk": previousRelaySortKey(
+			migration.Delivery.AvailableAt,
+			notifications.WorkKindDelivery,
+			migration.Delivery.TenantID,
+			migration.Delivery.DeliveryID,
+		),
+		":relay_gsi_sk": migration.RelayIndexKey.SortKey,
+	})
+	if err != nil {
+		return fmt.Errorf("encode notification delivery relay migration: %w", err)
+	}
+	_, err = store.Client.UpdateItem(ctx, &awssdk.UpdateItemInput{
+		TableName:        aws.String(store.Table),
+		Key:              key,
+		UpdateExpression: aws.String("SET #relay_gsi_sk = :relay_gsi_sk"),
+		ConditionExpression: aws.String(
+			"#entity_type = :expected_entity_type AND #tenant_id = :expected_tenant_id AND " +
+				"#outbox_id = :expected_outbox_id AND #delivery_id = :expected_delivery_id AND " +
+				"#state = :expected_state AND #revision = :expected_revision AND " +
+				"#relay_schema_version = :expected_relay_schema_version AND " +
+				"#available_at = :expected_available_at AND #relay_work_kind = :expected_relay_work_kind AND " +
+				"#relay_gsi_pk = :expected_relay_gsi_pk AND #relay_gsi_sk = :expected_relay_gsi_sk",
+		),
+		ExpressionAttributeNames: map[string]string{
+			"#entity_type": "entity_type", "#tenant_id": "tenant_id", "#outbox_id": "outbox_id",
+			"#delivery_id": "delivery_id", "#state": "state", "#revision": "delivery_revision",
+			"#relay_schema_version": "relay_schema_version", "#available_at": "available_at",
+			"#relay_work_kind": "relay_work_kind", "#relay_gsi_pk": "relay_gsi_pk",
+			"#relay_gsi_sk": "relay_gsi_sk",
+		},
+		ExpressionAttributeValues: values,
+	})
+	if err != nil {
+		return fmt.Errorf("update notification delivery relay fields: %w", err)
 	}
 	return nil
 }

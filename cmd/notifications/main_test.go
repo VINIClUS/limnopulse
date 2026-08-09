@@ -326,6 +326,10 @@ func (client *fakeDynamo) Query(
 	if client.queryError != nil {
 		return nil, client.queryError
 	}
+	if value, ok := input.ExpressionAttributeValues[":pk"].(*types.AttributeValueMemberS); ok &&
+		strings.HasPrefix(value.Value, "NOTIFICATION_OUTBOX#") {
+		return &awssdk.QueryOutput{}, nil
+	}
 	if client.queryOutput != nil {
 		return client.queryOutput, nil
 	}

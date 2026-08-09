@@ -38,6 +38,9 @@ func (client *fakeClient) Query(
 			return nil, err
 		}
 	}
+	if len(client.queryOutputs) == 0 {
+		return &awssdk.QueryOutput{}, nil
+	}
 	output := client.queryOutputs[0]
 	client.queryOutputs = client.queryOutputs[1:]
 	return output, nil
@@ -77,6 +80,7 @@ func TestBackfillRelayDryRunQueriesTenantOutboxesAndPaginatesWithoutScan(t *test
 			Items:            []map[string]types.AttributeValue{mustMarshalMap(t, legacyOutbox("outbox_email", "email", "ready"))},
 			LastEvaluatedKey: lastKey,
 		},
+		{},
 		{
 			Items: []map[string]types.AttributeValue{mustMarshalMap(t, legacyOutbox("outbox_telegram", "telegram", "ready"))},
 		},
@@ -94,8 +98,8 @@ func TestBackfillRelayDryRunQueriesTenantOutboxesAndPaginatesWithoutScan(t *test
 		summary.Updated != 0 || summary.RowFailures != 0 {
 		t.Fatalf("summary = %#v", summary)
 	}
-	if len(client.queryInputs) != 2 {
-		t.Fatalf("Query calls = %d, want 2", len(client.queryInputs))
+	if len(client.queryInputs) != 3 {
+		t.Fatalf("Query calls = %d, want 3", len(client.queryInputs))
 	}
 	for _, input := range client.queryInputs {
 		if input.IndexName != nil || input.KeyConditionExpression == nil ||
@@ -107,8 +111,8 @@ func TestBackfillRelayDryRunQueriesTenantOutboxesAndPaginatesWithoutScan(t *test
 	if client.queryInputs[0].ExclusiveStartKey != nil {
 		t.Fatalf("first ExclusiveStartKey = %#v", client.queryInputs[0].ExclusiveStartKey)
 	}
-	if !reflect.DeepEqual(client.queryInputs[1].ExclusiveStartKey, lastKey) {
-		t.Fatalf("second ExclusiveStartKey = %#v, want %#v", client.queryInputs[1].ExclusiveStartKey, lastKey)
+	if !reflect.DeepEqual(client.queryInputs[2].ExclusiveStartKey, lastKey) {
+		t.Fatalf("second tenant-query ExclusiveStartKey = %#v, want %#v", client.queryInputs[2].ExclusiveStartKey, lastKey)
 	}
 	if len(client.updateInputs) != 0 {
 		t.Fatalf("dry-run made %d UpdateItem calls", len(client.updateInputs))
@@ -338,6 +342,44 @@ func TestBackfillRelayMigratesPreviousRelaySortKeyLayout(t *testing.T) {
 	}
 }
 
+func TestBackfillRelayMigratesPreviousRelaySortKeyLayoutForPendingDelivery(t *testing.T) {
+	outbox := canonicalEmailOutbox(
+		t, legacyOutbox("outbox_pending_delivery", "email", "ready"), notifications.WorkKindIntent,
+	)
+	delivery := legacyPendingDelivery(t, "outbox_pending_delivery", "delivery_pending")
+	client := &fakeClient{queryOutputs: []*awssdk.QueryOutput{
+		{Items: []map[string]types.AttributeValue{mustMarshalMap(t, outbox)}},
+		{Items: []map[string]types.AttributeValue{mustMarshalMap(t, delivery)}},
+	}}
+
+	summary, err := (Store{Table: "domain", Client: client}).BackfillRelay(
+		context.Background(), BackfillOptions{Tenants: []string{"tnt_1"}, Apply: true, PageSize: 25},
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if summary.RowsQueried != 2 || summary.RowsNeedingUpdate != 1 || summary.Updated != 1 ||
+		summary.SchemaConflicts != 0 || len(client.queryInputs) != 2 || len(client.updateInputs) != 1 {
+		t.Fatalf("summary=%#v queries=%#v updates=%#v", summary, client.queryInputs, client.updateInputs)
+	}
+	if condition := aws.ToString(client.queryInputs[1].KeyConditionExpression); condition != "PK = :pk AND begins_with(SK, :prefix)" {
+		t.Fatalf("delivery query condition = %q", condition)
+	}
+	queryValues := unmarshalValues(t, client.queryInputs[1].ExpressionAttributeValues)
+	if queryValues[":pk"] != "NOTIFICATION_OUTBOX#outbox_pending_delivery" || queryValues[":prefix"] != "DELIVERY#" {
+		t.Fatalf("delivery query values = %#v", queryValues)
+	}
+	update := client.updateInputs[0]
+	if aws.ToString(update.UpdateExpression) != "SET #relay_gsi_sk = :relay_gsi_sk" {
+		t.Fatalf("delivery legacy layout update = %s", aws.ToString(update.UpdateExpression))
+	}
+	values := unmarshalValues(t, update.ExpressionAttributeValues)
+	if values[":expected_relay_gsi_sk"] != delivery["relay_gsi_sk"] ||
+		values[":relay_gsi_sk"] == delivery["relay_gsi_sk"] {
+		t.Fatalf("delivery legacy layout values = %#v", values)
+	}
+}
+
 func TestBackfillRelayClassifiesVersionMismatchAndDivergentRelayFieldsAsSchemaConflicts(t *testing.T) {
 	wrongVersion := legacyOutbox("outbox_wrong_version", "email", "ready")
 	wrongVersion["relay_schema_version"] = 2
@@ -456,6 +498,29 @@ func legacyOutbox(outboxID, channel, status string) map[string]any {
 		"event_id": "alert_1", "rule_id": "rule_1", "channel": channel,
 		"kind": "opening", "status": status, "depends_on_outbox_id": "",
 		"created_at": "2026-07-15T12:00:45.000000000Z",
+	}
+}
+
+func legacyPendingDelivery(t *testing.T, outboxID, deliveryID string) map[string]any {
+	t.Helper()
+	availableAt := "2026-07-15T12:00:45.000000000Z"
+	availableTime, err := time.Parse(fixedUTCLayout, availableAt)
+	if err != nil {
+		t.Fatal(err)
+	}
+	key, err := notifications.BuildRelayIndexKey(
+		notifications.WorkKindDelivery, "tnt_1", deliveryID, availableTime,
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return map[string]any{
+		"PK": "NOTIFICATION_OUTBOX#" + outboxID, "SK": "DELIVERY#" + deliveryID,
+		"entity_type": "notification_delivery", "relay_schema_version": 1,
+		"tenant_id": "tnt_1", "outbox_id": outboxID, "delivery_id": deliveryID,
+		"state": "pending", "delivery_revision": 1, "available_at": availableAt,
+		"relay_work_kind": string(notifications.WorkKindDelivery), "relay_gsi_pk": key.PartitionKey,
+		"relay_gsi_sk": availableAt + "#DELIVERY#dG50XzE#" + "ZGVsaXZlcnlfcGVuZGluZw",
 	}
 }
 
