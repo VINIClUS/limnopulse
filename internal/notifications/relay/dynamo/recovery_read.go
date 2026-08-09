@@ -166,7 +166,7 @@ func (store Store) currentMembershipActive(
 	if err := attributevalue.UnmarshalMap(item, &member); err != nil {
 		return false, fmt.Errorf("decode current membership: %w", err)
 	}
-	if member.EntityType != "membership" || member.TenantID != tenantID ||
+	if member.EntityType != "tenant_member" || member.TenantID != tenantID ||
 		member.RecipientID != recipientID || member.Role == "" || member.Version < 1 {
 		return false, fmt.Errorf("current membership is malformed")
 	}

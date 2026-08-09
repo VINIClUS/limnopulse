@@ -338,7 +338,7 @@ def _put_membership(
         Item={
             "PK": f"TENANT#{tenant_id}",
             "SK": f"MEMBER#{recipient_id}",
-            "entity_type": "membership",
+            "entity_type": "tenant_member",
             "tenant_id": tenant_id,
             "cognito_sub": recipient_id,
             "role": "owner",

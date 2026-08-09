@@ -125,7 +125,7 @@ func (store Store) queryMemberships(
 		if err := attributevalue.UnmarshalMap(item, &member); err != nil {
 			return membershipPage{}, fmt.Errorf("decode tenant membership: %w", err)
 		}
-		if member.EntityType != "membership" || member.TenantID != work.TenantID ||
+		if member.EntityType != "tenant_member" || member.TenantID != work.TenantID ||
 			member.PK != "TENANT#"+work.TenantID || member.SK != "MEMBER#"+member.RecipientID ||
 			member.RecipientID == "" || member.Role == "" || member.Status == "" || member.Version < 1 {
 			return membershipPage{}, fmt.Errorf("tenant membership is malformed")

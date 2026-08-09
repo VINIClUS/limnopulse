@@ -32,7 +32,7 @@ func (store Store) CheckGates(ctx context.Context, record worker.DeliveryRecord)
 		return worker.GateResult{}, fmt.Errorf("decode current membership: %w", err)
 	}
 	if membership.PK != "TENANT#"+snapshot.TenantID || membership.SK != "MEMBER#"+snapshot.RecipientID ||
-		membership.EntityType != "membership" || membership.TenantID != snapshot.TenantID ||
+		membership.EntityType != "tenant_member" || membership.TenantID != snapshot.TenantID ||
 		membership.RecipientID != snapshot.RecipientID || membership.Role == "" || membership.Version < 1 || membership.Status == "" {
 		return worker.GateResult{}, fmt.Errorf("current membership is malformed")
 	}

@@ -19,7 +19,7 @@ func TestExpandIntentCreatesRenderedPendingDeliveryAndCompletesPageAtomically(t 
 	relayTime := time.Date(2026, 7, 16, 12, 30, 0, 0, time.UTC)
 	work := openingWork(t, relayTime)
 	membership := marshalMap(t, map[string]any{
-		"PK": "TENANT#tnt_1", "SK": "MEMBER#sub_1", "entity_type": "membership",
+		"PK": "TENANT#tnt_1", "SK": "MEMBER#sub_1", "entity_type": "tenant_member",
 		"tenant_id": "tnt_1", "cognito_sub": "sub_1", "role": "owner", "status": "active",
 		"version": int64(7), "created_at": relayTime.Add(-time.Hour).Format(time.RFC3339Nano),
 	})
@@ -443,7 +443,7 @@ func openingEvent(relayTime time.Time) map[string]any {
 func activeMember(t *testing.T, relayTime time.Time, recipientID string) map[string]types.AttributeValue {
 	t.Helper()
 	return marshalMap(t, map[string]any{
-		"PK": "TENANT#tnt_1", "SK": "MEMBER#" + recipientID, "entity_type": "membership",
+		"PK": "TENANT#tnt_1", "SK": "MEMBER#" + recipientID, "entity_type": "tenant_member",
 		"tenant_id": "tnt_1", "cognito_sub": recipientID, "role": "owner", "status": "active",
 		"version": int64(7), "created_at": relayTime.Add(-time.Hour).Format(time.RFC3339Nano),
 	})

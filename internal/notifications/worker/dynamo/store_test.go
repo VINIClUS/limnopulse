@@ -259,7 +259,7 @@ func TestAcquireMalformedProviderOutcomeAwaitsDLQWithoutClaim(t *testing.T) {
 
 func TestCheckGatesRevalidatesMembershipAndAddressDeliverability(t *testing.T) {
 	record := testRecord(t)
-	active := map[string]any{"PK": "TENANT#tnt_1", "SK": "MEMBER#user_1", "entity_type": "membership", "tenant_id": "tnt_1", "cognito_sub": "user_1", "status": "active", "role": "owner", "version": int64(2)}
+	active := map[string]any{"PK": "TENANT#tnt_1", "SK": "MEMBER#user_1", "entity_type": "tenant_member", "tenant_id": "tnt_1", "cognito_sub": "user_1", "status": "active", "role": "owner", "version": int64(2)}
 	suppressed := map[string]any{"deliverability": "suppressed"}
 	client := &fakeClient{getItems: []map[string]types.AttributeValue{marshal(t, active), marshal(t, suppressed)}}
 	gate, err := (Store{Table: "domain", Client: client}).CheckGates(context.Background(), record)
