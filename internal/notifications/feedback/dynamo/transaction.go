@@ -15,7 +15,14 @@ import (
 type providerMetadata struct {
 	Outcome   notifications.ProviderOutcome
 	MessageID string
+	AttemptID string
 	Accepted  bool
+}
+
+type deliveryProviderDecision struct {
+	Metadata                 providerMetadata
+	OwnsAggregate            bool
+	AcceptedByAnotherAttempt bool
 }
 
 func (store Store) reconcileTransaction(
@@ -167,46 +174,76 @@ func (store Store) deliveryUpdate(
 	event feedback.Event,
 	now time.Time,
 ) (*types.Update, error) {
-	provider, err := reconcileProviderMetadata(
-		current.ProviderOutcome,
-		current.ProviderMessageID,
-		current.ProviderAccepted,
-		event,
-	)
+	decision, err := reconcileDeliveryProviderMetadata(current, event)
 	if err != nil {
 		return nil, err
 	}
-	nextState, err := notifications.ReconcileDeliveryStateFromProvider(current.State, event.ProviderOutcome)
-	if err != nil {
-		return nil, err
+	nextState := current.State
+	if decision.OwnsAggregate {
+		incomingStateOutcome := event.ProviderOutcome
+		if event.PermanentFailure && decision.AcceptedByAnotherAttempt {
+			incomingStateOutcome = notifications.ProviderOutcomeAccepted
+		}
+		nextState, err = notifications.ReconcileDeliveryStateFromProvider(current.State, incomingStateOutcome)
+		if err != nil {
+			return nil, err
+		}
 	}
 	valuesMap := map[string]any{
 		":entity": "notification_delivery", ":outbox_id": current.OutboxID, ":delivery_id": current.DeliveryID,
 		":current_state": string(current.State), ":next_state": string(nextState),
 		":current_revision": current.Revision, ":next_revision": current.Revision + 1,
-		":provider_outcome": string(provider.Outcome), ":provider_message_id": provider.MessageID,
-		":provider_accepted": provider.Accepted, ":now": fixedTime(now),
+		":provider_accepted": decision.Metadata.Accepted, ":now": fixedTime(now),
 	}
 	condition := "#entity = :entity AND #outbox_id = :outbox_id AND #delivery_id = :delivery_id AND #state = :current_state AND #revision = :current_revision"
-	condition = addCurrentCondition(condition, valuesMap, "#current_provider_outcome", ":current_provider_outcome", string(current.ProviderOutcome))
-	condition = addCurrentCondition(condition, valuesMap, "#current_provider_message_id", ":current_provider_message_id", current.ProviderMessageID)
-	update := "SET #state = :next_state, #revision = :next_revision, #provider_outcome = :provider_outcome, #provider_message_id = :provider_message_id, #provider_accepted = :provider_accepted, #feedback_updated_at = :now, #updated_at = :now"
-	if event.AcceptedEvidence {
-		update += ", #provider_accepted_at = if_not_exists(#provider_accepted_at, :now)"
+	condition = addOptionalStringCondition(condition, valuesMap, "#current_provider_outcome", ":current_provider_outcome", string(current.ProviderOutcome))
+	condition = addOptionalStringCondition(condition, valuesMap, "#current_provider_message_id", ":current_provider_message_id", current.ProviderMessageID)
+	sets := []string{
+		"#state = :next_state", "#revision = :next_revision", "#provider_accepted = :provider_accepted",
+		"#feedback_updated_at = :now", "#updated_at = :now",
+	}
+	removes := make([]string, 0, 8)
+	for _, optional := range []struct {
+		name  string
+		token string
+		value string
+	}{
+		{"#provider_outcome", ":provider_outcome", string(decision.Metadata.Outcome)},
+		{"#provider_message_id", ":provider_message_id", decision.Metadata.MessageID},
+		{"#provider_attempt_id", ":provider_attempt_id", decision.Metadata.AttemptID},
+	} {
+		if optional.value == "" {
+			removes = append(removes, optional.name)
+			continue
+		}
+		valuesMap[optional.token] = optional.value
+		sets = append(sets, optional.name+" = "+optional.token)
+	}
+	if decision.OwnsAggregate && event.AcceptedEvidence {
+		sets = append(sets, "#provider_accepted_at = if_not_exists(#provider_accepted_at, :now)")
 	}
 	if nextState != notifications.DeliveryStateProcessing && nextState != notifications.DeliveryStateRetryableFailed {
-		update += " REMOVE #lease_owner, #lease_expires, #next_attempt_at, #ambiguous_exhausted, #awaiting_intervention"
+		removes = append(removes,
+			"#lease_owner", "#lease_expires", "#next_attempt_at", "#ambiguous_exhausted", "#awaiting_intervention",
+		)
+	}
+	update := "SET " + strings.Join(sets, ", ")
+	if len(removes) != 0 {
+		update += " REMOVE " + strings.Join(removes, ", ")
 	}
 	names := map[string]string{
 		"#entity": "entity_type", "#outbox_id": "outbox_id", "#delivery_id": "delivery_id", "#state": "state",
 		"#revision": "delivery_revision", "#provider_outcome": "provider_outcome",
 		"#provider_message_id": "provider_message_id", "#provider_accepted": "provider_accepted",
+		"#provider_attempt_id": "provider_attempt_id",
 		"#feedback_updated_at": "feedback_updated_at", "#updated_at": "updated_at",
 		"#provider_accepted_at": "provider_accepted_at", "#lease_owner": "delivery_lease_owner",
 		"#lease_expires": "delivery_lease_expires_at", "#next_attempt_at": "next_attempt_at",
 		"#ambiguous_exhausted": "ambiguous_exhausted", "#awaiting_intervention": "awaiting_intervention",
 		"#current_provider_outcome": "provider_outcome", "#current_provider_message_id": "provider_message_id",
 	}
+	condition = addOptionalStringCondition(condition, valuesMap, "#current_provider_attempt_id", ":current_provider_attempt_id", current.ProviderAttemptID)
+	names["#current_provider_attempt_id"] = "provider_attempt_id"
 	values, err := attributevalue.MarshalMap(valuesMap)
 	if err != nil {
 		return nil, err
@@ -271,6 +308,14 @@ func addCurrentCondition(condition string, values map[string]any, name, token, c
 	return condition + " AND " + name + " = " + token
 }
 
+func addOptionalStringCondition(condition string, values map[string]any, name, token, current string) string {
+	values[token] = current
+	if current == "" {
+		return condition + " AND (attribute_not_exists(" + name + ") OR " + name + " = " + token + ")"
+	}
+	return condition + " AND " + name + " = " + token
+}
+
 func marshalKey(key notifications.StorageKey) map[string]types.AttributeValue {
 	encoded, _ := attributevalue.MarshalMap(map[string]string{"PK": key.PartitionKey, "SK": key.SortKey})
 	return encoded
@@ -303,5 +348,49 @@ func reconcileProviderMetadata(
 	return providerMetadata{
 		Outcome: outcome, MessageID: messageID,
 		Accepted: currentAccepted || event.AcceptedEvidence,
+	}, nil
+}
+
+func reconcileDeliveryProviderMetadata(
+	current deliveryRecord,
+	event feedback.Event,
+) (deliveryProviderDecision, error) {
+	sameOwner := current.ProviderAttemptID != "" && current.ProviderAttemptID == event.AttemptID
+	latestAttempt := current.LastAttemptID != "" && current.LastAttemptID == event.AttemptID
+	acceptedByAnotherAttempt := current.ProviderAccepted &&
+		((current.ProviderAttemptID != "" && !sameOwner) ||
+			(current.ProviderAttemptID == "" && current.ProviderMessageID != "" &&
+				current.ProviderMessageID != event.ProviderMessageID))
+	legacyOwner := current.ProviderAttemptID == "" &&
+		(current.LastAttemptID == "" || latestAttempt) &&
+		(current.ProviderMessageID == "" || current.ProviderMessageID == event.ProviderMessageID)
+	acceptedWithoutProviderOwner := event.AcceptedEvidence && current.ProviderAttemptID == "" &&
+		current.ProviderMessageID == "" && current.ProviderOutcome == ""
+	if !sameOwner && !latestAttempt && !legacyOwner && !acceptedWithoutProviderOwner {
+		return deliveryProviderDecision{
+			Metadata: providerMetadata{
+				Outcome: current.ProviderOutcome, MessageID: current.ProviderMessageID,
+				AttemptID: current.ProviderAttemptID, Accepted: current.ProviderAccepted,
+			},
+			AcceptedByAnotherAttempt: acceptedByAnotherAttempt,
+		}, nil
+	}
+
+	currentOutcome := current.ProviderOutcome
+	currentMessageID := current.ProviderMessageID
+	currentAccepted := current.ProviderAccepted
+	legacyMessageHasDifferentOwner := current.ProviderAttemptID == "" &&
+		current.ProviderMessageID != "" && current.ProviderMessageID != event.ProviderMessageID
+	if latestAttempt && ((current.ProviderAttemptID != "" && !sameOwner) || legacyMessageHasDifferentOwner) {
+		currentOutcome, currentMessageID = "", ""
+	}
+	provider, err := reconcileProviderMetadata(currentOutcome, currentMessageID, currentAccepted, event)
+	if err != nil {
+		return deliveryProviderDecision{}, err
+	}
+	provider.AttemptID = event.AttemptID
+	return deliveryProviderDecision{
+		Metadata: provider, OwnsAggregate: true,
+		AcceptedByAnotherAttempt: acceptedByAnotherAttempt,
 	}, nil
 }

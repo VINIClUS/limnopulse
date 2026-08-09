@@ -21,7 +21,6 @@ from limnopulse_api.domain.entities import TenantAccess
 from limnopulse_api.domain.notification_preferences import NotificationPreferenceView
 from limnopulse_api.services.notification_preferences import NotificationPreferenceService
 
-
 router = APIRouter(
     prefix="/tenants/{tenant_id}/me/notification-preferences",
     tags=["notification-preferences"],

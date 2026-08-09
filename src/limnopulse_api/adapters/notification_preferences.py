@@ -1,9 +1,9 @@
-from collections.abc import Callable, Mapping
+import json
 from asyncio import to_thread
+from collections.abc import Callable, Mapping
 from datetime import UTC, datetime, timedelta
 from decimal import Decimal
 from hashlib import sha256
-import json
 from typing import Any
 from uuid import uuid4
 
@@ -16,7 +16,6 @@ from limnopulse_api.domain.notification_preferences import (
     EmailDeliverabilityRecord,
     NotificationPreference,
 )
-
 
 AUDIT_RETENTION = timedelta(days=90)
 

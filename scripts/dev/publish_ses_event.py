@@ -9,7 +9,6 @@ from typing import Any, Protocol
 
 import boto3
 
-
 SUPPORTED_EVENT_TYPES = (
     "Send",
     "DeliveryDelay",

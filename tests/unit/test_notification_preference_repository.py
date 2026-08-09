@@ -1,7 +1,7 @@
+import json
 from copy import deepcopy
 from datetime import UTC, datetime
 from hashlib import sha256
-import json
 from threading import get_ident
 from typing import Any
 
@@ -17,7 +17,6 @@ from limnopulse_api.domain.notification_preferences import (
     EmailDeliverability,
     NotificationPreference,
 )
-
 
 NOW = datetime(2026, 7, 16, 12, 0, tzinfo=UTC)
 

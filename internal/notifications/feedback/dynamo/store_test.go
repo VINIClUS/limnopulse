@@ -208,6 +208,7 @@ func TestReconcileLateAcceptanceNeverResurrectsCancelledRecovery(t *testing.T) {
 	client.seed(attempt)
 	delivery := testDelivery("cancelled", "", 11)
 	delivery["kind"] = "recovery"
+	delivery["last_attempt_id"] = "att_1"
 	client.seed(delivery)
 
 	result, err := (Store{Table: "domain", Client: client}).Reconcile(
@@ -225,7 +226,9 @@ func TestReconcileLateAcceptanceNeverResurrectsCancelledRecovery(t *testing.T) {
 func TestReconcileLateSendPromotesUnknownAndKeepsAcceptanceEvidence(t *testing.T) {
 	client := newFakeClient(t)
 	client.seed(testAttempt("ambiguous", "", ""))
-	client.seed(testDelivery("unknown", "", 11))
+	delivery := testDelivery("unknown", "", 11)
+	delivery["last_attempt_id"] = "att_1"
+	client.seed(delivery)
 
 	result, err := (Store{Table: "domain", Client: client}).Reconcile(
 		context.Background(), testEvent(feedback.SemanticSend), testNow(),
@@ -234,8 +237,241 @@ func TestReconcileLateSendPromotesUnknownAndKeepsAcceptanceEvidence(t *testing.T
 		t.Fatalf("result=%#v err=%v", result, err)
 	}
 	deliveryValues := decodeValues(t, client.transactions[0].TransactItems[3].Update.ExpressionAttributeValues)
-	if deliveryValues[":next_state"] != "succeeded" || deliveryValues[":provider_accepted"] != true {
+	if deliveryValues[":next_state"] != "succeeded" || deliveryValues[":provider_accepted"] != true ||
+		deliveryValues[":provider_attempt_id"] != "att_1" {
 		t.Fatalf("late acceptance values = %#v", deliveryValues)
+	}
+}
+
+func TestReconcileStaleAttemptRejectDoesNotDowngradeLaterAcceptedAttempt(t *testing.T) {
+	client := newFakeClient(t)
+	olderAttempt := testAttempt("ambiguous", "", "")
+	olderAttempt["SK"] = "ATTEMPT#att_older"
+	olderAttempt["attempt_id"] = "att_older"
+	olderAttempt["attempt_number"] = int64(1)
+	client.seed(olderAttempt)
+	delivery := testDelivery("succeeded", "accepted", 12)
+	delivery["attempt_count"] = int64(2)
+	delivery["last_attempt_id"] = "att_later"
+	delivery["provider_attempt_id"] = "att_later"
+	delivery["provider_message_id"] = "ses_later"
+	delivery["provider_accepted"] = true
+	client.seed(delivery)
+
+	event := testEvent(feedback.SemanticReject)
+	event.AttemptID = "att_older"
+	event.ProviderMessageID = "ses_older"
+	result, err := (Store{Table: "domain", Client: client}).Reconcile(
+		context.Background(), event, testNow(),
+	)
+	if err != nil || result.Disposition != feedback.ReconcileApplied {
+		t.Fatalf("result=%#v err=%v", result, err)
+	}
+	attemptValues := decodeValues(t, client.transactions[0].TransactItems[2].Update.ExpressionAttributeValues)
+	if attemptValues[":next_outcome"] != "permanent_failed" ||
+		attemptValues[":provider_message_id"] != "ses_older" {
+		t.Fatalf("older Attempt was not reconciled: %#v", attemptValues)
+	}
+	deliveryValues := decodeValues(t, client.transactions[0].TransactItems[3].Update.ExpressionAttributeValues)
+	if deliveryValues[":next_state"] != "succeeded" ||
+		deliveryValues[":provider_outcome"] != "accepted" ||
+		deliveryValues[":provider_message_id"] != "ses_later" ||
+		deliveryValues[":provider_attempt_id"] != "att_later" {
+		t.Fatalf("later accepted aggregate was downgraded: %#v", deliveryValues)
+	}
+}
+
+func TestReconcileStaleAttemptHardBounceStillSuppressesWithoutDowngradingOwner(t *testing.T) {
+	client := newFakeClient(t)
+	olderAttempt := testAttempt("ambiguous", "", "")
+	olderAttempt["SK"] = "ATTEMPT#att_older"
+	olderAttempt["attempt_id"] = "att_older"
+	client.seed(olderAttempt)
+	delivery := testDelivery("succeeded", "accepted", 12)
+	delivery["last_attempt_id"] = "att_later"
+	delivery["provider_attempt_id"] = "att_later"
+	delivery["provider_message_id"] = "ses_later"
+	delivery["provider_accepted"] = true
+	client.seed(delivery)
+
+	event := testEvent(feedback.SemanticHardBounce)
+	event.AttemptID = "att_older"
+	event.ProviderMessageID = "ses_older"
+	result, err := (Store{Table: "domain", Client: client}).Reconcile(
+		context.Background(), event, testNow(),
+	)
+	if err != nil || result.Disposition != feedback.ReconcileApplied || !result.Suppressed {
+		t.Fatalf("result=%#v err=%v", result, err)
+	}
+	transaction := client.transactions[0]
+	if len(transaction.TransactItems) != 5 || transaction.TransactItems[4].Put == nil {
+		t.Fatalf("stale hard bounce did not preserve global suppression: %#v", transaction.TransactItems)
+	}
+	deliveryValues := decodeValues(t, transaction.TransactItems[3].Update.ExpressionAttributeValues)
+	if deliveryValues[":next_state"] != "succeeded" ||
+		deliveryValues[":provider_outcome"] != "accepted" ||
+		deliveryValues[":provider_attempt_id"] != "att_later" {
+		t.Fatalf("stale hard bounce downgraded aggregate owner: %#v", deliveryValues)
+	}
+}
+
+func TestReconcileLatestAttemptTakesOwnershipFromLegacyProviderMessage(t *testing.T) {
+	client := newFakeClient(t)
+	client.seed(testAttempt("ambiguous", "", ""))
+	delivery := testDelivery("retryable_failed", "delayed", 12)
+	delivery["last_attempt_id"] = "att_1"
+	delivery["provider_message_id"] = "ses_older"
+	delivery["provider_accepted"] = true
+	client.seed(delivery)
+
+	result, err := (Store{Table: "domain", Client: client}).Reconcile(
+		context.Background(), testEvent(feedback.SemanticSend), testNow(),
+	)
+	if err != nil || result.Disposition != feedback.ReconcileApplied {
+		t.Fatalf("result=%#v err=%v", result, err)
+	}
+	deliveryValues := decodeValues(t, client.transactions[0].TransactItems[3].Update.ExpressionAttributeValues)
+	if deliveryValues[":next_state"] != "succeeded" ||
+		deliveryValues[":provider_outcome"] != "accepted" ||
+		deliveryValues[":provider_message_id"] != "ses_message_1" ||
+		deliveryValues[":provider_attempt_id"] != "att_1" {
+		t.Fatalf("latest Attempt did not replace legacy provider ownership: %#v", deliveryValues)
+	}
+}
+
+func TestReconcileLaterAttemptRejectCannotEraseEarlierAcceptance(t *testing.T) {
+	client := newFakeClient(t)
+	laterAttempt := testAttempt("ambiguous", "", "")
+	laterAttempt["SK"] = "ATTEMPT#att_later"
+	laterAttempt["attempt_id"] = "att_later"
+	client.seed(laterAttempt)
+	delivery := testDelivery("succeeded", "accepted", 12)
+	delivery["last_attempt_id"] = "att_later"
+	delivery["provider_attempt_id"] = "att_older"
+	delivery["provider_message_id"] = "ses_older"
+	delivery["provider_accepted"] = true
+	client.seed(delivery)
+
+	event := testEvent(feedback.SemanticReject)
+	event.AttemptID = "att_later"
+	event.ProviderMessageID = "ses_later"
+	result, err := (Store{Table: "domain", Client: client}).Reconcile(
+		context.Background(), event, testNow(),
+	)
+	if err != nil || result.Disposition != feedback.ReconcileApplied {
+		t.Fatalf("result=%#v err=%v", result, err)
+	}
+	deliveryValues := decodeValues(t, client.transactions[0].TransactItems[3].Update.ExpressionAttributeValues)
+	if deliveryValues[":next_state"] != "succeeded" ||
+		deliveryValues[":provider_accepted"] != true ||
+		deliveryValues[":provider_outcome"] != "rejected" ||
+		deliveryValues[":provider_message_id"] != "ses_later" ||
+		deliveryValues[":provider_attempt_id"] != "att_later" {
+		t.Fatalf("later Reject erased acceptance from another Attempt: %#v", deliveryValues)
+	}
+}
+
+func TestReconcileLegacyStaleFeedbackDoesNotPersistEmptyOwnershipAndAllowsLatestAttempt(t *testing.T) {
+	client := newFakeClient(t)
+	olderAttempt := testAttempt("ambiguous", "", "")
+	olderAttempt["SK"] = "ATTEMPT#att_older"
+	olderAttempt["attempt_id"] = "att_older"
+	client.seed(olderAttempt)
+	delivery := testDelivery("retryable_failed", "", 12)
+	delivery["last_attempt_id"] = "att_latest"
+	client.seed(delivery)
+	client.onTransaction = func(call int) {
+		if call != 1 {
+			return
+		}
+		latestAttempt := testAttempt("ambiguous", "", "")
+		latestAttempt["SK"] = "ATTEMPT#att_latest"
+		latestAttempt["attempt_id"] = "att_latest"
+		client.seed(latestAttempt)
+		latestDelivery := testDelivery("retryable_failed", "", 13)
+		latestDelivery["last_attempt_id"] = "att_latest"
+		client.seed(latestDelivery)
+	}
+
+	stale := testEvent(feedback.SemanticReject)
+	stale.EventBridgeID = "evt_stale"
+	stale.AttemptID = "att_older"
+	stale.ProviderMessageID = "ses_older"
+	result, err := (Store{Table: "domain", Client: client}).Reconcile(
+		context.Background(), stale, testNow(),
+	)
+	if err != nil || result.Disposition != feedback.ReconcileApplied {
+		t.Fatalf("stale result=%#v err=%v", result, err)
+	}
+	staleUpdate := client.transactions[0].TransactItems[3].Update
+	if strings.Contains(*staleUpdate.UpdateExpression, "#provider_attempt_id = :provider_attempt_id") ||
+		!strings.Contains(*staleUpdate.UpdateExpression, "#provider_attempt_id") {
+		t.Fatalf("stale legacy ownership update = %s", *staleUpdate.UpdateExpression)
+	}
+
+	latest := testEvent(feedback.SemanticSend)
+	latest.EventBridgeID = "evt_latest"
+	latest.AttemptID = "att_latest"
+	latest.ProviderMessageID = "ses_latest"
+	result, err = (Store{Table: "domain", Client: client}).Reconcile(
+		context.Background(), latest, testNow().Add(time.Second),
+	)
+	if err != nil || result.Disposition != feedback.ReconcileApplied || len(client.transactions) != 2 {
+		t.Fatalf("latest result=%#v err=%v transactions=%d", result, err, len(client.transactions))
+	}
+	latestValues := decodeValues(t, client.transactions[1].TransactItems[3].Update.ExpressionAttributeValues)
+	if latestValues[":next_state"] != "succeeded" ||
+		latestValues[":provider_attempt_id"] != "att_latest" ||
+		latestValues[":provider_message_id"] != "ses_latest" ||
+		latestValues[":provider_accepted"] != true {
+		t.Fatalf("latest Attempt could not claim legacy aggregate: %#v", latestValues)
+	}
+}
+
+func TestReconcileAcceptedOlderAttemptClaimsUnownedAggregateWithoutResurrectingCancellation(t *testing.T) {
+	tests := []struct {
+		name      string
+		semantic  feedback.SemanticType
+		state     string
+		kind      string
+		wantState string
+	}{
+		{name: "Send", semantic: feedback.SemanticSend, state: "retryable_failed", kind: "opening", wantState: "succeeded"},
+		{name: "Delivery", semantic: feedback.SemanticDelivery, state: "retryable_failed", kind: "opening", wantState: "succeeded"},
+		{name: "cancelled recovery", semantic: feedback.SemanticSend, state: "cancelled", kind: "recovery", wantState: "cancelled"},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			client := newFakeClient(t)
+			olderAttempt := testAttempt("ambiguous", "", "")
+			olderAttempt["SK"] = "ATTEMPT#att_older"
+			olderAttempt["attempt_id"] = "att_older"
+			olderAttempt["notification_kind"] = test.kind
+			client.seed(olderAttempt)
+			delivery := testDelivery(test.state, "", 12)
+			delivery["attempt_count"] = int64(2)
+			delivery["last_attempt_id"] = "att_latest"
+			delivery["kind"] = test.kind
+			client.seed(delivery)
+
+			event := testEvent(test.semantic)
+			event.EventBridgeID = "evt_accepted_older"
+			event.AttemptID = "att_older"
+			event.ProviderMessageID = "ses_older"
+			result, err := (Store{Table: "domain", Client: client}).Reconcile(
+				context.Background(), event, testNow(),
+			)
+			if err != nil || result.Disposition != feedback.ReconcileApplied {
+				t.Fatalf("result=%#v err=%v", result, err)
+			}
+			deliveryValues := decodeValues(t, client.transactions[0].TransactItems[3].Update.ExpressionAttributeValues)
+			if deliveryValues[":next_state"] != test.wantState ||
+				deliveryValues[":provider_accepted"] != true ||
+				deliveryValues[":provider_attempt_id"] != "att_older" ||
+				deliveryValues[":provider_message_id"] != "ses_older" {
+				t.Fatalf("accepted older Attempt was not recorded monotonically: %#v", deliveryValues)
+			}
+		})
 	}
 }
 

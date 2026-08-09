@@ -1,13 +1,13 @@
 from datetime import UTC, datetime, timedelta
 
 import jwt
+from botocore.exceptions import EndpointConnectionError
 from cryptography.hazmat.primitives.asymmetric import rsa
 from fastapi import Request
 from fastapi.testclient import TestClient
-from botocore.exceptions import EndpointConnectionError
 
-from limnopulse_api.adapters.dynamodb import DynamoDomainRepository
 from limnopulse_api.adapters.alert_rules import DynamoAlertRuleRepository
+from limnopulse_api.adapters.dynamodb import DynamoDomainRepository
 from limnopulse_api.adapters.notification_preferences import (
     DynamoNotificationPreferenceRepository,
 )
@@ -16,9 +16,8 @@ from limnopulse_api.auth.cognito import CognitoJwtAuthProvider
 from limnopulse_api.auth.models import Principal
 from limnopulse_api.core.config import Settings
 from limnopulse_api.main import create_app
-from limnopulse_api.services.memberships import MembershipService
 from limnopulse_api.services.cognito_identity import CognitoIdentityVerifier
-
+from limnopulse_api.services.memberships import MembershipService
 
 TEST_ISSUER = "https://cognito-idp.us-east-1.amazonaws.com/pool_1"
 

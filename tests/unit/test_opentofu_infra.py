@@ -1,6 +1,7 @@
+import json
 import re
 from pathlib import Path
-
+from typing import Any
 
 ROOT = Path(__file__).resolve().parents[2]
 TOFU_ROOT = ROOT / "infra" / "opentofu"
@@ -14,6 +15,48 @@ def _opentofu_text_files() -> list[Path]:
     return [
         path for path in TOFU_ROOT.rglob("*") if path.is_file() and ".terraform" not in path.parts
     ]
+
+
+def _eventbridge_transformers(ses: str) -> dict[str, tuple[dict[str, str], str]]:
+    transformers: dict[str, tuple[dict[str, str], str]] = {}
+    target_pattern = re.compile(
+        r'resource "aws_cloudwatch_event_target" "(?P<name>[^"]+)"\s*\{'
+        r"(?P<body>.*?)(?=\nresource |\Z)",
+        re.DOTALL,
+    )
+    for target in target_pattern.finditer(ses):
+        body = target.group("body")
+        paths_match = re.search(r"input_paths\s*=\s*\{(?P<paths>.*?)\n\s*\}", body, re.DOTALL)
+        template_match = re.search(
+            r"input_template\s*=\s*<<-JSON\n(?P<template>.*?)\n\s*JSON",
+            body,
+            re.DOTALL,
+        )
+        if paths_match is None or template_match is None:
+            continue
+        paths = dict(re.findall(r'(\w+)\s*=\s*"([^"]+)"', paths_match.group("paths")))
+        transformers[target.group("name")] = (paths, template_match.group("template").strip())
+    return transformers
+
+
+def _render_eventbridge_template(
+    paths: dict[str, str], template: str, event: dict[str, Any]
+) -> dict[str, Any]:
+    def read_path(path: str) -> Any:
+        value: Any = event
+        for component in path.removeprefix("$.").split("."):
+            match = re.fullmatch(r"([^[]+)(?:\[(\d+)\])?", component)
+            assert match is not None
+            value = value[match.group(1)]
+            if match.group(2) is not None:
+                value = value[int(match.group(2))]
+        return value
+
+    rendered = template
+    for variable, path in paths.items():
+        rendered = rendered.replace(f"<{variable}>", json.dumps(read_path(path)))
+    assert not re.search(r"<\w+>", rendered)
+    return json.loads(rendered)
 
 
 def test_opentofu_layout_documents_cloud_boundary() -> None:
@@ -163,6 +206,101 @@ def test_notification_queues_and_ses_eventbridge_boundary_are_safe_by_default() 
         re.MULTILINE,
     )
     assert re.search(r'^ses_events_queue_name\s+=\s+"limnopulse-ses-events"$', tfvars, re.MULTILINE)
+
+
+def test_ses_eventbridge_targets_emit_only_parseable_non_pii_feedback() -> None:
+    ses = _read("ses.tf")
+    transformers = _eventbridge_transformers(ses)
+    assert set(transformers) == {"ses_events", "ses_events_bounce", "ses_events_reject"}
+
+    base_event = {
+        "version": "0",
+        "id": "evt_transformer_contract",
+        "detail-type": "Simple Email Service Email Sending Event",
+        "source": "aws.ses",
+        "detail": {
+            "eventType": "Send",
+            "mail": {
+                "messageId": "provider_message_1",
+                "source": "sender@example.test",
+                "destination": ["recipient@example.test"],
+                "headers": [{"name": "Subject", "value": "secret subject"}],
+                "commonHeaders": {"subject": "secret subject"},
+                "tags": {"delivery_id": ["del_1"], "attempt_id": ["att_1"]},
+            },
+            "bounce": {
+                "bounceType": "Permanent",
+                "bouncedRecipients": [{"emailAddress": "recipient@example.test"}],
+            },
+            "complaint": {
+                "complainedRecipients": [{"emailAddress": "recipient@example.test"}]
+            },
+            "deliveryDelay": {
+                "delayedRecipients": [{"emailAddress": "recipient@example.test"}]
+            },
+            "reject": {"reason": "Bad content"},
+        },
+    }
+    routes = {
+        "Send": "ses_events",
+        "Delivery": "ses_events",
+        "DeliveryDelay": "ses_events",
+        "Complaint": "ses_events",
+        "Bounce": "ses_events_bounce",
+        "Reject": "ses_events_reject",
+    }
+    forbidden_paths = {
+        "$.detail",
+        "$.detail.mail.source",
+        "$.detail.mail.destination",
+        "$.detail.mail.headers",
+        "$.detail.mail.commonHeaders",
+        "$.detail.bounce.bouncedRecipients",
+        "$.detail.complaint.complainedRecipients",
+        "$.detail.deliveryDelay.delayedRecipients",
+    }
+    forbidden_keys = {
+        "sourceIp",
+        "destination",
+        "headers",
+        "commonHeaders",
+        "subject",
+        "bouncedRecipients",
+        "complainedRecipients",
+        "delayedRecipients",
+        "recipients",
+        "emailAddress",
+    }
+
+    for event_type, route in routes.items():
+        paths, template = transformers[route]
+        assert forbidden_paths.isdisjoint(paths.values())
+        event = json.loads(json.dumps(base_event))
+        event["detail"]["eventType"] = event_type
+        emitted = _render_eventbridge_template(paths, template, event)
+        assert emitted["version"] == "0"
+        assert emitted["id"] == "evt_transformer_contract"
+        assert emitted["detail-type"] == "Simple Email Service Email Sending Event"
+        assert emitted["source"] == "aws.ses"
+        detail = emitted["detail"]
+        assert detail["eventType"] == event_type
+        assert detail["mail"] == {
+            "messageId": "provider_message_1",
+            "tags": {"delivery_id": ["del_1"], "attempt_id": ["att_1"]},
+        }
+        serialized = json.dumps(emitted)
+        assert "sender@example.test" not in serialized
+        assert "recipient@example.test" not in serialized
+        assert "secret subject" not in serialized
+        assert forbidden_keys.isdisjoint(re.findall(r'"([^"]+)"\s*:', serialized))
+        if event_type == "Bounce":
+            assert detail["bounce"] == {"bounceType": "Permanent"}
+        elif event_type == "Reject":
+            assert detail["reject"] == {"reason": "Bad content"}
+        elif event_type == "DeliveryDelay":
+            assert detail["deliveryDelay"] == {}
+        elif event_type == "Complaint":
+            assert detail["complaint"] == {}
 
 
 def test_notification_outputs_expose_runtime_queue_contract() -> None:

@@ -10,9 +10,8 @@ from limnopulse_api.domain.notification_preferences import (
     EmailDeliverabilityRecord,
     NotificationPreference,
 )
-from limnopulse_api.services.notification_preferences import NotificationPreferenceService
 from limnopulse_api.services.cognito_identity import VerifiedEmailIdentity
-
+from limnopulse_api.services.notification_preferences import NotificationPreferenceService
 
 NOW = datetime(2026, 7, 16, 12, 0, tzinfo=UTC)
 

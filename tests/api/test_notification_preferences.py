@@ -23,7 +23,6 @@ from limnopulse_api.services.cognito_identity import (
     CognitoIdentityVerifier,
 )
 
-
 NOW = datetime(2026, 7, 16, 12, 0, tzinfo=UTC)
 PATH = "/v1/tenants/tnt_1/me/notification-preferences"
 TOKEN = "same-validated-access-token"

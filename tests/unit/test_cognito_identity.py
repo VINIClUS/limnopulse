@@ -16,7 +16,6 @@ from limnopulse_api.services.cognito_identity import (
     CognitoIdentityVerifier,
 )
 
-
 NOW = datetime(2026, 7, 16, 12, 0, tzinfo=UTC)
 TOKEN = "same-validated-access-token"
 

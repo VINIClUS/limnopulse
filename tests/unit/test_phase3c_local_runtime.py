@@ -3,10 +3,10 @@ from __future__ import annotations
 import json
 from datetime import UTC, datetime
 from pathlib import Path
+
 import yaml
 
 from scripts.dev.publish_ses_event import build_ses_event, publish_event
-
 
 ROOT = Path(__file__).resolve().parents[2]
 

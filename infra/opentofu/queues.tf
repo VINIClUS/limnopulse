@@ -76,7 +76,11 @@ data "aws_iam_policy_document" "ses_events" {
     condition {
       test     = "ArnEquals"
       variable = "aws:SourceArn"
-      values   = [aws_cloudwatch_event_rule.ses_notifications.arn]
+      values = [
+        aws_cloudwatch_event_rule.ses_notifications.arn,
+        aws_cloudwatch_event_rule.ses_notifications_bounce.arn,
+        aws_cloudwatch_event_rule.ses_notifications_reject.arn,
+      ]
     }
   }
 }
@@ -102,7 +106,11 @@ data "aws_iam_policy_document" "ses_events_routing_dlq" {
     condition {
       test     = "ArnEquals"
       variable = "aws:SourceArn"
-      values   = [aws_cloudwatch_event_rule.ses_notifications.arn]
+      values = [
+        aws_cloudwatch_event_rule.ses_notifications.arn,
+        aws_cloudwatch_event_rule.ses_notifications_bounce.arn,
+        aws_cloudwatch_event_rule.ses_notifications_reject.arn,
+      ]
     }
   }
 }

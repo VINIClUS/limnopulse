@@ -88,11 +88,19 @@ func TestLoadRequiresExplicitProductionRateAndValidatesFlags(t *testing.T) {
 	if err != nil || loaded.ReceiveWait != 0 {
 		t.Fatalf("zero receive wait for deterministic local execution = %#v, %v", loaded, err)
 	}
+	loaded, err = Load([]string{"--invalid-visibility=1s"}, lookup(local))
+	if err != nil || loaded.InvalidVisibility != time.Second {
+		t.Fatalf("short invalid visibility for bounded local redrive = %#v, %v", loaded, err)
+	}
+	if _, err := Load([]string{"--invalid-visibility=1s"}, lookup(base)); err == nil {
+		t.Fatal("short invalid visibility was accepted in production")
+	}
 	for _, args := range [][]string{
 		{"--send-concurrency=0"}, {"--max-send-rate=0"}, {"--max-send-rate=NaN"},
 		{"--max-send-rate=+Inf"}, {"--send-burst=0"}, {"--feedback-concurrency=0"},
 		{"--receive-wait=0s"}, {"--receive-wait=-1s"}, {"--receive-wait=21s"},
-		{"--receive-wait=500ms"}, {"extra"},
+		{"--receive-wait=500ms"}, {"--invalid-visibility=0s"},
+		{"--invalid-visibility=500ms"}, {"extra"},
 	} {
 		if _, err := Load(args, lookup(base)); err == nil {
 			t.Fatalf("Load(%v) error = nil", args)

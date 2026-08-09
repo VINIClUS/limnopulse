@@ -7,7 +7,6 @@ import boto3
 
 from limnopulse_api.core.config import get_settings
 
-
 ALERT_INDEXES = (
     {
         "IndexName": "AlertEvaluationByDue",

@@ -2,11 +2,84 @@ package feedback
 
 import (
 	"fmt"
+	"os"
+	"path/filepath"
+	"strconv"
 	"strings"
 	"testing"
 
 	"github.com/VINIClUS/limnopulse/internal/notifications"
 )
+
+func TestOpenTofuEventBridgeTemplatesRemainParseableForEveryFeedbackType(t *testing.T) {
+	sesPath := filepath.Join("..", "..", "..", "infra", "opentofu", "ses.tf")
+	sesBytes, err := os.ReadFile(sesPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	ses := string(sesBytes)
+	tests := []struct {
+		eventType string
+		target    string
+		semantic  SemanticType
+		extra     map[string]string
+	}{
+		{eventType: "Send", target: "ses_events", semantic: SemanticSend},
+		{eventType: "Delivery", target: "ses_events", semantic: SemanticDelivery},
+		{eventType: "DeliveryDelay", target: "ses_events", semantic: SemanticDeliveryDelay},
+		{eventType: "Complaint", target: "ses_events", semantic: SemanticComplaint},
+		{eventType: "Bounce", target: "ses_events_bounce", semantic: SemanticHardBounce, extra: map[string]string{"bounce_type": "Permanent"}},
+		{eventType: "Reject", target: "ses_events_reject", semantic: SemanticReject, extra: map[string]string{"reject_reason": "Bad content"}},
+	}
+	for _, test := range tests {
+		t.Run(test.eventType, func(t *testing.T) {
+			template := tofuInputTemplate(t, ses, test.target)
+			values := map[string]string{
+				"version": "0", "id": "evt_transformer_contract",
+				"detail_type": "Simple Email Service Email Sending Event", "source": "aws.ses",
+				"event_type": test.eventType, "message_id": "provider_message_1",
+				"delivery_id": "del_1", "attempt_id": "att_1",
+			}
+			for name, value := range test.extra {
+				values[name] = value
+			}
+			for name, value := range values {
+				template = strings.ReplaceAll(template, "<"+name+">", strconv.Quote(value))
+			}
+			if strings.Contains(template, "<") {
+				t.Fatalf("unresolved input transformer variable: %s", template)
+			}
+			result, parseErr := ParseEvent([]byte(template))
+			if parseErr != nil || result.Disposition != ParseProcess || result.Event.SemanticType != test.semantic {
+				t.Fatalf("ParseEvent(transformer %s) = %#v, %v", test.target, result, parseErr)
+			}
+		})
+	}
+}
+
+func tofuInputTemplate(t *testing.T, ses, target string) string {
+	t.Helper()
+	resourceMarker := `resource "aws_cloudwatch_event_target" "` + target + `" {`
+	resourceStart := strings.Index(ses, resourceMarker)
+	if resourceStart < 0 {
+		t.Fatalf("target %s not found", target)
+	}
+	body := ses[resourceStart+len(resourceMarker):]
+	if nextResource := strings.Index(body, "\nresource "); nextResource >= 0 {
+		body = body[:nextResource]
+	}
+	templateMarker := "input_template = <<-JSON\n"
+	templateStart := strings.Index(body, templateMarker)
+	if templateStart < 0 {
+		t.Fatalf("target %s has no input template", target)
+	}
+	template := body[templateStart+len(templateMarker):]
+	templateEnd := strings.Index(template, "\n    JSON")
+	if templateEnd < 0 {
+		t.Fatalf("target %s input template is unterminated", target)
+	}
+	return strings.TrimSpace(template[:templateEnd])
+}
 
 func TestParseEventBridgeSESEventsMapsOnlyContractFeedback(t *testing.T) {
 	tests := []struct {

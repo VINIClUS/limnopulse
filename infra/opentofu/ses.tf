@@ -42,7 +42,31 @@ resource "aws_cloudwatch_event_rule" "ses_notifications" {
   event_pattern = jsonencode({
     source = ["aws.ses"]
     detail = {
-      eventType = ["Send", "Delivery", "DeliveryDelay", "Bounce", "Complaint", "Reject"]
+      eventType = ["Send", "Delivery", "DeliveryDelay", "Complaint"]
+    }
+  })
+}
+
+resource "aws_cloudwatch_event_rule" "ses_notifications_bounce" {
+  name        = "${var.ses_eventbridge_rule_name}-bounce"
+  description = "Route sanitized Limnopulse SES bounce feedback to SQS"
+
+  event_pattern = jsonencode({
+    source = ["aws.ses"]
+    detail = {
+      eventType = ["Bounce"]
+    }
+  })
+}
+
+resource "aws_cloudwatch_event_rule" "ses_notifications_reject" {
+  name        = "${var.ses_eventbridge_rule_name}-reject"
+  description = "Route sanitized Limnopulse SES reject feedback to SQS"
+
+  event_pattern = jsonencode({
+    source = ["aws.ses"]
+    detail = {
+      eventType = ["Reject"]
     }
   })
 }
@@ -51,6 +75,96 @@ resource "aws_cloudwatch_event_target" "ses_events" {
   rule      = aws_cloudwatch_event_rule.ses_notifications.name
   target_id = "limnopulse-ses-events"
   arn       = aws_sqs_queue.ses_events.arn
+
+  input_transformer {
+    input_paths = {
+      version     = "$.version"
+      id          = "$.id"
+      detail_type = "$.detail-type"
+      source      = "$.source"
+      event_type  = "$.detail.eventType"
+      message_id  = "$.detail.mail.messageId"
+      delivery_id = "$.detail.mail.tags.delivery_id[0]"
+      attempt_id  = "$.detail.mail.tags.attempt_id[0]"
+    }
+    input_template = <<-JSON
+      {"version":<version>,"id":<id>,"detail-type":<detail_type>,"source":<source>,"detail":{"eventType":<event_type>,"mail":{"messageId":<message_id>,"tags":{"delivery_id":[<delivery_id>],"attempt_id":[<attempt_id>]}},"deliveryDelay":{},"complaint":{}}}
+    JSON
+  }
+
+  dead_letter_config {
+    arn = aws_sqs_queue.ses_events_routing_dlq.arn
+  }
+
+  retry_policy {
+    maximum_event_age_in_seconds = 86400
+    maximum_retry_attempts       = 185
+  }
+
+  depends_on = [
+    aws_sqs_queue_policy.ses_events,
+    aws_sqs_queue_policy.ses_events_routing_dlq,
+  ]
+}
+
+resource "aws_cloudwatch_event_target" "ses_events_bounce" {
+  rule      = aws_cloudwatch_event_rule.ses_notifications_bounce.name
+  target_id = "limnopulse-ses-events-bounce"
+  arn       = aws_sqs_queue.ses_events.arn
+
+  input_transformer {
+    input_paths = {
+      version     = "$.version"
+      id          = "$.id"
+      detail_type = "$.detail-type"
+      source      = "$.source"
+      event_type  = "$.detail.eventType"
+      message_id  = "$.detail.mail.messageId"
+      delivery_id = "$.detail.mail.tags.delivery_id[0]"
+      attempt_id  = "$.detail.mail.tags.attempt_id[0]"
+      bounce_type = "$.detail.bounce.bounceType"
+    }
+    input_template = <<-JSON
+      {"version":<version>,"id":<id>,"detail-type":<detail_type>,"source":<source>,"detail":{"eventType":<event_type>,"mail":{"messageId":<message_id>,"tags":{"delivery_id":[<delivery_id>],"attempt_id":[<attempt_id>]}},"bounce":{"bounceType":<bounce_type>}}}
+    JSON
+  }
+
+  dead_letter_config {
+    arn = aws_sqs_queue.ses_events_routing_dlq.arn
+  }
+
+  retry_policy {
+    maximum_event_age_in_seconds = 86400
+    maximum_retry_attempts       = 185
+  }
+
+  depends_on = [
+    aws_sqs_queue_policy.ses_events,
+    aws_sqs_queue_policy.ses_events_routing_dlq,
+  ]
+}
+
+resource "aws_cloudwatch_event_target" "ses_events_reject" {
+  rule      = aws_cloudwatch_event_rule.ses_notifications_reject.name
+  target_id = "limnopulse-ses-events-reject"
+  arn       = aws_sqs_queue.ses_events.arn
+
+  input_transformer {
+    input_paths = {
+      version       = "$.version"
+      id            = "$.id"
+      detail_type   = "$.detail-type"
+      source        = "$.source"
+      event_type    = "$.detail.eventType"
+      message_id    = "$.detail.mail.messageId"
+      delivery_id   = "$.detail.mail.tags.delivery_id[0]"
+      attempt_id    = "$.detail.mail.tags.attempt_id[0]"
+      reject_reason = "$.detail.reject.reason"
+    }
+    input_template = <<-JSON
+      {"version":<version>,"id":<id>,"detail-type":<detail_type>,"source":<source>,"detail":{"eventType":<event_type>,"mail":{"messageId":<message_id>,"tags":{"delivery_id":[<delivery_id>],"attempt_id":[<attempt_id>]}},"reject":{"reason":<reject_reason>}}}
+    JSON
+  }
 
   dead_letter_config {
     arn = aws_sqs_queue.ses_events_routing_dlq.arn

@@ -1,7 +1,7 @@
-from datetime import UTC, datetime
 import json
-from pathlib import Path
 import tomllib
+from datetime import UTC, datetime
+from pathlib import Path
 
 import pytest
 from pydantic import ValidationError
@@ -15,7 +15,6 @@ from limnopulse_api.domain.notification_preferences import (
     severity_meets_minimum,
     severity_rank,
 )
-
 
 NOW = datetime(2026, 7, 16, 12, 0, tzinfo=UTC)
 

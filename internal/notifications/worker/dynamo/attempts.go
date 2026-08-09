@@ -117,8 +117,12 @@ func (store Store) CompleteAttempt(
 	}
 	if completion.ProviderMessageID != "" {
 		valuesMap[":provider_message_id"] = completion.ProviderMessageID
+		valuesMap[":provider_attempt_id"] = completion.AttemptID
 		attemptSet = append(attemptSet, "#provider_message_id = :provider_message_id")
-		deliverySet = append(deliverySet, "#provider_message_id = :provider_message_id")
+		deliverySet = append(deliverySet,
+			"#provider_message_id = :provider_message_id",
+			"#provider_attempt_id = :provider_attempt_id",
+		)
 	}
 	if completion.ProviderOutcome != "" {
 		valuesMap[":provider_outcome"] = string(completion.ProviderOutcome)
@@ -152,7 +156,8 @@ func (store Store) CompleteAttempt(
 		"#possibly_accepted": "possibly_accepted", "#ambiguous_exhausted": "ambiguous_exhausted",
 		"#awaiting_intervention": "awaiting_intervention", "#error_category": "error_category",
 		"#last_error_category": "last_error_category", "#provider_message_id": "provider_message_id",
-		"#provider_outcome": "provider_outcome", "#next_attempt_at": "next_attempt_at",
+		"#provider_attempt_id": "provider_attempt_id", "#provider_outcome": "provider_outcome",
+		"#next_attempt_at": "next_attempt_at",
 	}
 	deliveryUpdate := "SET " + strings.Join(deliverySet, ", ") + " REMOVE #lease_owner, #lease_expires"
 	if completion.NextAttemptAt.IsZero() {

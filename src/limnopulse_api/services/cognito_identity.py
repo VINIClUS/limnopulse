@@ -1,5 +1,5 @@
-from collections.abc import Callable
 from asyncio import to_thread
+from collections.abc import Callable
 from datetime import UTC, datetime
 from typing import Any, Protocol
 
@@ -13,7 +13,6 @@ from limnopulse_api.core.errors import (
     IdentityEmailError,
     IdentityServiceUnavailableError,
 )
-
 
 COGNITO_GET_USER_SCOPE = "aws.cognito.signin.user.admin"
 

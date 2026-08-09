@@ -136,6 +136,7 @@ func Load(args []string, lookup LookupEnv) (RunConfig, error) {
 	fs.Float64Var(&config.MaxSendRate, "max-send-rate", config.MaxSendRate, "maximum provider calls per second")
 	fs.IntVar(&config.SendBurst, "send-burst", config.SendBurst, "send rate limiter burst")
 	fs.DurationVar(&config.ReceiveWait, "receive-wait", config.ReceiveWait, "SQS long-poll wait (0s disables only in local/test)")
+	fs.DurationVar(&config.InvalidVisibility, "invalid-visibility", config.InvalidVisibility, "visibility delay for invalid messages (short overrides only in local/test)")
 	if err := fs.Parse(args); err != nil {
 		return RunConfig{}, err
 	}
@@ -153,6 +154,9 @@ func Load(args []string, lookup LookupEnv) (RunConfig, error) {
 		}
 		if config.ReceiveWait == 0 {
 			return RunConfig{}, fmt.Errorf("zero receive wait is allowed only in local or test")
+		}
+		if config.InvalidVisibility != InvalidVisibility {
+			return RunConfig{}, fmt.Errorf("short invalid visibility is allowed only in local or test")
 		}
 	} else if config.AppEnv != "local" && config.AppEnv != "test" {
 		return RunConfig{}, fmt.Errorf("APP_ENV must be local, test, staging or prod")
@@ -193,6 +197,10 @@ func Load(args []string, lookup LookupEnv) (RunConfig, error) {
 	}
 	if config.ReceiveWait < 0 || config.ReceiveWait > 20*time.Second || config.ReceiveWait%time.Second != 0 {
 		return RunConfig{}, fmt.Errorf("receive wait must be a whole number of seconds between 0s and 20s")
+	}
+	if config.InvalidVisibility <= 0 || config.InvalidVisibility > 12*time.Hour ||
+		config.InvalidVisibility%time.Second != 0 {
+		return RunConfig{}, fmt.Errorf("invalid visibility must be a whole number of seconds between 1s and 12h")
 	}
 	return config, nil
 }

@@ -269,7 +269,7 @@ func TestAttemptTransactionsFenceLeaseAndNeverCopyRenderedContentOrEmail(t *test
 		t.Fatalf("complete transactions = %d", len(client.transactions))
 	}
 	complete := transactionText(client.transactions[1])
-	for _, required := range []string{"delivery_lease_owner", "delivery_lease_epoch", "last_attempt_id", "started", "succeeded", "accepted"} {
+	for _, required := range []string{"delivery_lease_owner", "delivery_lease_epoch", "last_attempt_id", "provider_attempt_id", "started", "succeeded", "accepted"} {
 		if !strings.Contains(complete, required) {
 			t.Errorf("completion transaction missing %q: %s", required, complete)
 		}

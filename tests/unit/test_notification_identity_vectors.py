@@ -4,7 +4,6 @@ import json
 import struct
 from pathlib import Path
 
-
 FIXTURE_PATH = (
     Path(__file__).resolve().parents[2] / "testdata" / "notification_identity_vectors.json"
 )

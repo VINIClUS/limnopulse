@@ -2,26 +2,26 @@ from contextlib import asynccontextmanager
 
 import boto3
 import redis.asyncio as redis
+from botocore.exceptions import BotoCoreError, ClientError
 from fastapi import FastAPI
 from fastapi.requests import Request
 from fastapi.responses import JSONResponse
-from botocore.exceptions import BotoCoreError, ClientError
 from influxdb_client import InfluxDBClient
 
-from limnopulse_api.adapters.dynamodb import DynamoDomainRepository
-from limnopulse_api.adapters.alert_rules import DynamoAlertRuleRepository
 from limnopulse_api.adapters.alert_events import DynamoAlertEventRepository
+from limnopulse_api.adapters.alert_rules import DynamoAlertRuleRepository
+from limnopulse_api.adapters.dynamodb import DynamoDomainRepository
+from limnopulse_api.adapters.influxdb import InfluxTelemetryRepository
 from limnopulse_api.adapters.notification_preferences import (
     DynamoNotificationPreferenceRepository,
 )
-from limnopulse_api.adapters.influxdb import InfluxTelemetryRepository
 from limnopulse_api.adapters.redis import RedisCacheRepository
 from limnopulse_api.api.router import api_router
 from limnopulse_api.auth.providers import build_auth_provider
 from limnopulse_api.core.config import Settings, get_settings
 from limnopulse_api.core.errors import TelemetryQueryError
-from limnopulse_api.services.memberships import MembershipService
 from limnopulse_api.services.cognito_identity import CognitoIdentityVerifier
+from limnopulse_api.services.memberships import MembershipService
 
 
 def _dynamodb_client_kwargs(settings: Settings) -> dict[str, str]:

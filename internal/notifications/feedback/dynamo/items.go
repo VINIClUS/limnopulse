@@ -2,6 +2,7 @@ package dynamo
 
 import (
 	"fmt"
+	"strings"
 	"time"
 
 	"github.com/VINIClUS/limnopulse/internal/notifications"
@@ -42,8 +43,10 @@ type deliveryRecord struct {
 	NormalizedEmail   string                         `dynamodbav:"normalized_email"`
 	State             notifications.DeliveryState    `dynamodbav:"state"`
 	Revision          int64                          `dynamodbav:"delivery_revision"`
+	LastAttemptID     string                         `dynamodbav:"last_attempt_id"`
 	ProviderOutcome   notifications.ProviderOutcome  `dynamodbav:"provider_outcome"`
 	ProviderMessageID string                         `dynamodbav:"provider_message_id"`
+	ProviderAttemptID string                         `dynamodbav:"provider_attempt_id"`
 	ProviderAccepted  bool                           `dynamodbav:"provider_accepted"`
 }
 
@@ -115,6 +118,9 @@ func decodeDelivery(
 	}
 	if stored.ProviderOutcome != "" && stored.ProviderOutcome.Validate() != nil {
 		return deliveryRecord{}, fmt.Errorf("notification delivery provider outcome is invalid")
+	}
+	if strings.ContainsRune(stored.LastAttemptID, '\x00') || strings.ContainsRune(stored.ProviderAttemptID, '\x00') {
+		return deliveryRecord{}, fmt.Errorf("notification delivery attempt ownership is invalid")
 	}
 	return stored, nil
 }

@@ -10,7 +10,6 @@ from limnopulse_api.auth.providers import build_auth_provider
 from limnopulse_api.core.config import Settings
 from limnopulse_api.core.errors import AuthError
 
-
 TEST_ISSUER = "https://cognito-idp.us-east-1.amazonaws.com/pool_1"
 
 

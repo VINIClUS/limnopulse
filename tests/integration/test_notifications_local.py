@@ -9,11 +9,12 @@ import struct
 import subprocess
 import time
 import uuid
+from collections.abc import Callable, Iterator
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from decimal import Decimal
 from pathlib import Path
-from typing import Any, Callable, Iterator
+from typing import Any
 
 import boto3
 import pytest
@@ -22,7 +23,6 @@ from botocore.exceptions import ClientError, EndpointConnectionError
 
 from scripts.dev.init_dynamodb import ensure_table
 from scripts.dev.publish_ses_event import build_ses_event, publish_event
-
 
 ROOT = Path(__file__).resolve().parents[2]
 RUN_INTEGRATION = os.getenv("RUN_NOTIFICATION_INTEGRATION") == "1"
@@ -230,17 +230,25 @@ def _base_environment(runtime: Runtime, mode: str) -> dict[str, str]:
     return environment
 
 
-def _start_worker(runtime: Runtime, mode: str = "success") -> subprocess.Popen[str]:
+def _start_worker(
+    runtime: Runtime,
+    mode: str = "success",
+    *,
+    invalid_visibility: str | None = None,
+) -> subprocess.Popen[str]:
+    command = [
+        str(runtime.binary),
+        "worker",
+        "--send-concurrency=1",
+        "--feedback-concurrency=1",
+        "--max-send-rate=100",
+        "--send-burst=1",
+        "--receive-wait=0s",
+    ]
+    if invalid_visibility is not None:
+        command.append(f"--invalid-visibility={invalid_visibility}")
     return subprocess.Popen(
-        [
-            str(runtime.binary),
-            "worker",
-            "--send-concurrency=1",
-            "--feedback-concurrency=1",
-            "--max-send-rate=100",
-            "--send-burst=1",
-            "--receive-wait=0s",
-        ],
+        command,
         cwd=ROOT,
         env=_base_environment(runtime, mode),
         stdout=subprocess.PIPE,
@@ -278,6 +286,7 @@ def _run_relay(runtime: Runtime, relay_time: datetime) -> dict[str, Any]:
         cwd=ROOT,
         env=_base_environment(runtime, "success"),
         capture_output=True,
+        check=False,
         text=True,
         timeout=60,
     )
@@ -467,11 +476,11 @@ def _seed_opening_and_recovery(runtime: Runtime, now: datetime) -> dict[str, str
             "device_id": "device_integration",
             "metric": "temp_c",
             "operator": ">",
-            "threshold": Decimal("30"),
+            "threshold": Decimal(30),
             "window_start": _fixed(now - timedelta(minutes=5)),
             "window_end": _fixed(now),
             "last_evaluated_at": _fixed(now),
-            "last_evaluation_value": Decimal("31"),
+            "last_evaluation_value": Decimal(31),
         }
     )
     for outbox_id, kind, status, work_kind, dependency in (
@@ -563,7 +572,7 @@ def test_multiprocess_happy_path_recovery_dependency_feedback_and_suppression(
                     f"NOTIFICATION_OUTBOX#{identity['opening_outbox']}",
                     f"DELIVERY#{identity['opening_delivery']}",
                 ),
-                lambda item: item.get("provider_outcome") == wanted,
+                lambda item, wanted=wanted: item.get("provider_outcome") == wanted,
             )
 
         suppression_key = "EMAIL_IDENTITY#" + hashlib.sha256(identity["email"].encode()).hexdigest()
@@ -571,9 +580,6 @@ def test_multiprocess_happy_path_recovery_dependency_feedback_and_suppression(
         assert suppression["deliverability"] == "suppressed"
         assert suppression["suppression_reason"] == "complaint"
         assert "normalized_email" not in suppression
-    except BaseException as error:
-        summary = _stop_worker(worker)
-        pytest.fail(f"notification flow did not complete: {error}; summary={summary}")
     finally:
         if worker.poll() is None:
             _stop_worker(worker)
@@ -656,14 +662,6 @@ def test_crash_republication_and_duplicate_job_create_one_attempt(runtime: Runti
         assert summary["visibility_changed"] == 0
         duplicate = _read_item(runtime, f"NOTIFICATION_OUTBOX#{outbox}", f"DELIVERY#{delivery}")
         assert duplicate["attempt_count"] == 1
-    except BaseException as error:
-        summary = _stop_worker(worker)
-        durable = _read_item(runtime, f"NOTIFICATION_OUTBOX#{outbox}", f"DELIVERY#{delivery}")
-        pytest.fail(
-            "crash-republication flow did not complete: "
-            f"{error}; state={durable.get('state')} "
-            f"attempt_count={durable.get('attempt_count', 0)} summary={summary}"
-        )
     finally:
         if worker.poll() is None:
             _stop_worker(worker)
@@ -690,10 +688,71 @@ def test_retry_ambiguous_confirmation_and_no_feedback_unknown(runtime: Runtime) 
     retry_worker = _start_worker(runtime, "retryable")
     try:
         retried = _wait_delivery(runtime, retry[0], retry[1], "retryable_failed")
-        assert retried["attempt_count"] >= 1
+        assert retried["attempt_count"] == 1
         assert retried["last_error_category"] == "retryable_service_unavailable"
     finally:
         _stop_worker(retry_worker)
+
+    first_attempt_id = retried["last_attempt_id"]
+    runtime.table.update_item(
+        Key={"PK": f"NOTIFICATION_OUTBOX#{retry[0]}", "SK": f"DELIVERY#{retry[1]}"},
+        UpdateExpression="SET next_attempt_at = :due",
+        ConditionExpression="#state = :retryable AND attempt_count = :one",
+        ExpressionAttributeNames={"#state": "state"},
+        ExpressionAttributeValues={
+            ":due": _fixed(datetime.now(UTC) - timedelta(seconds=1)),
+            ":retryable": "retryable_failed",
+            ":one": 1,
+        },
+    )
+    _send_job(runtime, tenant, *retry)
+    retry_success_worker = _start_worker(runtime, "success")
+    try:
+        succeeded_after_retry = _wait_delivery(runtime, retry[0], retry[1], "succeeded")
+        assert succeeded_after_retry["attempt_count"] == 2
+        assert succeeded_after_retry["last_attempt_id"] != first_attempt_id
+        assert succeeded_after_retry["provider_attempt_id"] == succeeded_after_retry["last_attempt_id"]
+        attempts = runtime.table.query(
+            KeyConditionExpression="PK = :pk AND begins_with(SK, :attempt)",
+            ExpressionAttributeValues={
+                ":pk": f"NOTIFICATION_DELIVERY#{retry[1]}",
+                ":attempt": "ATTEMPT#",
+            },
+            ConsistentRead=True,
+        )["Items"]
+        assert {attempt["attempt_id"] for attempt in attempts} == {
+            first_attempt_id,
+            succeeded_after_retry["last_attempt_id"],
+        }
+        assert {attempt["outcome"] for attempt in attempts} == {"retryable", "succeeded"}
+
+        # A terminal duplicate is deleted without starting a third Attempt.
+        _send_job(runtime, tenant, *retry)
+        _wait_for(
+            lambda: runtime.sqs.get_queue_attributes(
+                QueueUrl=runtime.jobs_url,
+                AttributeNames=[
+                    "ApproximateNumberOfMessages",
+                    "ApproximateNumberOfMessagesNotVisible",
+                ],
+            )["Attributes"],
+            lambda attrs: (
+                attrs["ApproximateNumberOfMessages"] == "0"
+                and attrs["ApproximateNumberOfMessagesNotVisible"] == "0"
+            ),
+            timeout=40,
+        )
+        retry_summary = _stop_worker(retry_success_worker)
+        assert retry_summary["messages_deleted"] >= 2
+        assert retry_summary["visibility_changed"] == 0
+        assert _read_item(
+            runtime,
+            f"NOTIFICATION_OUTBOX#{retry[0]}",
+            f"DELIVERY#{retry[1]}",
+        )["attempt_count"] == 2
+    finally:
+        if retry_success_worker.poll() is None:
+            _stop_worker(retry_success_worker)
 
     ambiguous_event = "evt_ambiguous"
     ambiguous = (
@@ -843,27 +902,43 @@ def test_elasticmq_redrives_after_eight_receives_without_automatic_dlq_consumpti
     runtime: Runtime,
 ) -> None:
     runtime.sqs.send_message(QueueUrl=runtime.events_url, MessageBody="not-json")
-    receive_count = 0
-    for _ in range(12):
-        response = runtime.sqs.receive_message(
-            QueueUrl=runtime.events_url,
-            MaxNumberOfMessages=1,
-            WaitTimeSeconds=0,
-            VisibilityTimeout=0,
-            AttributeNames=["ApproximateReceiveCount"],
+    worker = _start_worker(runtime, invalid_visibility="1s")
+    try:
+        _wait_for(
+            lambda: runtime.sqs.get_queue_attributes(
+                QueueUrl=runtime.events_dlq_url,
+                AttributeNames=["ApproximateNumberOfMessages"],
+            )["Attributes"],
+            lambda attrs: attrs["ApproximateNumberOfMessages"] == "1",
+            timeout=20,
         )
-        messages = response.get("Messages", [])
-        if not messages:
-            break
-        receive_count = int(messages[0]["Attributes"]["ApproximateReceiveCount"])
-    assert receive_count == 8
-    dlq = _wait_for(
-        lambda: runtime.sqs.receive_message(
-            QueueUrl=runtime.events_dlq_url,
-            MaxNumberOfMessages=1,
-            WaitTimeSeconds=0,
-            VisibilityTimeout=30,
-        ).get("Messages", []),
-        bool,
-    )
+        summary = _stop_worker(worker)
+    finally:
+        if worker.poll() is None:
+            _stop_worker(worker)
+
+    feedback_summary = summary["consumers"]["ses_feedback"]
+    assert feedback_summary["messages_received"] == 8
+    assert feedback_summary["messages_deleted"] == 0
+    assert feedback_summary["visibility_changed"] == 8
+    assert feedback_summary["error_categories"]["invalid_feedback"] == 8
+    assert summary["feedback_metrics"]["malformed"] == 8
+    source = runtime.sqs.get_queue_attributes(
+        QueueUrl=runtime.events_url,
+        AttributeNames=["ApproximateNumberOfMessages", "ApproximateNumberOfMessagesNotVisible"],
+    )["Attributes"]
+    assert source == {
+        "ApproximateNumberOfMessages": "0",
+        "ApproximateNumberOfMessagesNotVisible": "0",
+    }
+
+    # Inspect only after the worker exits; its feedback consumer is wired to
+    # the source queue and never drains the DLQ.
+    dlq = runtime.sqs.receive_message(
+        QueueUrl=runtime.events_dlq_url,
+        MaxNumberOfMessages=1,
+        WaitTimeSeconds=0,
+        VisibilityTimeout=30,
+    ).get("Messages", [])
+    assert len(dlq) == 1
     assert dlq[0]["Body"] == "not-json"
