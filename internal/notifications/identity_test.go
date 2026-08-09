@@ -189,6 +189,20 @@ func TestDurableStorageKeysRejectEmptyAndNULInputs(t *testing.T) {
 	}
 }
 
+func TestDeliverabilityStorageKeyCanonicalizesEmailCasing(t *testing.T) {
+	lower, err := DeliverabilityStorageKey("owner@example.com")
+	if err != nil {
+		t.Fatal(err)
+	}
+	upper, err := DeliverabilityStorageKey("Owner@Example.COM")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if upper != lower {
+		t.Fatalf("uppercase key = %#v, lowercase key = %#v", upper, lower)
+	}
+}
+
 func loadIdentityFixture(t *testing.T) identityFixture {
 	t.Helper()
 	path := filepath.Join("..", "..", "testdata", "notification_identity_vectors.json")

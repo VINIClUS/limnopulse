@@ -123,7 +123,7 @@ func DeliverabilityStorageKey(normalizedEmail string) (StorageKey, error) {
 	if err := validateIdentityField("normalized email", normalizedEmail); err != nil {
 		return StorageKey{}, err
 	}
-	digest := sha256.Sum256([]byte(normalizedEmail))
+	digest := sha256.Sum256([]byte(strings.ToLower(normalizedEmail)))
 	return StorageKey{
 		PartitionKey: "EMAIL_IDENTITY#" + hex.EncodeToString(digest[:]),
 		SortKey:      "DELIVERABILITY",

@@ -216,7 +216,7 @@ class DynamoNotificationPreferenceRepository:
         }
 
     def _email_hash(self, address: str) -> str:
-        return sha256(address.encode("ascii")).hexdigest()
+        return sha256(address.lower().encode("ascii")).hexdigest()
 
     def _get_item(
         self,

@@ -202,6 +202,28 @@ async def test_deliverability_lookup_reads_go_feedback_suppression_row() -> None
 
 
 @pytest.mark.asyncio
+async def test_deliverability_lookup_canonicalizes_email_casing() -> None:
+    client = RecordingDynamoClient()
+    digest = sha256(b"verified@example.com").hexdigest()
+    client.seed(
+        "domain",
+        {
+            "PK": f"EMAIL_IDENTITY#{digest}",
+            "SK": "DELIVERABILITY",
+            "deliverability": "suppressed",
+            "suppression_reason": "hard_bounce",
+        },
+    )
+    repository = DynamoNotificationPreferenceRepository("domain", "audit", client)
+
+    record = await repository.get_email_deliverability("Verified@Example.COM")
+
+    assert record is not None
+    assert record.deliverability is EmailDeliverability.SUPPRESSED
+    assert record.suppression_reason == "hard_bounce"
+
+
+@pytest.mark.asyncio
 async def test_create_conditionally_persists_preference_and_redacted_audit_atomically() -> None:
     client = RecordingDynamoClient()
     repository = DynamoNotificationPreferenceRepository(
