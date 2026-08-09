@@ -58,7 +58,7 @@ func (queue Queue) Receive(
 		body := aws.ToString(message.Body)
 		receipt := aws.ToString(message.ReceiptHandle)
 		messageID := aws.ToString(message.MessageId)
-		if body == "" || receipt == "" || messageID == "" {
+		if receipt == "" || messageID == "" {
 			return nil, fmt.Errorf("received notification job is malformed")
 		}
 		receiveCount := 0

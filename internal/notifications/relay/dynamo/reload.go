@@ -11,38 +11,43 @@ import (
 	"github.com/aws/aws-sdk-go-v2/aws"
 	"github.com/aws/aws-sdk-go-v2/feature/dynamodb/attributevalue"
 	awssdk "github.com/aws/aws-sdk-go-v2/service/dynamodb"
+	"github.com/aws/aws-sdk-go-v2/service/dynamodb/types"
 )
 
 type relayItem struct {
-	PK                  string                         `dynamodbav:"PK"`
-	SK                  string                         `dynamodbav:"SK"`
-	EntityType          string                         `dynamodbav:"entity_type"`
-	TenantID            string                         `dynamodbav:"tenant_id"`
-	OutboxID            string                         `dynamodbav:"outbox_id"`
-	DeliveryID          string                         `dynamodbav:"delivery_id"`
-	EventID             string                         `dynamodbav:"event_id"`
-	RuleID              string                         `dynamodbav:"rule_id"`
-	DependsOnOutboxID   string                         `dynamodbav:"depends_on_outbox_id"`
-	Kind                notifications.NotificationKind `dynamodbav:"kind"`
-	Channel             notifications.Channel          `dynamodbav:"channel"`
-	ExpansionStatus     string                         `dynamodbav:"expansion_status"`
-	ExpansionRevision   int64                          `dynamodbav:"expansion_revision"`
-	ExpansionCursor     string                         `dynamodbav:"expansion_cursor"`
-	ExpansionStartedAt  string                         `dynamodbav:"expansion_started_at"`
-	RecipientsExamined  int                            `dynamodbav:"recipients_examined"`
-	DeliveriesCreated   int                            `dynamodbav:"deliveries_created"`
-	DeliveriesCancelled int                            `dynamodbav:"deliveries_cancelled"`
-	RecipientsFiltered  int                            `dynamodbav:"recipients_filtered"`
-	DeliveryState       string                         `dynamodbav:"state"`
-	DeliveryRevision    int64                          `dynamodbav:"delivery_revision"`
-	AvailableAt         string                         `dynamodbav:"available_at"`
-	RelaySchemaVersion  int64                          `dynamodbav:"relay_schema_version"`
-	RelayWorkKind       notifications.WorkKind         `dynamodbav:"relay_work_kind"`
-	RelayPK             string                         `dynamodbav:"relay_gsi_pk"`
-	RelaySK             string                         `dynamodbav:"relay_gsi_sk"`
-	RelayLeaseOwner     string                         `dynamodbav:"relay_lease_owner"`
-	RelayLeaseEpoch     int64                          `dynamodbav:"relay_lease_epoch"`
-	Traceparent         string                         `dynamodbav:"traceparent"`
+	PK                    string                         `dynamodbav:"PK"`
+	SK                    string                         `dynamodbav:"SK"`
+	EntityType            string                         `dynamodbav:"entity_type"`
+	TenantID              string                         `dynamodbav:"tenant_id"`
+	OutboxID              string                         `dynamodbav:"outbox_id"`
+	DeliveryID            string                         `dynamodbav:"delivery_id"`
+	EventID               string                         `dynamodbav:"event_id"`
+	RuleID                string                         `dynamodbav:"rule_id"`
+	DependsOnOutboxID     string                         `dynamodbav:"depends_on_outbox_id"`
+	Kind                  notifications.NotificationKind `dynamodbav:"kind"`
+	Channel               notifications.Channel          `dynamodbav:"channel"`
+	ExpansionStatus       string                         `dynamodbav:"expansion_status"`
+	ExpansionRevision     int64                          `dynamodbav:"expansion_revision"`
+	ExpansionCursor       string                         `dynamodbav:"expansion_cursor"`
+	ExpansionStartedAt    string                         `dynamodbav:"expansion_started_at"`
+	RecipientsExamined    int                            `dynamodbav:"recipients_examined"`
+	DeliveriesCreated     int                            `dynamodbav:"deliveries_created"`
+	DeliveriesCancelled   int                            `dynamodbav:"deliveries_cancelled"`
+	RecipientsFiltered    int                            `dynamodbav:"recipients_filtered"`
+	DeliveryState         string                         `dynamodbav:"state"`
+	DeliveryRevision      int64                          `dynamodbav:"delivery_revision"`
+	AvailableAt           string                         `dynamodbav:"available_at"`
+	RelaySchemaVersion    int64                          `dynamodbav:"relay_schema_version"`
+	RelayWorkKind         notifications.WorkKind         `dynamodbav:"relay_work_kind"`
+	RelayPK               string                         `dynamodbav:"relay_gsi_pk"`
+	RelaySK               string                         `dynamodbav:"relay_gsi_sk"`
+	RelayLeaseOwner       string                         `dynamodbav:"relay_lease_owner"`
+	RelayLeaseEpoch       int64                          `dynamodbav:"relay_lease_epoch"`
+	Traceparent           string                         `dynamodbav:"traceparent"`
+	EvaluationWindowStart string                         `dynamodbav:"evaluation_window_start"`
+	EvaluationWindowEnd   string                         `dynamodbav:"evaluation_window_end"`
+	EvaluatedAt           string                         `dynamodbav:"evaluated_at"`
+	EvaluationValue       *float64                       `dynamodbav:"evaluation_value"`
 }
 
 func (store Store) Reload(
@@ -149,6 +154,10 @@ func (store Store) Reload(
 			return relay.Work{}, false, fmt.Errorf("decode expansion start time: %w", err)
 		}
 	}
+	evaluation, err := evaluationSnapshotFromItem(output.Item, item)
+	if err != nil {
+		return relay.Work{}, false, err
+	}
 	return relay.Work{
 		Candidate: candidate, TenantID: item.TenantID, ItemID: itemID,
 		OutboxID: item.OutboxID, DeliveryID: item.DeliveryID, EventID: item.EventID, RuleID: item.RuleID,
@@ -158,5 +167,42 @@ func (store Store) Reload(
 		DeliveriesCreated: item.DeliveriesCreated, DeliveriesCancelled: item.DeliveriesCancelled,
 		RecipientsFiltered: item.RecipientsFiltered, LeaseOwner: item.RelayLeaseOwner,
 		LeaseEpoch: item.RelayLeaseEpoch, Traceparent: item.Traceparent,
+		Evaluation: evaluation,
 	}, true, nil
+}
+
+func evaluationSnapshotFromItem(
+	attributes map[string]types.AttributeValue,
+	item relayItem,
+) (relay.EvaluationSnapshot, error) {
+	_, hasStart := attributes["evaluation_window_start"]
+	_, hasEnd := attributes["evaluation_window_end"]
+	_, hasEvaluatedAt := attributes["evaluated_at"]
+	_, hasValue := attributes["evaluation_value"]
+	if !hasStart && !hasEnd && !hasEvaluatedAt && !hasValue {
+		return relay.EvaluationSnapshot{}, nil
+	}
+	if !hasStart || !hasEnd || !hasEvaluatedAt {
+		return relay.EvaluationSnapshot{}, fmt.Errorf("relay evaluation snapshot is incomplete")
+	}
+	windowStart, err := time.Parse(fixedUTCLayout, item.EvaluationWindowStart)
+	if err != nil {
+		return relay.EvaluationSnapshot{}, fmt.Errorf("decode relay evaluation window start: %w", err)
+	}
+	windowEnd, err := time.Parse(fixedUTCLayout, item.EvaluationWindowEnd)
+	if err != nil {
+		return relay.EvaluationSnapshot{}, fmt.Errorf("decode relay evaluation window end: %w", err)
+	}
+	evaluatedAt, err := time.Parse(fixedUTCLayout, item.EvaluatedAt)
+	if err != nil {
+		return relay.EvaluationSnapshot{}, fmt.Errorf("decode relay evaluation time: %w", err)
+	}
+	snapshot := relay.EvaluationSnapshot{
+		WindowStart: windowStart, WindowEnd: windowEnd, EvaluatedAt: evaluatedAt,
+		Value: item.EvaluationValue,
+	}
+	if err := snapshot.Validate(); err != nil {
+		return relay.EvaluationSnapshot{}, fmt.Errorf("validate relay evaluation snapshot: %w", err)
+	}
+	return snapshot, nil
 }

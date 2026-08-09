@@ -77,6 +77,41 @@ func TestSenderUsesImmutableDeliveryAndExactNoPIITags(t *testing.T) {
 	}
 }
 
+func TestSenderPreflightValidatesFromIdentityBeforeLimiterOrSES(t *testing.T) {
+	request := testSendRequest(t)
+	for _, value := range []string{
+		"missing-at-sign",
+		"alerts@example.com, other@example.com",
+		"Limnopulse <alerts@example.com",
+		"alerts@example.com\r\nBcc: private@example.com",
+	} {
+		t.Run(value, func(t *testing.T) {
+			client := &fakeSESClient{output: &awsses.SendEmailOutput{MessageId: aws.String("must_not_send")}}
+			sender := Sender{
+				Client: client, FromEmail: value,
+				ConfigurationSet: "limnopulse-notifications", Timeout: 15 * time.Second,
+			}
+			err := sender.Preflight(request)
+			var sendErr *worker.SendError
+			if !errors.As(err, &sendErr) || sendErr.Category != worker.ErrorFatalFromIdentity ||
+				client.calls.Load() != 0 {
+				t.Fatalf("from=%q err=%#v SES_calls=%d", value, err, client.calls.Load())
+			}
+		})
+	}
+
+	client := &fakeSESClient{output: &awsses.SendEmailOutput{MessageId: aws.String("ses_friendly")}}
+	sender := Sender{
+		Client: client, FromEmail: "Limnopulse <alerts@example.com>",
+		ConfigurationSet: "limnopulse-notifications", Timeout: 15 * time.Second,
+	}
+	result, err := sender.Send(context.Background(), request)
+	if err != nil || result.ProviderMessageID != "ses_friendly" || client.calls.Load() != 1 ||
+		aws.ToString(client.input.FromEmailAddress) != "Limnopulse <alerts@example.com>" {
+		t.Fatalf("friendly sender result=%#v err=%v input=%#v calls=%d", result, err, client.input, client.calls.Load())
+	}
+}
+
 func TestSenderClassifiesOnlyDefinitelyInvalidRecipientAsPermanent(t *testing.T) {
 	t.Run("locally invalid recipient is permanent before AWS", func(t *testing.T) {
 		client := &fakeSESClient{output: &awsses.SendEmailOutput{MessageId: aws.String("must_not_send")}}

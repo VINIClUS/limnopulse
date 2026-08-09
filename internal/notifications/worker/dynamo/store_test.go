@@ -182,6 +182,65 @@ func TestAcquireDefersAmbiguousExhaustionUntilFinalGrace(t *testing.T) {
 	}
 }
 
+func TestAcquireTreatsInterventionTimestampAsRepairHold(t *testing.T) {
+	now := testNow()
+	t.Run("future hold remains deferred", func(t *testing.T) {
+		item := testDeliveryItem(t, notifications.DeliveryStateRetryableFailed)
+		item["awaiting_intervention"] = true
+		item["next_attempt_at"] = now.Add(15 * time.Minute).Format(time.RFC3339Nano)
+		client := &fakeClient{getItems: []map[string]types.AttributeValue{marshal(t, item)}}
+
+		result, err := (Store{Table: "domain", Client: client}).Acquire(
+			context.Background(), testJob(t), worker.ClaimRequest{
+				Owner: "worker_1", Now: now, ExpiresAt: now.Add(time.Minute),
+			},
+		)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if result.Disposition != worker.AcquireDeferred || result.RetryAfter != 15*time.Minute ||
+			len(client.updates) != 0 {
+			t.Fatalf("future intervention hold result=%#v updates=%d", result, len(client.updates))
+		}
+	})
+
+	t.Run("due hold is claimed and cleared atomically", func(t *testing.T) {
+		item := testDeliveryItem(t, notifications.DeliveryStateRetryableFailed)
+		item["awaiting_intervention"] = true
+		item["next_attempt_at"] = now.Add(-time.Second).Format(time.RFC3339Nano)
+		claimed := cloneMap(item)
+		claimed["state"] = string(notifications.DeliveryStateProcessing)
+		claimed["delivery_revision"] = int64(4)
+		claimed["delivery_lease_owner"] = "worker_1"
+		claimed["delivery_lease_epoch"] = int64(1)
+		claimed["delivery_lease_expires_at"] = now.Add(time.Minute).Format(time.RFC3339Nano)
+		delete(claimed, "awaiting_intervention")
+		delete(claimed, "next_attempt_at")
+		client := &fakeClient{
+			getItems:    []map[string]types.AttributeValue{marshal(t, item)},
+			updateItems: []map[string]types.AttributeValue{marshal(t, claimed)},
+		}
+
+		result, err := (Store{Table: "domain", Client: client}).Acquire(
+			context.Background(), testJob(t), worker.ClaimRequest{
+				Owner: "worker_1", Now: now, ExpiresAt: now.Add(time.Minute),
+			},
+		)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if result.Disposition != worker.AcquireClaimed || result.Record.AwaitingIntervention ||
+			!result.Record.NextAttemptAt.IsZero() || len(client.updates) != 1 {
+			t.Fatalf("due intervention hold result=%#v updates=%d", result, len(client.updates))
+		}
+		update := client.updates[0]
+		if !strings.Contains(*update.ConditionExpression, "#revision = :revision") ||
+			!strings.Contains(*update.UpdateExpression, "REMOVE #next_attempt_at, #awaiting_intervention") {
+			t.Fatalf("intervention repair claim condition=%s update=%s", *update.ConditionExpression, *update.UpdateExpression)
+		}
+	})
+}
+
 func TestAcquireMalformedProviderOutcomeAwaitsDLQWithoutClaim(t *testing.T) {
 	now := testNow()
 	item := testDeliveryItem(t, notifications.DeliveryStateQueued)

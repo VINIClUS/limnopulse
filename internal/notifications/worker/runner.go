@@ -121,31 +121,36 @@ receiveLoop:
 			break receiveLoop
 		default:
 		}
-		messages, err := runner.Queue.Receive(receiveCtx, runner.ReceiveBatch, runner.ReceiveWait, runner.Visibility)
+		reserved, ok := reserveCapacity(receiveCtx, fatal.signal, semaphore, runner.ReceiveBatch)
+		if !ok {
+			break receiveLoop
+		}
+		messages, err := runner.Queue.Receive(receiveCtx, reserved, runner.ReceiveWait, runner.Visibility)
 		if err != nil {
+			releaseCapacity(semaphore, reserved)
 			if receiveCtx.Err() != nil {
 				break receiveLoop
 			}
 			fatal.record("queue_receive_failure")
 			break receiveLoop
 		}
+		if len(messages) > reserved {
+			releaseCapacity(semaphore, reserved)
+			fatal.record("queue_receive_contract_failure")
+			break receiveLoop
+		}
+		releaseCapacity(semaphore, reserved-len(messages))
 		collector.addReceived(len(messages))
-		for _, message := range messages {
+		for index, message := range messages {
 			if admissionStopped(receiveCtx, fatal.signal) {
-				break receiveLoop
-			}
-			select {
-			case semaphore <- struct{}{}:
-			case <-fatal.signal:
-				break receiveLoop
-			case <-receiveCtx.Done():
+				releaseCapacity(semaphore, len(messages)-index)
 				break receiveLoop
 			}
 			if runner.afterSlotAcquired != nil {
 				runner.afterSlotAcquired(message)
 			}
 			if admissionStopped(receiveCtx, fatal.signal) {
-				<-semaphore
+				releaseCapacity(semaphore, len(messages)-index)
 				break receiveLoop
 			}
 			inflight.Add(1)
@@ -182,6 +187,37 @@ receiveLoop:
 		collector.setFatal()
 	}
 	return collector.snapshot()
+}
+
+func reserveCapacity(
+	ctx context.Context,
+	fatal <-chan struct{},
+	semaphore chan struct{},
+	limit int,
+) (int, bool) {
+	select {
+	case semaphore <- struct{}{}:
+	case <-fatal:
+		return 0, false
+	case <-ctx.Done():
+		return 0, false
+	}
+	reserved := 1
+	for reserved < limit {
+		select {
+		case semaphore <- struct{}{}:
+			reserved++
+		default:
+			return reserved, true
+		}
+	}
+	return reserved, true
+}
+
+func releaseCapacity(semaphore chan struct{}, count int) {
+	for range count {
+		<-semaphore
+	}
 }
 
 func admissionStopped(ctx context.Context, fatal <-chan struct{}) bool {

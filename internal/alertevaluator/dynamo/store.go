@@ -327,6 +327,12 @@ func (store Store) outboxPut(request alertevaluator.CommitRequest, outbox alerte
 		"event_id": eventID, "tenant_id": request.Work.Rule.TenantID, "rule_id": request.Work.Rule.RuleID,
 		"channel": string(outbox.Channel), "kind": string(outbox.Kind), "status": string(outbox.Status),
 		"depends_on_outbox_id": outbox.DependsOnOutboxID, "created_at": createdAt,
+		"evaluation_window_start": alertevaluator.FixedUTCTimestamp(request.Slot.Add(-request.Work.Rule.Window)),
+		"evaluation_window_end":   alertevaluator.FixedUTCTimestamp(request.Slot),
+		"evaluated_at":            alertevaluator.FixedUTCTimestamp(request.Slot),
+	}
+	if request.Evaluation.Quality == alertevaluator.QualitySufficient {
+		values["evaluation_value"] = request.Evaluation.Value
 	}
 	if outbox.Channel == alertevaluator.ChannelEmail {
 		workKind, err := notifications.ClassifyOutboxRelayWork(

@@ -2,10 +2,35 @@ package relay
 
 import (
 	"context"
+	"fmt"
+	"math"
 	"time"
 
 	"github.com/VINIClUS/limnopulse/internal/notifications"
 )
+
+type EvaluationSnapshot struct {
+	WindowStart time.Time
+	WindowEnd   time.Time
+	EvaluatedAt time.Time
+	Value       *float64
+}
+
+func (snapshot EvaluationSnapshot) Present() bool {
+	return !snapshot.WindowStart.IsZero() || !snapshot.WindowEnd.IsZero() ||
+		!snapshot.EvaluatedAt.IsZero() || snapshot.Value != nil
+}
+
+func (snapshot EvaluationSnapshot) Validate() error {
+	if snapshot.WindowStart.IsZero() || snapshot.WindowEnd.IsZero() || snapshot.EvaluatedAt.IsZero() ||
+		!snapshot.WindowEnd.After(snapshot.WindowStart) {
+		return fmt.Errorf("evaluation snapshot timestamps are invalid")
+	}
+	if snapshot.Value != nil && (math.IsNaN(*snapshot.Value) || math.IsInf(*snapshot.Value, 0)) {
+		return fmt.Errorf("evaluation snapshot value is invalid")
+	}
+	return nil
+}
 
 type Candidate struct {
 	PK          string
@@ -51,6 +76,7 @@ type Work struct {
 	LeaseOwner          string
 	LeaseEpoch          int64
 	Traceparent         string
+	Evaluation          EvaluationSnapshot
 }
 
 type LeaseRequest struct {

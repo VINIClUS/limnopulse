@@ -23,6 +23,7 @@ import (
 const DefaultTimeout = 15 * time.Second
 
 var sesTagValue = regexp.MustCompile(`^[A-Za-z0-9_-]{1,256}$`)
+var sourceDisplayName = regexp.MustCompile(`^[A-Za-z0-9][A-Za-z0-9 ._'-]{0,63}$`)
 
 type Client interface {
 	SendEmail(context.Context, *awsses.SendEmailInput, ...func(*awsses.Options)) (*awsses.SendEmailOutput, error)
@@ -66,11 +67,12 @@ func WrapCredentials(provider aws.CredentialsProvider) aws.CredentialsProvider {
 }
 
 func (sender Sender) Preflight(request worker.SendRequest) error {
-	if sender.Client == nil || strings.TrimSpace(sender.FromEmail) == "" ||
-		strings.ContainsAny(sender.FromEmail, "\r\n") ||
-		(worker.SESConfigurationSetName(sender.ConfigurationSet)).Validate() != nil ||
+	if sender.Client == nil || (worker.SESConfigurationSetName(sender.ConfigurationSet)).Validate() != nil ||
 		request.AttemptID == "" || request.AttemptNumber < 1 {
 		return worker.NewSendError(worker.ErrorFatalConfigurationSet, errors.New("SES sender configuration is invalid"))
+	}
+	if err := validateSource(sender.FromEmail); err != nil {
+		return worker.NewSendError(worker.ErrorFatalFromIdentity, err)
 	}
 	if _, err := notifications.RestoreDelivery(request.Delivery); err != nil ||
 		request.Delivery.State != notifications.DeliveryStateProcessing || request.Delivery.Channel != notifications.ChannelEmail {
@@ -168,6 +170,32 @@ func validateRecipient(value string) error {
 	domain := value[at+1:]
 	if !strings.ContainsRune(domain, '.') || strings.HasPrefix(domain, ".") || strings.HasSuffix(domain, ".") {
 		return errors.New("SES recipient is invalid")
+	}
+	return nil
+}
+
+func validateSource(value string) error {
+	if value == "" || value != strings.TrimSpace(value) || strings.ContainsAny(value, "\r\n") {
+		return errors.New("SES source identity is invalid")
+	}
+	for index := 0; index < len(value); index++ {
+		if value[index] > 0x7f || value[index] < 0x20 {
+			return errors.New("SES source identity is invalid")
+		}
+	}
+	parsed, err := mail.ParseAddress(value)
+	if err != nil || validateRecipient(parsed.Address) != nil {
+		return errors.New("SES source identity is invalid")
+	}
+	if parsed.Name == "" {
+		if value != parsed.Address {
+			return errors.New("SES source identity is invalid")
+		}
+		return nil
+	}
+	display := strings.TrimSpace(strings.TrimSuffix(value, "<"+parsed.Address+">"))
+	if !sourceDisplayName.MatchString(display) || value != display+" <"+parsed.Address+">" || parsed.Name != display {
+		return errors.New("SES source identity is invalid")
 	}
 	return nil
 }

@@ -215,6 +215,13 @@ func (store Store) getConsistent(
 }
 
 func (event eventSnapshot) templateData() (notifications.EmailTemplateData, error) {
+	return event.templateDataFor(notifications.NotificationKindOpening, relay.EvaluationSnapshot{})
+}
+
+func (event eventSnapshot) templateDataFor(
+	kind notifications.NotificationKind,
+	snapshot relay.EvaluationSnapshot,
+) (notifications.EmailTemplateData, error) {
 	unit, err := metricUnit(event.Metric)
 	if err != nil {
 		return notifications.EmailTemplateData{}, err
@@ -227,14 +234,43 @@ func (event eventSnapshot) templateData() (notifications.EmailTemplateData, erro
 	if err != nil {
 		return notifications.EmailTemplateData{}, fmt.Errorf("event window end is invalid")
 	}
-	evaluatedAt, err := time.Parse(time.RFC3339Nano, event.LastEvaluatedAt)
-	if err != nil {
-		return notifications.EmailTemplateData{}, fmt.Errorf("event evaluation time is invalid")
+	var observedValue *float64
+	evaluatedAt := windowEnd
+	if snapshot.Present() {
+		if err := snapshot.Validate(); err != nil {
+			return notifications.EmailTemplateData{}, err
+		}
+		windowStart = snapshot.WindowStart
+		windowEnd = snapshot.WindowEnd
+		evaluatedAt = snapshot.EvaluatedAt
+		observedValue = snapshot.Value
+	} else {
+		lastEvaluatedAt, parseErr := time.Parse(time.RFC3339Nano, event.LastEvaluatedAt)
+		if parseErr != nil {
+			return notifications.EmailTemplateData{}, fmt.Errorf("event evaluation time is invalid")
+		}
+		switch kind {
+		case notifications.NotificationKindOpening:
+			if lastEvaluatedAt.Equal(windowEnd) {
+				observedValue = event.LastEvaluationValue
+			}
+		case notifications.NotificationKindRecovery:
+			duration := windowEnd.Sub(windowStart)
+			if duration <= 0 {
+				return notifications.EmailTemplateData{}, fmt.Errorf("event evaluation window is invalid")
+			}
+			windowEnd = lastEvaluatedAt
+			windowStart = lastEvaluatedAt.Add(-duration)
+			evaluatedAt = lastEvaluatedAt
+			observedValue = event.LastEvaluationValue
+		default:
+			return notifications.EmailTemplateData{}, kind.Validate()
+		}
 	}
 	return notifications.EmailTemplateData{
 		RuleName: event.RuleName, Severity: event.Severity, TenantID: event.TenantID,
 		PondID: event.PondID, DeviceID: event.DeviceID, Metric: event.Metric, Unit: unit,
-		Operator: event.Operator, Threshold: event.Threshold, ObservedValue: event.LastEvaluationValue,
+		Operator: event.Operator, Threshold: event.Threshold, ObservedValue: observedValue,
 		EvaluationWindow: windowEnd.Sub(windowStart), WindowStart: windowStart,
 		WindowEnd: windowEnd, EvaluatedAt: evaluatedAt, EventID: event.EventID,
 	}, nil

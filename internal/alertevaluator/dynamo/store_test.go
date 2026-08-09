@@ -211,13 +211,21 @@ func TestCommitOpeningAtomicallyWritesEventTransitionAndOutboxes(t *testing.T) {
 	if email["channel"] != "email" || email["kind"] != "opening" || email["status"] != "ready" {
 		t.Fatalf("email outbox legacy fields changed = %#v", email)
 	}
-	if len(email) != 18 || email["outbox_id"] != decision.Outboxes[0].OutboxID ||
+	telegram := unmarshalItem(t, items[5].Put.Item)
+	for _, snapshot := range []map[string]any{email, telegram} {
+		if snapshot["evaluation_window_start"] != alertevaluator.FixedUTCTimestamp(slot.Add(-work.Rule.Window)) ||
+			snapshot["evaluation_window_end"] != alertevaluator.FixedUTCTimestamp(slot) ||
+			snapshot["evaluated_at"] != alertevaluator.FixedUTCTimestamp(slot) ||
+			fmt.Sprint(snapshot["evaluation_value"]) != "4.2" {
+			t.Fatalf("opening outbox evaluation snapshot = %#v", snapshot)
+		}
+	}
+	if len(email) != 22 || email["outbox_id"] != decision.Outboxes[0].OutboxID ||
 		email["event_id"] != decision.EventID || email["rule_id"] != work.Rule.RuleID ||
 		email["created_at"] != alertevaluator.FixedUTCTimestamp(slot) {
 		t.Fatalf("email outbox identity or field set changed = %#v", email)
 	}
 
-	telegram := unmarshalItem(t, items[5].Put.Item)
 	for _, field := range []string{"relay_schema_version", "expansion_status", "available_at", "relay_work_kind", "relay_gsi_pk", "relay_gsi_sk"} {
 		if _, exists := telegram[field]; exists {
 			t.Fatalf("telegram outbox unexpectedly has %s: %#v", field, telegram)
@@ -226,7 +234,7 @@ func TestCommitOpeningAtomicallyWritesEventTransitionAndOutboxes(t *testing.T) {
 	if telegram["channel"] != "telegram" || telegram["kind"] != "opening" || telegram["status"] != "ready" {
 		t.Fatalf("telegram outbox changed = %#v", telegram)
 	}
-	if len(telegram) != 12 || telegram["outbox_id"] != decision.Outboxes[1].OutboxID ||
+	if len(telegram) != 16 || telegram["outbox_id"] != decision.Outboxes[1].OutboxID ||
 		telegram["event_id"] != decision.EventID || telegram["rule_id"] != work.Rule.RuleID ||
 		telegram["created_at"] != alertevaluator.FixedUTCTimestamp(slot) {
 		t.Fatalf("telegram outbox identity or field set changed = %#v", telegram)
@@ -282,12 +290,20 @@ func TestCommitRecoveryAddsDependencyRelayIndexOnlyToEmailOutbox(t *testing.T) {
 		email["relay_gsi_pk"] != wantRelay.PartitionKey || email["relay_gsi_sk"] != wantRelay.SortKey {
 		t.Fatalf("email recovery outbox = %#v", email)
 	}
-	if len(email) != 18 || email["outbox_id"] != decision.Outboxes[0].OutboxID ||
+	telegram := unmarshalItem(t, items[5].Put.Item)
+	for _, snapshot := range []map[string]any{email, telegram} {
+		if snapshot["evaluation_window_start"] != alertevaluator.FixedUTCTimestamp(slot.Add(-work.Rule.Window)) ||
+			snapshot["evaluation_window_end"] != alertevaluator.FixedUTCTimestamp(slot) ||
+			snapshot["evaluated_at"] != alertevaluator.FixedUTCTimestamp(slot) ||
+			fmt.Sprint(snapshot["evaluation_value"]) != "8.1" {
+			t.Fatalf("recovery outbox evaluation snapshot = %#v", snapshot)
+		}
+	}
+	if len(email) != 22 || email["outbox_id"] != decision.Outboxes[0].OutboxID ||
 		email["event_id"] != decision.ResolvedEventID || email["kind"] != "recovery" {
 		t.Fatalf("email recovery identity or field set changed = %#v", email)
 	}
 
-	telegram := unmarshalItem(t, items[5].Put.Item)
 	for _, field := range []string{"relay_schema_version", "expansion_status", "available_at", "relay_work_kind", "relay_gsi_pk", "relay_gsi_sk"} {
 		if _, exists := telegram[field]; exists {
 			t.Fatalf("telegram recovery unexpectedly has %s: %#v", field, telegram)
@@ -296,7 +312,7 @@ func TestCommitRecoveryAddsDependencyRelayIndexOnlyToEmailOutbox(t *testing.T) {
 	if telegram["status"] != "blocked" || telegram["depends_on_outbox_id"] != "outbox_open_telegram" {
 		t.Fatalf("telegram recovery changed = %#v", telegram)
 	}
-	if len(telegram) != 12 || telegram["outbox_id"] != decision.Outboxes[1].OutboxID ||
+	if len(telegram) != 16 || telegram["outbox_id"] != decision.Outboxes[1].OutboxID ||
 		telegram["event_id"] != decision.ResolvedEventID || telegram["kind"] != "recovery" {
 		t.Fatalf("telegram recovery identity or field set changed = %#v", telegram)
 	}

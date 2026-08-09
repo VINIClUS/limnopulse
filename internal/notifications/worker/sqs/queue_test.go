@@ -39,6 +39,43 @@ func TestQueueLongPollsJobsWithBoundedBatchAndReceiveCount(t *testing.T) {
 	}
 }
 
+func TestQueuePreservesEmptyBodyForPoisonHandlingButRejectsMissingTransportIdentity(t *testing.T) {
+	t.Run("empty body reaches handler", func(t *testing.T) {
+		client := &fakeClient{receiveOutput: &awssqs.ReceiveMessageOutput{Messages: []types.Message{{
+			MessageId: aws.String("message_1"), ReceiptHandle: aws.String("receipt_1"),
+			Body: aws.String(""), Attributes: map[string]string{"ApproximateReceiveCount": "8"},
+		}}}}
+		messages, err := (Queue{Client: client, QueueURL: "https://sqs/jobs"}).Receive(
+			context.Background(), 1, 0, time.Minute,
+		)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if len(messages) != 1 || messages[0].Body != "" || messages[0].ReceiveCount != 8 ||
+			messages[0].MessageID != "message_1" || messages[0].ReceiptHandle != "receipt_1" {
+			t.Fatalf("messages = %#v", messages)
+		}
+	})
+
+	for _, test := range []struct {
+		name    string
+		message types.Message
+	}{
+		{name: "missing message id", message: types.Message{ReceiptHandle: aws.String("receipt_1"), Body: aws.String("")}},
+		{name: "missing receipt", message: types.Message{MessageId: aws.String("message_1"), Body: aws.String("")}},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			client := &fakeClient{receiveOutput: &awssqs.ReceiveMessageOutput{Messages: []types.Message{test.message}}}
+			_, err := (Queue{Client: client, QueueURL: "https://sqs/jobs"}).Receive(
+				context.Background(), 1, 0, time.Minute,
+			)
+			if err == nil {
+				t.Fatal("malformed transport identity was accepted")
+			}
+		})
+	}
+}
+
 func TestQueueDeleteAndVisibilityUseLatestReceiptAndRequestDeadline(t *testing.T) {
 	client := &fakeClient{}
 	queue := Queue{Client: client, QueueURL: "https://sqs/jobs", ReceiveTimeout: 25 * time.Second, MutationTimeout: 5 * time.Second}

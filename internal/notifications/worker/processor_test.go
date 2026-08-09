@@ -103,6 +103,21 @@ func TestProcessorPreflightPreservesPossibleAcceptanceAndFatalSemantics(t *testi
 		}
 	})
 
+	t.Run("fatal source identity", func(t *testing.T) {
+		store := &fakeStore{acquire: claimedRecord(t, 0), gate: GateResult{Allowed: true}}
+		sender := &fakeSender{preflightErr: NewSendError(ErrorFatalFromIdentity, errors.New("invalid source"))}
+		limiter := &fakeLimiter{}
+		processor := testProcessor(store, sender)
+		processor.Limiter = limiter
+
+		decision := processor.Handle(context.Background(), validMessage(t))
+		if decision.Action != ActionFatal || decision.ErrorCategory != string(ErrorFatalFromIdentity) ||
+			decision.Visibility != 15*time.Minute || store.preflightState != notifications.DeliveryStateRetryableFailed ||
+			!store.preflightAwaitingIntervention || store.begun != 0 || sender.calls != 0 || limiter.calls != 0 {
+			t.Fatalf("decision=%#v sender=%#v limiter=%#v store=%#v", decision, sender, limiter, store)
+		}
+	})
+
 	t.Run("unexpected retryable preflight is promoted to fatal configuration", func(t *testing.T) {
 		store := &fakeStore{acquire: claimedRecord(t, 0), gate: GateResult{Allowed: true}}
 		sender := &fakeSender{preflightErr: NewSendError(ErrorRetryableUnknown, errors.New("invalid deterministic input"))}
@@ -128,6 +143,23 @@ func TestProcessorPreflightPreservesPossibleAcceptanceAndFatalSemantics(t *testi
 			t.Fatalf("decision=%#v sender=%#v store=%#v", decision, sender, store)
 		}
 	})
+}
+
+func TestProcessorSucceedsAfterFatalPreflightIsRepairedAndDeliveryIsReclaimed(t *testing.T) {
+	store := &fakeStore{acquire: claimedRecord(t, 0), gate: GateResult{Allowed: true}}
+	broken := &fakeSender{preflightErr: NewSendError(ErrorFatalFromIdentity, errors.New("invalid source"))}
+	first := testProcessor(store, broken).Handle(context.Background(), validMessage(t))
+	if first.Action != ActionFatal || store.preflightFailures != 1 || store.begun != 0 || broken.calls != 0 {
+		t.Fatalf("broken decision=%#v sender=%#v store=%#v", first, broken, store)
+	}
+
+	repaired := &fakeSender{result: SendResult{ProviderMessageID: "ses_after_repair"}}
+	second := testProcessor(store, repaired).Handle(context.Background(), validMessage(t))
+	if second.Action != ActionDelete || store.begun != 1 || repaired.calls != 1 ||
+		store.completion == nil || store.completion.NextState != notifications.DeliveryStateSucceeded ||
+		store.completion.ProviderMessageID != "ses_after_repair" {
+		t.Fatalf("repaired decision=%#v sender=%#v store=%#v", second, repaired, store)
+	}
 }
 
 func TestDefinitiveFailureTransitionPolicy(t *testing.T) {

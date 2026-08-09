@@ -26,6 +26,7 @@ func TestProcessorDeletesOnlyDurablyAppliedDuplicateOrIgnoredFeedback(t *testing
 		{name: "unknown association", body: eventJSON("Send", ""), result: ReconcileResult{Disposition: ReconcileAwaitDLQ}, wantAction: worker.ActionChangeVisibility, wantCategory: "feedback_unknown_association", wantCalls: 1},
 		{name: "persistence failure", body: eventJSON("Send", ""), storeErr: errors.New("private database error"), wantAction: worker.ActionChangeVisibility, wantCategory: "feedback_persistence_failure", wantCalls: 1},
 		{name: "malformed", body: `{}`, wantAction: worker.ActionChangeVisibility, wantCategory: "invalid_feedback"},
+		{name: "empty poison body", body: "", wantAction: worker.ActionChangeVisibility, wantCategory: "invalid_feedback"},
 	}
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {

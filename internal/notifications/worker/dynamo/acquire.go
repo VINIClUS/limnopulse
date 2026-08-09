@@ -74,9 +74,6 @@ func (store Store) Acquire(
 		if !record.NextAttemptAt.IsZero() && record.NextAttemptAt.After(request.Now) {
 			return worker.AcquireResult{Disposition: worker.AcquireDeferred, RetryAfter: record.NextAttemptAt.Sub(request.Now)}, nil
 		}
-		if record.AwaitingIntervention {
-			return worker.AcquireResult{Disposition: worker.AcquireDeferred, RetryAfter: 15 * time.Minute}, nil
-		}
 	case notifications.DeliveryStateProcessing:
 		if record.LeaseExpiresAt.IsZero() {
 			return worker.AcquireResult{Disposition: worker.AcquireAwaitDLQ}, nil
@@ -175,11 +172,12 @@ func (store Store) claim(
 	values, _ := attributevalue.MarshalMap(valuesMap)
 	output, err := store.Client.UpdateItem(ctx, &awssdk.UpdateItemInput{
 		TableName: aws.String(store.Table), Key: key, ReturnValues: types.ReturnValueAllNew,
-		UpdateExpression:    aws.String("SET #state = :processing, #revision = :next_revision, #lease_owner = :owner, #lease_epoch = :epoch, #lease_expires = :expires, #updated_at = :now REMOVE #next_attempt_at"),
+		UpdateExpression:    aws.String("SET #state = :processing, #revision = :next_revision, #lease_owner = :owner, #lease_epoch = :epoch, #lease_expires = :expires, #updated_at = :now REMOVE #next_attempt_at, #awaiting_intervention"),
 		ConditionExpression: aws.String(condition), ExpressionAttributeNames: map[string]string{
 			"#state": "state", "#revision": "delivery_revision", "#lease_owner": "delivery_lease_owner",
 			"#lease_epoch": "delivery_lease_epoch", "#lease_expires": "delivery_lease_expires_at",
 			"#updated_at": "updated_at", "#next_attempt_at": "next_attempt_at",
+			"#awaiting_intervention": "awaiting_intervention",
 		}, ExpressionAttributeValues: values,
 	})
 	if err != nil {

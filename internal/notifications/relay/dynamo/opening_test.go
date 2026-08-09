@@ -250,6 +250,89 @@ func TestExpandIntentRejectsMalformedDeliverabilityRecordInsteadOfFailingOpen(t 
 	}
 }
 
+func TestLegacyOpeningSnapshotDoesNotMixLaterEvaluationWithOriginalWindow(t *testing.T) {
+	windowEnd := time.Date(2026, 7, 16, 12, 30, 0, 0, time.UTC)
+	later := windowEnd.Add(3 * time.Minute)
+	value := 8.1
+	data, err := (eventSnapshot{
+		TenantID: "tnt_1", EventID: "event_1", RuleID: "rule_1", RuleName: "Oxigênio baixo",
+		Severity: "critical", PondID: "pond_1", DeviceID: "device_1", Metric: "do_mg_l",
+		Operator: "<", Threshold: 4.5,
+		WindowStart: windowEnd.Add(-5 * time.Minute).Format(time.RFC3339Nano),
+		WindowEnd:   windowEnd.Format(time.RFC3339Nano), LastEvaluatedAt: later.Format(time.RFC3339Nano),
+		LastEvaluationValue: &value,
+	}).templateData()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if data.ObservedValue != nil || !data.WindowStart.Equal(windowEnd.Add(-5*time.Minute)) ||
+		!data.WindowEnd.Equal(windowEnd) || !data.EvaluatedAt.Equal(windowEnd) {
+		t.Fatalf("legacy delayed opening data = %#v", data)
+	}
+}
+
+func TestOutboxEvaluationSnapshotWinsOverLaterMutableEventMetadata(t *testing.T) {
+	openingEnd := time.Date(2026, 7, 16, 12, 30, 0, 0, time.UTC)
+	laterValue := 8.1
+	openingValue := 4.2
+	event := eventSnapshot{
+		TenantID: "tnt_1", EventID: "event_1", RuleID: "rule_1", RuleName: "Oxigênio baixo",
+		Severity: "critical", PondID: "pond_1", DeviceID: "device_1", Metric: "do_mg_l",
+		Operator: "<", Threshold: 4.5,
+		WindowStart:         openingEnd.Add(-5 * time.Minute).Format(time.RFC3339Nano),
+		WindowEnd:           openingEnd.Format(time.RFC3339Nano),
+		LastEvaluatedAt:     openingEnd.Add(4 * time.Minute).Format(time.RFC3339Nano),
+		LastEvaluationValue: &laterValue,
+	}
+	snapshot := relay.EvaluationSnapshot{
+		WindowStart: openingEnd.Add(-5 * time.Minute), WindowEnd: openingEnd,
+		EvaluatedAt: openingEnd, Value: &openingValue,
+	}
+	data, err := event.templateDataFor(notifications.NotificationKindOpening, snapshot)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if data.ObservedValue == nil || *data.ObservedValue != openingValue ||
+		!data.WindowStart.Equal(snapshot.WindowStart) || !data.WindowEnd.Equal(snapshot.WindowEnd) ||
+		!data.EvaluatedAt.Equal(snapshot.EvaluatedAt) {
+		t.Fatalf("delayed opening data = %#v", data)
+	}
+}
+
+func TestRecoveryEvaluationSnapshotAndLegacyFallbackUseMatchingWindow(t *testing.T) {
+	openingEnd := time.Date(2026, 7, 16, 12, 30, 0, 0, time.UTC)
+	recoveryEnd := openingEnd.Add(4 * time.Minute)
+	recoveryValue := 8.1
+	event := eventSnapshot{
+		TenantID: "tnt_1", EventID: "event_1", RuleID: "rule_1", RuleName: "Oxigênio baixo",
+		Severity: "critical", PondID: "pond_1", DeviceID: "device_1", Metric: "do_mg_l",
+		Operator: "<", Threshold: 4.5,
+		WindowStart: openingEnd.Add(-5 * time.Minute).Format(time.RFC3339Nano),
+		WindowEnd:   openingEnd.Format(time.RFC3339Nano), LastEvaluatedAt: recoveryEnd.Format(time.RFC3339Nano),
+		LastEvaluationValue: &recoveryValue,
+	}
+
+	for name, snapshot := range map[string]relay.EvaluationSnapshot{
+		"durable outbox": {
+			WindowStart: recoveryEnd.Add(-5 * time.Minute), WindowEnd: recoveryEnd,
+			EvaluatedAt: recoveryEnd, Value: &recoveryValue,
+		},
+		"legacy backfill": {},
+	} {
+		t.Run(name, func(t *testing.T) {
+			data, err := event.templateDataFor(notifications.NotificationKindRecovery, snapshot)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if data.ObservedValue == nil || *data.ObservedValue != recoveryValue ||
+				!data.WindowStart.Equal(recoveryEnd.Add(-5*time.Minute)) ||
+				!data.WindowEnd.Equal(recoveryEnd) || !data.EvaluatedAt.Equal(recoveryEnd) {
+				t.Fatalf("recovery data = %#v", data)
+			}
+		})
+	}
+}
+
 func TestExpandIntentNextPageRequiresExactCursorAndPreservesSnapshotCounters(t *testing.T) {
 	relayTime := time.Date(2026, 7, 16, 12, 31, 0, 0, time.UTC)
 	startedAt := relayTime.Add(-time.Minute)

@@ -49,7 +49,7 @@ func (store Store) ExpandDependency(
 	if err != nil {
 		return relay.WorkResult{}, err
 	}
-	templateData, err := event.templateData()
+	templateData, err := event.templateDataFor(work.NotificationKind, work.Evaluation)
 	if err != nil {
 		return relay.WorkResult{}, err
 	}

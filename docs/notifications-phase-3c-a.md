@@ -15,6 +15,14 @@ with a fenced lease, so duplicate jobs do not create duplicate attempts. Redis
 is not a source of truth and is not required by this delivery path. There is no
 distributed DynamoDB/SQS transaction.
 
+Each new NotificationOutbox carries the immutable evaluation window, evaluation
+time and optional observed value that triggered that notification. The relay
+renders from that snapshot even when the mutable AlertEvent has since received
+later evaluations. Legacy/backfilled outboxes without these fields use a
+conservative compatibility path: an opening omits a value unless the event's
+last evaluation still matches its original window end, while a recovery derives
+a same-duration window ending at the event's last evaluation time.
+
 ## Runtime flow
 
 ```text
@@ -121,7 +129,10 @@ enabling either publisher or consumer.
    can write both the SES events queue and routing DLQ.
 7. Start one worker replica with explicit `NOTIFICATION_MAX_SEND_RATE`, monitor
    credentials, quota and throttling, and confirm a controlled notification plus
-   feedback reaches durable terminal state before increasing concurrency.
+   feedback reaches durable terminal state before increasing concurrency. The
+   source accepts a strict mailbox (`alerts@example.com`) or a conservative
+   ASCII friendly-name form (`Limnopulse <alerts@example.com>`); malformed
+   values stop the worker before rate limiting, Attempt creation or an SES call.
 8. Schedule the relay every 60 seconds. Run `notifications relay` as a one-shot
    task with a timeout below the cadence. systemd timer, Kubernetes CronJob,
    EventBridge Scheduler/ECS or an equivalent external scheduler may invoke the

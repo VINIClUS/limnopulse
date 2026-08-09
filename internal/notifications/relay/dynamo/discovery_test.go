@@ -382,6 +382,53 @@ func TestReloadReadsBaseConsistentlyAndSkipsMissingOrIndexDivergentRows(t *testi
 	}
 }
 
+func TestReloadCarriesImmutableOutboxEvaluationSnapshotAndRejectsPartialRows(t *testing.T) {
+	relayTime := time.Date(2026, 7, 16, 12, 30, 0, 0, time.UTC)
+	available := relayTime.Add(-time.Minute)
+	indexKey, err := notifications.BuildRelayIndexKey(
+		notifications.WorkKindIntent, "tnt_1", "outbox_1", available,
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	candidate := relay.Candidate{
+		PK: "TENANT#tnt_1", SK: "NOTIFICATION_OUTBOX#outbox_1",
+		RelayPK: indexKey.PartitionKey, RelaySK: indexKey.SortKey,
+		Kind: notifications.WorkKindIntent, AvailableAt: available,
+	}
+	base := map[string]any{
+		"PK": candidate.PK, "SK": candidate.SK, "entity_type": "notification_outbox",
+		"tenant_id": "tnt_1", "outbox_id": "outbox_1", "event_id": "event_1", "rule_id": "rule_1",
+		"kind": "opening", "channel": "email", "expansion_status": "pending",
+		"available_at": available.Format(fixedUTCLayout), "relay_schema_version": int64(1),
+		"relay_work_kind": string(notifications.WorkKindIntent),
+		"relay_gsi_pk":    indexKey.PartitionKey, "relay_gsi_sk": indexKey.SortKey,
+		"evaluation_window_start": relayTime.Add(-5 * time.Minute).Format(fixedUTCLayout),
+		"evaluation_window_end":   relayTime.Format(fixedUTCLayout),
+		"evaluated_at":            relayTime.Format(fixedUTCLayout), "evaluation_value": 4.2,
+	}
+	partial := make(map[string]any, len(base))
+	for key, value := range base {
+		partial[key] = value
+	}
+	delete(partial, "evaluation_window_end")
+	client := &fakeClient{getOutputs: []*awssdk.GetItemOutput{
+		{Item: marshalMap(t, base)}, {Item: marshalMap(t, partial)},
+	}}
+	store := Store{Table: "domain", Client: client}
+
+	work, current, err := store.Reload(context.Background(), candidate, relayTime)
+	if err != nil || !current || work.Evaluation.Value == nil || *work.Evaluation.Value != 4.2 ||
+		!work.Evaluation.WindowStart.Equal(relayTime.Add(-5*time.Minute)) ||
+		!work.Evaluation.WindowEnd.Equal(relayTime) || !work.Evaluation.EvaluatedAt.Equal(relayTime) {
+		t.Fatalf("snapshot reload work=%#v current=%t err=%v", work, current, err)
+	}
+	if work, current, err = store.Reload(context.Background(), candidate, relayTime); err == nil || current ||
+		work != (relay.Work{}) {
+		t.Fatalf("partial snapshot reload work=%#v current=%t err=%v", work, current, err)
+	}
+}
+
 func TestReloadAcceptsCanonicalMarkerlessPendingDelivery(t *testing.T) {
 	relayTime := time.Date(2026, 7, 16, 12, 30, 0, 0, time.UTC)
 	available := relayTime.Add(-time.Minute)
