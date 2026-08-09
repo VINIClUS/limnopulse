@@ -476,6 +476,46 @@ func TestCompleteAttemptPromotesWaitingRecoveryForPreviouslyNonterminalOpening(t
 	}
 }
 
+func TestCompleteAttemptRetriesWhenRecoveryAbsenceFenceLosesToFanout(t *testing.T) {
+	record := testRecord(t)
+	record.AttemptCount = 1
+	record.LastAttemptID = "att_1"
+	current := testDeliveryItem(t, notifications.DeliveryStateProcessing)
+	current["delivery_revision"] = int64(record.Revision)
+	current["attempt_count"] = int64(record.AttemptCount)
+	current["last_attempt_id"] = record.LastAttemptID
+	current["delivery_lease_owner"] = record.LeaseOwner
+	current["delivery_lease_epoch"] = record.LeaseEpoch
+	current["delivery_lease_expires_at"] = record.LeaseExpiresAt.Format(time.RFC3339Nano)
+	client := &fakeClient{
+		getItems: []map[string]types.AttributeValue{
+			nil, marshal(t, current), marshal(t, waitingRecoveryFor(t, record)),
+		},
+		transactionErrors: []error{&types.TransactionCanceledException{}},
+	}
+
+	err := (Store{Table: "domain", Client: client}).CompleteAttempt(
+		context.Background(), record, worker.AttemptCompletion{
+			AttemptID: "att_1", CompletedAt: testNow(),
+			Outcome: notifications.AttemptOutcomeSucceeded, NextState: notifications.DeliveryStateSucceeded,
+			ProviderOutcome: notifications.ProviderOutcomeAccepted, ProviderMessageID: "ses_message_1",
+		},
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(client.transactions) != 2 || len(client.transactions[0].TransactItems) != 3 ||
+		client.transactions[0].TransactItems[2].ConditionCheck == nil ||
+		len(client.transactions[1].TransactItems) != 3 ||
+		client.transactions[1].TransactItems[2].Update == nil {
+		t.Fatalf("completion did not retry the lost absence fence: %#v", client.transactions)
+	}
+	if text := transactionText(client.transactions[1]); !strings.Contains(text, "waiting_dependency") ||
+		!strings.Contains(text, "pending") {
+		t.Fatalf("retry did not promote waiting recovery: %s", text)
+	}
+}
+
 func TestCancelCancelsWaitingRecoveryForPreviouslyNonterminalOpening(t *testing.T) {
 	record := testRecord(t)
 	recovery := waitingRecoveryFor(t, record)

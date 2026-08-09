@@ -29,7 +29,10 @@ runner query one work lane with a DynamoDB key range from `WORK_KIND#` through
 `WORK_KIND#due_time#~`. Discovery never uses a DynamoDB `FilterExpression` for
 work kind: a delivery backlog therefore cannot starve opening intent or recovery
 dependency discovery within the same bucket. The one-time relay backfill writes
-this canonical index shape for existing rows.
+this canonical index shape for existing rows. It also conditionally migrates
+the short-lived predecessor layout
+`available_at#WORK_KIND#tenant_id_base64url#item_id_base64url`, so deploy the
+current backfill before turning on the lane-keyed relay query.
 
 ## Runtime flow
 

@@ -27,7 +27,7 @@ func TestReconcileWritesTransportSemanticAttemptAndDeliveryAtomically(t *testing
 	if result != (feedback.ReconcileResult{Disposition: feedback.ReconcileApplied}) {
 		t.Fatalf("result = %#v", result)
 	}
-	if len(client.transactions) != 1 || len(client.transactions[0].TransactItems) != 4 {
+	if len(client.transactions) != 1 || len(client.transactions[0].TransactItems) != 5 {
 		t.Fatalf("transactions = %#v", client.transactions)
 	}
 	transaction := client.transactions[0]
@@ -36,6 +36,9 @@ func TestReconcileWritesTransportSemanticAttemptAndDeliveryAtomically(t *testing
 	}
 	transport := decodePut(t, transaction.TransactItems[0].Put)
 	semantic := decodePut(t, transaction.TransactItems[1].Put)
+	if transaction.TransactItems[4].ConditionCheck == nil {
+		t.Fatalf("recovery absence fence = %#v", transaction.TransactItems[4])
+	}
 	if transport["entity_type"] != "ses_feedback_transport_dedupe" ||
 		transport["event_bridge_id_hash"] == "" || numericInt64(transport["expires_at"]) != testNow().Add(DefaultTransportRetention).Unix() {
 		t.Fatalf("transport dedupe = %#v", transport)
@@ -58,6 +61,7 @@ func TestReconcileWritesTransportSemanticAttemptAndDeliveryAtomically(t *testing
 	}
 	assertLookupOrder(t, client.gets, []notifications.StorageKey{
 		mustTransportKey(t), mustSemanticKey(t, feedback.SemanticSend), mustAttemptKey(t), mustDeliveryKey(t),
+		mustRecoveryDeliveryKey(t),
 	})
 }
 
@@ -298,6 +302,30 @@ func TestReconcileLateSendReactivatesParkedRecoveryDependencyIdempotently(t *tes
 		if !strings.Contains(text, required) {
 			t.Errorf("reactivation missing %q: %s", required, text)
 		}
+	}
+}
+
+func TestReconcileSendPromotesWaitingRecoveryWhenFeedbackWinsFromProcessingOpening(t *testing.T) {
+	client := newFakeClient(t)
+	client.seed(testAttempt("started", "", ""))
+	delivery := testDelivery("processing", "", 11)
+	delivery["last_attempt_id"] = "att_1"
+	client.seed(delivery)
+	seedWaitingRecovery(t, client)
+
+	result, err := (Store{Table: "domain", Client: client}).Reconcile(
+		context.Background(), testEvent(feedback.SemanticSend), testNow(),
+	)
+	if err != nil || result.Disposition != feedback.ReconcileApplied {
+		t.Fatalf("result=%#v err=%v", result, err)
+	}
+	transaction := client.transactions[0]
+	if len(transaction.TransactItems) != 5 || transaction.TransactItems[4].Update == nil {
+		t.Fatalf("processing opening did not promote recovery: %#v", transaction.TransactItems)
+	}
+	values := decodeValues(t, transaction.TransactItems[4].Update.ExpressionAttributeValues)
+	if values[":next_state"] != "pending" || values[":relay_pk"] == nil {
+		t.Fatalf("processing opening recovery update = %#v", values)
 	}
 }
 
@@ -984,6 +1012,24 @@ func mustAttemptKey(t *testing.T) notifications.StorageKey {
 func mustDeliveryKey(t *testing.T) notifications.StorageKey {
 	t.Helper()
 	key, err := notifications.DeliveryStorageKey("outbox_1", "del_1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	return key
+}
+
+func mustRecoveryDeliveryKey(t *testing.T) notifications.StorageKey {
+	t.Helper()
+	outboxID := notifications.OutboxID(
+		"alert_1", notifications.ChannelEmail, notifications.NotificationKindRecovery,
+	)
+	deliveryID, err := notifications.NewDeliveryID(
+		"alert_1", notifications.NotificationKindRecovery, notifications.ChannelEmail, "sub_1",
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	key, err := notifications.DeliveryStorageKey(outboxID, deliveryID)
 	if err != nil {
 		t.Fatal(err)
 	}

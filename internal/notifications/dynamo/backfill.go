@@ -2,6 +2,7 @@ package dynamo
 
 import (
 	"context"
+	"encoding/base64"
 	"errors"
 	"fmt"
 	"strconv"
@@ -71,6 +72,7 @@ const (
 	migrationNoop migrationKind = iota
 	migrationUpdateEmail
 	migrationUpdateWorkKind
+	migrationUpdateRelayIndex
 	migrationUpdateTelegram
 	migrationSchemaConflict
 )
@@ -292,6 +294,9 @@ func classifyRelayOutbox(
 	if isCanonicalEmailWithoutWorkKind(item, migration) {
 		return migrationUpdateWorkKind, migration, nil
 	}
+	if isPreviousEmailLayout(item, migration) {
+		return migrationUpdateRelayIndex, migration, nil
+	}
 	return migrationSchemaConflict, migration, nil
 }
 
@@ -328,6 +333,22 @@ func isCanonicalEmailWithoutWorkKind(
 		stringAttributeEquals(item, "available_at", migration.AvailableAt) &&
 		stringAttributeEquals(item, "relay_gsi_pk", migration.RelayIndexKey.PartitionKey) &&
 		stringAttributeEquals(item, "relay_gsi_sk", migration.RelayIndexKey.SortKey)
+}
+
+func isPreviousEmailLayout(item map[string]types.AttributeValue, migration relayMigration) bool {
+	previousSortKey := fmt.Sprintf(
+		"%s#%s#%s#%s",
+		migration.AvailableAt,
+		migration.WorkKind,
+		base64.RawURLEncoding.EncodeToString([]byte(migration.Outbox.TenantID)),
+		base64.RawURLEncoding.EncodeToString([]byte(migration.Outbox.OutboxID)),
+	)
+	return numberAttributeEquals(item, "relay_schema_version", notifications.RelaySchemaVersion) &&
+		stringAttributeEquals(item, "expansion_status", migration.Expansion) &&
+		stringAttributeEquals(item, "available_at", migration.AvailableAt) &&
+		stringAttributeEquals(item, "relay_work_kind", string(migration.WorkKind)) &&
+		stringAttributeEquals(item, "relay_gsi_pk", migration.RelayIndexKey.PartitionKey) &&
+		stringAttributeEquals(item, "relay_gsi_sk", previousSortKey)
 }
 
 func isCanonicalTelegram(item map[string]types.AttributeValue) bool {
@@ -401,6 +422,28 @@ func (store Store) updateRelayOutbox(
 			"#expansion_status = :expected_expansion_status AND #available_at = :expected_available_at AND " +
 			"#relay_gsi_pk = :expected_relay_gsi_pk AND #relay_gsi_sk = :expected_relay_gsi_sk AND " +
 			"attribute_not_exists(#relay_work_kind)"
+	} else if kind == migrationUpdateRelayIndex {
+		delete(valueMap, ":expansion_status")
+		valueMap[":expected_relay_schema_version"] = notifications.RelaySchemaVersion
+		valueMap[":expected_expansion_status"] = migration.Expansion
+		valueMap[":expected_available_at"] = migration.AvailableAt
+		valueMap[":expected_relay_work_kind"] = string(migration.WorkKind)
+		valueMap[":expected_relay_gsi_pk"] = migration.RelayIndexKey.PartitionKey
+		valueMap[":expected_relay_gsi_sk"] = fmt.Sprintf(
+			"%s#%s#%s#%s",
+			migration.AvailableAt,
+			migration.WorkKind,
+			base64.RawURLEncoding.EncodeToString([]byte(migration.Outbox.TenantID)),
+			base64.RawURLEncoding.EncodeToString([]byte(migration.Outbox.OutboxID)),
+		)
+		valueMap[":relay_gsi_sk"] = migration.RelayIndexKey.SortKey
+		updateExpression = "SET #relay_gsi_sk = :relay_gsi_sk"
+		conditionExpression = "#tenant_id = :expected_tenant_id AND #outbox_id = :expected_outbox_id AND " +
+			"#channel = :expected_channel AND #status = :expected_status AND #created_at = :expected_created_at AND " +
+			"#relay_schema_version = :expected_relay_schema_version AND " +
+			"#expansion_status = :expected_expansion_status AND #available_at = :expected_available_at AND " +
+			"#relay_work_kind = :expected_relay_work_kind AND #relay_gsi_pk = :expected_relay_gsi_pk AND " +
+			"#relay_gsi_sk = :expected_relay_gsi_sk"
 	}
 	values, err := attributevalue.MarshalMap(valueMap)
 	if err != nil {

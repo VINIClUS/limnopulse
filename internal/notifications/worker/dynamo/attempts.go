@@ -2,6 +2,7 @@ package dynamo
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"strings"
 
@@ -82,7 +83,7 @@ func (store Store) CompleteAttempt(
 	record worker.DeliveryRecord,
 	completion worker.AttemptCompletion,
 ) error {
-	return store.completeAttempt(ctx, record, completion, true)
+	return store.completeAttempt(ctx, record, completion, true, true)
 }
 
 func (store Store) completeAttempt(
@@ -90,6 +91,7 @@ func (store Store) completeAttempt(
 	record worker.DeliveryRecord,
 	completion worker.AttemptCompletion,
 	allowDelayedFeedbackMerge bool,
+	allowRecoveryFenceRetry bool,
 ) error {
 	if completion.AttemptID == "" || completion.AttemptID != record.LastAttemptID ||
 		completion.CompletedAt.IsZero() || completion.Outcome.Validate() != nil || completion.NextState.Validate() != nil ||
@@ -212,6 +214,8 @@ func (store Store) completeAttempt(
 	}
 	_, err = store.Client.TransactWriteItems(ctx, &awssdk.TransactWriteItemsInput{TransactItems: items})
 	if err != nil {
+		isRecoveryFenceConflict := allowRecoveryFenceRetry && recoveryOperation != nil &&
+			recoveryOperation.ConditionCheck != nil && isTransactionCanceled(err)
 		if allowDelayedFeedbackMerge {
 			refreshed, mergeable, terminal, refreshErr := store.refreshDelayedFeedbackCompletion(ctx, record, completion)
 			if refreshErr != nil {
@@ -227,8 +231,14 @@ func (store Store) completeAttempt(
 				}
 			}
 			if mergeable {
-				return store.completeAttempt(ctx, refreshed, completion, false)
+				return store.completeAttempt(ctx, refreshed, completion, false, false)
 			}
+			if isRecoveryFenceConflict && recoveryFenceRetryableRecord(record, completion, refreshed, terminal) {
+				return store.completeAttempt(ctx, record, completion, allowDelayedFeedbackMerge, false)
+			}
+		}
+		if isRecoveryFenceConflict && store.recoveryFenceRetryable(ctx, record, completion) {
+			return store.completeAttempt(ctx, record, completion, allowDelayedFeedbackMerge, false)
 		}
 		terminal, reconcileErr := store.completeAttemptBesideTerminal(ctx, record, completion)
 		if reconcileErr == nil && terminal {
@@ -240,6 +250,38 @@ func (store Store) completeAttempt(
 		return fmt.Errorf("persist notification attempt completion: %w", err)
 	}
 	return nil
+}
+
+func (store Store) recoveryFenceRetryable(
+	ctx context.Context,
+	record worker.DeliveryRecord,
+	completion worker.AttemptCompletion,
+) bool {
+	refreshed, terminal, err := store.Refresh(ctx, record)
+	return err == nil && recoveryFenceRetryableRecord(record, completion, refreshed, terminal)
+}
+
+func recoveryFenceRetryableRecord(
+	record worker.DeliveryRecord,
+	completion worker.AttemptCompletion,
+	refreshed worker.DeliveryRecord,
+	terminal bool,
+) bool {
+	if record.Delivery.Kind != notifications.NotificationKindOpening || terminal ||
+		(completion.NextState != notifications.DeliveryStateSucceeded &&
+			completion.NextState != notifications.DeliveryStatePermanentFailed &&
+			completion.NextState != notifications.DeliveryStateCancelled) {
+		return false
+	}
+	return refreshed.Delivery.State == notifications.DeliveryStateProcessing &&
+		refreshed.Revision == record.Revision && refreshed.LeaseOwner == record.LeaseOwner &&
+		refreshed.LeaseEpoch == record.LeaseEpoch && refreshed.AttemptCount == record.AttemptCount &&
+		refreshed.LastAttemptID == completion.AttemptID
+}
+
+func isTransactionCanceled(err error) bool {
+	var canceled *types.TransactionCanceledException
+	return errors.As(err, &canceled)
 }
 
 func (store Store) refreshDelayedFeedbackCompletion(

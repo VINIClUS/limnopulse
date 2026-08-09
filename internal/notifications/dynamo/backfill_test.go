@@ -308,6 +308,36 @@ func TestBackfillRelayUpgradesOnlyMissingWorkKindOnCanonicalV1EmailRows(t *testi
 	}
 }
 
+func TestBackfillRelayMigratesPreviousRelaySortKeyLayout(t *testing.T) {
+	legacyLayout := canonicalEmailOutbox(
+		t, legacyOutbox("outbox_legacy_layout", "email", "ready"), notifications.WorkKindIntent,
+	)
+	legacyLayout["relay_gsi_sk"] = "2026-07-15T12:00:45.000000000Z#INTENT#dG50XzE#b3V0Ym94X2xlZ2FjeV9sYXlvdXQ"
+	client := &fakeClient{queryOutputs: []*awssdk.QueryOutput{{Items: []map[string]types.AttributeValue{
+		mustMarshalMap(t, legacyLayout),
+	}}}}
+
+	summary, err := (Store{Table: "domain", Client: client}).BackfillRelay(
+		context.Background(), BackfillOptions{Tenants: []string{"tnt_1"}, Apply: true, PageSize: 25},
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if summary.RowsNeedingUpdate != 1 || summary.Updated != 1 || summary.SchemaConflicts != 0 ||
+		len(client.updateInputs) != 1 {
+		t.Fatalf("summary=%#v updates=%#v", summary, client.updateInputs)
+	}
+	update := client.updateInputs[0]
+	if aws.ToString(update.UpdateExpression) != "SET #relay_gsi_sk = :relay_gsi_sk" {
+		t.Fatalf("legacy layout update = %s", aws.ToString(update.UpdateExpression))
+	}
+	values := unmarshalValues(t, update.ExpressionAttributeValues)
+	if values[":expected_relay_gsi_sk"] != legacyLayout["relay_gsi_sk"] ||
+		values[":relay_gsi_sk"] != canonicalEmailOutbox(t, legacyOutbox("outbox_legacy_layout", "email", "ready"), notifications.WorkKindIntent)["relay_gsi_sk"] {
+		t.Fatalf("legacy layout values = %#v", values)
+	}
+}
+
 func TestBackfillRelayClassifiesVersionMismatchAndDivergentRelayFieldsAsSchemaConflicts(t *testing.T) {
 	wrongVersion := legacyOutbox("outbox_wrong_version", "email", "ready")
 	wrongVersion["relay_schema_version"] = 2

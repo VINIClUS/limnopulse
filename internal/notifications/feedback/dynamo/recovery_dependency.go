@@ -38,9 +38,16 @@ func (store Store) recoveryDependencyOperation(
 	decision deliveryProviderDecision,
 	nextOpeningState notifications.DeliveryState,
 ) (*types.TransactWriteItem, error) {
-	if attempt.Kind != notifications.NotificationKindOpening ||
-		opening.State != notifications.DeliveryStateUnknown ||
-		!decision.OwnsAggregate {
+	if attempt.Kind != notifications.NotificationKindOpening || !decision.OwnsAggregate {
+		return nil, nil
+	}
+	switch opening.State {
+	case notifications.DeliveryStatePending,
+		notifications.DeliveryStateQueued,
+		notifications.DeliveryStateProcessing,
+		notifications.DeliveryStateRetryableFailed,
+		notifications.DeliveryStateUnknown:
+	default:
 		return nil, nil
 	}
 	nextState := notifications.DeliveryState("")
