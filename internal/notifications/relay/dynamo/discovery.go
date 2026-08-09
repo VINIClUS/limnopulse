@@ -30,9 +30,9 @@ func (store Store) QueryDue(ctx context.Context, request relay.DueRequest) (rela
 		return relay.DuePage{}, fmt.Errorf("invalid relay due query: %w", err)
 	}
 	values, err := attributevalue.MarshalMap(map[string]string{
-		":pk":              fmt.Sprintf("NOTIFICATION_RELAY#V1#BUCKET#%02d", request.Bucket),
-		":due":             request.DueThrough.UTC().Format(fixedUTCLayout) + "#~",
-		":relay_work_kind": string(request.Kind),
+		":pk":    fmt.Sprintf("NOTIFICATION_RELAY#V1#BUCKET#%02d", request.Bucket),
+		":start": string(request.Kind) + "#",
+		":due":   string(request.Kind) + "#" + request.DueThrough.UTC().Format(fixedUTCLayout) + "#~",
 	})
 	if err != nil {
 		return relay.DuePage{}, fmt.Errorf("marshal relay query: %w", err)
@@ -40,14 +40,10 @@ func (store Store) QueryDue(ctx context.Context, request relay.DueRequest) (rela
 	input := &awssdk.QueryInput{
 		TableName:              aws.String(store.Table),
 		IndexName:              aws.String(RelayIndex),
-		KeyConditionExpression: aws.String("#relay_pk = :pk AND #relay_sk <= :due"),
-		FilterExpression: aws.String(
-			"(#relay_work_kind = :relay_work_kind OR attribute_not_exists(#relay_work_kind))",
-		),
+		KeyConditionExpression: aws.String("#relay_pk = :pk AND #relay_sk BETWEEN :start AND :due"),
 		ExpressionAttributeNames: map[string]string{
-			"#relay_pk":        "relay_gsi_pk",
-			"#relay_sk":        "relay_gsi_sk",
-			"#relay_work_kind": "relay_work_kind",
+			"#relay_pk": "relay_gsi_pk",
+			"#relay_sk": "relay_gsi_sk",
 		},
 		ExpressionAttributeValues: values,
 		Limit:                     aws.Int32(int32(request.PageSize)),
@@ -125,16 +121,16 @@ func candidateFromItem(item map[string]types.AttributeValue) (relay.Candidate, e
 	if raw.PK == "" || raw.SK == "" || raw.RelayPK == "" || len(parts) != 4 {
 		return relay.Candidate{}, fmt.Errorf("candidate is missing relay identity")
 	}
-	availableAt, err := time.Parse(fixedUTCLayout, parts[0])
+	kind := notifications.WorkKind(parts[0])
+	if err := kind.Validate(); err != nil {
+		return relay.Candidate{}, err
+	}
+	availableAt, err := time.Parse(fixedUTCLayout, parts[1])
 	if err != nil {
 		return relay.Candidate{}, fmt.Errorf("available time: %w", err)
 	}
-	if availableAt.UTC().Format(fixedUTCLayout) != parts[0] {
+	if availableAt.UTC().Format(fixedUTCLayout) != parts[1] {
 		return relay.Candidate{}, fmt.Errorf("available time is not canonical")
-	}
-	kind := notifications.WorkKind(parts[1])
-	if err := kind.Validate(); err != nil {
-		return relay.Candidate{}, err
 	}
 	tenantID, err := decodeRelayIdentityPart(parts[2])
 	if err != nil {

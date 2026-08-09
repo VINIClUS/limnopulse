@@ -109,23 +109,21 @@ func TestQueryDueUsesRelayGSIAndRoundTripsPaginationToken(t *testing.T) {
 	}
 	input := client.queryInputs[0]
 	if aws.ToString(input.IndexName) != RelayIndex ||
-		aws.ToString(input.KeyConditionExpression) != "#relay_pk = :pk AND #relay_sk <= :due" ||
-		aws.ToString(input.FilterExpression) !=
-			"(#relay_work_kind = :relay_work_kind OR attribute_not_exists(#relay_work_kind))" ||
+		aws.ToString(input.KeyConditionExpression) != "#relay_pk = :pk AND #relay_sk BETWEEN :start AND :due" ||
+		input.FilterExpression != nil ||
 		aws.ToInt32(input.Limit) != 25 || aws.ToBool(input.ConsistentRead) {
 		t.Fatalf("query input = %#v", input)
 	}
 	if input.ExpressionAttributeNames["#relay_pk"] != "relay_gsi_pk" ||
-		input.ExpressionAttributeNames["#relay_sk"] != "relay_gsi_sk" ||
-		input.ExpressionAttributeNames["#relay_work_kind"] != "relay_work_kind" {
+		input.ExpressionAttributeNames["#relay_sk"] != "relay_gsi_sk" {
 		t.Fatalf("query names = %#v", input.ExpressionAttributeNames)
 	}
 	var values map[string]string
 	if err := attributevalue.UnmarshalMap(input.ExpressionAttributeValues, &values); err != nil {
 		t.Fatal(err)
 	}
-	if values[":pk"] != indexKey.PartitionKey || values[":due"] != "2026-07-16T12:30:00.000000000Z#~" ||
-		values[":relay_work_kind"] != string(notifications.WorkKindIntent) {
+	if values[":pk"] != indexKey.PartitionKey || values[":start"] != "INTENT#" ||
+		values[":due"] != "INTENT#2026-07-16T12:30:00.000000000Z#~" {
 		t.Fatalf("query values = %#v", values)
 	}
 

@@ -6,6 +6,7 @@ from botocore.exceptions import ClientError, EndpointConnectionError
 from fastapi import Request
 from fastapi.testclient import TestClient
 
+from limnopulse_api.auth.dev import DevAuthProvider
 from limnopulse_api.auth.models import Principal
 from limnopulse_api.core.config import Settings
 from limnopulse_api.core.errors import AuthError, ConflictError
@@ -21,6 +22,7 @@ from limnopulse_api.main import create_app
 from limnopulse_api.services.cognito_identity import (
     COGNITO_GET_USER_SCOPE,
     CognitoIdentityVerifier,
+    DevIdentityVerifier,
 )
 
 NOW = datetime(2026, 7, 16, 12, 0, tzinfo=UTC)
@@ -269,6 +271,27 @@ def test_put_create_calls_cognito_with_same_token_and_returns_version_one() -> N
     assert saved.email_address == "User@xn--bcher-kva.example"
     assert audit.actor_id == "sub_1"
     assert audit.user_agent == "limnopulse-tests"
+
+
+def test_put_create_accepts_documented_development_identity_email() -> None:
+    repository = InMemoryNotificationPreferenceRepository()
+
+    response = TestClient(
+        build_app(
+            repository,
+            DevIdentityVerifier(clock=lambda: NOW),
+            auth_provider=DevAuthProvider(),
+        )
+    ).put(
+        PATH,
+        json={"expected_version": None, "email_enabled": True},
+        headers={"X-Dev-User-Sub": "sub_1", "X-Dev-User-Email": "local@example.test"},
+    )
+
+    assert response.status_code == 200
+    saved, _, _ = repository.save_calls[0]
+    assert saved.email_address == "local@example.test"
+    assert saved.identity_source == "development_header"
 
 
 def test_put_enabled_update_rechecks_cognito_and_disable_does_not() -> None:

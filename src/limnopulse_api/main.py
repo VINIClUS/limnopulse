@@ -20,7 +20,7 @@ from limnopulse_api.api.router import api_router
 from limnopulse_api.auth.providers import build_auth_provider
 from limnopulse_api.core.config import Settings, get_settings
 from limnopulse_api.core.errors import TelemetryQueryError
-from limnopulse_api.services.cognito_identity import CognitoIdentityVerifier
+from limnopulse_api.services.cognito_identity import CognitoIdentityVerifier, DevIdentityVerifier
 from limnopulse_api.services.memberships import MembershipService
 
 
@@ -97,12 +97,15 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             audit_table_name=resolved_settings.dynamodb_audit_table,
             client=dynamodb_client,
         )
-        cognito_client = boto3.client(
-            "cognito-idp",
-            **_cognito_client_kwargs(resolved_settings),
-        )
-        app.state.cognito_client = cognito_client
-        app.state.cognito_identity_verifier = CognitoIdentityVerifier(cognito_client)
+        if resolved_settings.auth_mode == "dev":
+            app.state.cognito_identity_verifier = DevIdentityVerifier()
+        else:
+            cognito_client = boto3.client(
+                "cognito-idp",
+                **_cognito_client_kwargs(resolved_settings),
+            )
+            app.state.cognito_client = cognito_client
+            app.state.cognito_identity_verifier = CognitoIdentityVerifier(cognito_client)
         app.state.membership_service = MembershipService(
             domain_repository=app.state.domain_repository,
             cache=app.state.cache_repository,

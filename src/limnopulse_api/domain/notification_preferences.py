@@ -38,7 +38,7 @@ class NotificationPreference(BaseModel):
     email_address: AsciiEmailAddress
     email_verified: bool
     checked_at: datetime
-    identity_source: Literal["cognito_get_user"]
+    identity_source: Literal["cognito_get_user", "development_header"]
     minimum_severity: AlertSeverity
     created_at: datetime
     updated_at: datetime

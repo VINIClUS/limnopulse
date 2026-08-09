@@ -185,7 +185,13 @@ func (store Store) completeAttempt(
 	if err != nil {
 		return err
 	}
-	_, err = store.Client.TransactWriteItems(ctx, &awssdk.TransactWriteItemsInput{TransactItems: []types.TransactWriteItem{
+	recoveryOperation, err := store.recoveryDependencyOperation(
+		ctx, record, completion.NextState, completion.CompletedAt,
+	)
+	if err != nil {
+		return err
+	}
+	items := []types.TransactWriteItem{
 		{Update: &types.Update{
 			TableName: aws.String(store.Table), Key: encodedAttemptKey,
 			UpdateExpression:          aws.String(attemptUpdate),
@@ -200,7 +206,11 @@ func (store Store) completeAttempt(
 			ExpressionAttributeNames:  usedNames(deliveryNames, deliveryExpression),
 			ExpressionAttributeValues: deliveryValues,
 		}},
-	}})
+	}
+	if recoveryOperation != nil {
+		items = append(items, *recoveryOperation)
+	}
+	_, err = store.Client.TransactWriteItems(ctx, &awssdk.TransactWriteItemsInput{TransactItems: items})
 	if err != nil {
 		if allowDelayedFeedbackMerge {
 			refreshed, mergeable, terminal, refreshErr := store.refreshDelayedFeedbackCompletion(ctx, record, completion)

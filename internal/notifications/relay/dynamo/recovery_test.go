@@ -128,31 +128,63 @@ func TestExpandDependencyCancelsInactiveMembershipWithoutRelayIndex(t *testing.T
 	}
 }
 
-func TestExpandDependencyReschedulesWholePageForNonterminalOpeningDelivery(t *testing.T) {
+func TestExpandDependencyPreservesNonterminalOpeningWithoutBlockingSucceededRecipient(t *testing.T) {
 	relayTime := time.Date(2026, 7, 16, 13, 0, 0, 0, time.UTC)
-	next := relayTime.Add(2 * time.Minute)
-	opening := succeededOpeningDelivery(t, relayTime)
+	nonterminal := succeededOpeningDelivery(t, relayTime)
 	var values map[string]any
-	if err := attributevalue.UnmarshalMap(opening, &values); err != nil {
+	if err := attributevalue.UnmarshalMap(nonterminal, &values); err != nil {
 		t.Fatal(err)
 	}
 	values["state"] = "retryable_failed"
-	values["available_at"] = next.Format(fixedUTCLayout)
+	values["available_at"] = relayTime.Add(2 * time.Minute).Format(fixedUTCLayout)
+	values["delivery_revision"] = int64(5)
 	client := &fakeClient{
-		queryOutputs: []*awssdk.QueryOutput{{Items: []map[string]types.AttributeValue{marshalMap(t, values)}}},
-		getOutputs:   []*awssdk.GetItemOutput{{Item: expandedOpeningOutbox(t)}},
+		queryOutputs: []*awssdk.QueryOutput{{Items: []map[string]types.AttributeValue{
+			marshalMap(t, values), succeededOpeningDelivery(t, relayTime),
+		}}},
+		getOutputs: []*awssdk.GetItemOutput{
+			{Item: expandedOpeningOutbox(t)}, {Item: marshalMap(t, openingEvent(relayTime))},
+			{Item: activeMember(t, relayTime, "sub_1")}, {},
+		},
 	}
 
-	_, err := (Store{Table: "domain", Client: client}).ExpandDependency(
+	result, err := (Store{Table: "domain", Client: client}).ExpandDependency(
 		context.Background(), recoveryWork(t, relayTime),
 		relay.ExpandRequest{RelayTime: relayTime, PageSize: 20},
 	)
-	retryAt, retry := relay.RetryAt(err)
-	if !retry || !retryAt.Equal(next) {
-		t.Fatalf("retry = %s, %t; err = %v", retryAt, retry, err)
+	if err != nil {
+		t.Fatal(err)
 	}
-	if len(client.transactInputs) != 0 {
-		t.Fatalf("nonterminal dependency partially committed: %#v", client.transactInputs)
+	if result.DeliveriesCreated != 2 || result.RecipientsExamined != 2 {
+		t.Fatalf("result = %#v", result)
+	}
+	if len(client.transactInputs) != 1 || len(client.transactInputs[0].TransactItems) != 4 {
+		t.Fatalf("nonterminal opening did not preserve its recovery beside the successful recipient: %#v", client.transactInputs)
+	}
+	var mutationText strings.Builder
+	for _, item := range client.transactInputs[0].TransactItems {
+		if item.Update != nil {
+			mutationText.WriteString(aws.ToString(item.Update.UpdateExpression))
+			mutationText.WriteString(aws.ToString(item.Update.ConditionExpression))
+			var values map[string]any
+			if err := attributevalue.UnmarshalMap(item.Update.ExpressionAttributeValues, &values); err != nil {
+				t.Fatal(err)
+			}
+			mutationText.WriteString(fmt.Sprint(values))
+		}
+		if item.ConditionCheck != nil {
+			mutationText.WriteString(aws.ToString(item.ConditionCheck.ConditionExpression))
+			var values map[string]any
+			if err := attributevalue.UnmarshalMap(item.ConditionCheck.ExpressionAttributeValues, &values); err != nil {
+				t.Fatal(err)
+			}
+			mutationText.WriteString(fmt.Sprint(values))
+		}
+	}
+	for _, required := range []string{"waiting_dependency", "pending"} {
+		if !strings.Contains(mutationText.String(), required) {
+			t.Fatalf("recovery transaction is missing %q: %s", required, mutationText.String())
+		}
 	}
 }
 
@@ -294,6 +326,7 @@ func succeededOpeningDelivery(t *testing.T, relayTime time.Time) map[string]type
 		"delivery_id": deliveryID, "event_id": "event_1", "rule_id": "rule_1",
 		"kind": "opening", "channel": "email", "recipient_id": "sub_1",
 		"normalized_email": "opening-snapshot@example.com", "state": "succeeded",
+		"delivery_revision":   int64(1),
 		"membership_snapshot": map[string]any{"role": "owner", "status": "active", "version": int64(7)},
 		"content": map[string]any{
 			"template_id": string(snapshot.TemplateID), "template_version": snapshot.TemplateVersion,

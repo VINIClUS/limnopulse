@@ -55,8 +55,8 @@ func BuildRelayIndexKey(
 		PartitionKey: fmt.Sprintf("NOTIFICATION_RELAY#V1#BUCKET#%02d", bucket),
 		SortKey: fmt.Sprintf(
 			"%s#%s#%s#%s",
-			fixedUTCTimestamp(scheduledAt),
 			workKind,
+			fixedUTCTimestamp(scheduledAt),
 			base64.RawURLEncoding.EncodeToString([]byte(tenantID)),
 			base64.RawURLEncoding.EncodeToString([]byte(itemID)),
 		),

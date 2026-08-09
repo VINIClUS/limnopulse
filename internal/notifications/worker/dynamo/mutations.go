@@ -10,6 +10,7 @@ import (
 	"github.com/aws/aws-sdk-go-v2/aws"
 	"github.com/aws/aws-sdk-go-v2/feature/dynamodb/attributevalue"
 	awssdk "github.com/aws/aws-sdk-go-v2/service/dynamodb"
+	"github.com/aws/aws-sdk-go-v2/service/dynamodb/types"
 )
 
 func (store Store) Cancel(
@@ -21,7 +22,7 @@ func (store Store) Cancel(
 	if reason.Validate() != nil || now.IsZero() || validateTransition(record.Delivery, notifications.DeliveryStateCancelled) != nil {
 		return fmt.Errorf("invalid delivery cancellation")
 	}
-	return store.transitionProcessing(ctx, record,
+	return store.transitionTerminalOpening(ctx, record, notifications.DeliveryStateCancelled, now,
 		"SET #state = :cancelled, #cancellation_reason = :reason, #updated_at = :now, #revision = :next_revision REMOVE #lease_owner, #lease_expires, #next_attempt_at, #awaiting_intervention",
 		map[string]string{"#cancellation_reason": "cancellation_reason", "#awaiting_intervention": "awaiting_intervention"},
 		map[string]any{":cancelled": string(notifications.DeliveryStateCancelled), ":reason": string(reason), ":now": fixedTime(now)},
@@ -79,7 +80,21 @@ func (store Store) CompletePreflightFailure(
 	if !completion.NextAttemptAt.IsZero() {
 		values[":next_attempt_at"] = fixedTime(completion.NextAttemptAt)
 	}
-	err := store.transitionProcessing(ctx, record, update,
+	transition := store.transitionProcessing
+	if completion.NextState == notifications.DeliveryStatePermanentFailed {
+		transition = func(
+			ctx context.Context,
+			record worker.DeliveryRecord,
+			update string,
+			extraNames map[string]string,
+			extraValues map[string]any,
+		) error {
+			return store.transitionTerminalOpening(
+				ctx, record, completion.NextState, completion.CompletedAt, update, extraNames, extraValues,
+			)
+		}
+	}
+	err := transition(ctx, record, update,
 		map[string]string{
 			"#last_error_category": "last_error_category", "#possibly_accepted": "possibly_accepted",
 			"#ambiguous_exhausted": "ambiguous_exhausted", "#awaiting_intervention": "awaiting_intervention",
@@ -173,11 +188,75 @@ func (store Store) transitionProcessing(
 	extraNames map[string]string,
 	extraValues map[string]any,
 ) error {
-	key, err := notifications.DeliveryStorageKey(record.Delivery.OutboxID, record.Delivery.DeliveryID)
+	mutation, err := store.processingTransitionMutation(record, update, extraNames, extraValues)
 	if err != nil {
 		return err
 	}
-	encodedKey, _ := attributevalue.MarshalMap(map[string]string{"PK": key.PartitionKey, "SK": key.SortKey})
+	_, err = store.Client.UpdateItem(ctx, &awssdk.UpdateItemInput{
+		TableName: mutation.TableName, Key: mutation.Key, UpdateExpression: mutation.UpdateExpression,
+		ConditionExpression: mutation.ConditionExpression, ExpressionAttributeNames: mutation.ExpressionAttributeNames,
+		ExpressionAttributeValues: mutation.ExpressionAttributeValues,
+	})
+	if err != nil {
+		return fmt.Errorf("transition notification delivery: %w", err)
+	}
+	return nil
+}
+
+func (store Store) transitionTerminalOpening(
+	ctx context.Context,
+	record worker.DeliveryRecord,
+	nextState notifications.DeliveryState,
+	now time.Time,
+	update string,
+	extraNames map[string]string,
+	extraValues map[string]any,
+) error {
+	mutation, err := store.processingTransitionMutation(record, update, extraNames, extraValues)
+	if err != nil {
+		return err
+	}
+	recovery, err := store.recoveryDependencyOperation(ctx, record, nextState, now)
+	if err != nil {
+		return err
+	}
+	if recovery == nil {
+		_, err = store.Client.UpdateItem(ctx, &awssdk.UpdateItemInput{
+			TableName: mutation.TableName, Key: mutation.Key, UpdateExpression: mutation.UpdateExpression,
+			ConditionExpression: mutation.ConditionExpression, ExpressionAttributeNames: mutation.ExpressionAttributeNames,
+			ExpressionAttributeValues: mutation.ExpressionAttributeValues,
+		})
+		if err != nil {
+			return fmt.Errorf("transition notification delivery: %w", err)
+		}
+		return nil
+	}
+	_, err = store.Client.TransactWriteItems(ctx, &awssdk.TransactWriteItemsInput{
+		TransactItems: []types.TransactWriteItem{
+			{Update: mutation},
+			*recovery,
+		},
+	})
+	if err != nil {
+		return fmt.Errorf("transition notification delivery: %w", err)
+	}
+	return nil
+}
+
+func (store Store) processingTransitionMutation(
+	record worker.DeliveryRecord,
+	update string,
+	extraNames map[string]string,
+	extraValues map[string]any,
+) (*types.Update, error) {
+	key, err := notifications.DeliveryStorageKey(record.Delivery.OutboxID, record.Delivery.DeliveryID)
+	if err != nil {
+		return nil, err
+	}
+	encodedKey, err := attributevalue.MarshalMap(map[string]string{"PK": key.PartitionKey, "SK": key.SortKey})
+	if err != nil {
+		return nil, err
+	}
 	valuesMap := map[string]any{
 		":processing": string(notifications.DeliveryStateProcessing), ":revision": record.Revision,
 		":next_revision": record.Revision + 1, ":owner": record.LeaseOwner, ":epoch": record.LeaseEpoch,
@@ -185,7 +264,10 @@ func (store Store) transitionProcessing(
 	for token, value := range extraValues {
 		valuesMap[token] = value
 	}
-	values, _ := attributevalue.MarshalMap(valuesMap)
+	values, err := attributevalue.MarshalMap(valuesMap)
+	if err != nil {
+		return nil, err
+	}
 	names := map[string]string{
 		"#state": "state", "#revision": "delivery_revision", "#updated_at": "updated_at",
 		"#lease_owner": "delivery_lease_owner", "#lease_epoch": "delivery_lease_epoch",
@@ -194,13 +276,9 @@ func (store Store) transitionProcessing(
 	for token, name := range extraNames {
 		names[token] = name
 	}
-	_, err = store.Client.UpdateItem(ctx, &awssdk.UpdateItemInput{
+	return &types.Update{
 		TableName: aws.String(store.Table), Key: encodedKey, UpdateExpression: aws.String(update),
 		ConditionExpression:      aws.String("#state = :processing AND #revision = :revision AND #lease_owner = :owner AND #lease_epoch = :epoch"),
 		ExpressionAttributeNames: names, ExpressionAttributeValues: values,
-	})
-	if err != nil {
-		return fmt.Errorf("transition notification delivery: %w", err)
-	}
-	return nil
+	}, nil
 }

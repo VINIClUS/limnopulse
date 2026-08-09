@@ -138,8 +138,7 @@ func (store Store) queryOpeningDeliveries(
 			delivery.RuleID != work.RuleID || delivery.Kind != "opening" || delivery.Channel != "email" ||
 			delivery.PK != "NOTIFICATION_OUTBOX#"+work.DependsOnOutboxID ||
 			delivery.SK != "DELIVERY#"+delivery.DeliveryID || delivery.RecipientID == "" ||
-			delivery.NormalizedEmail == "" || state.Validate() != nil ||
-			(state == notifications.DeliveryStateUnknown && delivery.Revision < 1) {
+			delivery.NormalizedEmail == "" || state.Validate() != nil || delivery.Revision < 1 {
 			return openingDeliveryPage{}, fmt.Errorf("opening delivery is malformed")
 		}
 		page.Deliveries = append(page.Deliveries, delivery)

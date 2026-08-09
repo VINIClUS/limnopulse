@@ -16,7 +16,7 @@ from limnopulse_api.auth.cognito import CognitoJwtAuthProvider
 from limnopulse_api.auth.models import Principal
 from limnopulse_api.core.config import Settings
 from limnopulse_api.main import create_app
-from limnopulse_api.services.cognito_identity import CognitoIdentityVerifier
+from limnopulse_api.services.cognito_identity import CognitoIdentityVerifier, DevIdentityVerifier
 from limnopulse_api.services.memberships import MembershipService
 
 TEST_ISSUER = "https://cognito-idp.us-east-1.amazonaws.com/pool_1"
@@ -243,7 +243,7 @@ def test_lifespan_uses_only_official_influx_client_and_closes_it(monkeypatch) ->
     assert influxdb_client.close_calls == 1
 
 
-def test_app_lifespan_uses_dummy_credentials_for_local_dynamodb(monkeypatch) -> None:
+def test_app_lifespan_uses_dev_identity_verifier_without_cognito_client(monkeypatch) -> None:
     dynamo_calls: list[dict[str, str | None]] = []
     fake_dynamo = object()
     fake_redis = FakeRedisClient()
@@ -273,14 +273,9 @@ def test_app_lifespan_uses_dummy_credentials_for_local_dynamodb(monkeypatch) -> 
                 "endpoint_url": "http://localhost:8000",
                 "aws_access_key_id": "local",
                 "aws_secret_access_key": "local",
-            },
-            {
-                "service_name": "cognito-idp",
-                "region_name": "us-east-1",
-                "aws_access_key_id": "local",
-                "aws_secret_access_key": "local",
-            },
+            }
         ]
+        assert isinstance(app.state.cognito_identity_verifier, DevIdentityVerifier)
 
 
 def test_me_reuses_app_scoped_auth_provider(monkeypatch) -> None:

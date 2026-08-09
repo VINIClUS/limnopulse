@@ -8,7 +8,7 @@
       "scheduled_at": "2026-07-16T12:34:56.123456789Z",
       "bucket": 29,
       "gsi_pk": "NOTIFICATION_RELAY#V1#BUCKET#29",
-      "gsi_sk": "2026-07-16T12:34:56.123456789Z#INTENT#dG50XzE#b3V0Ym94XzE"
+      "gsi_sk": "INTENT#2026-07-16T12:34:56.123456789Z#dG50XzE#b3V0Ym94XzE"
     },
     {
       "work_kind": "DEPENDENCY",
@@ -17,7 +17,7 @@
       "scheduled_at": "2026-01-02T03:04:05.000000006Z",
       "bucket": 50,
       "gsi_pk": "NOTIFICATION_RELAY#V1#BUCKET#50",
-      "gsi_sk": "2026-01-02T03:04:05.000000006Z#DEPENDENCY#dGVuYW50I2Jy#b3BlbmluZy9vdXRib3ggIzc"
+      "gsi_sk": "DEPENDENCY#2026-01-02T03:04:05.000000006Z#dGVuYW50I2Jy#b3BlbmluZy9vdXRib3ggIzc"
     },
     {
       "work_kind": "DELIVERY",
@@ -26,7 +26,7 @@
       "scheduled_at": "2026-12-31T23:59:59.999999999Z",
       "bucket": 55,
       "gsi_pk": "NOTIFICATION_RELAY#V1#BUCKET#55",
-      "gsi_sk": "2026-12-31T23:59:59.999999999Z#DELIVERY#dG50X8OhZ3Vhcw#ZGVsX-KYgw"
+      "gsi_sk": "DELIVERY#2026-12-31T23:59:59.999999999Z#dG50X8OhZ3Vhcw#ZGVsX-KYgw"
     }
   ],
   "delivery_vectors": [

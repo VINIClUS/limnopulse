@@ -28,8 +28,8 @@ def test_relay_identity_vectors_are_language_neutral() -> None:
         bucket = struct.unpack(">Q", hashlib.sha256(canonical).digest()[:8])[0] % 64
         sort_key = "#".join(
             (
-                vector["scheduled_at"],
                 vector["work_kind"],
+                vector["scheduled_at"],
                 _base64url(vector["tenant_id"]),
                 _base64url(vector["item_id"]),
             )

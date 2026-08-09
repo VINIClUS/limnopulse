@@ -91,3 +91,32 @@ class CognitoIdentityVerifier:
             if isinstance(name, str) and isinstance(value, str):
                 parsed[name] = value
         return parsed
+
+
+class DevIdentityVerifier:
+    """Accept the explicitly supplied local development identity email.
+
+    Development authentication is restricted to local and test environments by
+    Settings, so it has no Cognito access token to send to GetUser. It still
+    applies the same email syntax and ASCII boundary as the production verifier.
+    """
+
+    def __init__(self, *, clock: Callable[[], datetime] = utc_now) -> None:
+        self.clock = clock
+
+    async def verify(self, principal: Principal) -> VerifiedEmailIdentity:
+        email = principal.email
+        if email is None:
+            raise IdentityEmailError("a verified email address is required")
+        try:
+            result = validate_email(email, check_deliverability=False, test_environment=True)
+        except EmailNotValidError as exc:
+            raise IdentityEmailError("a valid email address is required") from exc
+        if result.smtputf8 or result.ascii_email is None:
+            raise IdentityEmailError("an ASCII-compatible email address is required")
+        return VerifiedEmailIdentity(
+            address=result.ascii_email,
+            verified=True,
+            checked_at=self.clock(),
+            identity_source="development_header",
+        )

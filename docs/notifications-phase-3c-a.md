@@ -23,6 +23,14 @@ conservative compatibility path: an opening omits a value unless the event's
 last evaluation still matches its original window end, while a recovery derives
 a same-duration window ending at the event's last evaluation time.
 
+The relay GSI retains 64 stable buckets. Its sort key is
+`WORK_KIND#available_at#tenant_id_base64url#item_id_base64url`, which lets every
+runner query one work lane with a DynamoDB key range from `WORK_KIND#` through
+`WORK_KIND#due_time#~`. Discovery never uses a DynamoDB `FilterExpression` for
+work kind: a delivery backlog therefore cannot starve opening intent or recovery
+dependency discovery within the same bucket. The one-time relay backfill writes
+this canonical index shape for existing rows.
+
 ## Runtime flow
 
 ```text
@@ -46,14 +54,15 @@ failures end durably and are not retried.
 
 Recovery fanout follows each opening Delivery independently. A succeeded
 opening creates a pending recovery; a definitive opening failure creates a
-cancelled recovery; and an `unknown` opening creates a durable
-`waiting_dependency` recovery with rendered content but no relay GSI. Late
-provider feedback conditionally promotes that waiting row to pending with its
-GSI, or cancels it after a definitive opening failure, in the same DynamoDB
-transaction that reconciles the opening. When feedback initially observes the
-recovery row absent, that transaction includes an absence fence. This makes a
-concurrent relay create lose one of the two revision/absence conditions and
-retry instead of leaving an unindexed waiting row orphaned.
+cancelled recovery; and an `unknown` or still in-flight opening creates a
+durable `waiting_dependency` recovery with rendered content but no relay GSI.
+An opening's terminal worker transition or late provider feedback conditionally
+promotes that waiting row to pending with its GSI, or cancels it after a
+definitive opening failure, in the same DynamoDB transaction as the opening
+transition. When either path initially observes the recovery row absent, that
+transaction includes an absence fence. This makes a concurrent relay create
+lose one of the two revision/absence conditions and retry instead of leaving an
+unindexed waiting row orphaned.
 
 ## Local execution
 

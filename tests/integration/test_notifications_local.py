@@ -175,7 +175,7 @@ def _relay_index(kind: str, tenant_id: str, item_id: str, at: datetime) -> tuple
     item = base64.urlsafe_b64encode(item_id.encode()).decode().rstrip("=")
     return (
         f"NOTIFICATION_RELAY#V1#BUCKET#{bucket:02d}",
-        f"{_fixed(at)}#{kind}#{tenant}#{item}",
+        f"{kind}#{_fixed(at)}#{tenant}#{item}",
     )
 
 

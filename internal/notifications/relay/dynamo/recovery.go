@@ -3,7 +3,6 @@ package dynamo
 import (
 	"context"
 	"fmt"
-	"time"
 
 	"github.com/VINIClUS/limnopulse/internal/notifications"
 	"github.com/VINIClUS/limnopulse/internal/notifications/relay"
@@ -32,21 +31,6 @@ func (store Store) ExpandDependency(
 	page, err := store.queryOpeningDeliveries(ctx, work, request.PageSize)
 	if err != nil {
 		return relay.WorkResult{}, err
-	}
-	for _, opening := range page.Deliveries {
-		if isNonterminalDelivery(notifications.DeliveryState(opening.State)) {
-			next := request.RelayTime.Add(time.Minute)
-			if opening.AvailableAt != "" {
-				availableAt, parseErr := time.Parse(fixedUTCLayout, opening.AvailableAt)
-				if parseErr != nil {
-					return relay.WorkResult{}, fmt.Errorf("opening delivery availability is invalid")
-				}
-				if availableAt.After(request.RelayTime) {
-					next = availableAt
-				}
-			}
-			return relay.WorkResult{}, &relay.RetryAtError{At: next}
-		}
 	}
 	event, err := store.loadEvent(ctx, work)
 	if err != nil {
@@ -85,7 +69,7 @@ func (store Store) ExpandDependency(
 		}
 		state := notifications.DeliveryState(opening.State)
 		var delivery notifications.Delivery
-		if state == notifications.DeliveryStateUnknown {
+		if state == notifications.DeliveryStateUnknown || isNonterminalDelivery(state) {
 			if localeErr := opening.Content.Locale.Validate(); localeErr != nil {
 				return relay.WorkResult{}, fmt.Errorf("opening delivery locale is invalid")
 			}
@@ -96,7 +80,7 @@ func (store Store) ExpandDependency(
 				delivery, err = notifications.NewWaitingDependencyDelivery(params)
 			}
 			if err == nil {
-				check, checkErr := store.openingUnknownCondition(opening)
+				check, checkErr := store.openingDependencyCondition(opening)
 				if checkErr != nil {
 					return relay.WorkResult{}, checkErr
 				}
@@ -150,7 +134,7 @@ func (store Store) ExpandDependency(
 	return result, nil
 }
 
-func (store Store) openingUnknownCondition(opening openingDelivery) (*types.ConditionCheck, error) {
+func (store Store) openingDependencyCondition(opening openingDelivery) (*types.ConditionCheck, error) {
 	key, err := attributevalue.MarshalMap(map[string]string{"PK": opening.PK, "SK": opening.SK})
 	if err != nil {
 		return nil, err
@@ -158,14 +142,14 @@ func (store Store) openingUnknownCondition(opening openingDelivery) (*types.Cond
 	values, err := attributevalue.MarshalMap(map[string]any{
 		":entity": "notification_delivery", ":outbox_id": opening.OutboxID,
 		":delivery_id": opening.DeliveryID, ":event_id": opening.EventID,
-		":unknown": string(notifications.DeliveryStateUnknown), ":revision": opening.Revision,
+		":state": opening.State, ":revision": opening.Revision,
 	})
 	if err != nil {
 		return nil, err
 	}
 	return &types.ConditionCheck{
 		TableName: aws.String(store.Table), Key: key,
-		ConditionExpression: aws.String("#entity = :entity AND #outbox_id = :outbox_id AND #delivery_id = :delivery_id AND #event_id = :event_id AND #state = :unknown AND #revision = :revision"),
+		ConditionExpression: aws.String("#entity = :entity AND #outbox_id = :outbox_id AND #delivery_id = :delivery_id AND #event_id = :event_id AND #state = :state AND #revision = :revision"),
 		ExpressionAttributeNames: map[string]string{
 			"#entity": "entity_type", "#outbox_id": "outbox_id", "#delivery_id": "delivery_id",
 			"#event_id": "event_id", "#state": "state", "#revision": "delivery_revision",

@@ -293,10 +293,14 @@ func TestCompletePreflightFailureFencesClaimWithoutCreatingAttemptAndTreatsTermi
 		if err != nil {
 			t.Fatal(err)
 		}
-		if len(client.updates) != 1 || len(client.transactions) != 0 {
+		if len(client.updates) != 0 || len(client.transactions) != 1 ||
+			len(client.transactions[0].TransactItems) != 2 {
 			t.Fatalf("updates=%d transactions=%d", len(client.updates), len(client.transactions))
 		}
-		update := client.updates[0]
+		update := client.transactions[0].TransactItems[0].Update
+		if update == nil || client.transactions[0].TransactItems[1].ConditionCheck == nil {
+			t.Fatalf("preflight terminal transaction = %#v", client.transactions[0].TransactItems)
+		}
 		for _, required := range []string{"#state = :next_state", "#revision = :next_revision", "#last_error_category = :error_category", "#lease_owner = :owner", "#lease_epoch = :epoch"} {
 			if !strings.Contains(*update.UpdateExpression+*update.ConditionExpression, required) {
 				t.Errorf("preflight mutation missing %q: update=%s condition=%s", required, *update.UpdateExpression, *update.ConditionExpression)
@@ -312,8 +316,8 @@ func TestCompletePreflightFailureFencesClaimWithoutCreatingAttemptAndTreatsTermi
 		terminal := testDeliveryItem(t, notifications.DeliveryStateSucceeded)
 		terminal["delivery_revision"] = record.Revision + 1
 		client := &fakeClient{
-			getItems:     []map[string]types.AttributeValue{marshal(t, terminal)},
-			updateErrors: []error{&types.ConditionalCheckFailedException{}},
+			getItems:          []map[string]types.AttributeValue{nil, marshal(t, terminal)},
+			transactionErrors: []error{&types.TransactionCanceledException{}},
 		}
 		err := (Store{Table: "domain", Client: client}).CompletePreflightFailure(
 			context.Background(), record, worker.PreflightFailureCompletion{
@@ -321,7 +325,8 @@ func TestCompletePreflightFailureFencesClaimWithoutCreatingAttemptAndTreatsTermi
 				NextState: notifications.DeliveryStatePermanentFailed,
 			},
 		)
-		if !errors.Is(err, worker.ErrConcurrentTerminal) || len(client.updates) != 1 || len(client.gets) != 1 {
+		if !errors.Is(err, worker.ErrConcurrentTerminal) || len(client.updates) != 0 ||
+			len(client.transactions) != 1 || len(client.gets) != 2 {
 			t.Fatalf("error=%v updates=%d gets=%d", err, len(client.updates), len(client.gets))
 		}
 	})
@@ -399,7 +404,7 @@ func TestCompleteAttemptReportsConcurrentTerminalFeedbackAsSafeNoOp(t *testing.T
 	completedAttempt["provider_message_id"] = "ses_message_1"
 	completedAttempt["completed_at"] = testNow().Format(time.RFC3339Nano)
 	client := &fakeClient{
-		getItems:          []map[string]types.AttributeValue{marshal(t, terminal), marshal(t, completedAttempt)},
+		getItems:          []map[string]types.AttributeValue{nil, marshal(t, terminal), marshal(t, completedAttempt)},
 		transactionErrors: []error{&types.TransactionCanceledException{}},
 	}
 
@@ -413,10 +418,87 @@ func TestCompleteAttemptReportsConcurrentTerminalFeedbackAsSafeNoOp(t *testing.T
 	if !errors.Is(err, worker.ErrConcurrentTerminal) {
 		t.Fatalf("CompleteAttempt() error = %v", err)
 	}
-	if len(client.gets) != 2 || len(client.transactions) != 1 || len(client.updates) != 0 ||
+	if len(client.gets) != 3 || len(client.transactions) != 1 || len(client.updates) != 0 ||
 		client.gets[0].ConsistentRead == nil || !*client.gets[0].ConsistentRead ||
-		client.gets[1].ConsistentRead == nil || !*client.gets[1].ConsistentRead {
+		client.gets[1].ConsistentRead == nil || !*client.gets[1].ConsistentRead ||
+		client.gets[2].ConsistentRead == nil || !*client.gets[2].ConsistentRead {
 		t.Fatalf("terminal reconciliation reads = %#v", client.gets)
+	}
+}
+
+func TestCompleteAttemptPromotesWaitingRecoveryForPreviouslyNonterminalOpening(t *testing.T) {
+	record := testRecord(t)
+	record.AttemptCount = 1
+	record.LastAttemptID = "att_1"
+	recoveryOutboxID := notifications.OutboxID(
+		record.Delivery.EventID, record.Delivery.Channel, notifications.NotificationKindRecovery,
+	)
+	recoveryDeliveryID, err := notifications.NewDeliveryID(
+		record.Delivery.EventID, notifications.NotificationKindRecovery,
+		record.Delivery.Channel, record.Delivery.RecipientID,
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	recovery := testDeliveryItem(t, notifications.DeliveryStateWaitingDependency)
+	recovery["PK"] = "NOTIFICATION_OUTBOX#" + recoveryOutboxID
+	recovery["SK"] = "DELIVERY#" + recoveryDeliveryID
+	recovery["outbox_id"] = recoveryOutboxID
+	recovery["delivery_id"] = recoveryDeliveryID
+	recovery["kind"] = "recovery"
+	recovery["depends_on_outbox_id"] = record.Delivery.OutboxID
+	recovery["depends_on_delivery_id"] = record.Delivery.DeliveryID
+	recovery["delivery_revision"] = int64(1)
+	client := &fakeClient{getItems: []map[string]types.AttributeValue{marshal(t, recovery)}}
+
+	err = (Store{Table: "domain", Client: client}).CompleteAttempt(
+		context.Background(), record, worker.AttemptCompletion{
+			AttemptID: "att_1", CompletedAt: testNow(),
+			Outcome: notifications.AttemptOutcomeSucceeded, NextState: notifications.DeliveryStateSucceeded,
+			ProviderOutcome: notifications.ProviderOutcomeAccepted, ProviderMessageID: "ses_message_1",
+		},
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(client.transactions) != 1 || len(client.transactions[0].TransactItems) != 3 {
+		t.Fatalf("completion transaction = %#v", client.transactions)
+	}
+	update := client.transactions[0].TransactItems[2].Update
+	if update == nil {
+		t.Fatalf("waiting recovery was not promoted: %#v", client.transactions[0].TransactItems)
+	}
+	text := transactionText(client.transactions[0])
+	for _, required := range []string{"waiting_dependency", "pending", "relay_gsi_pk"} {
+		if !strings.Contains(text, required) {
+			t.Fatalf("recovery promotion is missing %q: %s", required, text)
+		}
+	}
+}
+
+func TestCancelCancelsWaitingRecoveryForPreviouslyNonterminalOpening(t *testing.T) {
+	record := testRecord(t)
+	recovery := waitingRecoveryFor(t, record)
+	client := &fakeClient{getItems: []map[string]types.AttributeValue{marshal(t, recovery)}}
+
+	err := (Store{Table: "domain", Client: client}).Cancel(
+		context.Background(), record, notifications.CancellationReasonEmailSuppressed, testNow(),
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(client.transactions) != 1 || len(client.transactions[0].TransactItems) != 2 {
+		t.Fatalf("cancellation transaction = %#v", client.transactions)
+	}
+	update := client.transactions[0].TransactItems[1].Update
+	if update == nil {
+		t.Fatalf("waiting recovery was not cancelled: %#v", client.transactions[0].TransactItems)
+	}
+	text := transactionText(client.transactions[0])
+	for _, required := range []string{"waiting_dependency", "cancelled", "opening_delivery_not_succeeded"} {
+		if !strings.Contains(text, required) {
+			t.Fatalf("recovery cancellation is missing %q: %s", required, text)
+		}
 	}
 }
 
@@ -552,7 +634,7 @@ func TestCurrentAttemptDeliveryDelayDoesNotLoseConfirmedSendCompletion(t *testin
 
 	client := &fakeClient{
 		getItems: []map[string]types.AttributeValue{
-			nil, nil, marshal(t, attempt), marshal(t, delivery), marshal(t, refreshed),
+			nil, nil, marshal(t, attempt), marshal(t, delivery), nil, marshal(t, refreshed),
 		},
 		transactionErrors: []error{nil, &types.TransactionCanceledException{}, nil},
 	}
@@ -720,6 +802,30 @@ func testAttemptItem(record worker.DeliveryRecord, attemptID string, outcome not
 		"entity_type": "notification_attempt", "delivery_id": record.Delivery.DeliveryID,
 		"attempt_id": attemptID, "outcome": string(outcome),
 	}
+}
+
+func waitingRecoveryFor(t *testing.T, record worker.DeliveryRecord) map[string]any {
+	t.Helper()
+	recoveryOutboxID := notifications.OutboxID(
+		record.Delivery.EventID, record.Delivery.Channel, notifications.NotificationKindRecovery,
+	)
+	recoveryDeliveryID, err := notifications.NewDeliveryID(
+		record.Delivery.EventID, notifications.NotificationKindRecovery,
+		record.Delivery.Channel, record.Delivery.RecipientID,
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	recovery := testDeliveryItem(t, notifications.DeliveryStateWaitingDependency)
+	recovery["PK"] = "NOTIFICATION_OUTBOX#" + recoveryOutboxID
+	recovery["SK"] = "DELIVERY#" + recoveryDeliveryID
+	recovery["outbox_id"] = recoveryOutboxID
+	recovery["delivery_id"] = recoveryDeliveryID
+	recovery["kind"] = "recovery"
+	recovery["depends_on_outbox_id"] = record.Delivery.OutboxID
+	recovery["depends_on_delivery_id"] = record.Delivery.DeliveryID
+	recovery["delivery_revision"] = int64(1)
+	return recovery
 }
 
 func decodeExpressionValues(t *testing.T, values map[string]types.AttributeValue) map[string]any {
