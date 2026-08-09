@@ -117,6 +117,39 @@ func TestTemplateRendererOmitsAbsentObservedValue(t *testing.T) {
 	}
 }
 
+func TestTemplateRendererLabelsPondWideOpeningAndRecoveryWithoutEmptyDevice(t *testing.T) {
+	renderer := mustTemplateRenderer(t)
+	data := validEmailTemplateData()
+	data.DeviceID = ""
+
+	for _, templateID := range []TemplateID{TemplateAlertOpeningV1, TemplateAlertRecoveryV1} {
+		t.Run(string(templateID), func(t *testing.T) {
+			content, err := renderer.Render(templateID, LocalePTBR, data)
+			if err != nil {
+				t.Fatalf("Render() error = %v", err)
+			}
+			wantSubject := "[critical] Alerta aberto: Oxigênio baixo (viveiro inteiro)"
+			if templateID == TemplateAlertRecoveryV1 {
+				wantSubject = "[critical] Alerta recuperado: Oxigênio baixo (viveiro inteiro)"
+			}
+			if content.Subject() != wantSubject {
+				t.Errorf("subject = %q, want %q", content.Subject(), wantSubject)
+			}
+			for name, rendered := range map[string]string{
+				"subject": content.Subject(), "text": content.Text(), "html": content.HTML(),
+			} {
+				if !strings.Contains(rendered, "viveiro inteiro") {
+					t.Errorf("%s does not label pond-wide scope: %q", name, rendered)
+				}
+				if strings.Contains(rendered, "Dispositivo") ||
+					(strings.ContainsAny(rendered, "\r\n") && name == "subject") {
+					t.Errorf("%s contains empty device/control characters: %q", name, rendered)
+				}
+			}
+		})
+	}
+}
+
 func TestTemplateRendererEnforcesOutputLimits(t *testing.T) {
 	renderer := mustTemplateRenderer(t)
 
@@ -178,7 +211,7 @@ func TestTemplateRendererRejectsMissingOrNULRequiredData(t *testing.T) {
 		{name: "severity", mutate: func(data *EmailTemplateData) { data.Severity = "" }},
 		{name: "tenant ID", mutate: func(data *EmailTemplateData) { data.TenantID = "tnt\x001" }},
 		{name: "pond ID", mutate: func(data *EmailTemplateData) { data.PondID = "" }},
-		{name: "device ID", mutate: func(data *EmailTemplateData) { data.DeviceID = "" }},
+		{name: "device ID NUL", mutate: func(data *EmailTemplateData) { data.DeviceID = "dev\x001" }},
 		{name: "metric", mutate: func(data *EmailTemplateData) { data.Metric = "" }},
 		{name: "unit", mutate: func(data *EmailTemplateData) { data.Unit = "" }},
 		{name: "operator", mutate: func(data *EmailTemplateData) { data.Operator = "" }},

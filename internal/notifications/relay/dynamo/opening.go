@@ -113,7 +113,7 @@ func (store Store) ExpandIntent(
 		}
 		deliveries = append(deliveries, delivery)
 	}
-	if err := store.commitFanoutPage(ctx, work, request, deliveries, result, page.NextCursor); err != nil {
+	if err := store.commitFanoutPage(ctx, work, request, deliveries, nil, result, page.NextCursor); err != nil {
 		return relay.WorkResult{}, err
 	}
 	return result, nil

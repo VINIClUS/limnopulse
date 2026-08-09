@@ -148,13 +148,17 @@ func (data EmailTemplateData) Validate() error {
 		"severity":  data.Severity,
 		"tenant ID": data.TenantID,
 		"pond ID":   data.PondID,
-		"device ID": data.DeviceID,
 		"metric":    data.Metric,
 		"unit":      data.Unit,
 		"operator":  data.Operator,
 		"event ID":  data.EventID,
 	} {
 		if err := validateIdentityField(name, value); err != nil {
+			return err
+		}
+	}
+	if data.DeviceID != "" {
+		if err := validateIdentityField("device ID", data.DeviceID); err != nil {
 			return err
 		}
 	}

@@ -271,6 +271,32 @@ func TestLegacyOpeningSnapshotDoesNotMixLaterEvaluationWithOriginalWindow(t *tes
 	}
 }
 
+func TestLegacyRuleNameControlsAreNormalizedBeforeRendering(t *testing.T) {
+	now := time.Date(2026, 7, 16, 12, 30, 0, 0, time.UTC)
+	data, err := (eventSnapshot{
+		TenantID: "tnt_1", EventID: "event_1", RuleID: "rule_1",
+		RuleName: "Oxigênio\r\nBcc: victim@example.test", Severity: "critical",
+		PondID: "pond_1", DeviceID: "device_1", Metric: "do_mg_l", Operator: "<", Threshold: 4.5,
+		WindowStart: now.Add(-5 * time.Minute).Format(time.RFC3339Nano),
+		WindowEnd:   now.Format(time.RFC3339Nano), LastEvaluatedAt: now.Format(time.RFC3339Nano),
+	}).templateData()
+	if err != nil {
+		t.Fatal(err)
+	}
+	renderer, err := notifications.NewTemplateRenderer()
+	if err != nil {
+		t.Fatal(err)
+	}
+	content, err := renderer.Render(notifications.TemplateAlertOpeningV1, notifications.LocalePTBR, data)
+	if err != nil {
+		t.Fatalf("legacy relay render must converge, got %v", err)
+	}
+	if strings.ContainsAny(data.RuleName, "\r\n\t") || strings.ContainsAny(content.Subject(), "\r\n") ||
+		data.RuleName != "Oxigênio Bcc: victim@example.test" {
+		t.Fatalf("legacy rule name was not normalized: data=%q subject=%q", data.RuleName, content.Subject())
+	}
+}
+
 func TestOutboxEvaluationSnapshotWinsOverLaterMutableEventMetadata(t *testing.T) {
 	openingEnd := time.Date(2026, 7, 16, 12, 30, 0, 0, time.UTC)
 	laterValue := 8.1

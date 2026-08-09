@@ -123,19 +123,21 @@ func EmailDeliverabilities() []EmailDeliverability {
 type DeliveryState string
 
 const (
-	DeliveryStatePending         DeliveryState = "pending"
-	DeliveryStateQueued          DeliveryState = "queued"
-	DeliveryStateProcessing      DeliveryState = "processing"
-	DeliveryStateRetryableFailed DeliveryState = "retryable_failed"
-	DeliveryStateSucceeded       DeliveryState = "succeeded"
-	DeliveryStatePermanentFailed DeliveryState = "permanent_failed"
-	DeliveryStateCancelled       DeliveryState = "cancelled"
-	DeliveryStateUnknown         DeliveryState = "unknown"
+	DeliveryStatePending           DeliveryState = "pending"
+	DeliveryStateWaitingDependency DeliveryState = "waiting_dependency"
+	DeliveryStateQueued            DeliveryState = "queued"
+	DeliveryStateProcessing        DeliveryState = "processing"
+	DeliveryStateRetryableFailed   DeliveryState = "retryable_failed"
+	DeliveryStateSucceeded         DeliveryState = "succeeded"
+	DeliveryStatePermanentFailed   DeliveryState = "permanent_failed"
+	DeliveryStateCancelled         DeliveryState = "cancelled"
+	DeliveryStateUnknown           DeliveryState = "unknown"
 )
 
 func (state DeliveryState) Validate() error {
 	switch state {
 	case DeliveryStatePending,
+		DeliveryStateWaitingDependency,
 		DeliveryStateQueued,
 		DeliveryStateProcessing,
 		DeliveryStateRetryableFailed,
@@ -160,6 +162,7 @@ func (state *DeliveryState) UnmarshalJSON(data []byte) error {
 func DeliveryStates() []DeliveryState {
 	return []DeliveryState{
 		DeliveryStatePending,
+		DeliveryStateWaitingDependency,
 		DeliveryStateQueued,
 		DeliveryStateProcessing,
 		DeliveryStateRetryableFailed,

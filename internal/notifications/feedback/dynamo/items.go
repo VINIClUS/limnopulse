@@ -40,6 +40,7 @@ type deliveryRecord struct {
 	EventID           string                         `dynamodbav:"event_id"`
 	Kind              notifications.NotificationKind `dynamodbav:"kind"`
 	Channel           notifications.Channel          `dynamodbav:"channel"`
+	RecipientID       string                         `dynamodbav:"recipient_id"`
 	NormalizedEmail   string                         `dynamodbav:"normalized_email"`
 	State             notifications.DeliveryState    `dynamodbav:"state"`
 	Revision          int64                          `dynamodbav:"delivery_revision"`
@@ -108,7 +109,7 @@ func decodeDelivery(
 	}
 	if stored.PK != key.PartitionKey || stored.SK != key.SortKey || stored.EntityType != "notification_delivery" ||
 		stored.OutboxID != attempt.OutboxID || stored.DeliveryID != event.DeliveryID || stored.TenantID != attempt.TenantID ||
-		stored.EventID == "" || stored.NormalizedEmail == "" || stored.Revision < 1 ||
+		stored.EventID == "" || stored.RecipientID == "" || stored.NormalizedEmail == "" || stored.Revision < 1 ||
 		stored.EventID != attempt.EventID || stored.Kind != attempt.Kind || stored.Channel != notifications.ChannelEmail ||
 		stored.Channel != attempt.Channel || stored.State.Validate() != nil {
 		return deliveryRecord{}, fmt.Errorf("notification delivery association is invalid")

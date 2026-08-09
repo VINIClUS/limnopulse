@@ -82,6 +82,15 @@ func (store Store) CompleteAttempt(
 	record worker.DeliveryRecord,
 	completion worker.AttemptCompletion,
 ) error {
+	return store.completeAttempt(ctx, record, completion, true)
+}
+
+func (store Store) completeAttempt(
+	ctx context.Context,
+	record worker.DeliveryRecord,
+	completion worker.AttemptCompletion,
+	allowDelayedFeedbackMerge bool,
+) error {
 	if completion.AttemptID == "" || completion.AttemptID != record.LastAttemptID ||
 		completion.CompletedAt.IsZero() || completion.Outcome.Validate() != nil || completion.NextState.Validate() != nil ||
 		validateTransition(record.Delivery, completion.NextState) != nil {
@@ -193,6 +202,24 @@ func (store Store) CompleteAttempt(
 		}},
 	}})
 	if err != nil {
+		if allowDelayedFeedbackMerge {
+			refreshed, mergeable, terminal, refreshErr := store.refreshDelayedFeedbackCompletion(ctx, record, completion)
+			if refreshErr != nil {
+				return fmt.Errorf("reconcile delayed feedback before notification attempt completion: %w", refreshErr)
+			}
+			if terminal {
+				resolved, reconcileErr := store.completeAttemptBesideKnownTerminal(ctx, record, completion, refreshed)
+				if reconcileErr == nil && resolved {
+					return worker.ErrConcurrentTerminal
+				}
+				if reconcileErr != nil {
+					return fmt.Errorf("persist notification attempt completion after terminal race: %w", reconcileErr)
+				}
+			}
+			if mergeable {
+				return store.completeAttempt(ctx, refreshed, completion, false)
+			}
+		}
 		terminal, reconcileErr := store.completeAttemptBesideTerminal(ctx, record, completion)
 		if reconcileErr == nil && terminal {
 			return worker.ErrConcurrentTerminal
@@ -205,6 +232,46 @@ func (store Store) CompleteAttempt(
 	return nil
 }
 
+func (store Store) refreshDelayedFeedbackCompletion(
+	ctx context.Context,
+	record worker.DeliveryRecord,
+	completion worker.AttemptCompletion,
+) (worker.DeliveryRecord, bool, bool, error) {
+	if completion.Outcome != notifications.AttemptOutcomeSucceeded ||
+		completion.NextState != notifications.DeliveryStateSucceeded ||
+		completion.ProviderOutcome != notifications.ProviderOutcomeAccepted || completion.ProviderMessageID == "" {
+		return worker.DeliveryRecord{}, false, false, nil
+	}
+	key, err := notifications.DeliveryStorageKey(record.Delivery.OutboxID, record.Delivery.DeliveryID)
+	if err != nil {
+		return worker.DeliveryRecord{}, false, false, err
+	}
+	item, err := store.getConsistent(ctx, key.PartitionKey, key.SortKey)
+	if err != nil {
+		return worker.DeliveryRecord{}, false, false, err
+	}
+	if len(item) == 0 {
+		return worker.DeliveryRecord{}, false, false, fmt.Errorf("claimed delivery disappeared")
+	}
+	_, refreshed, err := decodeDelivery(item)
+	if err != nil {
+		return worker.DeliveryRecord{}, false, false, err
+	}
+	switch refreshed.Delivery.State {
+	case notifications.DeliveryStateSucceeded, notifications.DeliveryStatePermanentFailed,
+		notifications.DeliveryStateCancelled, notifications.DeliveryStateUnknown:
+		return refreshed, false, true, nil
+	}
+	mergeable := refreshed.Delivery.State == notifications.DeliveryStateProcessing &&
+		refreshed.Revision > record.Revision && refreshed.LeaseOwner == record.LeaseOwner &&
+		refreshed.LeaseEpoch == record.LeaseEpoch && refreshed.AttemptCount == record.AttemptCount &&
+		refreshed.LastAttemptID == completion.AttemptID &&
+		refreshed.ProviderOutcome == notifications.ProviderOutcomeDelayed &&
+		refreshed.ProviderAttemptID == completion.AttemptID &&
+		refreshed.ProviderMessageID == completion.ProviderMessageID
+	return refreshed, mergeable, false, nil
+}
+
 func (store Store) completeAttemptBesideTerminal(
 	ctx context.Context,
 	record worker.DeliveryRecord,
@@ -214,6 +281,15 @@ func (store Store) completeAttemptBesideTerminal(
 	if err != nil || !terminal {
 		return false, err
 	}
+	return store.completeAttemptBesideKnownTerminal(ctx, record, completion, refreshed)
+}
+
+func (store Store) completeAttemptBesideKnownTerminal(
+	ctx context.Context,
+	record worker.DeliveryRecord,
+	completion worker.AttemptCompletion,
+	refreshed worker.DeliveryRecord,
+) (bool, error) {
 	attemptKey, err := notifications.AttemptStorageKey(record.Delivery.DeliveryID, completion.AttemptID)
 	if err != nil {
 		return false, err

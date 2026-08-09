@@ -42,6 +42,7 @@ type deliveryItem struct {
 	NextAttemptAt          string                           `dynamodbav:"next_attempt_at"`
 	ProviderOutcome        notifications.ProviderOutcome    `dynamodbav:"provider_outcome"`
 	ProviderMessageID      string                           `dynamodbav:"provider_message_id"`
+	ProviderAttemptID      string                           `dynamodbav:"provider_attempt_id"`
 	PossiblyAccepted       bool                             `dynamodbav:"possibly_accepted"`
 	AmbiguousExhausted     bool                             `dynamodbav:"ambiguous_exhausted"`
 	AwaitingIntervention   bool                             `dynamodbav:"awaiting_intervention"`
@@ -112,7 +113,8 @@ func decodeDelivery(item map[string]types.AttributeValue) (deliveryItem, worker.
 		Delivery: snapshot, Revision: stored.DeliveryRevision, AttemptCount: stored.AttemptCount,
 		LastAttemptID: stored.LastAttemptID, LeaseOwner: stored.DeliveryLeaseOwner,
 		LeaseEpoch: stored.DeliveryLeaseEpoch, ProviderOutcome: stored.ProviderOutcome,
-		ProviderMessageID: stored.ProviderMessageID, PossiblyAccepted: stored.PossiblyAccepted,
+		ProviderMessageID: stored.ProviderMessageID, ProviderAttemptID: stored.ProviderAttemptID,
+		PossiblyAccepted:     stored.PossiblyAccepted,
 		AmbiguousExhausted:   stored.AmbiguousExhausted,
 		AwaitingIntervention: stored.AwaitingIntervention, AwaitingDLQ: stored.AwaitingDLQ,
 	}

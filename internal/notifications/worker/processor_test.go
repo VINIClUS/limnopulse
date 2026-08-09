@@ -162,6 +162,33 @@ func TestProcessorSucceedsAfterFatalPreflightIsRepairedAndDeliveryIsReclaimed(t 
 	}
 }
 
+func TestProcessorFifthFatalHoldConvergesAfterRestartWithoutSixthProviderCall(t *testing.T) {
+	fifthStore := &fakeStore{acquire: claimedRecord(t, MaxProviderCalls-1), gate: GateResult{Allowed: true}}
+	fatalSender := &fakeSender{err: NewSendError(ErrorFatalCredentials, errors.New("credentials revoked"))}
+	fifth := testProcessor(fifthStore, fatalSender).Handle(context.Background(), validMessage(t))
+	if fifth.Action != ActionFatal || fatalSender.calls != 1 || fifthStore.completion == nil ||
+		fifthStore.completion.NextState != notifications.DeliveryStateRetryableFailed ||
+		!fifthStore.completion.AwaitingIntervention {
+		t.Fatalf("fifth decision=%#v sender=%#v store=%#v", fifth, fatalSender, fifthStore)
+	}
+
+	// A later due claim represents the durable hold being released after an
+	// operator repair/restart. The absolute provider-call budget is not reset.
+	acquired := claimedRecord(t, MaxProviderCalls)
+	store := &fakeStore{acquire: acquired, gate: GateResult{Allowed: true}}
+	sender := &fakeSender{result: SendResult{ProviderMessageID: "must_not_be_sent"}}
+
+	decision := testProcessor(store, sender).Handle(context.Background(), validMessage(t))
+
+	if decision.Action != ActionDelete || sender.preflightCalls != 0 || sender.calls != 0 ||
+		store.begun != 0 || store.preflightFailures != 1 ||
+		store.preflightState != notifications.DeliveryStatePermanentFailed ||
+		store.preflightCategory != string(ErrorProviderCallLimitExhausted) ||
+		store.preflightAwaitingIntervention {
+		t.Fatalf("decision=%#v sender=%#v store=%#v", decision, sender, store)
+	}
+}
+
 func TestDefinitiveFailureTransitionPolicy(t *testing.T) {
 	now := time.Date(2026, 7, 16, 15, 0, 0, 0, time.UTC)
 	tests := []struct {

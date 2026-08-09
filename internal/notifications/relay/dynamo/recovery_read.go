@@ -26,6 +26,7 @@ type openingDelivery struct {
 	RecipientID     string `dynamodbav:"recipient_id"`
 	NormalizedEmail string `dynamodbav:"normalized_email"`
 	State           string `dynamodbav:"state"`
+	Revision        int64  `dynamodbav:"delivery_revision"`
 	AvailableAt     string `dynamodbav:"available_at"`
 	Membership      struct {
 		Role    string `dynamodbav:"role"`
@@ -96,6 +97,12 @@ func (store Store) queryOpeningDeliveries(
 	work relay.Work,
 	pageSize int,
 ) (openingDeliveryPage, error) {
+	// An unknown opening consumes both a recovery Delivery mutation and an
+	// opening-revision fence in the same TransactWriteItems. Capping dependency
+	// pages at 49 leaves room for every fence and the outbox checkpoint.
+	if pageSize > 49 {
+		pageSize = 49
+	}
 	values, err := attributevalue.MarshalMap(map[string]string{
 		":pk": "NOTIFICATION_OUTBOX#" + work.DependsOnOutboxID, ":delivery_prefix": "DELIVERY#",
 	})
@@ -131,7 +138,8 @@ func (store Store) queryOpeningDeliveries(
 			delivery.RuleID != work.RuleID || delivery.Kind != "opening" || delivery.Channel != "email" ||
 			delivery.PK != "NOTIFICATION_OUTBOX#"+work.DependsOnOutboxID ||
 			delivery.SK != "DELIVERY#"+delivery.DeliveryID || delivery.RecipientID == "" ||
-			delivery.NormalizedEmail == "" || state.Validate() != nil {
+			delivery.NormalizedEmail == "" || state.Validate() != nil ||
+			(state == notifications.DeliveryStateUnknown && delivery.Revision < 1) {
 			return openingDeliveryPage{}, fmt.Errorf("opening delivery is malformed")
 		}
 		page.Deliveries = append(page.Deliveries, delivery)

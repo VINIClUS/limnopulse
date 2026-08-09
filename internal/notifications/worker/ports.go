@@ -32,6 +32,7 @@ type DeliveryRecord struct {
 	NextAttemptAt        time.Time
 	ProviderOutcome      notifications.ProviderOutcome
 	ProviderMessageID    string
+	ProviderAttemptID    string
 	PossiblyAccepted     bool
 	AmbiguousExhausted   bool
 	AwaitingIntervention bool
@@ -163,17 +164,18 @@ type LeaseGuard interface {
 type SendErrorCategory string
 
 const (
-	ErrorPermanentRecipient       SendErrorCategory = "permanent_bad_recipient"
-	ErrorRetryableThrottling      SendErrorCategory = "retryable_throttling"
-	ErrorRetryableQuota           SendErrorCategory = "retryable_daily_quota"
-	ErrorRetryableService         SendErrorCategory = "retryable_service_unavailable"
-	ErrorRetryableUnknown         SendErrorCategory = "retryable_unknown"
-	ErrorAmbiguousTimeout         SendErrorCategory = "ambiguous_timeout"
-	ErrorAmbiguousConnectionReset SendErrorCategory = "ambiguous_connection_reset"
-	ErrorFatalAccountSuspended    SendErrorCategory = "fatal_account_suspended"
-	ErrorFatalFromIdentity        SendErrorCategory = "fatal_from_identity"
-	ErrorFatalConfigurationSet    SendErrorCategory = "fatal_configuration_set"
-	ErrorFatalCredentials         SendErrorCategory = "fatal_credentials"
+	ErrorPermanentRecipient         SendErrorCategory = "permanent_bad_recipient"
+	ErrorProviderCallLimitExhausted SendErrorCategory = "provider_call_limit_exhausted"
+	ErrorRetryableThrottling        SendErrorCategory = "retryable_throttling"
+	ErrorRetryableQuota             SendErrorCategory = "retryable_daily_quota"
+	ErrorRetryableService           SendErrorCategory = "retryable_service_unavailable"
+	ErrorRetryableUnknown           SendErrorCategory = "retryable_unknown"
+	ErrorAmbiguousTimeout           SendErrorCategory = "ambiguous_timeout"
+	ErrorAmbiguousConnectionReset   SendErrorCategory = "ambiguous_connection_reset"
+	ErrorFatalAccountSuspended      SendErrorCategory = "fatal_account_suspended"
+	ErrorFatalFromIdentity          SendErrorCategory = "fatal_from_identity"
+	ErrorFatalConfigurationSet      SendErrorCategory = "fatal_configuration_set"
+	ErrorFatalCredentials           SendErrorCategory = "fatal_credentials"
 )
 
 type SendError struct {
@@ -193,7 +195,7 @@ func (err *SendError) Unwrap() error { return err.err }
 
 func (category SendErrorCategory) disposition() sendDisposition {
 	switch category {
-	case ErrorPermanentRecipient:
+	case ErrorPermanentRecipient, ErrorProviderCallLimitExhausted:
 		return sendPermanent
 	case ErrorAmbiguousTimeout, ErrorAmbiguousConnectionReset:
 		return sendAmbiguous

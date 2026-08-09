@@ -44,6 +44,17 @@ two-minute confirmation grace; accepted feedback can resolve uncertainty, while
 exhausted ambiguity without feedback ends in `unknown`. Permanent recipient
 failures end durably and are not retried.
 
+Recovery fanout follows each opening Delivery independently. A succeeded
+opening creates a pending recovery; a definitive opening failure creates a
+cancelled recovery; and an `unknown` opening creates a durable
+`waiting_dependency` recovery with rendered content but no relay GSI. Late
+provider feedback conditionally promotes that waiting row to pending with its
+GSI, or cancels it after a definitive opening failure, in the same DynamoDB
+transaction that reconciles the opening. When feedback initially observes the
+recovery row absent, that transaction includes an absence fence. This makes a
+concurrent relay create lose one of the two revision/absence conditions and
+retry instead of leaving an unindexed waiting row orphaned.
+
 ## Local execution
 
 Start the local dependencies and initialize DynamoDB:
@@ -127,13 +138,19 @@ enabling either publisher or consumer.
    `ses_configuration_set_name` output, and the account must have the intended
    production-access or sandbox recipient coverage. Confirm the EventBridge rule
    can write both the SES events queue and routing DLQ.
-7. Start one worker replica with explicit `NOTIFICATION_MAX_SEND_RATE`, monitor
-   credentials, quota and throttling, and confirm a controlled notification plus
-   feedback reaches durable terminal state before increasing concurrency. The
+7. Start one worker replica only after draining and stopping every older
+   feedback-worker replica, then deploy and verify the new feedback workers.
+   This ordering is required for `waiting_dependency`: an older worker can
+   reconcile its opening feedback but cannot promote or cancel that newer
+   recovery state. Do not run old and new feedback workers concurrently during
+   this rollout. Set explicit `NOTIFICATION_MAX_SEND_RATE`, monitor credentials,
+   quota and throttling, and confirm a controlled notification plus feedback
+   reaches durable terminal state before increasing concurrency. The
    source accepts a strict mailbox (`alerts@example.com`) or a conservative
    ASCII friendly-name form (`Limnopulse <alerts@example.com>`); malformed
    values stop the worker before rate limiting, Attempt creation or an SES call.
-8. Schedule the relay every 60 seconds. Run `notifications relay` as a one-shot
+8. Schedule the relay every 60 seconds only after the new feedback worker is
+   healthy. Run `notifications relay` as a one-shot
    task with a timeout below the cadence. systemd timer, Kubernetes CronJob,
    EventBridge Scheduler/ECS or an equivalent external scheduler may invoke the
    same image; the domain contains no scheduling loop.
@@ -191,7 +208,9 @@ process count needs no DynamoDB migration because the persisted total remains
 ## Rollback
 
 If delivery behavior is unsafe, turn off the relay first so no new SQS jobs are
-published. Send `SIGTERM` to the worker and allow its 30-second internal drain
+published. Once any `waiting_dependency` recovery exists, do not roll back to
+an older feedback worker; keep the compatible worker running to reconcile it.
+Send `SIGTERM` to the worker and allow its 30-second internal drain
 budget plus shutdown headroom; do not kill it during a provider call unless the
 incident requires accepting an ambiguous outcome, and preserve DynamoDB
 delivery and attempt rows, relay index attributes, queues and DLQs. They are the
@@ -248,7 +267,10 @@ suppression outcomes.
 At minimum, alert on a nonzero DLQ depth, repeated relay partial/fatal exits,
 oldest relay backlog above two scheduler periods, sustained worker queue age,
 any `unknown` increase, credential/configuration fatal categories, and a
-nonzero `active_concurrency` after graceful shutdown.
+nonzero `active_concurrency` after graceful shutdown. Also monitor the count and
+oldest `updated_at` of `waiting_dependency` recoveries. A growing or aging set
+means late feedback is missing, malformed, in a DLQ, or failing its conditional
+reconciliation and requires operator investigation.
 
 ## PII, retention and API boundary
 
@@ -270,3 +292,8 @@ No public Delivery or Attempt API is introduced in Phase 3C-A. Existing Alert
 Event routes remain the tenant-facing incident surface. Operational access to
 delivery and attempt records is service-side only, and user-facing notification
 history requires a separate authorization and redaction design.
+
+Alert-rule create, update and replace requests reject control characters in the
+rule name. Persisted `AlertRule` decoding remains compatible with legacy names
+that predate that boundary, so rollout needs no backfill; the relay normalizes
+controls and whitespace before rendering those legacy values into email.

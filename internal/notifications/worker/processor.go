@@ -113,6 +113,14 @@ func (processor Processor) Handle(ctx context.Context, message QueueMessage) Dec
 		processor.Metrics.RecordUnknown()
 		return Decision{Action: ActionDelete}
 	}
+	if record.AttemptCount >= MaxProviderCalls {
+		return processor.completePreflightFailure(
+			ctx,
+			record,
+			processor.Now().UTC(),
+			NewSendError(ErrorProviderCallLimitExhausted, errors.New("provider call limit exhausted")),
+		)
+	}
 
 	limiterCtx := ctx
 	stopLimiterGuard := func() error { return nil }

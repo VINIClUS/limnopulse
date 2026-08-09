@@ -34,6 +34,8 @@ func (store Store) reconcileTransaction(
 	deliveryKey notifications.StorageKey,
 	attempt attemptRecord,
 	delivery deliveryRecord,
+	decision deliveryProviderDecision,
+	recoveryOperation *types.TransactWriteItem,
 	suppression suppressionRecord,
 	writeSuppression bool,
 ) (*awssdk.TransactWriteItemsInput, error) {
@@ -46,10 +48,6 @@ func (store Store) reconcileTransaction(
 		return nil, err
 	}
 	attemptUpdate, err := store.attemptUpdate(attemptKey, attempt, event, now)
-	if err != nil {
-		return nil, err
-	}
-	decision, err := reconcileDeliveryProviderMetadata(delivery, event)
 	if err != nil {
 		return nil, err
 	}
@@ -69,6 +67,9 @@ func (store Store) reconcileTransaction(
 	}
 	items := []types.TransactWriteItem{
 		{Put: transport}, {Put: semantic}, {Update: attemptUpdate}, deliveryOperation,
+	}
+	if recoveryOperation != nil {
+		items = append(items, *recoveryOperation)
 	}
 	if writeSuppression {
 		put, putErr := store.suppressionPut(event, delivery, suppression, now)
@@ -189,13 +190,7 @@ func (store Store) deliveryUpdate(
 	now time.Time,
 	decision deliveryProviderDecision,
 ) (*types.Update, error) {
-	nextState := current.State
-	incomingStateOutcome := event.ProviderOutcome
-	if event.PermanentFailure && decision.AcceptedByAnotherAttempt {
-		incomingStateOutcome = notifications.ProviderOutcomeAccepted
-	}
-	var err error
-	nextState, err = notifications.ReconcileDeliveryStateFromProvider(current.State, incomingStateOutcome)
+	nextState, err := reconciledDeliveryState(current, event, decision)
 	if err != nil {
 		return nil, err
 	}
@@ -263,6 +258,18 @@ func (store Store) deliveryUpdate(
 		ConditionExpression: aws.String(condition), ExpressionAttributeNames: usedNames(names, update+condition),
 		ExpressionAttributeValues: values,
 	}, nil
+}
+
+func reconciledDeliveryState(
+	current deliveryRecord,
+	event feedback.Event,
+	decision deliveryProviderDecision,
+) (notifications.DeliveryState, error) {
+	incomingStateOutcome := event.ProviderOutcome
+	if event.PermanentFailure && decision.AcceptedByAnotherAttempt {
+		incomingStateOutcome = notifications.ProviderOutcomeAccepted
+	}
+	return notifications.ReconcileDeliveryStateFromProvider(current.State, incomingStateOutcome)
 }
 
 func (store Store) deliveryConditionCheck(

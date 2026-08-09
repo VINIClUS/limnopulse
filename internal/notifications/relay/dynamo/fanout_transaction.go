@@ -22,16 +22,21 @@ func (store Store) commitFanoutPage(
 	work relay.Work,
 	request relay.ExpandRequest,
 	deliveries []notifications.Delivery,
+	dependencyChecks []types.TransactWriteItem,
 	result relay.WorkResult,
 	nextCursor string,
 ) error {
-	items := make([]types.TransactWriteItem, 0, len(deliveries)+1)
+	items := make([]types.TransactWriteItem, 0, len(deliveries)+len(dependencyChecks)+1)
 	for _, delivery := range deliveries {
 		mutation, err := store.deliveryMutation(delivery, request.RelayTime)
 		if err != nil {
 			return err
 		}
 		items = append(items, types.TransactWriteItem{Update: mutation})
+	}
+	items = append(items, dependencyChecks...)
+	if len(items) >= 100 {
+		return fmt.Errorf("relay fanout page exceeds DynamoDB transaction capacity")
 	}
 	outboxMutation, err := store.outboxMutation(work, request, result, nextCursor)
 	if err != nil {
@@ -100,30 +105,33 @@ func (store Store) deliveryMutation(
 		)
 	}
 	payloadCondition := "#cancellation_reason = :cancellation_reason"
-	if snapshot.State == notifications.DeliveryStatePending {
+	if snapshot.State == notifications.DeliveryStatePending ||
+		snapshot.State == notifications.DeliveryStateWaitingDependency {
 		content := snapshot.Content
 		values[":content"] = map[string]any{
 			"template_id": string(content.TemplateID), "template_version": content.TemplateVersion,
 			"locale": string(content.Locale), "subject": content.Subject, "text": content.Text,
 			"html": content.HTML, "content_hash": content.ContentHash,
 		}
-		index, indexErr := notifications.BuildRelayIndexKey(
-			notifications.WorkKindDelivery, snapshot.TenantID, snapshot.DeliveryID, availableAt,
-		)
-		if indexErr != nil {
-			return nil, indexErr
+		fields = append(fields, struct{ name, value string }{"content", ":content"})
+		if snapshot.State == notifications.DeliveryStatePending {
+			index, indexErr := notifications.BuildRelayIndexKey(
+				notifications.WorkKindDelivery, snapshot.TenantID, snapshot.DeliveryID, availableAt,
+			)
+			if indexErr != nil {
+				return nil, indexErr
+			}
+			values[":available_at"] = availableAt.UTC().Format(fixedUTCLayout)
+			values[":relay_work_kind"] = string(notifications.WorkKindDelivery)
+			values[":relay_pk"] = index.PartitionKey
+			values[":relay_sk"] = index.SortKey
+			fields = append(fields,
+				struct{ name, value string }{"available_at", ":available_at"},
+				struct{ name, value string }{"relay_work_kind", ":relay_work_kind"},
+				struct{ name, value string }{"relay_gsi_pk", ":relay_pk"},
+				struct{ name, value string }{"relay_gsi_sk", ":relay_sk"},
+			)
 		}
-		values[":available_at"] = availableAt.UTC().Format(fixedUTCLayout)
-		values[":relay_work_kind"] = string(notifications.WorkKindDelivery)
-		values[":relay_pk"] = index.PartitionKey
-		values[":relay_sk"] = index.SortKey
-		fields = append(fields,
-			struct{ name, value string }{"content", ":content"},
-			struct{ name, value string }{"available_at", ":available_at"},
-			struct{ name, value string }{"relay_work_kind", ":relay_work_kind"},
-			struct{ name, value string }{"relay_gsi_pk", ":relay_pk"},
-			struct{ name, value string }{"relay_gsi_sk", ":relay_sk"},
-		)
 		payloadCondition = "#content = :content"
 	} else {
 		values[":cancellation_reason"] = string(snapshot.CancellationReason)

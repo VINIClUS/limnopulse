@@ -113,6 +113,20 @@ func (store Store) reconcileOnce(
 	if err != nil {
 		return feedback.ReconcileResult{Disposition: feedback.ReconcileAwaitDLQ}, false, nil
 	}
+	deliveryDecision, err := reconcileDeliveryProviderMetadata(delivery, event)
+	if err != nil {
+		return feedback.ReconcileResult{Disposition: feedback.ReconcileAwaitDLQ}, false, nil
+	}
+	nextDeliveryState, err := reconciledDeliveryState(delivery, event, deliveryDecision)
+	if err != nil {
+		return feedback.ReconcileResult{Disposition: feedback.ReconcileAwaitDLQ}, false, nil
+	}
+	recoveryOperation, err := store.recoveryDependencyOperation(
+		ctx, now, attempt, delivery, deliveryDecision, nextDeliveryState,
+	)
+	if err != nil {
+		return feedback.ReconcileResult{Disposition: feedback.ReconcileAwaitDLQ}, false, nil
+	}
 
 	var suppression suppressionRecord
 	writeSuppression := false
@@ -134,7 +148,7 @@ func (store Store) reconcileOnce(
 
 	input, err := store.reconcileTransaction(
 		event, now, transportKey, semanticKey, attemptKey, deliveryKey,
-		attempt, delivery, suppression, writeSuppression,
+		attempt, delivery, deliveryDecision, recoveryOperation, suppression, writeSuppression,
 	)
 	if err != nil {
 		return feedback.ReconcileResult{}, false, err

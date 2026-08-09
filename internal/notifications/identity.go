@@ -87,6 +87,12 @@ func NewDeliveryID(
 	return "del_" + hex.EncodeToString(digest[:]), nil
 }
 
+func OutboxID(eventID string, channel Channel, kind NotificationKind) string {
+	canonical := eventID + "\x00" + string(channel) + "\x00" + string(kind)
+	digest := sha256.Sum256([]byte(canonical))
+	return "outbox_" + hex.EncodeToString(digest[:])
+}
+
 func DeliveryStorageKey(outboxID, deliveryID string) (StorageKey, error) {
 	if err := validateIdentityField("outbox ID", outboxID); err != nil {
 		return StorageKey{}, err

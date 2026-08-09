@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"strings"
 	"time"
+	"unicode"
 
 	"github.com/VINIClUS/limnopulse/internal/notifications"
 	"github.com/VINIClUS/limnopulse/internal/notifications/relay"
@@ -268,12 +269,26 @@ func (event eventSnapshot) templateDataFor(
 		}
 	}
 	return notifications.EmailTemplateData{
-		RuleName: event.RuleName, Severity: event.Severity, TenantID: event.TenantID,
+		RuleName: normalizeLegacyRuleName(event.RuleName), Severity: event.Severity, TenantID: event.TenantID,
 		PondID: event.PondID, DeviceID: event.DeviceID, Metric: event.Metric, Unit: unit,
 		Operator: event.Operator, Threshold: event.Threshold, ObservedValue: observedValue,
 		EvaluationWindow: windowEnd.Sub(windowStart), WindowStart: windowStart,
 		WindowEnd: windowEnd, EvaluatedAt: evaluatedAt, EventID: event.EventID,
 	}, nil
+}
+
+func normalizeLegacyRuleName(value string) string {
+	value = strings.Map(func(character rune) rune {
+		if unicode.IsControl(character) {
+			return ' '
+		}
+		return character
+	}, value)
+	value = strings.Join(strings.Fields(value), " ")
+	if value == "" {
+		return "Regra de alerta"
+	}
+	return value
 }
 
 func metricUnit(metric string) (string, error) {

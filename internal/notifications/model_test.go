@@ -41,7 +41,7 @@ func TestNotificationEnumsExposeOnlyContractValues(t *testing.T) {
 		{
 			name: "delivery states",
 			got:  stringsOf(DeliveryStates()),
-			want: []string{"pending", "queued", "processing", "retryable_failed", "succeeded", "permanent_failed", "cancelled", "unknown"},
+			want: []string{"pending", "waiting_dependency", "queued", "processing", "retryable_failed", "succeeded", "permanent_failed", "cancelled", "unknown"},
 		},
 		{
 			name: "attempt outcomes",

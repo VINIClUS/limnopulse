@@ -104,6 +104,24 @@ func TestRecoveryModelsRequireOpeningRelationship(t *testing.T) {
 	if _, err := NewPendingDelivery(params); err == nil {
 		t.Fatal("recovery delivery without opening delivery accepted")
 	}
+
+	params.DependsOnDeliveryID = "del_opening_1"
+	waiting, err := NewWaitingDependencyDelivery(params)
+	if err != nil || waiting.State() != DeliveryStateWaitingDependency {
+		t.Fatalf("waiting recovery = %#v, %v", waiting.Snapshot(), err)
+	}
+	openingID, err := NewDeliveryID("alert_1", NotificationKindOpening, ChannelEmail, "user_1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	params.Kind = NotificationKindOpening
+	params.DeliveryID = openingID
+	params.Content = mustRenderedContentFor(t, TemplateAlertOpeningV1)
+	params.DependsOnOutboxID = ""
+	params.DependsOnDeliveryID = ""
+	if _, err := NewWaitingDependencyDelivery(params); err == nil {
+		t.Fatal("opening delivery accepted waiting dependency state")
+	}
 }
 
 func TestDeliveryValidationUsesOnlyCanonicalDeliveryIdentityInputs(t *testing.T) {
@@ -212,17 +230,19 @@ func TestCancelledDeliveryCarriesReasonWithoutRenderedContent(t *testing.T) {
 
 func TestDeliveryStateTransitionMatrix(t *testing.T) {
 	allowed := map[[2]DeliveryState]bool{
-		{DeliveryStatePending, DeliveryStateQueued}:             true,
-		{DeliveryStatePending, DeliveryStateCancelled}:          true,
-		{DeliveryStateQueued, DeliveryStateProcessing}:          true,
-		{DeliveryStateQueued, DeliveryStateCancelled}:           true,
-		{DeliveryStateProcessing, DeliveryStateRetryableFailed}: true,
-		{DeliveryStateProcessing, DeliveryStateSucceeded}:       true,
-		{DeliveryStateProcessing, DeliveryStatePermanentFailed}: true,
-		{DeliveryStateProcessing, DeliveryStateCancelled}:       true,
-		{DeliveryStateProcessing, DeliveryStateUnknown}:         true,
-		{DeliveryStateRetryableFailed, DeliveryStateProcessing}: true,
-		{DeliveryStateRetryableFailed, DeliveryStateCancelled}:  true,
+		{DeliveryStateWaitingDependency, DeliveryStatePending}:   true,
+		{DeliveryStateWaitingDependency, DeliveryStateCancelled}: true,
+		{DeliveryStatePending, DeliveryStateQueued}:              true,
+		{DeliveryStatePending, DeliveryStateCancelled}:           true,
+		{DeliveryStateQueued, DeliveryStateProcessing}:           true,
+		{DeliveryStateQueued, DeliveryStateCancelled}:            true,
+		{DeliveryStateProcessing, DeliveryStateRetryableFailed}:  true,
+		{DeliveryStateProcessing, DeliveryStateSucceeded}:        true,
+		{DeliveryStateProcessing, DeliveryStatePermanentFailed}:  true,
+		{DeliveryStateProcessing, DeliveryStateCancelled}:        true,
+		{DeliveryStateProcessing, DeliveryStateUnknown}:          true,
+		{DeliveryStateRetryableFailed, DeliveryStateProcessing}:  true,
+		{DeliveryStateRetryableFailed, DeliveryStateCancelled}:   true,
 	}
 
 	for _, current := range DeliveryStates() {

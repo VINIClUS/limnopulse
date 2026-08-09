@@ -7,7 +7,7 @@
 <dt>Severidade</dt><dd>{{.Severity}}</dd>
 <dt>Tenant</dt><dd>{{.TenantID}}</dd>
 <dt>Viveiro</dt><dd>{{.PondID}}</dd>
-<dt>Dispositivo</dt><dd>{{.DeviceID}}</dd>
+{{if .DeviceID}}<dt>Dispositivo</dt><dd>{{.DeviceID}}</dd>{{else}}<dt>Escopo</dt><dd>viveiro inteiro</dd>{{end}}
 <dt>Métrica</dt><dd>{{.Metric}} ({{.Unit}})</dd>
 <dt>Condição</dt><dd>{{.Operator}} {{number .Threshold}} {{.Unit}}</dd>
 {{if .ObservedValue}}<dt>Valor observado</dt><dd>{{numberPtr .ObservedValue}} {{.Unit}}</dd>

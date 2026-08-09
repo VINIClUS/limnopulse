@@ -7,6 +7,9 @@ import (
 
 	"github.com/VINIClUS/limnopulse/internal/notifications"
 	"github.com/VINIClUS/limnopulse/internal/notifications/relay"
+	"github.com/aws/aws-sdk-go-v2/aws"
+	"github.com/aws/aws-sdk-go-v2/feature/dynamodb/attributevalue"
+	"github.com/aws/aws-sdk-go-v2/service/dynamodb/types"
 )
 
 func (store Store) ExpandDependency(
@@ -59,6 +62,7 @@ func (store Store) ExpandDependency(
 	}
 	result := relay.WorkResult{}
 	deliveries := make([]notifications.Delivery, 0, len(page.Deliveries))
+	dependencyChecks := make([]types.TransactWriteItem, 0)
 	for _, opening := range page.Deliveries {
 		result.RecipientsExamined++
 		deliveryID, idErr := notifications.NewDeliveryID(
@@ -81,7 +85,25 @@ func (store Store) ExpandDependency(
 		}
 		state := notifications.DeliveryState(opening.State)
 		var delivery notifications.Delivery
-		if state != notifications.DeliveryStateSucceeded {
+		if state == notifications.DeliveryStateUnknown {
+			if localeErr := opening.Content.Locale.Validate(); localeErr != nil {
+				return relay.WorkResult{}, fmt.Errorf("opening delivery locale is invalid")
+			}
+			params.Content, err = renderer.Render(
+				notifications.TemplateAlertRecoveryV1, opening.Content.Locale, templateData,
+			)
+			if err == nil {
+				delivery, err = notifications.NewWaitingDependencyDelivery(params)
+			}
+			if err == nil {
+				check, checkErr := store.openingUnknownCondition(opening)
+				if checkErr != nil {
+					return relay.WorkResult{}, checkErr
+				}
+				dependencyChecks = append(dependencyChecks, types.TransactWriteItem{ConditionCheck: check})
+			}
+			result.DeliveriesCreated++
+		} else if state != notifications.DeliveryStateSucceeded {
 			params.CancellationReason = notifications.CancellationReasonOpeningNotSucceeded
 			delivery, err = notifications.NewCancelledDelivery(params)
 			result.DeliveriesCancelled++
@@ -122,10 +144,34 @@ func (store Store) ExpandDependency(
 		}
 		deliveries = append(deliveries, delivery)
 	}
-	if err := store.commitFanoutPage(ctx, work, request, deliveries, result, page.NextCursor); err != nil {
+	if err := store.commitFanoutPage(ctx, work, request, deliveries, dependencyChecks, result, page.NextCursor); err != nil {
 		return relay.WorkResult{}, err
 	}
 	return result, nil
+}
+
+func (store Store) openingUnknownCondition(opening openingDelivery) (*types.ConditionCheck, error) {
+	key, err := attributevalue.MarshalMap(map[string]string{"PK": opening.PK, "SK": opening.SK})
+	if err != nil {
+		return nil, err
+	}
+	values, err := attributevalue.MarshalMap(map[string]any{
+		":entity": "notification_delivery", ":outbox_id": opening.OutboxID,
+		":delivery_id": opening.DeliveryID, ":event_id": opening.EventID,
+		":unknown": string(notifications.DeliveryStateUnknown), ":revision": opening.Revision,
+	})
+	if err != nil {
+		return nil, err
+	}
+	return &types.ConditionCheck{
+		TableName: aws.String(store.Table), Key: key,
+		ConditionExpression: aws.String("#entity = :entity AND #outbox_id = :outbox_id AND #delivery_id = :delivery_id AND #event_id = :event_id AND #state = :unknown AND #revision = :revision"),
+		ExpressionAttributeNames: map[string]string{
+			"#entity": "entity_type", "#outbox_id": "outbox_id", "#delivery_id": "delivery_id",
+			"#event_id": "event_id", "#state": "state", "#revision": "delivery_revision",
+		},
+		ExpressionAttributeValues: values,
+	}, nil
 }
 
 func isNonterminalDelivery(state notifications.DeliveryState) bool {

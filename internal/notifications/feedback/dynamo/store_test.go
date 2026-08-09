@@ -243,6 +243,231 @@ func TestReconcileLateSendPromotesUnknownAndKeepsAcceptanceEvidence(t *testing.T
 	}
 }
 
+func TestReconcileLateSendReactivatesParkedRecoveryDependencyIdempotently(t *testing.T) {
+	client := newFakeClient(t)
+	client.seed(testAttempt("ambiguous", "", ""))
+	delivery := testDelivery("unknown", "", 11)
+	delivery["last_attempt_id"] = "att_1"
+	client.seed(delivery)
+	recoveryOutboxID := notifications.OutboxID(
+		"alert_1", notifications.ChannelEmail, notifications.NotificationKindRecovery,
+	)
+	recoveryDeliveryID, err := notifications.NewDeliveryID(
+		"alert_1", notifications.NotificationKindRecovery, notifications.ChannelEmail, "sub_1",
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	client.seed(map[string]any{
+		"PK": "NOTIFICATION_OUTBOX#" + recoveryOutboxID, "SK": "DELIVERY#" + recoveryDeliveryID,
+		"entity_type": "notification_delivery", "relay_schema_version": int64(1),
+		"tenant_id": "tnt_1", "outbox_id": recoveryOutboxID, "delivery_id": recoveryDeliveryID,
+		"event_id": "alert_1", "kind": "recovery", "channel": "email", "recipient_id": "sub_1",
+		"depends_on_outbox_id": "outbox_1", "depends_on_delivery_id": "del_1",
+		"state": "waiting_dependency", "delivery_revision": int64(1),
+	})
+
+	result, err := (Store{Table: "domain", Client: client}).Reconcile(
+		context.Background(), testEvent(feedback.SemanticSend), testNow(),
+	)
+	if err != nil || result.Disposition != feedback.ReconcileApplied {
+		t.Fatalf("result=%#v err=%v", result, err)
+	}
+	transaction := client.transactions[0]
+	if len(transaction.TransactItems) != 5 || transaction.TransactItems[4].Update == nil {
+		t.Fatalf("late acceptance transaction = %#v", transaction.TransactItems)
+	}
+	reactivation := transaction.TransactItems[4].Update
+	var key map[string]string
+	if err := attributevalue.UnmarshalMap(reactivation.Key, &key); err != nil {
+		t.Fatal(err)
+	}
+	if key["PK"] != "NOTIFICATION_OUTBOX#"+recoveryOutboxID || key["SK"] != "DELIVERY#"+recoveryDeliveryID {
+		t.Fatalf("reactivated key = %#v", key)
+	}
+	text := *reactivation.ConditionExpression + " " + *reactivation.UpdateExpression
+	for _, name := range reactivation.ExpressionAttributeNames {
+		text += " " + name
+	}
+	var values map[string]any
+	if err := attributevalue.UnmarshalMap(reactivation.ExpressionAttributeValues, &values); err != nil {
+		t.Fatal(err)
+	}
+	text += fmt.Sprint(values)
+	for _, required := range []string{"waiting_dependency", "pending", "relay_gsi_pk", "delivery_revision"} {
+		if !strings.Contains(text, required) {
+			t.Errorf("reactivation missing %q: %s", required, text)
+		}
+	}
+}
+
+func TestReconcileLateRejectCancelsWaitingRecoveryWithoutRelayIndex(t *testing.T) {
+	client := newFakeClient(t)
+	client.seed(testAttempt("ambiguous", "", ""))
+	delivery := testDelivery("unknown", "", 11)
+	delivery["last_attempt_id"] = "att_1"
+	client.seed(delivery)
+	seedWaitingRecovery(t, client)
+
+	result, err := (Store{Table: "domain", Client: client}).Reconcile(
+		context.Background(), testEvent(feedback.SemanticReject), testNow(),
+	)
+	if err != nil || result.Disposition != feedback.ReconcileApplied {
+		t.Fatalf("result=%#v err=%v", result, err)
+	}
+	update := client.transactions[0].TransactItems[4].Update
+	if update == nil {
+		t.Fatalf("missing waiting recovery cancellation: %#v", client.transactions[0].TransactItems)
+	}
+	values := decodeValues(t, update.ExpressionAttributeValues)
+	if values[":next_state"] != "cancelled" ||
+		values[":cancellation_reason"] != "opening_delivery_not_succeeded" ||
+		values[":relay_pk"] != nil || values[":relay_sk"] != nil {
+		t.Fatalf("waiting recovery cancellation values = %#v", values)
+	}
+}
+
+func TestReconcileOwnedLateHardBounceUsesEffectiveSucceededStateAndSuppression(t *testing.T) {
+	client := newFakeClient(t)
+	client.seed(testAttempt("ambiguous", "", ""))
+	delivery := testDelivery("unknown", "", 11)
+	delivery["last_attempt_id"] = "att_1"
+	client.seed(delivery)
+	seedWaitingRecovery(t, client)
+
+	result, err := (Store{Table: "domain", Client: client}).Reconcile(
+		context.Background(), testEvent(feedback.SemanticHardBounce), testNow(),
+	)
+	if err != nil || result.Disposition != feedback.ReconcileApplied || !result.Suppressed {
+		t.Fatalf("result=%#v err=%v", result, err)
+	}
+	transaction := client.transactions[0]
+	if len(transaction.TransactItems) != 6 || transaction.TransactItems[5].Put == nil {
+		t.Fatalf("hard-bounce transaction = %#v", transaction.TransactItems)
+	}
+	values := decodeValues(t, transaction.TransactItems[4].Update.ExpressionAttributeValues)
+	if values[":next_state"] != "pending" || values[":relay_pk"] == nil ||
+		values[":cancellation_reason"] != nil {
+		t.Fatalf("hard-bounce dependency must follow effective succeeded state: %#v", values)
+	}
+}
+
+func TestReconcileDeliveryDelayLeavesWaitingRecoveryUnindexed(t *testing.T) {
+	client := newFakeClient(t)
+	client.seed(testAttempt("ambiguous", "", ""))
+	delivery := testDelivery("unknown", "", 11)
+	delivery["last_attempt_id"] = "att_1"
+	client.seed(delivery)
+	seedWaitingRecovery(t, client)
+
+	result, err := (Store{Table: "domain", Client: client}).Reconcile(
+		context.Background(), testEvent(feedback.SemanticDeliveryDelay), testNow(),
+	)
+	if err != nil || result.Disposition != feedback.ReconcileApplied ||
+		len(client.transactions[0].TransactItems) != 4 {
+		t.Fatalf("result=%#v err=%v transaction=%#v", result, err, client.transactions[0].TransactItems)
+	}
+}
+
+func TestReconcileStaleFeedbackCannotResolveWaitingRecoveryDependency(t *testing.T) {
+	for _, semantic := range []feedback.SemanticType{feedback.SemanticSend, feedback.SemanticHardBounce} {
+		t.Run(string(semantic), func(t *testing.T) {
+			client := newFakeClient(t)
+			attempt := testAttempt("ambiguous", "", "")
+			attempt["SK"] = "ATTEMPT#att_old"
+			attempt["attempt_id"] = "att_old"
+			client.seed(attempt)
+			delivery := testDelivery("unknown", "delayed", 11)
+			delivery["last_attempt_id"] = "att_new"
+			delivery["provider_attempt_id"] = "att_new"
+			delivery["provider_message_id"] = "ses_new"
+			delivery["provider_accepted"] = true
+			client.seed(delivery)
+			seedWaitingRecovery(t, client)
+			event := testEvent(semantic)
+			event.AttemptID = "att_old"
+			event.ProviderMessageID = "ses_old"
+
+			result, err := (Store{Table: "domain", Client: client}).Reconcile(
+				context.Background(), event, testNow(),
+			)
+			if err != nil || result.Disposition != feedback.ReconcileApplied {
+				t.Fatalf("result=%#v err=%v", result, err)
+			}
+			wantItems := 4
+			if semantic == feedback.SemanticHardBounce {
+				wantItems = 5 // suppression is still monotonic, dependency state is not owned.
+			}
+			transaction := client.transactions[0]
+			if len(transaction.TransactItems) != wantItems ||
+				transaction.TransactItems[3].ConditionCheck == nil || transaction.TransactItems[3].Update != nil {
+				t.Fatalf("stale feedback mutated aggregate/dependency: %#v", transaction.TransactItems)
+			}
+			if wantItems == 5 && transaction.TransactItems[4].Put == nil {
+				t.Fatalf("hard-bounce suppression missing: %#v", transaction.TransactItems)
+			}
+		})
+	}
+}
+
+func TestReconcileFencesRecoveryAbsenceAcrossRelayCreateRace(t *testing.T) {
+	client := newFakeClient(t)
+	client.seed(testAttempt("ambiguous", "", ""))
+	delivery := testDelivery("unknown", "", 11)
+	delivery["last_attempt_id"] = "att_1"
+	client.seed(delivery)
+	recoveryOutboxID := notifications.OutboxID(
+		"alert_1", notifications.ChannelEmail, notifications.NotificationKindRecovery,
+	)
+	recoveryDeliveryID, err := notifications.NewDeliveryID(
+		"alert_1", notifications.NotificationKindRecovery, notifications.ChannelEmail, "sub_1",
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	recoveryKey := "NOTIFICATION_OUTBOX#" + recoveryOutboxID + "\x00DELIVERY#" + recoveryDeliveryID
+
+	client.transactionHook = func(input *awssdk.TransactWriteItemsInput, call int) error {
+		if call != 1 {
+			return nil
+		}
+		// Relay wins immediately after feedback observed the recovery key absent.
+		seedWaitingRecovery(t, client)
+		for _, item := range input.TransactItems {
+			if item.ConditionCheck == nil {
+				continue
+			}
+			var key map[string]string
+			if unmarshalErr := attributevalue.UnmarshalMap(item.ConditionCheck.Key, &key); unmarshalErr != nil {
+				t.Fatal(unmarshalErr)
+			}
+			if key["PK"]+"\x00"+key["SK"] == recoveryKey &&
+				strings.Contains(*item.ConditionCheck.ConditionExpression, "attribute_not_exists") {
+				return &types.TransactionCanceledException{}
+			}
+		}
+		return nil
+	}
+
+	result, err := (Store{Table: "domain", Client: client}).Reconcile(
+		context.Background(), testEvent(feedback.SemanticSend), testNow(),
+	)
+	if err != nil || result.Disposition != feedback.ReconcileApplied {
+		t.Fatalf("result=%#v err=%v", result, err)
+	}
+	if len(client.transactions) != 2 {
+		t.Fatalf("feedback transactions = %d, want absence conflict then waiting promotion", len(client.transactions))
+	}
+	first, second := client.transactions[0], client.transactions[1]
+	if len(first.TransactItems) != 5 || first.TransactItems[4].ConditionCheck == nil ||
+		len(second.TransactItems) != 5 || second.TransactItems[4].Update == nil {
+		t.Fatalf("race transactions = first:%#v second:%#v", first.TransactItems, second.TransactItems)
+	}
+	if first.ClientRequestToken != nil || second.ClientRequestToken != nil {
+		t.Fatalf("shape-changing retry must not reuse idempotency token: first:%v second:%v", first.ClientRequestToken, second.ClientRequestToken)
+	}
+}
+
 func TestReconcileStaleAttemptRejectDoesNotDowngradeLaterAcceptedAttempt(t *testing.T) {
 	client := newFakeClient(t)
 	olderAttempt := testAttempt("ambiguous", "", "")
@@ -575,6 +800,7 @@ type fakeClient struct {
 	transactionErr    error
 	transactionErrors []error
 	onTransaction     func(int)
+	transactionHook   func(*awssdk.TransactWriteItemsInput, int) error
 }
 
 func newFakeClient(t *testing.T) *fakeClient {
@@ -603,6 +829,11 @@ func (client *fakeClient) TransactWriteItems(_ context.Context, input *awssdk.Tr
 	client.transactions = append(client.transactions, input)
 	if client.onTransaction != nil {
 		client.onTransaction(len(client.transactions))
+	}
+	if client.transactionHook != nil {
+		if err := client.transactionHook(input, len(client.transactions)); err != nil {
+			return &awssdk.TransactWriteItemsOutput{}, err
+		}
 	}
 	if len(client.transactionErrors) != 0 {
 		err := client.transactionErrors[0]
@@ -662,13 +893,35 @@ func testDelivery(state, providerOutcome string, revision int64) map[string]any 
 	item := map[string]any{
 		"PK": "NOTIFICATION_OUTBOX#outbox_1", "SK": "DELIVERY#del_1", "entity_type": "notification_delivery",
 		"tenant_id": "tnt_1", "outbox_id": "outbox_1", "delivery_id": "del_1", "event_id": "alert_1",
-		"kind": "opening", "channel": "email", "normalized_email": "owner@example.com", "state": state,
+		"kind": "opening", "channel": "email", "recipient_id": "sub_1",
+		"normalized_email": "owner@example.com", "state": state,
 		"delivery_revision": revision,
 	}
 	if providerOutcome != "" {
 		item["provider_outcome"] = providerOutcome
 	}
 	return item
+}
+
+func seedWaitingRecovery(t *testing.T, client *fakeClient) {
+	t.Helper()
+	recoveryOutboxID := notifications.OutboxID(
+		"alert_1", notifications.ChannelEmail, notifications.NotificationKindRecovery,
+	)
+	recoveryDeliveryID, err := notifications.NewDeliveryID(
+		"alert_1", notifications.NotificationKindRecovery, notifications.ChannelEmail, "sub_1",
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	client.seed(map[string]any{
+		"PK": "NOTIFICATION_OUTBOX#" + recoveryOutboxID, "SK": "DELIVERY#" + recoveryDeliveryID,
+		"entity_type": "notification_delivery", "relay_schema_version": int64(1),
+		"tenant_id": "tnt_1", "outbox_id": recoveryOutboxID, "delivery_id": recoveryDeliveryID,
+		"event_id": "alert_1", "kind": "recovery", "channel": "email", "recipient_id": "sub_1",
+		"depends_on_outbox_id": "outbox_1", "depends_on_delivery_id": "del_1",
+		"state": "waiting_dependency", "delivery_revision": int64(1),
+	})
 }
 
 func testSuppression(reason string, rank int64) map[string]any {

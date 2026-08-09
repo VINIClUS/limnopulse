@@ -2,12 +2,14 @@ package dynamo
 
 import (
 	"context"
+	"fmt"
 	"strings"
 	"testing"
 	"time"
 
 	"github.com/VINIClUS/limnopulse/internal/notifications"
 	"github.com/VINIClUS/limnopulse/internal/notifications/relay"
+	"github.com/aws/aws-sdk-go-v2/aws"
 	"github.com/aws/aws-sdk-go-v2/feature/dynamodb/attributevalue"
 	awssdk "github.com/aws/aws-sdk-go-v2/service/dynamodb"
 	"github.com/aws/aws-sdk-go-v2/service/dynamodb/types"
@@ -151,6 +153,90 @@ func TestExpandDependencyReschedulesWholePageForNonterminalOpeningDelivery(t *te
 	}
 	if len(client.transactInputs) != 0 {
 		t.Fatalf("nonterminal dependency partially committed: %#v", client.transactInputs)
+	}
+}
+
+func TestExpandDependencyCreatesSucceededAndWaitingRecoveriesWithoutHeadOfLineBlocking(t *testing.T) {
+	relayTime := time.Date(2026, 7, 16, 13, 0, 0, 0, time.UTC)
+	succeeded := succeededOpeningDelivery(t, relayTime)
+	unknown := succeededOpeningDelivery(t, relayTime)
+	var values map[string]any
+	if err := attributevalue.UnmarshalMap(unknown, &values); err != nil {
+		t.Fatal(err)
+	}
+	unknownOpeningID, err := notifications.NewDeliveryID(
+		"event_1", notifications.NotificationKindOpening, notifications.ChannelEmail, "sub_2",
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	values["SK"] = "DELIVERY#" + unknownOpeningID
+	values["delivery_id"] = unknownOpeningID
+	values["recipient_id"] = "sub_2"
+	values["normalized_email"] = "second@example.com"
+	values["state"] = "unknown"
+	values["delivery_revision"] = int64(11)
+	client := &fakeClient{
+		queryOutputs: []*awssdk.QueryOutput{{Items: []map[string]types.AttributeValue{succeeded, marshalMap(t, values)}}},
+		getOutputs: []*awssdk.GetItemOutput{
+			{Item: expandedOpeningOutbox(t)}, {Item: marshalMap(t, openingEvent(relayTime))},
+			{Item: activeMember(t, relayTime, "sub_1")}, {},
+		},
+	}
+
+	result, err := (Store{Table: "domain", Client: client}).ExpandDependency(
+		context.Background(), recoveryWork(t, relayTime),
+		relay.ExpandRequest{RelayTime: relayTime, PageSize: 99},
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if result.DeliveriesCreated != 2 || result.DeliveriesCancelled != 0 ||
+		result.RecipientsExamined != 2 || len(client.transactInputs) != 1 {
+		t.Fatalf("result=%#v transactions=%d", result, len(client.transactInputs))
+	}
+	if client.queryInputs[0].Limit == nil || *client.queryInputs[0].Limit != 49 {
+		t.Fatalf("dependency query limit = %v, want 49 for worst-case transaction capacity", client.queryInputs[0].Limit)
+	}
+	transaction := client.transactInputs[0]
+	if len(transaction.TransactItems) != 4 || transaction.TransactItems[0].Update == nil ||
+		transaction.TransactItems[1].Update == nil || transaction.TransactItems[2].ConditionCheck == nil ||
+		transaction.TransactItems[3].Update == nil {
+		t.Fatalf("mixed recovery transaction = %#v", transaction.TransactItems)
+	}
+	var text strings.Builder
+	for _, item := range transaction.TransactItems {
+		if item.Update != nil {
+			text.WriteString(aws.ToString(item.Update.UpdateExpression))
+			text.WriteString(aws.ToString(item.Update.ConditionExpression))
+			for _, name := range item.Update.ExpressionAttributeNames {
+				text.WriteString(name)
+			}
+			var decoded map[string]any
+			if err := attributevalue.UnmarshalMap(item.Update.ExpressionAttributeValues, &decoded); err != nil {
+				t.Fatal(err)
+			}
+			text.WriteString(fmt.Sprint(decoded))
+		}
+		if item.ConditionCheck != nil {
+			text.WriteString(aws.ToString(item.ConditionCheck.ConditionExpression))
+			for _, name := range item.ConditionCheck.ExpressionAttributeNames {
+				text.WriteString(name)
+			}
+			var decoded map[string]any
+			if err := attributevalue.UnmarshalMap(item.ConditionCheck.ExpressionAttributeValues, &decoded); err != nil {
+				t.Fatal(err)
+			}
+			text.WriteString(fmt.Sprint(decoded))
+		}
+	}
+	for _, required := range []string{"unknown", "delivery_revision", "waiting_dependency", "pending", "relay_gsi_pk"} {
+		if !strings.Contains(text.String(), required) {
+			t.Errorf("mixed recovery transaction missing %q: %s", required, text.String())
+		}
+	}
+	if strings.Contains(text.String(), "opening_delivery_not_succeeded") {
+		t.Fatalf("unknown opening permanently cancelled recovery: %s", text.String())
 	}
 }
 

@@ -145,6 +145,13 @@ func NewPendingDelivery(params DeliveryParams) (Delivery, error) {
 	return newDelivery(params, DeliveryStatePending)
 }
 
+func NewWaitingDependencyDelivery(params DeliveryParams) (Delivery, error) {
+	if params.Kind != NotificationKindRecovery || params.DependsOnOutboxID == "" || params.DependsOnDeliveryID == "" {
+		return Delivery{}, fmt.Errorf("waiting dependency delivery must reference its opening delivery")
+	}
+	return newDelivery(params, DeliveryStateWaitingDependency)
+}
+
 func NewCancelledDelivery(params DeliveryParams) (Delivery, error) {
 	if params.CancellationReason == "" {
 		params.CancellationReason = CancellationReasonCancelled
@@ -243,6 +250,10 @@ func RestoreDelivery(snapshot DeliverySnapshot) (Delivery, error) {
 }
 
 var deliveryTransitions = map[DeliveryState]map[DeliveryState]struct{}{
+	DeliveryStateWaitingDependency: {
+		DeliveryStatePending:   {},
+		DeliveryStateCancelled: {},
+	},
 	DeliveryStatePending: {
 		DeliveryStateQueued:    {},
 		DeliveryStateCancelled: {},
@@ -360,6 +371,10 @@ func (delivery Delivery) Validate() error {
 	}
 	if err := validateOpeningRelationship(delivery.Kind, "dependent opening delivery ID", delivery.DependsOnDeliveryID); err != nil {
 		return err
+	}
+	if delivery.state == DeliveryStateWaitingDependency &&
+		(delivery.Kind != NotificationKindRecovery || delivery.DependsOnOutboxID == "" || delivery.DependsOnDeliveryID == "") {
+		return fmt.Errorf("waiting dependency delivery must reference its opening delivery")
 	}
 	if err := delivery.MembershipSnapshot.Validate(); err != nil {
 		return err

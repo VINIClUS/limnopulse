@@ -4,7 +4,7 @@ Regra: {{.RuleName}}
 Severidade: {{.Severity}}
 Tenant: {{.TenantID}}
 Viveiro: {{.PondID}}
-Dispositivo: {{.DeviceID}}
+{{if .DeviceID}}Dispositivo: {{.DeviceID}}{{else}}Escopo: viveiro inteiro{{end}}
 Métrica: {{.Metric}} ({{.Unit}})
 Condição: {{.Operator}} {{number .Threshold}} {{.Unit}}
 {{if .ObservedValue}}Valor observado: {{numberPtr .ObservedValue}} {{.Unit}}

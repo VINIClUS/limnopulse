@@ -522,6 +522,75 @@ func TestStaleFeedbackCommitDoesNotRaceSuccessfulCurrentAttemptCompletion(t *tes
 	}
 }
 
+func TestCurrentAttemptDeliveryDelayDoesNotLoseConfirmedSendCompletion(t *testing.T) {
+	record := testRecord(t)
+	record.AttemptCount = 1
+	record.LastAttemptID = "att_current"
+
+	attempt := map[string]any{
+		"PK": "NOTIFICATION_DELIVERY#" + record.Delivery.DeliveryID, "SK": "ATTEMPT#att_current",
+		"entity_type": "notification_attempt", "tenant_id": record.Delivery.TenantID,
+		"outbox_id": record.Delivery.OutboxID, "delivery_id": record.Delivery.DeliveryID,
+		"attempt_id": "att_current", "event_id": record.Delivery.EventID,
+		"notification_kind": string(record.Delivery.Kind), "channel": string(record.Delivery.Channel),
+		"outcome": "started", "started_at": testNow().Add(-time.Second).Format(time.RFC3339Nano),
+	}
+	delivery := testDeliveryItem(t, notifications.DeliveryStateProcessing)
+	delivery["delivery_revision"] = record.Revision
+	delivery["attempt_count"] = int64(record.AttemptCount)
+	delivery["last_attempt_id"] = record.LastAttemptID
+	delivery["delivery_lease_owner"] = record.LeaseOwner
+	delivery["delivery_lease_epoch"] = record.LeaseEpoch
+	delivery["delivery_lease_expires_at"] = record.LeaseExpiresAt.Format(time.RFC3339Nano)
+
+	refreshed := cloneMap(delivery)
+	refreshed["delivery_revision"] = record.Revision + 1
+	refreshed["provider_attempt_id"] = record.LastAttemptID
+	refreshed["provider_message_id"] = "ses_current"
+	refreshed["provider_outcome"] = "delayed"
+	refreshed["possibly_accepted"] = true
+
+	client := &fakeClient{
+		getItems: []map[string]types.AttributeValue{
+			nil, nil, marshal(t, attempt), marshal(t, delivery), marshal(t, refreshed),
+		},
+		transactionErrors: []error{nil, &types.TransactionCanceledException{}, nil},
+	}
+	event := feedback.Event{
+		EventBridgeID: "evt_delay_current", ProviderMessageID: "ses_current",
+		DeliveryID: record.Delivery.DeliveryID, AttemptID: record.LastAttemptID,
+		SemanticType:    feedback.SemanticDeliveryDelay,
+		ProviderOutcome: notifications.ProviderOutcomeDelayed, AcceptedEvidence: true,
+	}
+	result, err := (feedbackdynamo.Store{Table: "domain", Client: client}).Reconcile(
+		context.Background(), event, testNow(),
+	)
+	if err != nil || result.Disposition != feedback.ReconcileApplied {
+		t.Fatalf("DeliveryDelay result=%#v err=%v", result, err)
+	}
+
+	err = (Store{Table: "domain", Client: client}).CompleteAttempt(
+		context.Background(), record, worker.AttemptCompletion{
+			AttemptID: record.LastAttemptID, CompletedAt: testNow(),
+			Outcome: notifications.AttemptOutcomeSucceeded, NextState: notifications.DeliveryStateSucceeded,
+			ProviderOutcome: notifications.ProviderOutcomeAccepted, ProviderMessageID: "ses_current",
+		},
+	)
+	if err != nil {
+		t.Fatalf("confirmed send completion lost after DeliveryDelay: %v", err)
+	}
+	if len(client.transactions) != 3 {
+		t.Fatalf("transactions = %d, want feedback + failed completion + merged completion", len(client.transactions))
+	}
+	mergedValues := decodeExpressionValues(
+		t, client.transactions[2].TransactItems[1].Update.ExpressionAttributeValues,
+	)
+	if fmt.Sprint(mergedValues[":revision"]) != fmt.Sprint(record.Revision+1) ||
+		mergedValues[":provider_outcome"] != "accepted" || mergedValues[":provider_message_id"] != "ses_current" {
+		t.Fatalf("merged completion values = %#v", mergedValues)
+	}
+}
+
 func TestCompleteAttemptFinalizesCurrentStartedAttemptWhenOlderFeedbackTerminalizesDelivery(t *testing.T) {
 	for _, terminalState := range []notifications.DeliveryState{
 		notifications.DeliveryStateSucceeded,
