@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"reflect"
 	"strings"
 	"testing"
 	"time"
@@ -306,6 +307,41 @@ func TestCheckGatesReadsLegacyCasedDeliverabilityDuringRollout(t *testing.T) {
 	}
 }
 
+func TestCheckGatesCapturesEveryDeliverabilityDependencyInFence(t *testing.T) {
+	record := testRecord(t)
+	record.Delivery.NormalizedEmail = "Owner@Example.COM"
+	preference := currentPreference(record, true, "warning")
+	preference["email_address"] = record.Delivery.NormalizedEmail
+	client := &fakeClient{getItems: []map[string]types.AttributeValue{
+		marshal(t, currentMembership(record)), marshal(t, preference),
+		marshal(t, currentAlertEvent(record, "critical")), nil,
+		marshal(t, map[string]any{"deliverability": "deliverable"}),
+	}}
+
+	gate, err := (Store{Table: "domain", Client: client}).CheckGates(context.Background(), record)
+
+	if err != nil || !gate.Allowed || !gate.Fence.IsComplete() {
+		t.Fatalf("gate=%#v err=%v", gate, err)
+	}
+	canonical, err := notifications.DeliverabilityStorageKey(record.Delivery.NormalizedEmail)
+	if err != nil {
+		t.Fatal(err)
+	}
+	legacy, err := notifications.LegacyDeliverabilityStorageKey(record.Delivery.NormalizedEmail)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if gate.Fence.MembershipVersion != 2 || gate.Fence.PreferenceVersion != 2 ||
+		gate.Fence.PreferenceEmailAddress != record.Delivery.NormalizedEmail ||
+		gate.Fence.PreferenceMinimumSeverity != "warning" || gate.Fence.EventSeverity != "critical" ||
+		!reflect.DeepEqual(gate.Fence.DeliverabilityDependencies, []worker.DeliverabilityDependency{
+			{Key: canonical},
+			{Key: legacy, Exists: true, State: notifications.EmailDeliverabilityDeliverable},
+		}) {
+		t.Fatalf("gate fence=%#v", gate.Fence)
+	}
+}
+
 func TestCheckGatesCancelsWhenCurrentPreferenceNoLongerQualifiesDelivery(t *testing.T) {
 	record := testRecord(t)
 	active := currentMembership(record)
@@ -399,6 +435,7 @@ func TestAttemptTransactionsFenceLeaseAndNeverCopyRenderedContentOrEmail(t *test
 	store := Store{Table: "domain", Client: client}
 	started, err := store.BeginAttempt(context.Background(), record, worker.BeginAttemptRequest{
 		AttemptID: "att_1", StartedAt: testNow(), LeaseRequiredUntil: testNow().Add(20 * time.Second),
+		GateFence: testGateFence(t, record),
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -406,10 +443,41 @@ func TestAttemptTransactionsFenceLeaseAndNeverCopyRenderedContentOrEmail(t *test
 	if started.AttemptCount != record.AttemptCount+1 || started.Revision != record.Revision+1 {
 		t.Fatalf("started record = %#v", started)
 	}
-	if len(client.transactions) != 1 || len(client.transactions[0].TransactItems) != 2 {
+	if len(client.transactions) != 1 || len(client.transactions[0].TransactItems) != 6 {
 		t.Fatalf("begin transactions = %#v", client.transactions)
 	}
 	begin := client.transactions[0]
+	checks := conditionChecksByKey(t, begin)
+	for key, fields := range map[string][]string{
+		"TENANT#" + record.Delivery.TenantID + "#MEMBER#" + record.Delivery.RecipientID: {
+			"entity_type", "tenant_id", "cognito_sub", "status", "version",
+		},
+		"TENANT#" + record.Delivery.TenantID + "#NOTIFICATION_PREFERENCE#USER#" + record.Delivery.RecipientID: {
+			"entity_type", "tenant_id", "cognito_sub", "version", "email_enabled", "email_address", "email_verified", "minimum_severity",
+		},
+		"TENANT#" + record.Delivery.TenantID + "#ALERT_EVENT#" + record.Delivery.EventID: {
+			"entity_type", "tenant_id", "event_id", "rule_id", "severity",
+		},
+	} {
+		check := checks[key]
+		if check == nil {
+			t.Errorf("missing eligibility condition check for %s", key)
+			continue
+		}
+		for _, field := range fields {
+			if !containsName(check.ExpressionAttributeNames, field) {
+				t.Errorf("condition check %s does not fence %q: %#v", key, field, check)
+			}
+		}
+	}
+	deliverabilityKey, err := notifications.DeliverabilityStorageKey(record.Delivery.NormalizedEmail)
+	if err != nil {
+		t.Fatal(err)
+	}
+	deliverability := checks[deliverabilityKey.PartitionKey+"#"+deliverabilityKey.SortKey]
+	if deliverability == nil || *deliverability.ConditionExpression != "attribute_not_exists(PK) AND attribute_not_exists(SK)" {
+		t.Fatalf("deliverability absence fence = %#v", deliverability)
+	}
 	if condition := *begin.TransactItems[0].Update.ConditionExpression; !strings.Contains(condition, "#lease_expires >= :lease_required_until") {
 		t.Fatalf("begin condition does not fence an expired claim: %s", condition)
 	}
@@ -1154,6 +1222,38 @@ func transactionText(input *awssdk.TransactWriteItemsInput) string {
 		}
 	}
 	return builder.String()
+}
+
+func conditionChecksByKey(t *testing.T, input *awssdk.TransactWriteItemsInput) map[string]*types.ConditionCheck {
+	t.Helper()
+	checks := make(map[string]*types.ConditionCheck)
+	for _, item := range input.TransactItems {
+		if item.ConditionCheck == nil {
+			continue
+		}
+		var key map[string]string
+		if err := attributevalue.UnmarshalMap(item.ConditionCheck.Key, &key); err != nil {
+			t.Fatal(err)
+		}
+		checks[key["PK"]+"#"+key["SK"]] = item.ConditionCheck
+	}
+	return checks
+}
+
+func testGateFence(t *testing.T, record worker.DeliveryRecord) worker.GateFence {
+	t.Helper()
+	deliverabilityKey, err := notifications.DeliverabilityStorageKey(record.Delivery.NormalizedEmail)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return worker.GateFence{
+		MembershipVersion:          2,
+		PreferenceVersion:          2,
+		PreferenceEmailAddress:     record.Delivery.NormalizedEmail,
+		PreferenceMinimumSeverity:  "warning",
+		EventSeverity:              "critical",
+		DeliverabilityDependencies: []worker.DeliverabilityDependency{{Key: deliverabilityKey}},
+	}
 }
 
 func toString(value any) string {

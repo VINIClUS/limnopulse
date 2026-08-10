@@ -203,6 +203,12 @@ func (processor Processor) Handle(ctx context.Context, message QueueMessage) Dec
 		}
 		return Decision{Action: ActionDelete}
 	}
+	if !gate.Fence.IsComplete() {
+		if err := stopLimiter(); err != nil {
+			return processor.deferClaim(ctx, record, processor.Now().UTC(), "lease_renewal_failed", time.Minute)
+		}
+		return processor.deferClaim(ctx, record, processor.Now().UTC(), "invalid_gate", time.Minute)
+	}
 	if limiterCtx.Err() != nil {
 		_ = stopLimiter()
 		return processor.deferClaim(ctx, record, processor.Now().UTC(), "lease_renewal_failed", time.Minute)
@@ -223,6 +229,7 @@ func (processor Processor) Handle(ctx context.Context, message QueueMessage) Dec
 	record, err = processor.Store.BeginAttempt(mutationCtx, record, BeginAttemptRequest{
 		AttemptID: attemptID, StartedAt: attemptStartedAt,
 		LeaseRequiredUntil: attemptStartedAt.Add(providerTimeout + 2*durableMutationTimeout),
+		GateFence:          gate.Fence,
 	})
 	cancelMutation()
 	if err != nil {

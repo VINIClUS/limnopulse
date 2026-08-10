@@ -50,11 +50,16 @@ AlertEvent + NotificationOutbox (DynamoDB transaction in the evaluator)
 
 The worker resolves an active membership and immutable email snapshot before a
 provider call, checks suppression twice around rate limiting, and writes attempt
-start/completion durably. It makes at most five provider calls per delivery.
-Retryable failures use full jitter up to 15 minutes. Ambiguous timeouts add a
-two-minute confirmation grace; accepted feedback can resolve uncertainty, while
-exhausted ambiguity without feedback ends in `unknown`. Permanent recipient
-failures end durably and are not retried.
+start/completion durably. Its final allowed gate captures membership, preference,
+event and deliverability dependencies; `BeginAttempt` condition-checks those
+same durable values in the transaction that records the Attempt. A preference
+disable/address change, membership change, event change or new suppression after
+that final read therefore rejects the attempt start before SES is called. It
+makes at most five provider calls per delivery. Retryable failures use full
+jitter up to 15 minutes. Ambiguous timeouts add a two-minute confirmation grace;
+accepted feedback can resolve uncertainty, while exhausted ambiguity without
+feedback ends in `unknown`. Permanent recipient failures end durably and are not
+retried.
 
 Recovery fanout follows each opening Delivery independently. A succeeded
 opening creates a pending recovery; a definitive opening failure creates a

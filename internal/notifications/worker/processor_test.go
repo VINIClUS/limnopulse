@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"reflect"
 	"sync"
 	"testing"
 	"time"
@@ -48,6 +49,32 @@ func TestProcessorRenewalFailureBeforeSendNeverCallsProvider(t *testing.T) {
 	decision := processor.Handle(context.Background(), validMessage(t))
 	if decision.Action != ActionChangeVisibility || store.deferred != 1 || store.begun != 0 || sender.calls != 0 {
 		t.Fatalf("renewal failure decision=%#v store=%#v sends=%d", decision, store, sender.calls)
+	}
+}
+
+func TestProcessorRejectsAllowedGateWithoutFenceBeforeAttemptOrSES(t *testing.T) {
+	store := &fakeStore{
+		acquire: claimedRecord(t, 0), gate: GateResult{Allowed: true}, leaveGateUnfenced: true,
+	}
+	sender := &fakeSender{}
+
+	decision := testProcessor(store, sender).Handle(context.Background(), validMessage(t))
+
+	if decision.Action != ActionChangeVisibility || decision.ErrorCategory != "invalid_gate" ||
+		store.deferred != 1 || store.begun != 0 || sender.calls != 0 {
+		t.Fatalf("decision=%#v store=%#v sender=%#v", decision, store, sender)
+	}
+}
+
+func TestProcessorPassesFinalGateFenceIntoAttemptTransaction(t *testing.T) {
+	acquired := claimedRecord(t, 0)
+	fence := fakeGateFence(acquired.Record)
+	store := &fakeStore{acquire: acquired, gate: GateResult{Allowed: true, Fence: fence}}
+
+	decision := testProcessor(store, &fakeSender{result: SendResult{ProviderMessageID: "ses_1"}}).Handle(context.Background(), validMessage(t))
+
+	if decision.Action != ActionDelete || store.begun != 1 || !reflect.DeepEqual(store.beginRequest.GateFence, fence) {
+		t.Fatalf("decision=%#v begin=%#v want fence=%#v", decision, store.beginRequest, fence)
 	}
 }
 
@@ -631,6 +658,7 @@ type fakeStore struct {
 	gateErr                       error
 	gateCalls                     int
 	gateCheck                     func(int)
+	leaveGateUnfenced             bool
 	cancelled                     bool
 	cancellationReason            notifications.CancellationReason
 	deferred                      int
@@ -655,12 +683,16 @@ type fakeStore struct {
 func (store *fakeStore) Acquire(context.Context, notifications.JobEnvelope, ClaimRequest) (AcquireResult, error) {
 	return store.acquire, store.acquireErr
 }
-func (store *fakeStore) CheckGates(context.Context, DeliveryRecord) (GateResult, error) {
+func (store *fakeStore) CheckGates(_ context.Context, record DeliveryRecord) (GateResult, error) {
 	store.gateCalls++
 	if store.gateCheck != nil {
 		store.gateCheck(store.gateCalls)
 	}
-	return store.gate, store.gateErr
+	gate := store.gate
+	if gate.Allowed && !store.leaveGateUnfenced && !gate.Fence.IsComplete() {
+		gate.Fence = fakeGateFence(record)
+	}
+	return gate, store.gateErr
 }
 func (store *fakeStore) Cancel(_ context.Context, _ DeliveryRecord, reason notifications.CancellationReason, _ time.Time) error {
 	store.cancelled = true
@@ -840,6 +872,18 @@ func claimedRecord(t *testing.T, attempts int) AcquireResult {
 		LeaseOwner: "worker_1", LeaseEpoch: 2,
 		LeaseExpiresAt: time.Date(2026, 7, 16, 15, 1, 0, 0, time.UTC),
 	}}
+}
+
+func fakeGateFence(record DeliveryRecord) GateFence {
+	deliverabilityKey, _ := notifications.DeliverabilityStorageKey(record.Delivery.NormalizedEmail)
+	return GateFence{
+		MembershipVersion:          1,
+		PreferenceVersion:          1,
+		PreferenceEmailAddress:     record.Delivery.NormalizedEmail,
+		PreferenceMinimumSeverity:  "warning",
+		EventSeverity:              "critical",
+		DeliverabilityDependencies: []DeliverabilityDependency{{Key: deliverabilityKey}},
+	}
 }
 
 func validMessage(t *testing.T) QueueMessage {

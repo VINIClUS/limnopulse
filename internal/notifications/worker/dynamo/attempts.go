@@ -21,7 +21,7 @@ func (store Store) BeginAttempt(
 ) (worker.DeliveryRecord, error) {
 	if record.Delivery.State != notifications.DeliveryStateProcessing || request.AttemptID == "" ||
 		request.StartedAt.IsZero() || !request.LeaseRequiredUntil.After(request.StartedAt) ||
-		record.AttemptCount < 0 || record.AttemptCount >= worker.MaxProviderCalls {
+		record.AttemptCount < 0 || record.AttemptCount >= worker.MaxProviderCalls || !request.GateFence.IsComplete() {
 		return worker.DeliveryRecord{}, fmt.Errorf("invalid attempt start")
 	}
 	deliveryKey, err := notifications.DeliveryStorageKey(record.Delivery.OutboxID, record.Delivery.DeliveryID)
@@ -52,7 +52,7 @@ func (store Store) BeginAttempt(
 		":attempt_id": request.AttemptID, ":started_at": fixedTime(request.StartedAt),
 		":lease_required_until": fixedTime(request.LeaseRequiredUntil),
 	})
-	_, err = store.Client.TransactWriteItems(ctx, &awssdk.TransactWriteItemsInput{TransactItems: []types.TransactWriteItem{
+	items := []types.TransactWriteItem{
 		{Update: &types.Update{
 			TableName: aws.String(store.Table), Key: encodedDeliveryKey,
 			UpdateExpression:    aws.String("SET #attempt_count = :next_attempt_count, #last_attempt_id = :attempt_id, #last_attempt_started_at = :started_at, #updated_at = :started_at, #revision = :next_revision"),
@@ -67,7 +67,13 @@ func (store Store) BeginAttempt(
 		}},
 		{Put: &types.Put{TableName: aws.String(store.Table), Item: encodedAttempt,
 			ConditionExpression: aws.String("attribute_not_exists(PK) AND attribute_not_exists(SK)")}},
-	}})
+	}
+	gateConditions, err := store.gateFenceConditions(record, request.GateFence)
+	if err != nil {
+		return worker.DeliveryRecord{}, err
+	}
+	items = append(items, gateConditions...)
+	_, err = store.Client.TransactWriteItems(ctx, &awssdk.TransactWriteItemsInput{TransactItems: items})
 	if err != nil {
 		return worker.DeliveryRecord{}, fmt.Errorf("persist notification attempt start: %w", err)
 	}
@@ -76,6 +82,109 @@ func (store Store) BeginAttempt(
 	record.LastAttemptID = request.AttemptID
 	record.Delivery.UpdatedAt = request.StartedAt.UTC()
 	return record, nil
+}
+
+func (store Store) gateFenceConditions(
+	record worker.DeliveryRecord,
+	fence worker.GateFence,
+) ([]types.TransactWriteItem, error) {
+	if !fence.IsComplete() {
+		return nil, fmt.Errorf("invalid gate fence")
+	}
+	key := func(partitionKey, sortKey string) (map[string]types.AttributeValue, error) {
+		return attributevalue.MarshalMap(map[string]string{"PK": partitionKey, "SK": sortKey})
+	}
+	condition := func(
+		partitionKey string,
+		sortKey string,
+		expression string,
+		names map[string]string,
+		values map[string]any,
+	) (types.TransactWriteItem, error) {
+		encodedKey, err := key(partitionKey, sortKey)
+		if err != nil {
+			return types.TransactWriteItem{}, err
+		}
+		encodedValues, err := attributevalue.MarshalMap(values)
+		if err != nil {
+			return types.TransactWriteItem{}, err
+		}
+		return types.TransactWriteItem{ConditionCheck: &types.ConditionCheck{
+			TableName: aws.String(store.Table), Key: encodedKey,
+			ConditionExpression:       aws.String(expression),
+			ExpressionAttributeNames:  names,
+			ExpressionAttributeValues: encodedValues,
+		}}, nil
+	}
+	tenantKey := "TENANT#" + record.Delivery.TenantID
+	membership, err := condition(
+		tenantKey, "MEMBER#"+record.Delivery.RecipientID,
+		"#entity = :entity AND #tenant_id = :tenant_id AND #recipient_id = :recipient_id AND #status = :active AND #version = :version",
+		map[string]string{
+			"#entity": "entity_type", "#tenant_id": "tenant_id", "#recipient_id": "cognito_sub",
+			"#status": "status", "#version": "version",
+		},
+		map[string]any{
+			":entity": "tenant_member", ":tenant_id": record.Delivery.TenantID,
+			":recipient_id": record.Delivery.RecipientID, ":active": "active", ":version": fence.MembershipVersion,
+		},
+	)
+	if err != nil {
+		return nil, err
+	}
+	preference, err := condition(
+		tenantKey, "NOTIFICATION_PREFERENCE#USER#"+record.Delivery.RecipientID,
+		"#entity = :entity AND #tenant_id = :tenant_id AND #recipient_id = :recipient_id AND #version = :version AND #enabled = :enabled AND #address = :address AND #verified = :verified AND #minimum_severity = :minimum_severity",
+		map[string]string{
+			"#entity": "entity_type", "#tenant_id": "tenant_id", "#recipient_id": "cognito_sub", "#version": "version",
+			"#enabled": "email_enabled", "#address": "email_address", "#verified": "email_verified",
+			"#minimum_severity": "minimum_severity",
+		},
+		map[string]any{
+			":entity": "notification_preference", ":tenant_id": record.Delivery.TenantID,
+			":recipient_id": record.Delivery.RecipientID, ":version": fence.PreferenceVersion,
+			":enabled": true, ":address": fence.PreferenceEmailAddress, ":verified": true,
+			":minimum_severity": fence.PreferenceMinimumSeverity,
+		},
+	)
+	if err != nil {
+		return nil, err
+	}
+	event, err := condition(
+		tenantKey, "ALERT_EVENT#"+record.Delivery.EventID,
+		"#entity = :entity AND #tenant_id = :tenant_id AND #event_id = :event_id AND #rule_id = :rule_id AND #severity = :severity",
+		map[string]string{
+			"#entity": "entity_type", "#tenant_id": "tenant_id", "#event_id": "event_id", "#rule_id": "rule_id", "#severity": "severity",
+		},
+		map[string]any{
+			":entity": "alert_event", ":tenant_id": record.Delivery.TenantID,
+			":event_id": record.Delivery.EventID, ":rule_id": record.Delivery.RuleID, ":severity": fence.EventSeverity,
+		},
+	)
+	if err != nil {
+		return nil, err
+	}
+	items := []types.TransactWriteItem{membership, preference, event}
+	for _, dependency := range fence.DeliverabilityDependencies {
+		encodedKey, err := key(dependency.Key.PartitionKey, dependency.Key.SortKey)
+		if err != nil {
+			return nil, err
+		}
+		check := &types.ConditionCheck{TableName: aws.String(store.Table), Key: encodedKey}
+		if dependency.Exists {
+			values, err := attributevalue.MarshalMap(map[string]any{":deliverability": string(dependency.State)})
+			if err != nil {
+				return nil, err
+			}
+			check.ConditionExpression = aws.String("#deliverability = :deliverability")
+			check.ExpressionAttributeNames = map[string]string{"#deliverability": "deliverability"}
+			check.ExpressionAttributeValues = values
+		} else {
+			check.ConditionExpression = aws.String("attribute_not_exists(PK) AND attribute_not_exists(SK)")
+		}
+		items = append(items, types.TransactWriteItem{ConditionCheck: check})
+	}
+	return items, nil
 }
 
 func (store Store) CompleteAttempt(

@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"strings"
 	"time"
 
 	"github.com/VINIClUS/limnopulse/internal/notifications"
@@ -55,6 +56,54 @@ type ClaimRequest struct {
 type GateResult struct {
 	Allowed            bool
 	CancellationReason notifications.CancellationReason
+	Fence              GateFence
+}
+
+// GateFence records every durable value that allowed the final recipient gate.
+// BeginAttempt condition-checks it atomically with recording the started
+// Attempt, so an eligibility change after CheckGates cannot reach the provider.
+type GateFence struct {
+	MembershipVersion          int64
+	PreferenceVersion          int64
+	PreferenceEmailAddress     string
+	PreferenceMinimumSeverity  string
+	EventSeverity              string
+	DeliverabilityDependencies []DeliverabilityDependency
+}
+
+type DeliverabilityDependency struct {
+	Key    notifications.StorageKey
+	Exists bool
+	State  notifications.EmailDeliverability
+}
+
+func (fence GateFence) IsComplete() bool {
+	if fence.MembershipVersion < 1 || fence.PreferenceVersion < 1 ||
+		fence.PreferenceEmailAddress == "" || strings.ContainsRune(fence.PreferenceEmailAddress, '\x00') ||
+		!isGateSeverity(fence.PreferenceMinimumSeverity) || !isGateSeverity(fence.EventSeverity) ||
+		len(fence.DeliverabilityDependencies) < 1 || len(fence.DeliverabilityDependencies) > 2 {
+		return false
+	}
+	seen := make(map[notifications.StorageKey]struct{}, len(fence.DeliverabilityDependencies))
+	for _, dependency := range fence.DeliverabilityDependencies {
+		if dependency.Key.PartitionKey == "" || dependency.Key.SortKey == "" ||
+			strings.ContainsRune(dependency.Key.PartitionKey, '\x00') || strings.ContainsRune(dependency.Key.SortKey, '\x00') {
+			return false
+		}
+		if _, exists := seen[dependency.Key]; exists {
+			return false
+		}
+		seen[dependency.Key] = struct{}{}
+		if dependency.Exists && dependency.State != notifications.EmailDeliverabilityUnknown &&
+			dependency.State != notifications.EmailDeliverabilityDeliverable {
+			return false
+		}
+	}
+	return true
+}
+
+func isGateSeverity(value string) bool {
+	return value == "warning" || value == "critical"
 }
 
 type DeferRequest struct {
@@ -67,6 +116,7 @@ type BeginAttemptRequest struct {
 	AttemptID          string
 	StartedAt          time.Time
 	LeaseRequiredUntil time.Time
+	GateFence          GateFence
 }
 
 type AttemptCompletion struct {

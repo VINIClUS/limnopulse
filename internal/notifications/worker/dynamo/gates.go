@@ -111,35 +111,59 @@ func (store Store) CheckGates(ctx context.Context, record worker.DeliveryRecord)
 	if eventSeverity < minimumSeverity {
 		return worker.GateResult{CancellationReason: notifications.CancellationReasonCancelled}, nil
 	}
-	deliverabilityItem, err := store.currentDeliverability(ctx, snapshot.NormalizedEmail)
+	deliverabilityReads, err := store.currentDeliverability(ctx, snapshot.NormalizedEmail)
 	if err != nil {
 		return worker.GateResult{}, err
 	}
-	if len(deliverabilityItem) == 0 {
-		return worker.GateResult{Allowed: true}, nil
+	fence := worker.GateFence{
+		MembershipVersion:          membership.Version,
+		PreferenceVersion:          preference.Version,
+		PreferenceEmailAddress:     preference.EmailAddress,
+		PreferenceMinimumSeverity:  preference.MinimumSeverity,
+		EventSeverity:              event.Severity,
+		DeliverabilityDependencies: make([]worker.DeliverabilityDependency, 0, len(deliverabilityReads)),
 	}
-	var deliverability struct {
-		State notifications.EmailDeliverability `dynamodbav:"deliverability"`
+	for _, read := range deliverabilityReads {
+		dependency := worker.DeliverabilityDependency{Key: read.Key}
+		if len(read.Item) == 0 {
+			fence.DeliverabilityDependencies = append(fence.DeliverabilityDependencies, dependency)
+			continue
+		}
+		var deliverability struct {
+			State notifications.EmailDeliverability `dynamodbav:"deliverability"`
+		}
+		if err := attributevalue.UnmarshalMap(read.Item, &deliverability); err != nil {
+			return worker.GateResult{}, fmt.Errorf("decode current deliverability: %w", err)
+		}
+		if err := deliverability.State.Validate(); err != nil {
+			return worker.GateResult{}, fmt.Errorf("current deliverability is malformed")
+		}
+		switch deliverability.State {
+		case notifications.EmailDeliverabilityUnknown, notifications.EmailDeliverabilityDeliverable:
+			dependency.Exists = true
+			dependency.State = deliverability.State
+			fence.DeliverabilityDependencies = append(fence.DeliverabilityDependencies, dependency)
+		case notifications.EmailDeliverabilitySuppressed:
+			return worker.GateResult{CancellationReason: notifications.CancellationReasonEmailSuppressed}, nil
+		default:
+			return worker.GateResult{}, fmt.Errorf("current deliverability is malformed")
+		}
 	}
-	if err := attributevalue.UnmarshalMap(deliverabilityItem, &deliverability); err != nil {
-		return worker.GateResult{}, fmt.Errorf("decode current deliverability: %w", err)
+	if !fence.IsComplete() {
+		return worker.GateResult{}, fmt.Errorf("current gate fence is malformed")
 	}
-	if err := deliverability.State.Validate(); err != nil {
-		return worker.GateResult{}, fmt.Errorf("current deliverability is malformed")
-	}
-	switch deliverability.State {
-	case notifications.EmailDeliverabilityUnknown, notifications.EmailDeliverabilityDeliverable:
-		return worker.GateResult{Allowed: true}, nil
-	case notifications.EmailDeliverabilitySuppressed:
-		return worker.GateResult{CancellationReason: notifications.CancellationReasonEmailSuppressed}, nil
-	}
-	return worker.GateResult{}, fmt.Errorf("current deliverability is malformed")
+	return worker.GateResult{Allowed: true, Fence: fence}, nil
+}
+
+type deliverabilityRead struct {
+	Key  notifications.StorageKey
+	Item map[string]types.AttributeValue
 }
 
 func (store Store) currentDeliverability(
 	ctx context.Context,
 	email string,
-) (map[string]types.AttributeValue, error) {
+) ([]deliverabilityRead, error) {
 	deliverabilityKey, err := notifications.DeliverabilityStorageKey(email)
 	if err != nil {
 		return nil, err
@@ -149,16 +173,23 @@ func (store Store) currentDeliverability(
 		return nil, err
 	}
 	if len(deliverabilityItem) != 0 {
-		return deliverabilityItem, nil
+		return []deliverabilityRead{{Key: deliverabilityKey, Item: deliverabilityItem}}, nil
 	}
 	legacyKey, err := notifications.LegacyDeliverabilityStorageKey(email)
 	if err != nil {
 		return nil, err
 	}
 	if legacyKey == deliverabilityKey {
-		return nil, nil
+		return []deliverabilityRead{{Key: deliverabilityKey}}, nil
 	}
-	return store.getConsistent(ctx, legacyKey.PartitionKey, legacyKey.SortKey)
+	legacyItem, err := store.getConsistent(ctx, legacyKey.PartitionKey, legacyKey.SortKey)
+	if err != nil {
+		return nil, err
+	}
+	return []deliverabilityRead{
+		{Key: deliverabilityKey},
+		{Key: legacyKey, Item: legacyItem},
+	}, nil
 }
 
 func severityRank(value string) (int, error) {
