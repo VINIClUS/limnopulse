@@ -1,4 +1,5 @@
 import json
+import re
 from copy import deepcopy
 from datetime import UTC, datetime
 from hashlib import sha256
@@ -87,6 +88,22 @@ class RecordingDynamoClient:
                     raise TransactionFailure()
                 continue
             if "Update" in operation:
+                update = operation["Update"]
+                key = self._decode(update["Key"])
+                item_key = (update["TableName"], key["PK"], key["SK"])
+                item = candidate.setdefault(item_key, dict(key))
+                names = update["ExpressionAttributeNames"]
+                values = self._decode(update["ExpressionAttributeValues"])
+                for attribute_name, value_name in re.findall(
+                    r"(#[a-z_]+) = :([a-z_]+)",
+                    update["UpdateExpression"],
+                ):
+                    item[names[attribute_name]] = values[f":{value_name}"]
+                for attribute_name, value_name in re.findall(
+                    r"(#[a-z_]+) = if_not_exists\(#[a-z_]+, :([a-z_]+)\)",
+                    update["UpdateExpression"],
+                ):
+                    item.setdefault(names[attribute_name], values[f":{value_name}"])
                 continue
             raise AssertionError(f"unsupported transaction operation: {operation!r}")
         self.items = candidate
@@ -308,6 +325,93 @@ async def test_case_only_email_update_migrates_legacy_suppression_atomically() -
     assert migration_values[":suppression_rank"] == 2
     assert "if_not_exists" in migration["UpdateExpression"]
     assert client.get_item_calls[0]["ConsistentRead"] is True
+
+
+@pytest.mark.asyncio
+async def test_address_change_preserves_departed_legacy_suppression_across_return() -> None:
+    client = RecordingDynamoClient()
+    original = make_preference(version=1, email_address="User@example.com")
+    different = make_preference(version=2, email_address="other@example.com")
+    returned = make_preference(version=3, email_address="user@example.com")
+    client.seed("domain", preference_item(version=1, email_address="User@example.com"))
+    client.seed(
+        "domain",
+        {
+            "PK": f"EMAIL_IDENTITY#{sha256(b'User@example.com').hexdigest()}",
+            "SK": "DELIVERABILITY",
+            "deliverability": "suppressed",
+            "suppression_reason": "hard_bounce",
+        },
+    )
+    repository = DynamoNotificationPreferenceRepository(
+        "domain",
+        "audit",
+        client,
+        clock=lambda: NOW,
+    )
+
+    await repository.save(
+        different,
+        1,
+        AuditContext(actor_id="sub_1"),
+        previous=original,
+    )
+
+    first_migration = client.transact_write_items_calls[0]["TransactItems"][2]["Update"]
+    assert client._decode(first_migration["Key"]) == {
+        "PK": f"EMAIL_IDENTITY#{sha256(b'user@example.com').hexdigest()}",
+        "SK": "DELIVERABILITY",
+    }
+
+    await repository.save(
+        returned,
+        2,
+        AuditContext(actor_id="sub_1"),
+        previous=different,
+    )
+
+    deliverability = await repository.get_email_deliverability("user@example.com")
+
+    assert deliverability is not None
+    assert deliverability.deliverability is EmailDeliverability.SUPPRESSED
+    assert deliverability.suppression_reason == "hard_bounce"
+
+
+@pytest.mark.asyncio
+async def test_address_change_fences_observed_legacy_deliverability_state() -> None:
+    client = RecordingDynamoClient()
+    previous = make_preference(version=1, email_address="User@example.com")
+    updated = make_preference(version=2, email_address="other@example.com")
+    client.seed("domain", preference_item(version=1, email_address="User@example.com"))
+    client.seed(
+        "domain",
+        {
+            "PK": f"EMAIL_IDENTITY#{sha256(b'User@example.com').hexdigest()}",
+            "SK": "DELIVERABILITY",
+            "deliverability": "deliverable",
+        },
+    )
+    repository = DynamoNotificationPreferenceRepository(
+        "domain",
+        "audit",
+        client,
+        clock=lambda: NOW,
+    )
+
+    await repository.save(
+        updated,
+        1,
+        AuditContext(actor_id="sub_1"),
+        previous=previous,
+    )
+
+    fence = client.transact_write_items_calls[0]["TransactItems"][2]["ConditionCheck"]
+    assert client._decode(fence["Key"]) == {
+        "PK": f"EMAIL_IDENTITY#{sha256(b'User@example.com').hexdigest()}",
+        "SK": "DELIVERABILITY",
+    }
+    assert fence["ConditionExpression"] == "#deliverability = :deliverability"
+    assert client._decode(fence["ExpressionAttributeValues"])[":deliverability"] == "deliverable"
 
 
 @pytest.mark.asyncio

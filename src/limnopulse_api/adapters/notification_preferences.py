@@ -150,13 +150,9 @@ class DynamoNotificationPreferenceRepository:
         preference: NotificationPreference,
         previous: NotificationPreference | None,
     ) -> dict[str, Any] | None:
-        if (
-            previous is None
-            or previous.email_address == preference.email_address
-            or previous.email_address.lower() != preference.email_address.lower()
-        ):
+        if previous is None or previous.email_address == preference.email_address:
             return None
-        canonical_key = self._deliverability_key(preference.email_address)
+        canonical_key = self._deliverability_key(previous.email_address)
         legacy_key = self._legacy_deliverability_key(previous.email_address)
         if canonical_key == legacy_key:
             return None
@@ -175,7 +171,17 @@ class DynamoNotificationPreferenceRepository:
                 }
             }
         if legacy.get("deliverability") != EmailDeliverability.SUPPRESSED.value:
-            return None
+            return {
+                "ConditionCheck": {
+                    "TableName": self.domain_table_name,
+                    "Key": self._serialize_item(legacy_key),
+                    "ConditionExpression": "#deliverability = :deliverability",
+                    "ExpressionAttributeNames": {"#deliverability": "deliverability"},
+                    "ExpressionAttributeValues": self._serialize_values(
+                        {":deliverability": legacy.get("deliverability")}
+                    ),
+                }
+            }
 
         values: dict[str, Any] = {
             ":entity_type": "email_deliverability",
