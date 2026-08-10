@@ -69,6 +69,12 @@ class DynamoNotificationPreferenceRepository:
             self.domain_table_name,
             self._deliverability_key(address),
         )
+        if item is None and address != address.lower():
+            item = await to_thread(
+                self._get_item,
+                self.domain_table_name,
+                self._legacy_deliverability_key(address),
+            )
         if item is None:
             return None
         return EmailDeliverabilityRecord(
@@ -217,6 +223,12 @@ class DynamoNotificationPreferenceRepository:
 
     def _email_hash(self, address: str) -> str:
         return sha256(address.lower().encode("ascii")).hexdigest()
+
+    def _legacy_deliverability_key(self, address: str) -> dict[str, str]:
+        return {
+            "PK": f"EMAIL_IDENTITY#{sha256(address.encode('ascii')).hexdigest()}",
+            "SK": "DELIVERABILITY",
+        }
 
     def _get_item(
         self,

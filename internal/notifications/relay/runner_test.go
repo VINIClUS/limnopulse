@@ -72,6 +72,25 @@ type laneStore struct {
 	processedKinds []notifications.WorkKind
 }
 
+func TestRunRejectsFutureRelayTimeBeforeDiscovery(t *testing.T) {
+	now := time.Date(2026, 7, 16, 13, 0, 0, 0, time.UTC)
+	future := now.Add(time.Second)
+	store := &fakeStore{}
+	runner := Runner{Store: store, Publisher: fakePublisher{}, Clock: func() time.Time { return now }}
+	config := relayconfig.RunConfig{
+		RelayTime: &future, Shard: 0, ShardCount: 1,
+		QueryParallelism: 1, WorkParallelism: 1, MaxWork: 1, FanoutPageSize: 1,
+		GlobalDeadline: 45 * time.Second, SoftDeadline: 40 * time.Second,
+		ItemTimeout: 10 * time.Second, LeaseTTL: 20 * time.Second,
+	}
+
+	summary := runner.Run(context.Background(), config)
+
+	if summary.ExitCode != ExitFatal || summary.ErrorCategories["configuration"] != 1 || len(store.queries) != 0 {
+		t.Fatalf("summary=%#v queries=%#v", summary, store.queries)
+	}
+}
+
 func (store *laneStore) QueryDue(_ context.Context, request DueRequest) (DuePage, error) {
 	store.mu.Lock()
 	defer store.mu.Unlock()

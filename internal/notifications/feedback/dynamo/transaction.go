@@ -408,7 +408,7 @@ func reconcileDeliveryProviderMetadata(
 	legacyOwner := current.ProviderAttemptID == "" &&
 		(current.LastAttemptID == "" || latestAttempt) &&
 		(current.ProviderMessageID == "" || current.ProviderMessageID == event.ProviderMessageID)
-	acceptedWithoutProviderOwner := event.AcceptedEvidence && current.ProviderAttemptID == "" &&
+	acceptedWithoutProviderOwner := event.AcceptedEvidence && event.CompletesAttempt() && current.ProviderAttemptID == "" &&
 		current.ProviderMessageID == "" && current.ProviderOutcome == ""
 	if !sameOwner && !latestAttempt && !legacyOwner && !acceptedWithoutProviderOwner {
 		return deliveryProviderDecision{

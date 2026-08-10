@@ -8,6 +8,7 @@ import (
 	"github.com/VINIClUS/limnopulse/internal/notifications"
 	"github.com/VINIClUS/limnopulse/internal/notifications/worker"
 	"github.com/aws/aws-sdk-go-v2/feature/dynamodb/attributevalue"
+	"github.com/aws/aws-sdk-go-v2/service/dynamodb/types"
 )
 
 func (store Store) CheckGates(ctx context.Context, record worker.DeliveryRecord) (worker.GateResult, error) {
@@ -110,11 +111,7 @@ func (store Store) CheckGates(ctx context.Context, record worker.DeliveryRecord)
 	if eventSeverity < minimumSeverity {
 		return worker.GateResult{CancellationReason: notifications.CancellationReasonCancelled}, nil
 	}
-	deliverabilityKey, err := notifications.DeliverabilityStorageKey(snapshot.NormalizedEmail)
-	if err != nil {
-		return worker.GateResult{}, err
-	}
-	deliverabilityItem, err := store.getConsistent(ctx, deliverabilityKey.PartitionKey, deliverabilityKey.SortKey)
+	deliverabilityItem, err := store.currentDeliverability(ctx, snapshot.NormalizedEmail)
 	if err != nil {
 		return worker.GateResult{}, err
 	}
@@ -139,15 +136,39 @@ func (store Store) CheckGates(ctx context.Context, record worker.DeliveryRecord)
 	return worker.GateResult{}, fmt.Errorf("current deliverability is malformed")
 }
 
+func (store Store) currentDeliverability(
+	ctx context.Context,
+	email string,
+) (map[string]types.AttributeValue, error) {
+	deliverabilityKey, err := notifications.DeliverabilityStorageKey(email)
+	if err != nil {
+		return nil, err
+	}
+	deliverabilityItem, err := store.getConsistent(ctx, deliverabilityKey.PartitionKey, deliverabilityKey.SortKey)
+	if err != nil {
+		return nil, err
+	}
+	if len(deliverabilityItem) != 0 {
+		return deliverabilityItem, nil
+	}
+	legacyKey, err := notifications.LegacyDeliverabilityStorageKey(email)
+	if err != nil {
+		return nil, err
+	}
+	if legacyKey == deliverabilityKey {
+		return nil, nil
+	}
+	return store.getConsistent(ctx, legacyKey.PartitionKey, legacyKey.SortKey)
+}
+
 func severityRank(value string) (int, error) {
 	switch value {
 	case "warning":
 		return 1, nil
 	case "critical":
 		return 2, nil
-	default:
-		return 0, fmt.Errorf("alert severity is unsupported")
 	}
+	return 0, fmt.Errorf("alert severity is unsupported")
 }
 
 func isASCII(value string) bool {

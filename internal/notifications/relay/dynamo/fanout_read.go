@@ -176,8 +176,23 @@ func (store Store) addressSuppressed(ctx context.Context, address string) (bool,
 		return false, err
 	}
 	item, err := store.getConsistent(ctx, key.PartitionKey, key.SortKey)
-	if err != nil || len(item) == 0 {
+	if err != nil {
 		return false, err
+	}
+	if len(item) == 0 {
+		legacyKey, legacyErr := notifications.LegacyDeliverabilityStorageKey(address)
+		if legacyErr != nil {
+			return false, legacyErr
+		}
+		if legacyKey != key {
+			item, err = store.getConsistent(ctx, legacyKey.PartitionKey, legacyKey.SortKey)
+			if err != nil {
+				return false, err
+			}
+		}
+	}
+	if len(item) == 0 {
+		return false, nil
 	}
 	var record struct {
 		Deliverability notifications.EmailDeliverability `dynamodbav:"deliverability"`

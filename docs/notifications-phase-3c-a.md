@@ -150,6 +150,11 @@ enabling either publisher or consumer.
    when a bound is reached; increase the explicit bound or narrow the tenant
    batch, then repeat the idempotent run. Telegram rows are marked
    `deferred_unsupported_channel` and are not indexed for email relay.
+
+   Deliverability identities use the lowercase ASCII mailbox hash. Readers keep
+   a case-sensitive predecessor-key fallback for suppressions written before
+   this canonicalization, so existing bounce and complaint suppressions remain
+   effective throughout the rollout.
 6. Validate SES: `SES_FROM_EMAIL` must be a verified identity in the same
    region, `SES_CONFIGURATION_SET_NAME` must equal the OpenTofu
    `ses_configuration_set_name` output, and the account must have the intended

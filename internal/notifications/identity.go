@@ -130,6 +130,19 @@ func DeliverabilityStorageKey(normalizedEmail string) (StorageKey, error) {
 	}, nil
 }
 
+// LegacyDeliverabilityStorageKey preserves read compatibility for rows written
+// before deliverability identities were canonicalized to lowercase.
+func LegacyDeliverabilityStorageKey(email string) (StorageKey, error) {
+	if err := validateIdentityField("normalized email", email); err != nil {
+		return StorageKey{}, err
+	}
+	digest := sha256.Sum256([]byte(email))
+	return StorageKey{
+		PartitionKey: "EMAIL_IDENTITY#" + hex.EncodeToString(digest[:]),
+		SortKey:      "DELIVERABILITY",
+	}, nil
+}
+
 func validateIdentityField(name, value string) error {
 	if value == "" {
 		return fmt.Errorf("%s must not be empty", name)

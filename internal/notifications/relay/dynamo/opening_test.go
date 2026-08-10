@@ -151,6 +151,23 @@ func TestExpandIntentCreatesRenderedPendingDeliveryAndCompletesPageAtomically(t 
 	}
 }
 
+func TestAddressSuppressedReadsLegacyCasedKeyDuringRollout(t *testing.T) {
+	client := &fakeClient{getOutputs: []*awssdk.GetItemOutput{
+		{}, {Item: marshalMap(t, map[string]any{"deliverability": "suppressed"})},
+	}}
+
+	suppressed, err := (Store{Table: "domain", Client: client}).addressSuppressed(
+		context.Background(), "Owner@Example.COM",
+	)
+
+	if err != nil || !suppressed {
+		t.Fatalf("suppressed=%t err=%v", suppressed, err)
+	}
+	if len(client.getInputs) != 2 {
+		t.Fatalf("deliverability reads = %d, want 2", len(client.getInputs))
+	}
+}
+
 func TestExpandIntentFiltersBelowMinimumSeverityWithoutDelivery(t *testing.T) {
 	relayTime := time.Date(2026, 7, 16, 12, 30, 0, 0, time.UTC)
 	work := openingWork(t, relayTime)

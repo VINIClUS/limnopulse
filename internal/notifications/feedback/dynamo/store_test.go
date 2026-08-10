@@ -397,6 +397,31 @@ func TestReconcileDeliveryDelayLeavesWaitingRecoveryUnindexed(t *testing.T) {
 	}
 }
 
+func TestReconcileStaleDeliveryDelayDoesNotClaimUnownedActiveAttempt(t *testing.T) {
+	client := newFakeClient(t)
+	olderAttempt := testAttempt("ambiguous", "", "")
+	olderAttempt["SK"] = "ATTEMPT#att_older"
+	olderAttempt["attempt_id"] = "att_older"
+	client.seed(olderAttempt)
+	delivery := testDelivery("processing", "", 12)
+	delivery["last_attempt_id"] = "att_newer"
+	client.seed(delivery)
+	event := testEvent(feedback.SemanticDeliveryDelay)
+	event.AttemptID = "att_older"
+	event.ProviderMessageID = "ses_older"
+
+	result, err := (Store{Table: "domain", Client: client}).Reconcile(
+		context.Background(), event, testNow(),
+	)
+	if err != nil || result.Disposition != feedback.ReconcileApplied {
+		t.Fatalf("result=%#v err=%v", result, err)
+	}
+	deliveryOperation := client.transactions[0].TransactItems[3]
+	if deliveryOperation.ConditionCheck == nil || deliveryOperation.Update != nil {
+		t.Fatalf("stale delay claimed the active aggregate: %#v", deliveryOperation)
+	}
+}
+
 func TestReconcileStaleFeedbackCannotResolveWaitingRecoveryDependency(t *testing.T) {
 	for _, semantic := range []feedback.SemanticType{feedback.SemanticSend, feedback.SemanticHardBounce} {
 		t.Run(string(semantic), func(t *testing.T) {

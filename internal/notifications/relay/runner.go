@@ -79,6 +79,12 @@ func (runner Runner) Run(parent context.Context, config relayconfig.RunConfig) R
 		ShardCount: config.ShardCount, ScopeCompleted: true,
 		ErrorCategories: make(map[string]int),
 	}
+	if config.RelayTime != nil && relayTime.After(runnerStartedAt) {
+		summary.ScopeCompleted = false
+		summary.RetryRecommended = true
+		summary.ErrorCategories["configuration"]++
+		return finishSummary(summary, ExitFatal, budgetStartedAt, clock().UTC())
+	}
 	if runner.Store == nil {
 		summary.ScopeCompleted = false
 		summary.RetryRecommended = true

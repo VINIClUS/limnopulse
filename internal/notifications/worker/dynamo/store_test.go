@@ -285,6 +285,27 @@ func TestCheckGatesRevalidatesMembershipAndAddressDeliverability(t *testing.T) {
 	}
 }
 
+func TestCheckGatesReadsLegacyCasedDeliverabilityDuringRollout(t *testing.T) {
+	record := testRecord(t)
+	record.Delivery.NormalizedEmail = "Owner@Example.COM"
+	preference := currentPreference(record, true, "warning")
+	preference["email_address"] = record.Delivery.NormalizedEmail
+	client := &fakeClient{getItems: []map[string]types.AttributeValue{
+		marshal(t, currentMembership(record)), marshal(t, preference),
+		marshal(t, currentAlertEvent(record, "critical")), nil,
+		marshal(t, map[string]any{"deliverability": "suppressed"}),
+	}}
+
+	gate, err := (Store{Table: "domain", Client: client}).CheckGates(context.Background(), record)
+
+	if err != nil || gate.Allowed || gate.CancellationReason != notifications.CancellationReasonEmailSuppressed {
+		t.Fatalf("gate=%#v err=%v", gate, err)
+	}
+	if len(client.gets) != 5 {
+		t.Fatalf("deliverability reads = %d, want 5", len(client.gets))
+	}
+}
+
 func TestCheckGatesCancelsWhenCurrentPreferenceNoLongerQualifiesDelivery(t *testing.T) {
 	record := testRecord(t)
 	active := currentMembership(record)
