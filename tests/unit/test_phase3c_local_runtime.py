@@ -55,7 +55,7 @@ def test_notification_compose_processes_use_real_sdk_endpoints_and_safe_fake_sen
     assert worker["init"] is True
     assert worker["stop_grace_period"] == "45s"
     assert worker["environment"]["NOTIFICATION_EMAIL_SENDER_MODE"] == "success"
-    assert worker["environment"]["NOTIFICATION_FAKE_MESSAGE_ID"] == "provider_message_local_compose"
+    assert "NOTIFICATION_FAKE_MESSAGE_ID" not in worker["environment"]
     assert worker["environment"]["SES_CONFIGURATION_SET_NAME"] == "limnopulse-notifications"
     assert worker["environment"]["SQS_ENDPOINT_URL"] == "http://elasticmq:9324"
     assert worker["environment"]["SQS_NOTIFICATION_JOBS_URL"].endswith(

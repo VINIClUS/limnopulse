@@ -65,18 +65,30 @@ class RecordingDynamoClient:
         self.transact_write_items_calls.append(kwargs)
         candidate = deepcopy(self.items)
         for operation in kwargs["TransactItems"]:
-            put = operation["Put"]
-            item = self._decode(put["Item"])
-            key = (put["TableName"], item["PK"], item["SK"])
-            existing = candidate.get(key)
-            condition = put.get("ConditionExpression", "")
-            if "attribute_not_exists" in condition and existing is not None:
-                raise TransactionFailure()
-            if ":expected_version" in put.get("ExpressionAttributeValues", {}):
-                values = self._decode(put["ExpressionAttributeValues"])
-                if existing is None or existing.get("version") != values[":expected_version"]:
+            if "Put" in operation:
+                put = operation["Put"]
+                item = self._decode(put["Item"])
+                key = (put["TableName"], item["PK"], item["SK"])
+                existing = candidate.get(key)
+                condition = put.get("ConditionExpression", "")
+                if "attribute_not_exists" in condition and existing is not None:
                     raise TransactionFailure()
-            candidate[key] = item
+                if ":expected_version" in put.get("ExpressionAttributeValues", {}):
+                    values = self._decode(put["ExpressionAttributeValues"])
+                    if existing is None or existing.get("version") != values[":expected_version"]:
+                        raise TransactionFailure()
+                candidate[key] = item
+                continue
+            if "ConditionCheck" in operation:
+                check = operation["ConditionCheck"]
+                key = self._decode(check["Key"])
+                existing = candidate.get((check["TableName"], key["PK"], key["SK"]))
+                if "attribute_not_exists" in check.get("ConditionExpression", "") and existing is not None:
+                    raise TransactionFailure()
+                continue
+            if "Update" in operation:
+                continue
+            raise AssertionError(f"unsupported transaction operation: {operation!r}")
         self.items = candidate
         return {}
 
@@ -243,6 +255,89 @@ async def test_deliverability_lookup_reads_legacy_cased_hash_during_rollout() ->
     assert record is not None
     assert record.deliverability is EmailDeliverability.SUPPRESSED
     assert record.suppression_reason == "hard_bounce"
+
+
+@pytest.mark.asyncio
+async def test_case_only_email_update_migrates_legacy_suppression_atomically() -> None:
+    client = RecordingDynamoClient()
+    previous = make_preference(version=1, email_address="User@example.com")
+    updated = make_preference(version=2, email_address="user@example.com")
+    client.seed("domain", preference_item(version=1, email_address="User@example.com"))
+    legacy_digest = sha256(b"User@example.com").hexdigest()
+    client.seed(
+        "domain",
+        {
+            "PK": f"EMAIL_IDENTITY#{legacy_digest}",
+            "SK": "DELIVERABILITY",
+            "entity_type": "email_deliverability",
+            "schema_version": 1,
+            "deliverability": "suppressed",
+            "suppression_reason": "hard_bounce",
+            "suppression_rank": 2,
+            "source_delivery_id": "delivery-1",
+            "source_attempt_id": "attempt-1",
+            "source_provider_message_id": "provider-message-1",
+            "suppressed_at": NOW.isoformat(),
+            "updated_at": NOW.isoformat(),
+        },
+    )
+    repository = DynamoNotificationPreferenceRepository(
+        "domain",
+        "audit",
+        client,
+        clock=lambda: NOW,
+    )
+
+    await repository.save(
+        updated,
+        1,
+        AuditContext(actor_id="sub_1"),
+        previous=previous,
+    )
+
+    transaction = client.transact_write_items_calls[0]["TransactItems"]
+    migration = transaction[2]["Update"]
+    migration_key = client._decode(migration["Key"])
+    assert migration_key == {
+        "PK": f"EMAIL_IDENTITY#{sha256(b'user@example.com').hexdigest()}",
+        "SK": "DELIVERABILITY",
+    }
+    migration_values = client._decode(migration["ExpressionAttributeValues"])
+    assert migration_values[":suppressed"] == "suppressed"
+    assert migration_values[":suppression_reason"] == "hard_bounce"
+    assert migration_values[":suppression_rank"] == 2
+    assert "if_not_exists" in migration["UpdateExpression"]
+    assert client.get_item_calls[0]["ConsistentRead"] is True
+
+
+@pytest.mark.asyncio
+async def test_case_only_email_update_fences_absent_legacy_suppression() -> None:
+    client = RecordingDynamoClient()
+    previous = make_preference(version=1, email_address="User@example.com")
+    updated = make_preference(version=2, email_address="user@example.com")
+    client.seed("domain", preference_item(version=1, email_address="User@example.com"))
+    repository = DynamoNotificationPreferenceRepository(
+        "domain",
+        "audit",
+        client,
+        clock=lambda: NOW,
+    )
+
+    await repository.save(
+        updated,
+        1,
+        AuditContext(actor_id="sub_1"),
+        previous=previous,
+    )
+
+    transaction = client.transact_write_items_calls[0]["TransactItems"]
+    fence = transaction[2]["ConditionCheck"]
+    legacy_key = client._decode(fence["Key"])
+    assert legacy_key == {
+        "PK": f"EMAIL_IDENTITY#{sha256(b'User@example.com').hexdigest()}",
+        "SK": "DELIVERABILITY",
+    }
+    assert fence["ConditionExpression"] == "attribute_not_exists(PK) AND attribute_not_exists(SK)"
 
 
 @pytest.mark.asyncio

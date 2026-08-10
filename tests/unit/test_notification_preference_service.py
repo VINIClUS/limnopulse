@@ -74,6 +74,20 @@ class DeliverabilityMustPrecedeCommitRepository(FakeNotificationPreferenceReposi
         return await super().get_email_deliverability(address)
 
 
+class CaseTransitionRepository(FakeNotificationPreferenceRepository):
+    async def get_email_deliverability(
+        self,
+        address: str,
+    ) -> EmailDeliverabilityRecord | None:
+        self.deliverability_calls.append(address)
+        if address == "User@example.com":
+            return EmailDeliverabilityRecord(
+                deliverability=EmailDeliverability.SUPPRESSED,
+                suppression_reason="hard_bounce",
+            )
+        return None
+
+
 class FailingIdentityVerifier:
     async def verify(self, principal):
         raise AssertionError("GET must not call Cognito")
@@ -418,3 +432,30 @@ async def test_put_loads_deliverability_before_the_atomic_commit() -> None:
     assert result.version == 1
     assert repository.deliverability_calls == ["verified@example.com"]
     assert len(repository.save_calls) == 1
+
+
+@pytest.mark.asyncio
+async def test_put_preserves_legacy_suppression_view_across_case_only_email_change() -> None:
+    existing = make_preference(version=2, email_address="User@example.com")
+    repository = CaseTransitionRepository(existing)
+    verifier = FakeIdentityVerifier(
+        VerifiedEmailIdentity(
+            address="user@example.com",
+            verified=True,
+            checked_at=NOW,
+            identity_source="cognito_get_user",
+        )
+    )
+
+    result = await NotificationPreferenceService(repository, verifier, clock=lambda: NOW).put(
+        "tnt_1",
+        PRINCIPAL,
+        expected_version=2,
+        email_enabled=True,
+        minimum_severity=AlertSeverity.WARNING,
+        audit=AUDIT,
+    )
+
+    assert repository.deliverability_calls == ["user@example.com", "User@example.com"]
+    assert result.email.deliverability is EmailDeliverability.SUPPRESSED
+    assert result.email.effective_enabled is False

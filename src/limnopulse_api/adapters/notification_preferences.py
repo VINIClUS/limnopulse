@@ -92,6 +92,10 @@ class DynamoNotificationPreferenceRepository:
     ) -> NotificationPreference:
         self._validate_change(preference, expected_version, previous)
         now = self.clock()
+        legacy_suppression_migration = await self._legacy_suppression_migration(
+            preference,
+            previous,
+        )
         preference_put: dict[str, Any] = {
             "TableName": self.domain_table_name,
             "Item": self._serialize_item(self._preference_item(preference)),
@@ -117,26 +121,103 @@ class DynamoNotificationPreferenceRepository:
             action = "notification_preference.updated"
 
         audit_item = self._audit_item(preference, previous, audit, action, now)
+        transaction_items: list[dict[str, Any]] = [
+            {"Put": preference_put},
+            {
+                "Put": {
+                    "TableName": self.audit_table_name,
+                    "Item": self._serialize_item(audit_item),
+                    "ConditionExpression": (
+                        "attribute_not_exists(PK) AND attribute_not_exists(SK)"
+                    ),
+                }
+            },
+        ]
+        if legacy_suppression_migration is not None:
+            transaction_items.append(legacy_suppression_migration)
         try:
             await to_thread(
                 self.client.transact_write_items,
-                TransactItems=[
-                    {"Put": preference_put},
-                    {
-                        "Put": {
-                            "TableName": self.audit_table_name,
-                            "Item": self._serialize_item(audit_item),
-                            "ConditionExpression": (
-                                "attribute_not_exists(PK) AND attribute_not_exists(SK)"
-                            ),
-                        }
-                    },
-                ]
+                TransactItems=transaction_items,
             )
         except Exception as exc:
             self._raise_if_conflict(exc)
             raise
         return preference
+
+    async def _legacy_suppression_migration(
+        self,
+        preference: NotificationPreference,
+        previous: NotificationPreference | None,
+    ) -> dict[str, Any] | None:
+        if (
+            previous is None
+            or previous.email_address == preference.email_address
+            or previous.email_address.lower() != preference.email_address.lower()
+        ):
+            return None
+        canonical_key = self._deliverability_key(preference.email_address)
+        legacy_key = self._legacy_deliverability_key(previous.email_address)
+        if canonical_key == legacy_key:
+            return None
+        legacy = await to_thread(
+            self._get_item,
+            self.domain_table_name,
+            legacy_key,
+            consistent=True,
+        )
+        if legacy is None:
+            return {
+                "ConditionCheck": {
+                    "TableName": self.domain_table_name,
+                    "Key": self._serialize_item(legacy_key),
+                    "ConditionExpression": "attribute_not_exists(PK) AND attribute_not_exists(SK)",
+                }
+            }
+        if legacy.get("deliverability") != EmailDeliverability.SUPPRESSED.value:
+            return None
+
+        values: dict[str, Any] = {
+            ":entity_type": "email_deliverability",
+            ":schema_version": 1,
+            ":suppressed": EmailDeliverability.SUPPRESSED.value,
+        }
+        names = {
+            "#entity_type": "entity_type",
+            "#schema_version": "schema_version",
+            "#deliverability": "deliverability",
+        }
+        sets = [
+            "#entity_type = if_not_exists(#entity_type, :entity_type)",
+            "#schema_version = if_not_exists(#schema_version, :schema_version)",
+            "#deliverability = :suppressed",
+        ]
+        for attribute in (
+            "suppression_reason",
+            "suppression_rank",
+            "source_delivery_id",
+            "source_attempt_id",
+            "source_provider_message_id",
+            "suppressed_at",
+            "updated_at",
+        ):
+            value = legacy.get(attribute)
+            if value is None:
+                continue
+            name = f"#{attribute}"
+            placeholder = f":{attribute}"
+            names[name] = attribute
+            values[placeholder] = value
+            sets.append(f"{name} = if_not_exists({name}, {placeholder})")
+        return {
+            "Update": {
+                "TableName": self.domain_table_name,
+                "Key": self._serialize_item(canonical_key),
+                "UpdateExpression": f"SET {', '.join(sets)}",
+                "ExpressionAttributeNames": names,
+                "ExpressionAttributeValues": self._serialize_values(values),
+            }
+        }
 
     def _preference_item(self, preference: NotificationPreference) -> dict[str, Any]:
         return {

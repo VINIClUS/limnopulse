@@ -152,9 +152,14 @@ enabling either publisher or consumer.
    `deferred_unsupported_channel` and are not indexed for email relay.
 
    Deliverability identities use the lowercase ASCII mailbox hash. Readers keep
-   a case-sensitive predecessor-key fallback for suppressions written before
-   this canonicalization, so existing bounce and complaint suppressions remain
-   effective throughout the rollout.
+   a case-sensitive predecessor-key fallback while a preference still has its
+   historical mailbox casing. A case-only email change through the preference
+   API copies a legacy suppression to the canonical key in the same DynamoDB
+   transaction as the preference update. When no legacy row is observed, that
+   transaction fences its absence; a concurrently-written legacy suppression
+   makes the update conflict rather than letting the new casing bypass it.
+   Retry the conditional preference update after that conflict. Do not change
+   persisted preference email casing outside this API path.
 6. Validate SES: `SES_FROM_EMAIL` must be a verified identity in the same
    region, `SES_CONFIGURATION_SET_NAME` must equal the OpenTofu
    `ses_configuration_set_name` output, and the account must have the intended

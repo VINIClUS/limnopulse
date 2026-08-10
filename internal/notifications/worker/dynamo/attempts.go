@@ -231,7 +231,7 @@ func (store Store) completeAttempt(
 				}
 			}
 			if mergeable {
-				return store.completeAttempt(ctx, refreshed, completion, false, false)
+				return store.completeAttempt(ctx, refreshed, completion, false, true)
 			}
 			if isRecoveryFenceConflict && recoveryFenceRetryableRecord(record, completion, refreshed, terminal) {
 				return store.completeAttempt(ctx, record, completion, allowDelayedFeedbackMerge, false)

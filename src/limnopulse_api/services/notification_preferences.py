@@ -109,6 +109,15 @@ class NotificationPreferenceService:
         deliverability_record = await self.repository.get_email_deliverability(
             preference.email_address
         )
+        if (
+            deliverability_record is None
+            and existing is not None
+            and existing.email_address != preference.email_address
+            and existing.email_address.lower() == preference.email_address.lower()
+        ):
+            deliverability_record = await self.repository.get_email_deliverability(
+                existing.email_address
+            )
         saved = await self.repository.save(
             preference,
             expected_version,

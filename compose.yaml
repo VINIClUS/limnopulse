@@ -135,7 +135,6 @@ services:
       SES_FROM_EMAIL: alerts@example.test
       SES_CONFIGURATION_SET_NAME: limnopulse-notifications
       NOTIFICATION_EMAIL_SENDER_MODE: success
-      NOTIFICATION_FAKE_MESSAGE_ID: provider_message_local_compose
       NOTIFICATION_MAX_SEND_RATE: "10"
     command: ["worker"]
     init: true
