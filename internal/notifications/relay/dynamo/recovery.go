@@ -123,6 +123,13 @@ func (store Store) ExpandDependency(
 				}
 			}
 		}
+		if err == nil && state == notifications.DeliveryStateSucceeded {
+			check, checkErr := store.openingDependencyCondition(opening)
+			if checkErr != nil {
+				return relay.WorkResult{}, checkErr
+			}
+			dependencyChecks = append(dependencyChecks, types.TransactWriteItem{ConditionCheck: check})
+		}
 		if err != nil {
 			return relay.WorkResult{}, fmt.Errorf("build recovery delivery: %w", err)
 		}

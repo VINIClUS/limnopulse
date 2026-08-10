@@ -56,7 +56,8 @@ func TestExpandDependencyChainsSucceededOpeningWithoutRecheckingPreference(t *te
 		}
 	}
 	transaction := client.transactInputs[0]
-	if len(transaction.TransactItems) != 2 || transaction.TransactItems[0].Update == nil {
+	if len(transaction.TransactItems) != 3 || transaction.TransactItems[0].Update == nil ||
+		transaction.TransactItems[1].ConditionCheck == nil {
 		t.Fatalf("recovery transaction = %#v", transaction.TransactItems)
 	}
 	var values map[string]any
@@ -77,6 +78,18 @@ func TestExpandDependencyChainsSucceededOpeningWithoutRecheckingPreference(t *te
 		values[":depends_on_outbox_id"] != "opening_outbox" ||
 		values[":depends_on_delivery_id"] != openingID {
 		t.Fatalf("recovery values = %#v", values)
+	}
+	openingFence := transaction.TransactItems[1].ConditionCheck
+	if !strings.Contains(aws.ToString(openingFence.ConditionExpression), "#state = :state") ||
+		!strings.Contains(aws.ToString(openingFence.ConditionExpression), "#revision = :revision") {
+		t.Fatalf("succeeded opening fence = %s", aws.ToString(openingFence.ConditionExpression))
+	}
+	var fenceValues map[string]any
+	if err := attributevalue.UnmarshalMap(openingFence.ExpressionAttributeValues, &fenceValues); err != nil {
+		t.Fatal(err)
+	}
+	if fenceValues[":state"] != "succeeded" || fmt.Sprint(fenceValues[":revision"]) != "1" {
+		t.Fatalf("succeeded opening fence values = %#v", fenceValues)
 	}
 	content, ok := values[":content"].(map[string]any)
 	if !ok || content["locale"] != "pt-BR" || content["template_id"] != "alert-recovery/v1" {
@@ -158,7 +171,7 @@ func TestExpandDependencyPreservesNonterminalOpeningWithoutBlockingSucceededReci
 	if result.DeliveriesCreated != 2 || result.RecipientsExamined != 2 {
 		t.Fatalf("result = %#v", result)
 	}
-	if len(client.transactInputs) != 1 || len(client.transactInputs[0].TransactItems) != 4 {
+	if len(client.transactInputs) != 1 || len(client.transactInputs[0].TransactItems) != 5 {
 		t.Fatalf("nonterminal opening did not preserve its recovery beside the successful recipient: %#v", client.transactInputs)
 	}
 	var mutationText strings.Builder
@@ -231,9 +244,9 @@ func TestExpandDependencyCreatesSucceededAndWaitingRecoveriesWithoutHeadOfLineBl
 		t.Fatalf("dependency query limit = %v, want 49 for worst-case transaction capacity", client.queryInputs[0].Limit)
 	}
 	transaction := client.transactInputs[0]
-	if len(transaction.TransactItems) != 4 || transaction.TransactItems[0].Update == nil ||
+	if len(transaction.TransactItems) != 5 || transaction.TransactItems[0].Update == nil ||
 		transaction.TransactItems[1].Update == nil || transaction.TransactItems[2].ConditionCheck == nil ||
-		transaction.TransactItems[3].Update == nil {
+		transaction.TransactItems[3].ConditionCheck == nil || transaction.TransactItems[4].Update == nil {
 		t.Fatalf("mixed recovery transaction = %#v", transaction.TransactItems)
 	}
 	var text strings.Builder

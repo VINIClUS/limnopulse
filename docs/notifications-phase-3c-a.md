@@ -63,10 +63,13 @@ durable `waiting_dependency` recovery with rendered content but no relay GSI.
 An opening's terminal worker transition or late provider feedback conditionally
 promotes that waiting row to pending with its GSI, or cancels it after a
 definitive opening failure, in the same DynamoDB transaction as the opening
-transition. When either path initially observes the recovery row absent, that
-transaction includes an absence fence. This makes a concurrent relay create
-lose one of the two revision/absence conditions and retry instead of leaving an
-unindexed waiting row orphaned.
+transition. Recovery fanout also fences the source opening's state and revision,
+including an opening read as `succeeded`; a concurrent definitive feedback
+transition makes the fanout retry instead of publishing a recovery for a
+rejected opening. When either path initially observes the recovery row absent,
+that transaction includes an absence fence. This makes a concurrent relay
+create lose one of the two revision/absence conditions and retry instead of
+leaving an unindexed waiting row orphaned.
 
 ## Local execution
 
