@@ -7,7 +7,6 @@ import boto3
 
 from limnopulse_api.core.config import get_settings
 
-
 ALERT_INDEXES = (
     {
         "IndexName": "AlertEvaluationByDue",
@@ -24,6 +23,17 @@ ALERT_INDEXES = (
             {"AttributeName": "GSI2SK", "KeyType": "RANGE"},
         ],
         "Projection": {"ProjectionType": "ALL"},
+    },
+    {
+        "IndexName": "NotificationRelayByAvailableAt",
+        "KeySchema": [
+            {"AttributeName": "relay_gsi_pk", "KeyType": "HASH"},
+            {"AttributeName": "relay_gsi_sk", "KeyType": "RANGE"},
+        ],
+        "Projection": {
+            "ProjectionType": "INCLUDE",
+            "NonKeyAttributes": ["relay_work_kind"],
+        },
     },
 )
 GSI_WAIT_DELAY_SECONDS = 20
@@ -49,7 +59,14 @@ def ensure_table(
         if include_alert_indexes:
             definitions.extend(
                 {"AttributeName": name, "AttributeType": "S"}
-                for name in ("GSI1PK", "GSI1SK", "GSI2PK", "GSI2SK")
+                for name in (
+                    "GSI1PK",
+                    "GSI1SK",
+                    "GSI2PK",
+                    "GSI2SK",
+                    "relay_gsi_pk",
+                    "relay_gsi_sk",
+                )
             )
         request = {
             "TableName": table_name,
@@ -80,6 +97,7 @@ def ensure_alert_indexes(client: boto3.client, table_name: str) -> None:
         description = client.describe_table(TableName=table_name)["Table"]
         status = index_status(description, index_name)
         if status == "ACTIVE":
+            validate_index_definition(description, index, table_name)
             continue
         if status is None:
             client.update_table(
@@ -91,6 +109,8 @@ def ensure_alert_indexes(client: boto3.client, table_name: str) -> None:
                 GlobalSecondaryIndexUpdates=[{"Create": index}],
             )
         wait_for_index_active(client, table_name, index_name)
+        description = client.describe_table(TableName=table_name)["Table"]
+        validate_index_definition(description, index, table_name)
         print(f"Index {index_name} is ACTIVE on {table_name}")
 
 
@@ -108,8 +128,7 @@ def wait_for_index_active(
         if attempt + 1 < GSI_WAIT_MAX_ATTEMPTS:
             time.sleep(GSI_WAIT_DELAY_SECONDS)
     raise TimeoutError(
-        f"Index {index_name} on {table_name} did not become ACTIVE; "
-        f"last status was {last_status}"
+        f"Index {index_name} on {table_name} did not become ACTIVE; last status was {last_status}"
     )
 
 
@@ -122,6 +141,38 @@ def index_status(description: dict[str, Any], index_name: str) -> str | None:
         ),
         None,
     )
+
+
+def validate_index_definition(
+    description: dict[str, Any],
+    expected: dict[str, Any],
+    table_name: str,
+) -> None:
+    actual = next(
+        (
+            index
+            for index in description.get("GlobalSecondaryIndexes", [])
+            if index["IndexName"] == expected["IndexName"]
+        ),
+        None,
+    )
+    # Lightweight unit-test fakes may model lifecycle status only. Real
+    # DescribeTable responses always carry both fields.
+    if actual is None or "KeySchema" not in actual or "Projection" not in actual:
+        return
+    actual_projection = actual["Projection"]
+    expected_projection = expected["Projection"]
+    compatible = (
+        actual["KeySchema"] == expected["KeySchema"]
+        and actual_projection.get("ProjectionType") == expected_projection.get("ProjectionType")
+        and sorted(actual_projection.get("NonKeyAttributes", []))
+        == sorted(expected_projection.get("NonKeyAttributes", []))
+    )
+    if not compatible:
+        raise RuntimeError(
+            f"Index {expected['IndexName']} on {table_name} has an incompatible "
+            "key/projection definition; recreate the local table"
+        )
 
 
 def ensure_ttl(client: boto3.client, table_name: str) -> None:

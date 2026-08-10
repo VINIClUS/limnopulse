@@ -1,20 +1,23 @@
 from datetime import UTC, datetime, timedelta
 
 import jwt
+from botocore.exceptions import EndpointConnectionError
 from cryptography.hazmat.primitives.asymmetric import rsa
 from fastapi import Request
 from fastapi.testclient import TestClient
-from botocore.exceptions import EndpointConnectionError
 
-from limnopulse_api.adapters.dynamodb import DynamoDomainRepository
 from limnopulse_api.adapters.alert_rules import DynamoAlertRuleRepository
+from limnopulse_api.adapters.dynamodb import DynamoDomainRepository
+from limnopulse_api.adapters.notification_preferences import (
+    DynamoNotificationPreferenceRepository,
+)
 from limnopulse_api.adapters.redis import RedisCacheRepository
 from limnopulse_api.auth.cognito import CognitoJwtAuthProvider
 from limnopulse_api.auth.models import Principal
 from limnopulse_api.core.config import Settings
 from limnopulse_api.main import create_app
+from limnopulse_api.services.cognito_identity import CognitoIdentityVerifier, DevIdentityVerifier
 from limnopulse_api.services.memberships import MembershipService
-
 
 TEST_ISSUER = "https://cognito-idp.us-east-1.amazonaws.com/pool_1"
 
@@ -87,6 +90,7 @@ def test_app_lifespan_wires_runtime_dependencies(monkeypatch) -> None:
     redis_calls: list[str] = []
     influx_calls: list[dict[str, str]] = []
     fake_dynamo = object()
+    fake_cognito = object()
     fake_redis = FakeRedisClient()
     fake_query_api = object()
 
@@ -103,7 +107,10 @@ def test_app_lifespan_wires_runtime_dependencies(monkeypatch) -> None:
 
     def fake_boto3_client(service_name: str, **kwargs):
         dynamo_calls.append({"service_name": service_name, **kwargs})
-        return fake_dynamo
+        if service_name == "dynamodb":
+            return fake_dynamo
+        assert service_name == "cognito-idp"
+        return fake_cognito
 
     def fake_redis_from_url(url: str):
         redis_calls.append(url)
@@ -133,6 +140,8 @@ def test_app_lifespan_wires_runtime_dependencies(monkeypatch) -> None:
     assert influx_calls == []
     assert not hasattr(app.state, "domain_repository")
     assert not hasattr(app.state, "alert_rule_repository")
+    assert not hasattr(app.state, "notification_preference_repository")
+    assert not hasattr(app.state, "cognito_identity_verifier")
     assert not hasattr(app.state, "membership_service")
     assert not hasattr(app.state, "auth_provider")
     assert not hasattr(app.state, "telemetry_repository")
@@ -145,13 +154,26 @@ def test_app_lifespan_wires_runtime_dependencies(monkeypatch) -> None:
                 "endpoint_url": "http://localhost:8000",
                 "aws_access_key_id": "local",
                 "aws_secret_access_key": "local",
-            }
+            },
+            {
+                "service_name": "cognito-idp",
+                "region_name": "us-east-1",
+                "aws_access_key_id": "local",
+                "aws_secret_access_key": "local",
+            },
         ]
         assert redis_calls == ["redis://localhost:6379/0"]
         assert isinstance(app.state.domain_repository, DynamoDomainRepository)
         assert app.state.domain_repository.client is fake_dynamo
         assert isinstance(app.state.alert_rule_repository, DynamoAlertRuleRepository)
         assert app.state.alert_rule_repository.client is fake_dynamo
+        assert isinstance(
+            app.state.notification_preference_repository,
+            DynamoNotificationPreferenceRepository,
+        )
+        assert app.state.notification_preference_repository.client is fake_dynamo
+        assert isinstance(app.state.cognito_identity_verifier, CognitoIdentityVerifier)
+        assert app.state.cognito_identity_verifier.client is fake_cognito
         assert isinstance(app.state.cache_repository, RedisCacheRepository)
         assert app.state.cache_repository.redis is fake_redis
         assert isinstance(app.state.membership_service, MembershipService)
@@ -221,7 +243,7 @@ def test_lifespan_uses_only_official_influx_client_and_closes_it(monkeypatch) ->
     assert influxdb_client.close_calls == 1
 
 
-def test_app_lifespan_uses_dummy_credentials_for_local_dynamodb(monkeypatch) -> None:
+def test_app_lifespan_uses_dev_identity_verifier_without_cognito_client(monkeypatch) -> None:
     dynamo_calls: list[dict[str, str | None]] = []
     fake_dynamo = object()
     fake_redis = FakeRedisClient()
@@ -253,6 +275,7 @@ def test_app_lifespan_uses_dummy_credentials_for_local_dynamodb(monkeypatch) -> 
                 "aws_secret_access_key": "local",
             }
         ]
+        assert isinstance(app.state.cognito_identity_verifier, DevIdentityVerifier)
 
 
 def test_me_reuses_app_scoped_auth_provider(monkeypatch) -> None:

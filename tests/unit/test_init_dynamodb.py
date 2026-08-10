@@ -1,3 +1,4 @@
+from copy import deepcopy
 from typing import Any
 
 import pytest
@@ -69,8 +70,7 @@ class IndexLifecycleClient(FakeDynamoClient):
     def describe_table(self, **kwargs: Any) -> dict[str, Any]:
         self.index_describe_calls += 1
         indexes = [
-            {"IndexName": name, "IndexStatus": status}
-            for name, status in self.indexes.items()
+            {"IndexName": name, "IndexStatus": status} for name, status in self.indexes.items()
         ]
         if self.activate_created_indexes:
             for name, status in tuple(self.indexes.items()):
@@ -132,15 +132,20 @@ def test_new_domain_table_includes_alert_evaluation_and_event_indexes(
         "GSI1SK",
         "GSI2PK",
         "GSI2SK",
+        "relay_gsi_pk",
+        "relay_gsi_sk",
     }
     assert [index["IndexName"] for index in create["GlobalSecondaryIndexes"]] == [
         "AlertEvaluationByDue",
         "AlertEventsByTenantTime",
+        "NotificationRelayByAvailableAt",
     ]
-    assert create["GlobalSecondaryIndexes"][0]["Projection"] == {
-        "ProjectionType": "KEYS_ONLY"
-    }
+    assert create["GlobalSecondaryIndexes"][0]["Projection"] == {"ProjectionType": "KEYS_ONLY"}
     assert create["GlobalSecondaryIndexes"][1]["Projection"] == {"ProjectionType": "ALL"}
+    assert create["GlobalSecondaryIndexes"][2]["Projection"] == {
+        "ProjectionType": "INCLUDE",
+        "NonKeyAttributes": ["relay_work_kind"],
+    }
 
 
 def test_already_enabled_ttl_is_left_unchanged() -> None:
@@ -164,10 +169,15 @@ def test_existing_table_waits_for_each_index_before_creating_next(
         call["GlobalSecondaryIndexUpdates"][0]["Create"]["IndexName"]
         for call in client.update_table_calls
     ]
-    assert created == ["AlertEvaluationByDue", "AlertEventsByTenantTime"]
+    assert created == [
+        "AlertEvaluationByDue",
+        "AlertEventsByTenantTime",
+        "NotificationRelayByAvailableAt",
+    ]
     assert client.indexes == {
         "AlertEvaluationByDue": "ACTIVE",
         "AlertEventsByTenantTime": "ACTIVE",
+        "NotificationRelayByAvailableAt": "ACTIVE",
     }
 
 
@@ -183,6 +193,7 @@ def test_new_table_waits_for_all_indexes_before_returning(
     assert client.indexes == {
         "AlertEvaluationByDue": "ACTIVE",
         "AlertEventsByTenantTime": "ACTIVE",
+        "NotificationRelayByAvailableAt": "ACTIVE",
     }
     assert client.index_describe_calls >= 3
 
@@ -200,9 +211,34 @@ def test_existing_creating_index_is_awaited(
 
     ensure_table(client, "LimnopulseDomain", include_alert_indexes=True)
 
-    assert client.update_table_calls == []
+    assert [
+        call["GlobalSecondaryIndexUpdates"][0]["Create"]["IndexName"]
+        for call in client.update_table_calls
+    ] == ["NotificationRelayByAvailableAt"]
     assert client.indexes["AlertEvaluationByDue"] == "ACTIVE"
+    assert client.indexes["NotificationRelayByAvailableAt"] == "ACTIVE"
     assert client.index_describe_calls >= 2
+
+
+def test_existing_relay_index_with_old_projection_fails_closed() -> None:
+    class OldRelayProjectionClient(IndexLifecycleClient):
+        def describe_table(self, **kwargs: Any) -> dict[str, Any]:
+            indexes = []
+            for expected in init_dynamodb.ALERT_INDEXES:
+                actual = deepcopy(expected)
+                actual["IndexStatus"] = "ACTIVE"
+                if actual["IndexName"] == "NotificationRelayByAvailableAt":
+                    actual["Projection"] = {"ProjectionType": "KEYS_ONLY"}
+                indexes.append(actual)
+            return {"Table": {"GlobalSecondaryIndexes": indexes}}
+
+    client = OldRelayProjectionClient()
+
+    with pytest.raises(
+        RuntimeError,
+        match="NotificationRelayByAvailableAt.*incompatible.*recreate",
+    ):
+        ensure_table(client, "LimnopulseDomain", include_alert_indexes=True)
 
 
 def test_index_wait_times_out_with_index_name(

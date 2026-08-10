@@ -8,10 +8,14 @@ from limnopulse_api.auth.providers import build_auth_provider
 from limnopulse_api.core.errors import AuthError
 from limnopulse_api.domain.entities import TenantAccess
 from limnopulse_api.domain.roles import READ_ROLES, TenantRole
-from limnopulse_api.repositories.domain import DomainRepository
-from limnopulse_api.repositories.alerts import AlertRuleRepository
 from limnopulse_api.repositories.alert_events import AlertEventRepository
+from limnopulse_api.repositories.alerts import AlertRuleRepository
+from limnopulse_api.repositories.domain import DomainRepository
+from limnopulse_api.repositories.notification_preferences import (
+    NotificationPreferenceRepository,
+)
 from limnopulse_api.repositories.telemetry import TelemetryRepository
+from limnopulse_api.services.cognito_identity import CognitoIdentityVerifier
 from limnopulse_api.services.memberships import MembershipService
 
 
@@ -58,10 +62,28 @@ def get_alert_event_repository(request: Request) -> AlertEventRepository:
     return _get_state_dependency(request, "alert_event_repository")
 
 
+def get_notification_preference_repository(
+    request: Request,
+) -> NotificationPreferenceRepository:
+    return _get_state_dependency(request, "notification_preference_repository")
+
+
+def get_cognito_identity_verifier(request: Request) -> CognitoIdentityVerifier | None:
+    return getattr(request.app.state, "cognito_identity_verifier", None)
+
+
 DomainRepositoryDep = Annotated[DomainRepository, Depends(get_domain_repository)]
 AlertRuleRepositoryDep = Annotated[AlertRuleRepository, Depends(get_alert_rule_repository)]
 AlertEventRepositoryDep = Annotated[AlertEventRepository, Depends(get_alert_event_repository)]
 TelemetryRepositoryDep = Annotated[TelemetryRepository, Depends(get_telemetry_repository)]
+NotificationPreferenceRepositoryDep = Annotated[
+    NotificationPreferenceRepository,
+    Depends(get_notification_preference_repository),
+]
+CognitoIdentityVerifierDep = Annotated[
+    CognitoIdentityVerifier | None,
+    Depends(get_cognito_identity_verifier),
+]
 MembershipServiceDep = Annotated[MembershipService, Depends(get_membership_service)]
 
 

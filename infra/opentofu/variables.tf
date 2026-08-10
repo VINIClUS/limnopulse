@@ -40,22 +40,46 @@ variable "cognito_client_name" {
   default     = "limnopulse-app"
 }
 
-variable "alerts_queue_name" {
-  description = "SQS queue name for future alert and notification workers."
+variable "notification_jobs_queue_name" {
+  description = "SQS queue name consumed by the notification email worker."
   type        = string
-  default     = "limnopulse-alerts"
+  default     = "limnopulse-notification-jobs"
 }
 
-variable "alerts_dlq_name" {
-  description = "SQS dead-letter queue name for future alert and notification workers."
+variable "notification_jobs_dlq_name" {
+  description = "Dead-letter queue name for notification jobs."
   type        = string
-  default     = "limnopulse-alerts-dlq"
+  default     = "limnopulse-notification-jobs-dlq"
 }
 
-variable "ses_email_identity" {
-  description = "Optional SES email or domain identity. Leave empty to skip SES identity creation."
+variable "ses_events_queue_name" {
+  description = "SQS queue name consumed by the SES feedback worker."
   type        = string
-  default     = ""
+  default     = "limnopulse-ses-events"
+}
+
+variable "ses_events_dlq_name" {
+  description = "Dead-letter queue name for malformed or repeatedly failing SES feedback."
+  type        = string
+  default     = "limnopulse-ses-events-dlq"
+}
+
+variable "ses_events_routing_dlq_name" {
+  description = "Dead-letter queue name for EventBridge-to-SQS routing failures."
+  type        = string
+  default     = "limnopulse-ses-events-routing-dlq"
+}
+
+variable "ses_configuration_set_name" {
+  description = "SESv2 configuration set attached by the notification worker."
+  type        = string
+  default     = "limnopulse-notifications"
+}
+
+variable "ses_eventbridge_rule_name" {
+  description = "EventBridge rule that routes SES feedback into SQS."
+  type        = string
+  default     = "limnopulse-ses-events"
 }
 
 variable "redis_url" {

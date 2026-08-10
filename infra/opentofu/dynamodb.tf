@@ -34,6 +34,16 @@ resource "aws_dynamodb_table" "domain" {
     type = "S"
   }
 
+  attribute {
+    name = "relay_gsi_pk"
+    type = "S"
+  }
+
+  attribute {
+    name = "relay_gsi_sk"
+    type = "S"
+  }
+
   global_secondary_index {
     name            = "AlertEvaluationByDue"
     hash_key        = "GSI1PK"
@@ -46,6 +56,14 @@ resource "aws_dynamodb_table" "domain" {
     hash_key        = "GSI2PK"
     range_key       = "GSI2SK"
     projection_type = "ALL"
+  }
+
+  global_secondary_index {
+    name               = "NotificationRelayByAvailableAt"
+    hash_key           = "relay_gsi_pk"
+    range_key          = "relay_gsi_sk"
+    projection_type    = "INCLUDE"
+    non_key_attributes = ["relay_work_kind"]
   }
 
   ttl {

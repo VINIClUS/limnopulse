@@ -20,7 +20,6 @@ from limnopulse_api.domain.entities import Device, Membership, Pond
 from limnopulse_api.domain.roles import TenantRole
 from limnopulse_api.main import create_app
 
-
 NOW = datetime(2026, 7, 15, 12, 0, tzinfo=UTC)
 
 
@@ -311,6 +310,7 @@ def test_write_roles_can_create_alert_rule_with_server_id(role: TenantRole) -> N
         ({"channels": []}, 422),
         ({"channels": ["email", "email"]}, 422),
         ({"metric": "unknown"}, 422),
+        ({"name": "Oxigênio baixo\r\nBcc: victim@example.test"}, 422),
     ],
 )
 def test_create_rejects_invalid_alert_rule_payloads(
@@ -382,6 +382,26 @@ def test_patch_rejects_empty_immutable_or_null_changes(payload: dict[str, Any]) 
     )
 
     assert response.status_code == 422
+
+
+def test_patch_and_replace_reject_control_characters_in_rule_name() -> None:
+    app, _, _ = app_for_role(TenantRole.ADMIN)
+    client = TestClient(app)
+    path = "/v1/tenants/tnt_1/alert-rules/rule_1"
+
+    patch_response = client.patch(
+        path,
+        json={"expected_version": 1, "name": "Linha\tquebrada"},
+        headers=dev_headers(),
+    )
+    replace_response = client.post(
+        f"{path}/replace",
+        json={"expected_version": 1, **create_payload(name="Linha\nquebrada")},
+        headers=dev_headers(**{"Idempotency-Key": "control-name"}),
+    )
+
+    assert patch_response.status_code == 422
+    assert replace_response.status_code == 422
 
 
 def test_replace_requires_valid_idempotency_key() -> None:

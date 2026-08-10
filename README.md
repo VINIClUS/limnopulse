@@ -11,7 +11,7 @@ cp .env.example .env
 python -m venv .venv
 . .venv/bin/activate
 pip install -e ".[dev]"
-docker compose up -d redis dynamodb-local influxdb mqtt-broker telegraf
+docker compose up -d redis dynamodb-local influxdb mqtt-broker telegraf elasticmq
 # creates LimnopulseDomain and LimnopulseAudit and enables expires_at TTL
 python scripts/dev/init_dynamodb.py
 python scripts/dev/seed_local.py
@@ -75,7 +75,9 @@ Example creation body:
 
 PATCH accepts `expected_version` plus at least one mutable field. Tenant, pond, optional device, and metric form the semantic identity and cannot be patched. To change identity, call `/replace` with a complete replacement body, `expected_version`, and an `Idempotency-Key` header between 8 and 128 characters. The same key and payload replays the result for 24 hours; reusing the key with another payload returns `409`.
 
-Phase 3B evaluates rules but does not send notifications. It stores opening and recovery outboxes durably for the Phase 3C dispatcher.
+Phase 3B evaluates rules and transactionally stores opening and recovery
+outboxes. Phase 3C-A relays eligible email outboxes to SQS and delivers them
+through SES; Telegram declarations remain deferred for Phase 3C-B.
 
 ## Alert Events and Evaluation
 
@@ -100,6 +102,28 @@ docker compose --profile manual run --rm alert-evaluator run
 The process exits after the owned work is complete. Scheduling remains external.
 See [Phase 3B evaluator operations](docs/alert-evaluator-phase-3b.md) for replay,
 sharding, schedule backfill, scheduler examples, exit codes and metrics.
+
+## Email Notifications
+
+Phase 3C-A adds a one-shot notification relay plus one continuous email/SES
+feedback worker. For a deterministic local run, initialize DynamoDB, start the
+fake worker, and invoke the relay:
+
+```bash
+docker compose up -d dynamodb-local elasticmq
+python scripts/dev/init_dynamodb.py
+docker compose --profile notifications up -d notification-worker
+docker compose --profile notifications run --rm notification-relay
+```
+
+The local worker uses a fake successful sender; it never contacts SES. The relay
+has no loop and is intended for an external 60-second scheduler. DynamoDB holds
+the authoritative delivery and attempt state, while SQS remains an at-least-once
+transport. Phase 3C-A adds no public Delivery or Attempt API.
+
+See [Phase 3C-A notification operations](docs/notifications-phase-3c-a.md) for
+cloud rollout order, relay backfill, SES prerequisites, replay, metrics, DLQ
+recovery, rollback and PII limits.
 
 ## Local Telemetry Ingestion
 
@@ -146,11 +170,27 @@ tofu fmt -check
 tofu validate
 ```
 
-The scaffold covers DynamoDB on-demand tables and alert indexes, Cognito User Pool/client, SQS with DLQ, and optional SES identity. `backend.example.hcl` is a placeholder for a future real remote-state setup; do not use it for local validation. Redis cloud, InfluxDB managed provisioning, production MQTT hardening, scheduled evaluator deployment, and notification delivery remain future slices. Do not commit real backend config, `.tfvars`, state files, plans, account ids, domains, or secrets.
+The scaffold covers DynamoDB on-demand tables and alert/notification indexes,
+Cognito User Pool/client, encrypted notification and SES-feedback queues with
+three DLQs, an SESv2 configuration set, and EventBridge feedback routing.
+`backend.example.hcl` is a placeholder for a future real remote-state setup; do
+not use it for local validation. SES identities and production sending access
+are account operations outside this generic stack. Redis cloud, InfluxDB managed
+provisioning, production MQTT hardening and scheduler deployment remain
+environment-specific slices. Do not commit real backend config, `.tfvars`, state
+files, plans, account IDs, domains or secrets.
 
 ## Tests
 
 ```bash
 python -m pytest -q
 go test -race ./...
+```
+
+The multiprocess notification suite is opt-in because it requires healthy local
+DynamoDB and ElasticMQ services:
+
+```bash
+RUN_NOTIFICATION_INTEGRATION=1 \
+  python -m pytest -q tests/integration/test_notifications_local.py
 ```

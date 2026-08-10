@@ -1,0 +1,946 @@
+package worker
+
+import (
+	"context"
+	"encoding/json"
+	"errors"
+	"reflect"
+	"sync"
+	"testing"
+	"time"
+
+	"github.com/VINIClUS/limnopulse/internal/notifications"
+)
+
+func TestProcessorRejectsInvalidAndDeletesTerminalDuplicatesWithoutSES(t *testing.T) {
+	store := &fakeStore{}
+	sender := &fakeSender{}
+	processor := testProcessor(store, sender)
+
+	decision := processor.Handle(context.Background(), QueueMessage{
+		Body:          `{\"schema_version\":1,\"normalized_email\":\"secret@example.com\"}`,
+		ReceiptHandle: "receipt_invalid",
+	})
+	if decision.Action != ActionChangeVisibility || decision.Visibility != time.Minute || sender.calls != 0 {
+		t.Fatalf("invalid decision = %#v, sends = %d", decision, sender.calls)
+	}
+	validWithPII := validMessage(t)
+	validWithPII.Body = `{\"schema_version\":1,\"message_type\":\"notification.delivery\",` +
+		`\"tenant_id\":\"tnt_1\",\"outbox_id\":\"outbox_1\",\"delivery_id\":\"del_1\",` +
+		`\"event_id\":\"alert_1\",\"kind\":\"opening\",\"channel\":\"email\",` +
+		`\"normalized_email\":\"secret@example.com\"}`
+	decision = processor.Handle(context.Background(), validWithPII)
+	if decision.Action != ActionChangeVisibility || sender.calls != 0 {
+		t.Fatalf("PII-bearing strict envelope decision = %#v", decision)
+	}
+
+	store.acquire = AcquireResult{Disposition: AcquireTerminal}
+	decision = processor.Handle(context.Background(), validMessage(t))
+	if decision.Action != ActionDelete || sender.calls != 0 {
+		t.Fatalf("terminal duplicate decision = %#v, sends = %d", decision, sender.calls)
+	}
+}
+
+func TestProcessorRenewalFailureBeforeSendNeverCallsProvider(t *testing.T) {
+	store := &fakeStore{acquire: claimedRecord(t, 0), gate: GateResult{Allowed: true}}
+	sender := &fakeSender{}
+	processor := testProcessor(store, sender)
+	processor.Guard = failingGuard{}
+	decision := processor.Handle(context.Background(), validMessage(t))
+	if decision.Action != ActionChangeVisibility || store.deferred != 1 || store.begun != 0 || sender.calls != 0 {
+		t.Fatalf("renewal failure decision=%#v store=%#v sends=%d", decision, store, sender.calls)
+	}
+}
+
+func TestProcessorRejectsAllowedGateWithoutFenceBeforeAttemptOrSES(t *testing.T) {
+	store := &fakeStore{
+		acquire: claimedRecord(t, 0), gate: GateResult{Allowed: true}, leaveGateUnfenced: true,
+	}
+	sender := &fakeSender{}
+
+	decision := testProcessor(store, sender).Handle(context.Background(), validMessage(t))
+
+	if decision.Action != ActionChangeVisibility || decision.ErrorCategory != "invalid_gate" ||
+		store.deferred != 1 || store.begun != 0 || sender.calls != 0 {
+		t.Fatalf("decision=%#v store=%#v sender=%#v", decision, store, sender)
+	}
+}
+
+func TestProcessorPassesFinalGateFenceIntoAttemptTransaction(t *testing.T) {
+	acquired := claimedRecord(t, 0)
+	fence := fakeGateFence(acquired.Record)
+	store := &fakeStore{acquire: acquired, gate: GateResult{Allowed: true, Fence: fence}}
+
+	decision := testProcessor(store, &fakeSender{result: SendResult{ProviderMessageID: "ses_1"}}).Handle(context.Background(), validMessage(t))
+
+	if decision.Action != ActionDelete || store.begun != 1 || !reflect.DeepEqual(store.beginRequest.GateFence, fence) {
+		t.Fatalf("decision=%#v begin=%#v want fence=%#v", decision, store.beginRequest, fence)
+	}
+}
+
+func TestProcessorCompletesPermanentRecipientPreflightWithoutAttemptOrProviderCall(t *testing.T) {
+	store := &fakeStore{acquire: claimedRecord(t, 0), gate: GateResult{Allowed: true}}
+	sender := &fakeSender{preflightErr: NewSendError(ErrorPermanentRecipient, errors.New("invalid recipient"))}
+	limiter := &fakeLimiter{}
+	processor := testProcessor(store, sender)
+	processor.Limiter = limiter
+
+	decision := processor.Handle(context.Background(), validMessage(t))
+	if decision.Action != ActionDelete || decision.ErrorCategory != string(ErrorPermanentRecipient) {
+		t.Fatalf("decision = %#v", decision)
+	}
+	if sender.preflightCalls != 1 || sender.calls != 0 || limiter.calls != 0 || store.begun != 0 ||
+		store.preflightFailures != 1 || store.preflightState != notifications.DeliveryStatePermanentFailed ||
+		store.preflightCategory != string(ErrorPermanentRecipient) {
+		t.Fatalf("sender=%#v limiter=%#v store=%#v", sender, limiter, store)
+	}
+}
+
+func TestProcessorPreflightPreservesPossibleAcceptanceAndFatalSemantics(t *testing.T) {
+	t.Run("permanent recipient after ambiguous call", func(t *testing.T) {
+		acquired := claimedRecord(t, 1)
+		acquired.Record.PossiblyAccepted = true
+		store := &fakeStore{acquire: acquired, gate: GateResult{Allowed: true}}
+		sender := &fakeSender{preflightErr: NewSendError(ErrorPermanentRecipient, errors.New("invalid recipient"))}
+		limiter := &fakeLimiter{}
+		processor := testProcessor(store, sender)
+		processor.Limiter = limiter
+
+		decision := processor.Handle(context.Background(), validMessage(t))
+		if decision.Action != ActionChangeVisibility || decision.ErrorCategory != string(ErrorPermanentRecipient) ||
+			decision.Visibility <= 0 || store.preflightState != notifications.DeliveryStateRetryableFailed ||
+			!store.preflightPossiblyAccepted || !store.preflightAmbiguousExhausted || store.preflightAwaitingIntervention ||
+			store.begun != 0 || sender.calls != 0 || limiter.calls != 0 {
+			t.Fatalf("decision=%#v sender=%#v limiter=%#v store=%#v", decision, sender, limiter, store)
+		}
+	})
+
+	t.Run("fatal configuration", func(t *testing.T) {
+		store := &fakeStore{acquire: claimedRecord(t, 0), gate: GateResult{Allowed: true}}
+		sender := &fakeSender{preflightErr: NewSendError(ErrorFatalConfigurationSet, errors.New("invalid configuration"))}
+		limiter := &fakeLimiter{}
+		processor := testProcessor(store, sender)
+		processor.Limiter = limiter
+
+		decision := processor.Handle(context.Background(), validMessage(t))
+		if decision.Action != ActionFatal || decision.ErrorCategory != string(ErrorFatalConfigurationSet) ||
+			decision.Visibility != 15*time.Minute || store.preflightState != notifications.DeliveryStateRetryableFailed ||
+			!store.preflightAwaitingIntervention || store.begun != 0 || sender.calls != 0 || limiter.calls != 0 {
+			t.Fatalf("decision=%#v sender=%#v limiter=%#v store=%#v", decision, sender, limiter, store)
+		}
+	})
+
+	t.Run("fatal source identity", func(t *testing.T) {
+		store := &fakeStore{acquire: claimedRecord(t, 0), gate: GateResult{Allowed: true}}
+		sender := &fakeSender{preflightErr: NewSendError(ErrorFatalFromIdentity, errors.New("invalid source"))}
+		limiter := &fakeLimiter{}
+		processor := testProcessor(store, sender)
+		processor.Limiter = limiter
+
+		decision := processor.Handle(context.Background(), validMessage(t))
+		if decision.Action != ActionFatal || decision.ErrorCategory != string(ErrorFatalFromIdentity) ||
+			decision.Visibility != 15*time.Minute || store.preflightState != notifications.DeliveryStateRetryableFailed ||
+			!store.preflightAwaitingIntervention || store.begun != 0 || sender.calls != 0 || limiter.calls != 0 {
+			t.Fatalf("decision=%#v sender=%#v limiter=%#v store=%#v", decision, sender, limiter, store)
+		}
+	})
+
+	t.Run("unexpected retryable preflight is promoted to fatal configuration", func(t *testing.T) {
+		store := &fakeStore{acquire: claimedRecord(t, 0), gate: GateResult{Allowed: true}}
+		sender := &fakeSender{preflightErr: NewSendError(ErrorRetryableUnknown, errors.New("invalid deterministic input"))}
+		limiter := &fakeLimiter{}
+		processor := testProcessor(store, sender)
+		processor.Limiter = limiter
+
+		decision := processor.Handle(context.Background(), validMessage(t))
+		if decision.Action != ActionFatal || decision.ErrorCategory != string(ErrorFatalConfigurationSet) ||
+			store.preflightCategory != string(ErrorFatalConfigurationSet) || !store.preflightAwaitingIntervention ||
+			store.begun != 0 || sender.calls != 0 || limiter.calls != 0 {
+			t.Fatalf("decision=%#v sender=%#v limiter=%#v store=%#v", decision, sender, limiter, store)
+		}
+	})
+
+	t.Run("concurrent terminal", func(t *testing.T) {
+		store := &fakeStore{
+			acquire: claimedRecord(t, 0), gate: GateResult{Allowed: true}, preflightErr: ErrConcurrentTerminal,
+		}
+		sender := &fakeSender{preflightErr: NewSendError(ErrorPermanentRecipient, errors.New("invalid recipient"))}
+		decision := testProcessor(store, sender).Handle(context.Background(), validMessage(t))
+		if decision.Action != ActionDelete || store.preflightFailures != 1 || store.begun != 0 || sender.calls != 0 {
+			t.Fatalf("decision=%#v sender=%#v store=%#v", decision, sender, store)
+		}
+	})
+}
+
+func TestProcessorSucceedsAfterFatalPreflightIsRepairedAndDeliveryIsReclaimed(t *testing.T) {
+	store := &fakeStore{acquire: claimedRecord(t, 0), gate: GateResult{Allowed: true}}
+	broken := &fakeSender{preflightErr: NewSendError(ErrorFatalFromIdentity, errors.New("invalid source"))}
+	first := testProcessor(store, broken).Handle(context.Background(), validMessage(t))
+	if first.Action != ActionFatal || store.preflightFailures != 1 || store.begun != 0 || broken.calls != 0 {
+		t.Fatalf("broken decision=%#v sender=%#v store=%#v", first, broken, store)
+	}
+
+	repaired := &fakeSender{result: SendResult{ProviderMessageID: "ses_after_repair"}}
+	second := testProcessor(store, repaired).Handle(context.Background(), validMessage(t))
+	if second.Action != ActionDelete || store.begun != 1 || repaired.calls != 1 ||
+		store.completion == nil || store.completion.NextState != notifications.DeliveryStateSucceeded ||
+		store.completion.ProviderMessageID != "ses_after_repair" {
+		t.Fatalf("repaired decision=%#v sender=%#v store=%#v", second, repaired, store)
+	}
+}
+
+func TestProcessorFifthFatalHoldConvergesAfterRestartWithoutSixthProviderCall(t *testing.T) {
+	fifthStore := &fakeStore{acquire: claimedRecord(t, MaxProviderCalls-1), gate: GateResult{Allowed: true}}
+	fatalSender := &fakeSender{err: NewSendError(ErrorFatalCredentials, errors.New("credentials revoked"))}
+	fifth := testProcessor(fifthStore, fatalSender).Handle(context.Background(), validMessage(t))
+	if fifth.Action != ActionFatal || fatalSender.calls != 1 || fifthStore.completion == nil ||
+		fifthStore.completion.NextState != notifications.DeliveryStateRetryableFailed ||
+		!fifthStore.completion.AwaitingIntervention {
+		t.Fatalf("fifth decision=%#v sender=%#v store=%#v", fifth, fatalSender, fifthStore)
+	}
+
+	// A later due claim represents the durable hold being released after an
+	// operator repair/restart. The absolute provider-call budget is not reset.
+	acquired := claimedRecord(t, MaxProviderCalls)
+	store := &fakeStore{acquire: acquired, gate: GateResult{Allowed: true}}
+	sender := &fakeSender{result: SendResult{ProviderMessageID: "must_not_be_sent"}}
+
+	decision := testProcessor(store, sender).Handle(context.Background(), validMessage(t))
+
+	if decision.Action != ActionDelete || sender.preflightCalls != 0 || sender.calls != 0 ||
+		store.begun != 0 || store.preflightFailures != 1 ||
+		store.preflightState != notifications.DeliveryStatePermanentFailed ||
+		store.preflightCategory != string(ErrorProviderCallLimitExhausted) ||
+		store.preflightAwaitingIntervention {
+		t.Fatalf("decision=%#v sender=%#v store=%#v", decision, sender, store)
+	}
+}
+
+func TestDefinitiveFailureTransitionPolicy(t *testing.T) {
+	now := time.Date(2026, 7, 16, 15, 0, 0, 0, time.UTC)
+	tests := []struct {
+		name                 string
+		category             SendErrorCategory
+		possiblyAccepted     bool
+		wantState            notifications.DeliveryState
+		wantNextAttemptAt    time.Time
+		wantPossiblyAccepted bool
+		wantAmbiguous        bool
+		wantIntervention     bool
+		wantAction           DecisionAction
+		wantVisibility       time.Duration
+	}{
+		{
+			name: "permanent normal", category: ErrorPermanentRecipient,
+			wantState: notifications.DeliveryStatePermanentFailed, wantAction: ActionDelete,
+		},
+		{
+			name: "permanent possibly accepted", category: ErrorPermanentRecipient, possiblyAccepted: true,
+			wantState: notifications.DeliveryStateRetryableFailed, wantNextAttemptAt: now.Add(2*time.Minute + 30*time.Second),
+			wantPossiblyAccepted: true, wantAmbiguous: true, wantAction: ActionChangeVisibility,
+			wantVisibility: 2*time.Minute + 30*time.Second,
+		},
+		{
+			name: "fatal", category: ErrorFatalCredentials,
+			wantState: notifications.DeliveryStateRetryableFailed, wantNextAttemptAt: now.Add(15 * time.Minute),
+			wantIntervention: true, wantAction: ActionFatal, wantVisibility: 15 * time.Minute,
+		},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			record := DeliveryRecord{AttemptCount: 2, PossiblyAccepted: test.possiblyAccepted}
+			plan, ok := planDefinitiveFailure(record, test.category, now, 0.5)
+			if !ok || plan.NextState != test.wantState || !plan.NextAttemptAt.Equal(test.wantNextAttemptAt) ||
+				plan.PossiblyAccepted != test.wantPossiblyAccepted || plan.AmbiguousExhausted != test.wantAmbiguous ||
+				plan.AwaitingIntervention != test.wantIntervention || plan.Action != test.wantAction ||
+				plan.Visibility != test.wantVisibility {
+				t.Fatalf("plan = %#v", plan)
+			}
+		})
+	}
+}
+
+func TestProcessorDefinitiveFailurePlanConsumesJitterOnlyForAmbiguousPermanentFailure(t *testing.T) {
+	calls := 0
+	processor := Processor{JitterFraction: func() float64 {
+		calls++
+		return 0.5
+	}}
+	now := time.Date(2026, 7, 16, 15, 0, 0, 0, time.UTC)
+	_, _ = processor.planDefinitiveFailure(DeliveryRecord{}, ErrorFatalCredentials, now)
+	_, _ = processor.planDefinitiveFailure(DeliveryRecord{}, ErrorPermanentRecipient, now)
+	if calls != 0 {
+		t.Fatalf("jitter calls before ambiguous permanent = %d", calls)
+	}
+	_, _ = processor.planDefinitiveFailure(
+		DeliveryRecord{PossiblyAccepted: true}, ErrorPermanentRecipient, now,
+	)
+	if calls != 1 {
+		t.Fatalf("jitter calls = %d, want 1", calls)
+	}
+}
+
+func TestProcessorStopsRenewalGuardBeforeAttemptAndPairsCountWithProviderCall(t *testing.T) {
+	store := &fakeStore{acquire: claimedRecord(t, 0), gate: GateResult{Allowed: true}}
+	sender := &fakeSender{result: SendResult{ProviderMessageID: "ses_1"}}
+	guard := &recordingGuard{}
+	processor := testProcessor(store, sender)
+	processor.Guard = guard
+
+	decision := processor.Handle(context.Background(), validMessage(t))
+	if decision.Action != ActionDelete || len(guard.records) != 1 || guard.stopped != 1 || sender.calls != 1 {
+		t.Fatalf("decision=%#v records=%#v stopped=%d", decision, guard.records, guard.stopped)
+	}
+	if guard.records[0].Revision != 3 || guard.records[0].AttemptCount != 0 {
+		t.Fatalf("guard records = %#v", guard.records)
+	}
+}
+
+func TestProcessorKeepsRenewalGuardThroughSecondGateCheck(t *testing.T) {
+	guard := &recordingGuard{}
+	store := &fakeStore{acquire: claimedRecord(t, 0), gate: GateResult{Allowed: true}}
+	store.gateCheck = func(call int) {
+		if call == 2 && guard.stopped != 0 {
+			t.Fatal("renewal guard stopped before the final gate check")
+		}
+	}
+	processor := testProcessor(store, &fakeSender{result: SendResult{ProviderMessageID: "ses_1"}})
+	processor.Guard = guard
+
+	decision := processor.Handle(context.Background(), validMessage(t))
+	if decision.Action != ActionDelete || store.gateCalls != 2 || guard.stopped != 1 {
+		t.Fatalf("decision=%#v gate_calls=%d guard_stops=%d", decision, store.gateCalls, guard.stopped)
+	}
+}
+
+func TestProcessorWaitsForCrossingLimiterRenewalBeforeBeginningAttempt(t *testing.T) {
+	beginCalled := make(chan struct{})
+	store := &fakeStore{
+		acquire: claimedRecord(t, 0), gate: GateResult{Allowed: true},
+		beginCalled: beginCalled,
+	}
+	sender := &fakeSender{result: SendResult{ProviderMessageID: "ses_1"}}
+	guard := &crossingGuard{renewalStarted: make(chan struct{}), releaseRenewal: make(chan struct{})}
+	processor := testProcessor(store, sender)
+	processor.Guard = guard
+	message := validMessage(t)
+	done := make(chan Decision, 1)
+	go func() { done <- processor.Handle(context.Background(), message) }()
+
+	<-guard.renewalStarted
+	select {
+	case <-beginCalled:
+		t.Fatal("attempt began while the revision-N renewal was still running")
+	default:
+	}
+	close(guard.releaseRenewal)
+	decision := <-done
+	if decision.Action != ActionDelete {
+		t.Fatalf("decision = %#v", decision)
+	}
+	select {
+	case <-beginCalled:
+	default:
+		t.Fatal("attempt did not begin after the revision-N guard stopped")
+	}
+}
+
+func TestProcessorDoesNotOpenSecondRenewalWindowBetweenAttemptAndProvider(t *testing.T) {
+	store := &fakeStore{acquire: claimedRecord(t, 0), gate: GateResult{Allowed: true}}
+	sender := &fakeSender{result: SendResult{ProviderMessageID: "ses_1"}}
+	processor := testProcessor(store, sender)
+	guard := &secondFailingGuard{}
+	processor.Guard = guard
+
+	decision := processor.Handle(context.Background(), validMessage(t))
+	if decision.Action != ActionDelete || store.begun != 1 || store.completion == nil ||
+		store.completion.Outcome != notifications.AttemptOutcomeSucceeded ||
+		sender.calls != 1 || guard.calls != 1 {
+		t.Fatalf("decision=%#v completion=%#v sends=%d", decision, store.completion, sender.calls)
+	}
+}
+
+func TestProcessorFifthSlotIsConsumedByAnActualProviderCall(t *testing.T) {
+	acquired := claimedRecord(t, 4)
+	acquired.Record.PossiblyAccepted = true
+	store := &fakeStore{acquire: acquired, gate: GateResult{Allowed: true}}
+	sender := &fakeSender{result: SendResult{ProviderMessageID: "ses_5"}}
+	processor := testProcessor(store, sender)
+	guard := &secondFailingGuard{}
+	processor.Guard = guard
+
+	decision := processor.Handle(context.Background(), validMessage(t))
+	if decision.Action != ActionDelete || sender.calls != 1 || sender.sawAttemptCount != 5 ||
+		store.completion == nil || store.completion.Outcome != notifications.AttemptOutcomeSucceeded ||
+		guard.calls != 1 {
+		t.Fatalf("decision=%#v completion=%#v sends=%d", decision, store.completion, sender.calls)
+	}
+}
+
+func TestProcessorDoesNotLetAnUnusedSecondGuardOverrideProviderSuccess(t *testing.T) {
+	store := &fakeStore{acquire: claimedRecord(t, 0), gate: GateResult{Allowed: true}}
+	sender := &fakeSender{result: SendResult{ProviderMessageID: "ses_maybe_accepted"}}
+	processor := testProcessor(store, sender)
+	guard := &secondStopFailingGuard{}
+	processor.Guard = guard
+
+	decision := processor.Handle(context.Background(), validMessage(t))
+	if decision.Action != ActionDelete || sender.calls != 1 || store.completion == nil ||
+		store.completion.Outcome != notifications.AttemptOutcomeSucceeded ||
+		store.completion.ProviderMessageID != "ses_maybe_accepted" || guard.calls != 1 {
+		t.Fatalf("decision=%#v completion=%#v sends=%d", decision, store.completion, sender.calls)
+	}
+}
+
+func TestProcessorAmbiguousRefreshAlreadyTerminalIsNoop(t *testing.T) {
+	acquired := claimedRecord(t, 2)
+	acquired.Record.PossiblyAccepted = true
+	store := &fakeStore{acquire: acquired, refreshTerminal: true, gate: GateResult{Allowed: true}}
+	sender := &fakeSender{}
+	decision := testProcessor(store, sender).Handle(context.Background(), validMessage(t))
+	if decision.Action != ActionDelete || store.refreshes != 1 || store.begun != 0 || sender.calls != 0 {
+		t.Fatalf("reconciled decision=%#v store=%#v sends=%d", decision, store, sender.calls)
+	}
+}
+
+func TestProcessorFinalizesDelayedProviderOwnershipWithoutDuplicateSend(t *testing.T) {
+	acquired := claimedRecord(t, 1)
+	acquired.Record.ProviderOutcome = notifications.ProviderOutcomeDelayed
+	store := &fakeStore{acquire: acquired, gate: GateResult{Allowed: true}}
+	sender := &fakeSender{}
+
+	decision := testProcessor(store, sender).Handle(context.Background(), validMessage(t))
+	if decision.Action != ActionDelete || store.refreshes != 1 || !store.unknown ||
+		store.begun != 0 || sender.calls != 0 {
+		t.Fatalf("decision=%#v refreshes=%d unknown=%t begun=%d sends=%d", decision, store.refreshes, store.unknown, store.begun, sender.calls)
+	}
+}
+
+func TestProcessorCapturesAttemptAndCompletionTimesAroundProviderCall(t *testing.T) {
+	store := &fakeStore{acquire: claimedRecord(t, 0), gate: GateResult{Allowed: true}}
+	sender := &fakeSender{result: SendResult{ProviderMessageID: "ses_1"}}
+	processor := testProcessor(store, sender)
+	times := []time.Time{
+		time.Date(2026, 7, 16, 15, 0, 0, 0, time.UTC),
+		time.Date(2026, 7, 16, 15, 0, 7, 0, time.UTC),
+		time.Date(2026, 7, 16, 15, 0, 19, 0, time.UTC),
+	}
+	processor.Now = func() time.Time {
+		value := times[0]
+		times = times[1:]
+		return value
+	}
+	decision := processor.Handle(context.Background(), validMessage(t))
+	if decision.Action != ActionDelete || !store.beginRequest.StartedAt.Equal(time.Date(2026, 7, 16, 15, 0, 7, 0, time.UTC)) ||
+		!store.beginRequest.LeaseRequiredUntil.Equal(time.Date(2026, 7, 16, 15, 0, 32, 0, time.UTC)) ||
+		store.completion == nil || !store.completion.CompletedAt.Equal(time.Date(2026, 7, 16, 15, 0, 19, 0, time.UTC)) {
+		t.Fatalf("clock decision=%#v begin=%#v completion=%#v", decision, store.beginRequest, store.completion)
+	}
+}
+
+func TestProcessorUnknownProviderCategoryIsDurablyClassifiedRetryableUnknown(t *testing.T) {
+	store := &fakeStore{acquire: claimedRecord(t, 0), gate: GateResult{Allowed: true}}
+	sender := &fakeSender{err: NewSendError("invented", errors.New("unexpected"))}
+	decision := testProcessor(store, sender).Handle(context.Background(), validMessage(t))
+	if decision.Action != ActionChangeVisibility || store.completion == nil ||
+		store.completion.ErrorCategory != string(ErrorRetryableUnknown) {
+		t.Fatalf("unknown category decision=%#v completion=%#v", decision, store.completion)
+	}
+}
+
+func TestProcessorWiresAggregateMetricsWithoutIdentifiers(t *testing.T) {
+	acquired := claimedRecord(t, 1)
+	acquired.Record.PossiblyAccepted = true
+	store := &fakeStore{acquire: acquired, gate: GateResult{Allowed: true}}
+	sender := &fakeSender{err: NewSendError(ErrorRetryableThrottling, errors.New("slow"))}
+	processor := testProcessor(store, sender)
+	processor.Metrics = NewMetrics(1)
+	decision := processor.Handle(context.Background(), validMessage(t))
+	snapshot := processor.Metrics.Snapshot()
+	if decision.Action != ActionChangeVisibility || snapshot.Attempts != 1 || snapshot.SendStarted != 1 ||
+		snapshot.Retries != 1 || snapshot.Throttling != 1 || snapshot.PossibleDuplicates != 1 ||
+		snapshot.ActiveConcurrency != 0 {
+		t.Fatalf("decision=%#v metrics=%#v", decision, snapshot)
+	}
+}
+
+func TestProcessorMembershipAndSuppressionGatesDoNotConsumeTokenOrAttempt(t *testing.T) {
+	for _, gate := range []GateResult{
+		{Allowed: false, CancellationReason: notifications.CancellationReasonRecipientMembershipInactive},
+		{Allowed: false, CancellationReason: notifications.CancellationReasonEmailSuppressed},
+	} {
+		store := &fakeStore{acquire: claimedRecord(t, 0), gate: gate}
+		limiter := &fakeLimiter{}
+		sender := &fakeSender{}
+		processor := testProcessor(store, sender)
+		processor.Limiter = limiter
+
+		decision := processor.Handle(context.Background(), validMessage(t))
+		if decision.Action != ActionDelete || !store.cancelled || store.begun != 0 ||
+			limiter.calls != 0 || sender.calls != 0 {
+			t.Fatalf("gate decision = %#v store=%#v limiter=%d sender=%d", decision, store, limiter.calls, sender.calls)
+		}
+	}
+}
+
+func TestProcessorRechecksMembershipAndSuppressionAfterLimiterBeforeAttempt(t *testing.T) {
+	for _, denied := range []GateResult{
+		{CancellationReason: notifications.CancellationReasonRecipientMembershipInactive},
+		{CancellationReason: notifications.CancellationReasonEmailSuppressed},
+	} {
+		store := &fakeStore{acquire: claimedRecord(t, 0), gate: GateResult{Allowed: true}}
+		limiter := &fakeLimiter{onWait: func() { store.gate = denied }}
+		sender := &fakeSender{}
+		processor := testProcessor(store, sender)
+		processor.Limiter = limiter
+
+		decision := processor.Handle(context.Background(), validMessage(t))
+		if decision.Action != ActionDelete || store.gateCalls != 2 || !store.cancelled ||
+			store.cancellationReason != denied.CancellationReason || store.begun != 0 ||
+			sender.calls != 0 || limiter.calls != 1 {
+			t.Fatalf("denied=%#v decision=%#v store=%#v limiter=%d sends=%d", denied, decision, store, limiter.calls, sender.calls)
+		}
+	}
+}
+
+func TestProcessorPersistsAttemptBeforeSESAndSucceeds(t *testing.T) {
+	store := &fakeStore{acquire: claimedRecord(t, 0), gate: GateResult{Allowed: true}}
+	sender := &fakeSender{result: SendResult{ProviderMessageID: "ses_message_1"}}
+	processor := testProcessor(store, sender)
+
+	decision := processor.Handle(context.Background(), validMessage(t))
+	if decision.Action != ActionDelete || store.begun != 1 || sender.calls != 1 || store.completion == nil {
+		t.Fatalf("success decision=%#v store=%#v sends=%d", decision, store, sender.calls)
+	}
+	if sender.sawAttemptCount != 1 || store.sequence != "begin,send,complete" {
+		t.Fatalf("persistence/send sequence = %q, sender attempt count = %d", store.sequence, sender.sawAttemptCount)
+	}
+	if store.completion.NextState != notifications.DeliveryStateSucceeded ||
+		store.completion.ProviderOutcome != notifications.ProviderOutcomeAccepted ||
+		store.completion.ProviderMessageID != "ses_message_1" {
+		t.Fatalf("completion = %#v", store.completion)
+	}
+}
+
+func TestProcessorLimiterCancellationDefersWithoutAttempt(t *testing.T) {
+	store := &fakeStore{acquire: claimedRecord(t, 0), gate: GateResult{Allowed: true}}
+	processor := testProcessor(store, &fakeSender{})
+	processor.Limiter = &fakeLimiter{err: context.Canceled}
+
+	decision := processor.Handle(context.Background(), validMessage(t))
+	if decision.Action != ActionChangeVisibility || store.deferred != 1 || store.begun != 0 {
+		t.Fatalf("limiter cancellation decision=%#v store=%#v", decision, store)
+	}
+}
+
+func TestProcessorRetryAndAmbiguousExhaustionUseVisibilityWithoutSixthCall(t *testing.T) {
+	t.Run("fifth confirmed retry is permanent", func(t *testing.T) {
+		store := &fakeStore{acquire: claimedRecord(t, 4), gate: GateResult{Allowed: true}}
+		sender := &fakeSender{err: NewSendError(ErrorRetryableService, errors.New("unavailable"))}
+		processor := testProcessor(store, sender)
+		decision := processor.Handle(context.Background(), validMessage(t))
+		if decision.Action != ActionDelete || sender.calls != 1 || store.completion == nil ||
+			store.completion.NextState != notifications.DeliveryStatePermanentFailed {
+			t.Fatalf("retry exhaustion decision=%#v completion=%#v sends=%d", decision, store.completion, sender.calls)
+		}
+	})
+
+	t.Run("fifth ambiguous waits final grace then becomes unknown", func(t *testing.T) {
+		store := &fakeStore{acquire: claimedRecord(t, 4), gate: GateResult{Allowed: true}}
+		sender := &fakeSender{err: NewSendError(ErrorAmbiguousTimeout, context.DeadlineExceeded)}
+		processor := testProcessor(store, sender)
+		decision := processor.Handle(context.Background(), validMessage(t))
+		if decision.Action != ActionChangeVisibility || sender.calls != 1 || store.completion == nil ||
+			!store.completion.AmbiguousExhausted || !store.completion.PossiblyAccepted ||
+			store.completion.NextState != notifications.DeliveryStateRetryableFailed {
+			t.Fatalf("ambiguous fifth decision=%#v completion=%#v", decision, store.completion)
+		}
+
+		unknownRecord := claimedRecord(t, 5)
+		unknownRecord.Record.AmbiguousExhausted = true
+		unknownRecord.Record.PossiblyAccepted = true
+		store = &fakeStore{acquire: unknownRecord, gate: GateResult{Allowed: true}}
+		sender = &fakeSender{}
+		processor = testProcessor(store, sender)
+		decision = processor.Handle(context.Background(), validMessage(t))
+		if decision.Action != ActionDelete || !store.unknown || sender.calls != 0 {
+			t.Fatalf("final grace decision=%#v unknown=%t sends=%d", decision, store.unknown, sender.calls)
+		}
+	})
+}
+
+func TestProcessorMixedAmbiguousHistoryNeverBecomesPermanentOnFifthConfirmedFailure(t *testing.T) {
+	for _, category := range []SendErrorCategory{ErrorRetryableService, ErrorPermanentRecipient} {
+		acquired := claimedRecord(t, 4)
+		acquired.Record.PossiblyAccepted = true
+		store := &fakeStore{acquire: acquired, gate: GateResult{Allowed: true}}
+		sender := &fakeSender{err: NewSendError(category, errors.New("fifth failure"))}
+		decision := testProcessor(store, sender).Handle(context.Background(), validMessage(t))
+		if decision.Action != ActionChangeVisibility || store.completion == nil ||
+			store.completion.NextState != notifications.DeliveryStateRetryableFailed ||
+			!store.completion.PossiblyAccepted || !store.completion.AmbiguousExhausted ||
+			store.completion.NextAttemptAt.IsZero() {
+			t.Fatalf("category=%s decision=%#v completion=%#v", category, decision, store.completion)
+		}
+	}
+}
+
+func TestProcessorExpiredStartedAttemptBecomesAmbiguousWithoutImmediateSES(t *testing.T) {
+	acquired := claimedRecord(t, 1)
+	acquired.Record.StartedAttemptID = "att_interrupted"
+	store := &fakeStore{acquire: acquired, gate: GateResult{Allowed: true}}
+	sender := &fakeSender{}
+	decision := testProcessor(store, sender).Handle(context.Background(), validMessage(t))
+	if decision.Action != ActionChangeVisibility || sender.calls != 0 || store.completion == nil ||
+		store.completion.AttemptID != "att_interrupted" ||
+		store.completion.Outcome != notifications.AttemptOutcomeAmbiguous {
+		t.Fatalf("interrupted decision=%#v completion=%#v sends=%d", decision, store.completion, sender.calls)
+	}
+}
+
+func TestProcessorFatalSystemicLeavesMessageAndStopsWorker(t *testing.T) {
+	store := &fakeStore{acquire: claimedRecord(t, 0), gate: GateResult{Allowed: true}}
+	sender := &fakeSender{err: NewSendError(ErrorFatalCredentials, errors.New("credentials"))}
+	decision := testProcessor(store, sender).Handle(context.Background(), validMessage(t))
+	if decision.Action != ActionFatal || decision.Visibility <= 0 || store.completion == nil ||
+		!store.completion.AwaitingIntervention ||
+		store.completion.NextState != notifications.DeliveryStateRetryableFailed {
+		t.Fatalf("fatal decision=%#v completion=%#v", decision, store.completion)
+	}
+}
+
+func TestProcessorFatalProviderPersistenceFailureStillStopsWorker(t *testing.T) {
+	store := &fakeStore{
+		acquire: claimedRecord(t, 0), gate: GateResult{Allowed: true},
+		completeErr: errors.New("DynamoDB unavailable"),
+	}
+	sender := &fakeSender{err: NewSendError(ErrorFatalCredentials, errors.New("credentials"))}
+	decision := testProcessor(store, sender).Handle(context.Background(), validMessage(t))
+	if decision.Action != ActionFatal || decision.Visibility != 15*time.Minute ||
+		decision.ErrorCategory != "fatal_persistence_failure" {
+		t.Fatalf("decision = %#v", decision)
+	}
+}
+
+func TestProcessorDeletesWhenFeedbackWinsAttemptCompletionRace(t *testing.T) {
+	for _, sender := range []*fakeSender{
+		{result: SendResult{ProviderMessageID: "ses_message_1"}},
+		{err: NewSendError(ErrorRetryableService, errors.New("late provider response"))},
+	} {
+		store := &fakeStore{
+			acquire: claimedRecord(t, 0), gate: GateResult{Allowed: true},
+			completeErr: ErrConcurrentTerminal,
+		}
+		decision := testProcessor(store, sender).Handle(context.Background(), validMessage(t))
+		if decision.Action != ActionDelete || decision.ErrorCategory != "" || store.completion == nil {
+			t.Fatalf("decision=%#v completion=%#v", decision, store.completion)
+		}
+	}
+}
+
+func TestProcessorPreservesFatalSystemicDecisionWhenFeedbackWinsCompletionRace(t *testing.T) {
+	store := &fakeStore{
+		acquire: claimedRecord(t, 0), gate: GateResult{Allowed: true},
+		completeErr: ErrConcurrentTerminal,
+	}
+	sender := &fakeSender{err: NewSendError(ErrorFatalCredentials, errors.New("credentials"))}
+	decision := testProcessor(store, sender).Handle(context.Background(), validMessage(t))
+	if decision.Action != ActionFatal || decision.ErrorCategory != string(ErrorFatalCredentials) ||
+		decision.Visibility != 15*time.Minute {
+		t.Fatalf("fatal decision = %#v", decision)
+	}
+}
+
+type fakeStore struct {
+	acquire                       AcquireResult
+	acquireErr                    error
+	gate                          GateResult
+	gateErr                       error
+	gateCalls                     int
+	gateCheck                     func(int)
+	leaveGateUnfenced             bool
+	cancelled                     bool
+	cancellationReason            notifications.CancellationReason
+	deferred                      int
+	begun                         int
+	unknown                       bool
+	completion                    *AttemptCompletion
+	completeErr                   error
+	preflightFailures             int
+	preflightState                notifications.DeliveryState
+	preflightCategory             string
+	preflightPossiblyAccepted     bool
+	preflightAmbiguousExhausted   bool
+	preflightAwaitingIntervention bool
+	preflightErr                  error
+	sequence                      string
+	beginRequest                  BeginAttemptRequest
+	refreshTerminal               bool
+	refreshes                     int
+	beginCalled                   chan struct{}
+}
+
+func (store *fakeStore) Acquire(context.Context, notifications.JobEnvelope, ClaimRequest) (AcquireResult, error) {
+	return store.acquire, store.acquireErr
+}
+func (store *fakeStore) CheckGates(_ context.Context, record DeliveryRecord) (GateResult, error) {
+	store.gateCalls++
+	if store.gateCheck != nil {
+		store.gateCheck(store.gateCalls)
+	}
+	gate := store.gate
+	if gate.Allowed && !store.leaveGateUnfenced && !gate.Fence.IsComplete() {
+		gate.Fence = fakeGateFence(record)
+	}
+	return gate, store.gateErr
+}
+func (store *fakeStore) Cancel(_ context.Context, _ DeliveryRecord, reason notifications.CancellationReason, _ time.Time) error {
+	store.cancelled = true
+	store.cancellationReason = reason
+	return nil
+}
+func (store *fakeStore) Defer(_ context.Context, _ DeliveryRecord, _ DeferRequest) error {
+	store.deferred++
+	return nil
+}
+func (store *fakeStore) CompletePreflightFailure(_ context.Context, _ DeliveryRecord, completion PreflightFailureCompletion) error {
+	store.preflightFailures++
+	store.preflightState = completion.NextState
+	store.preflightCategory = completion.ErrorCategory
+	store.preflightPossiblyAccepted = completion.PossiblyAccepted
+	store.preflightAmbiguousExhausted = completion.AmbiguousExhausted
+	store.preflightAwaitingIntervention = completion.AwaitingIntervention
+	return store.preflightErr
+}
+func (store *fakeStore) BeginAttempt(_ context.Context, record DeliveryRecord, request BeginAttemptRequest) (DeliveryRecord, error) {
+	if store.beginCalled != nil {
+		close(store.beginCalled)
+	}
+	store.begun++
+	store.sequence = appendSequence(store.sequence, "begin")
+	store.beginRequest = request
+	record.Revision++
+	record.AttemptCount++
+	record.LastAttemptID = request.AttemptID
+	return record, nil
+}
+func (store *fakeStore) Refresh(_ context.Context, record DeliveryRecord) (DeliveryRecord, bool, error) {
+	store.refreshes++
+	return record, store.refreshTerminal, nil
+}
+func (store *fakeStore) CompleteAttempt(_ context.Context, _ DeliveryRecord, completion AttemptCompletion) error {
+	store.sequence = appendSequence(store.sequence, "complete")
+	store.completion = &completion
+	return store.completeErr
+}
+func (store *fakeStore) FinalizeUnknown(context.Context, DeliveryRecord, time.Time) error {
+	store.unknown = true
+	return nil
+}
+func (store *fakeStore) Renew(context.Context, DeliveryRecord, time.Time) error { return nil }
+
+type fakeSender struct {
+	result          SendResult
+	err             error
+	preflightErr    error
+	preflightCalls  int
+	calls           int
+	sawAttemptCount int
+	store           *fakeStore
+}
+
+func (sender *fakeSender) Preflight(SendRequest) error {
+	sender.preflightCalls++
+	return sender.preflightErr
+}
+
+func (sender *fakeSender) Send(_ context.Context, request SendRequest) (SendResult, error) {
+	sender.calls++
+	sender.sawAttemptCount = request.AttemptNumber
+	if sender.store != nil {
+		sender.store.sequence = appendSequence(sender.store.sequence, "send")
+	}
+	return sender.result, sender.err
+}
+
+type fakeLimiter struct {
+	calls  int
+	err    error
+	onWait func()
+}
+
+func (limiter *fakeLimiter) Wait(context.Context) error {
+	limiter.calls++
+	if limiter.onWait != nil {
+		limiter.onWait()
+	}
+	return limiter.err
+}
+
+type fakeGuard struct{}
+
+func (fakeGuard) Protect(ctx context.Context, _ QueueMessage, _ DeliveryRecord) (context.Context, func() error) {
+	return ctx, func() error { return nil }
+}
+
+type recordingGuard struct {
+	records []DeliveryRecord
+	stopped int
+}
+
+func (guard *recordingGuard) Protect(ctx context.Context, _ QueueMessage, record DeliveryRecord) (context.Context, func() error) {
+	guard.records = append(guard.records, record)
+	return ctx, func() error {
+		guard.stopped++
+		return nil
+	}
+}
+
+type crossingGuard struct {
+	renewalStarted chan struct{}
+	releaseRenewal chan struct{}
+	calls          int
+}
+
+func (guard *crossingGuard) Protect(ctx context.Context, _ QueueMessage, _ DeliveryRecord) (context.Context, func() error) {
+	guard.calls++
+	if guard.calls != 1 {
+		return ctx, func() error { return nil }
+	}
+	var once sync.Once
+	done := make(chan struct{})
+	return ctx, func() error {
+		once.Do(func() {
+			go func() {
+				close(guard.renewalStarted)
+				<-guard.releaseRenewal
+				close(done)
+			}()
+		})
+		<-done
+		return nil
+	}
+}
+
+type secondFailingGuard struct{ calls int }
+
+func (guard *secondFailingGuard) Protect(ctx context.Context, _ QueueMessage, _ DeliveryRecord) (context.Context, func() error) {
+	guard.calls++
+	if guard.calls == 1 {
+		return ctx, func() error { return nil }
+	}
+	failed, cancel := context.WithCancel(ctx)
+	cancel()
+	return failed, func() error { return errors.New("provider guard renewal failed") }
+}
+
+type secondStopFailingGuard struct{ calls int }
+
+func (guard *secondStopFailingGuard) Protect(ctx context.Context, _ QueueMessage, _ DeliveryRecord) (context.Context, func() error) {
+	guard.calls++
+	if guard.calls == 1 {
+		return ctx, func() error { return nil }
+	}
+	return ctx, func() error { return errors.New("provider guard stop failed") }
+}
+
+type failingGuard struct{}
+
+func (failingGuard) Protect(ctx context.Context, _ QueueMessage, _ DeliveryRecord) (context.Context, func() error) {
+	failed, cancel := context.WithCancel(ctx)
+	cancel()
+	return failed, func() error { return errors.New("renewal failed") }
+}
+
+func testProcessor(store *fakeStore, sender *fakeSender) Processor {
+	if sender.store == nil {
+		sender.store = store
+	}
+	return Processor{
+		Store: store, Sender: sender, Limiter: &fakeLimiter{}, Guard: fakeGuard{},
+		Now:             func() time.Time { return time.Date(2026, 7, 16, 15, 0, 0, 0, time.UTC) },
+		NewAttemptID:    func() string { return "att_deterministic" },
+		JitterFraction:  func() float64 { return 0.5 },
+		ProviderTimeout: 15 * time.Second, InvalidVisibility: time.Minute,
+	}
+}
+
+func claimedRecord(t *testing.T, attempts int) AcquireResult {
+	t.Helper()
+	return AcquireResult{Disposition: AcquireClaimed, Record: DeliveryRecord{
+		Delivery: validDeliverySnapshot(t), Revision: 3, AttemptCount: attempts,
+		LeaseOwner: "worker_1", LeaseEpoch: 2,
+		LeaseExpiresAt: time.Date(2026, 7, 16, 15, 1, 0, 0, time.UTC),
+	}}
+}
+
+func fakeGateFence(record DeliveryRecord) GateFence {
+	deliverabilityKey, _ := notifications.DeliverabilityStorageKey(record.Delivery.NormalizedEmail)
+	return GateFence{
+		MembershipVersion:          1,
+		PreferenceVersion:          1,
+		PreferenceEmailAddress:     record.Delivery.NormalizedEmail,
+		PreferenceMinimumSeverity:  "warning",
+		EventSeverity:              "critical",
+		DeliverabilityDependencies: []DeliverabilityDependency{{Key: deliverabilityKey}},
+	}
+}
+
+func validMessage(t *testing.T) QueueMessage {
+	t.Helper()
+	snapshot := validDeliverySnapshot(t)
+	job, err := notifications.NewDeliveryJob(snapshot.TenantID, snapshot.OutboxID, snapshot.DeliveryID,
+		snapshot.EventID, snapshot.Kind, snapshot.Channel)
+	if err != nil {
+		t.Fatal(err)
+	}
+	body, err := json.Marshal(job)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return QueueMessage{MessageID: "sqs_1", ReceiptHandle: "receipt_1", Body: string(body)}
+}
+
+func validDeliverySnapshot(t *testing.T) notifications.DeliverySnapshot {
+	t.Helper()
+	renderer, err := notifications.NewTemplateRenderer()
+	if err != nil {
+		t.Fatal(err)
+	}
+	now := time.Date(2026, 7, 16, 14, 0, 0, 0, time.UTC)
+	content, err := renderer.Render(notifications.TemplateAlertOpeningV1, notifications.LocalePTBR,
+		notifications.EmailTemplateData{
+			RuleName: "Oxigênio baixo", Severity: "critical", TenantID: "tnt_1", PondID: "pond_1",
+			DeviceID: "dev_1", Metric: "dissolved_oxygen", Unit: "mg/L", Operator: "<",
+			Threshold: 4.5, EvaluationWindow: 5 * time.Minute, WindowStart: now.Add(-5 * time.Minute),
+			WindowEnd: now, EvaluatedAt: now, EventID: "alert_1",
+		})
+	if err != nil {
+		t.Fatal(err)
+	}
+	deliveryID, err := notifications.NewDeliveryID("alert_1", notifications.NotificationKindOpening,
+		notifications.ChannelEmail, "user_1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	delivery, err := notifications.NewPendingDelivery(notifications.DeliveryParams{
+		TenantID: "tnt_1", OutboxID: "outbox_1", DeliveryID: deliveryID, EventID: "alert_1",
+		RuleID: "rule_1", Kind: notifications.NotificationKindOpening, Channel: notifications.ChannelEmail,
+		RecipientID: "user_1", NormalizedEmail: "owner@example.com",
+		MembershipSnapshot: notifications.MembershipSnapshot{Role: "owner", Status: "active", Version: 1},
+		Content:            content, CreatedAt: now, UpdatedAt: now,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	snapshot := delivery.Snapshot()
+	snapshot.State = notifications.DeliveryStateProcessing
+	return snapshot
+}
+
+func appendSequence(current, next string) string {
+	if current == "" {
+		return next
+	}
+	return current + "," + next
+}

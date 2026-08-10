@@ -1,0 +1,199 @@
+package feedback
+
+import (
+	"fmt"
+	"os"
+	"path/filepath"
+	"strconv"
+	"strings"
+	"testing"
+
+	"github.com/VINIClUS/limnopulse/internal/notifications"
+)
+
+func TestOpenTofuEventBridgeTemplatesRemainParseableForEveryFeedbackType(t *testing.T) {
+	sesPath := filepath.Join("..", "..", "..", "infra", "opentofu", "ses.tf")
+	sesBytes, err := os.ReadFile(sesPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	ses := string(sesBytes)
+	tests := []struct {
+		eventType string
+		target    string
+		semantic  SemanticType
+		extra     map[string]string
+	}{
+		{eventType: "Send", target: "ses_events", semantic: SemanticSend},
+		{eventType: "Delivery", target: "ses_events", semantic: SemanticDelivery},
+		{eventType: "DeliveryDelay", target: "ses_events", semantic: SemanticDeliveryDelay},
+		{eventType: "Complaint", target: "ses_events", semantic: SemanticComplaint},
+		{eventType: "Bounce", target: "ses_events_bounce", semantic: SemanticHardBounce, extra: map[string]string{"bounce_type": "Permanent"}},
+		{eventType: "Reject", target: "ses_events_reject", semantic: SemanticReject, extra: map[string]string{"reject_reason": "Bad content"}},
+	}
+	for _, test := range tests {
+		t.Run(test.eventType, func(t *testing.T) {
+			template := tofuInputTemplate(t, ses, test.target)
+			values := map[string]string{
+				"version": "0", "id": "evt_transformer_contract",
+				"detail_type": "Simple Email Service Email Sending Event", "source": "aws.ses",
+				"event_type": test.eventType, "message_id": "provider_message_1",
+				"delivery_id": "del_1", "attempt_id": "att_1",
+			}
+			for name, value := range test.extra {
+				values[name] = value
+			}
+			for name, value := range values {
+				template = strings.ReplaceAll(template, "<"+name+">", strconv.Quote(value))
+			}
+			if strings.Contains(template, "<") {
+				t.Fatalf("unresolved input transformer variable: %s", template)
+			}
+			result, parseErr := ParseEvent([]byte(template))
+			if parseErr != nil || result.Disposition != ParseProcess || result.Event.SemanticType != test.semantic {
+				t.Fatalf("ParseEvent(transformer %s) = %#v, %v", test.target, result, parseErr)
+			}
+		})
+	}
+}
+
+func tofuInputTemplate(t *testing.T, ses, target string) string {
+	t.Helper()
+	resourceMarker := `resource "aws_cloudwatch_event_target" "` + target + `" {`
+	resourceStart := strings.Index(ses, resourceMarker)
+	if resourceStart < 0 {
+		t.Fatalf("target %s not found", target)
+	}
+	body := ses[resourceStart+len(resourceMarker):]
+	if nextResource := strings.Index(body, "\nresource "); nextResource >= 0 {
+		body = body[:nextResource]
+	}
+	templateMarker := "input_template = <<-JSON\n"
+	templateStart := strings.Index(body, templateMarker)
+	if templateStart < 0 {
+		t.Fatalf("target %s has no input template", target)
+	}
+	template := body[templateStart+len(templateMarker):]
+	templateEnd := strings.Index(template, "\n    JSON")
+	if templateEnd < 0 {
+		t.Fatalf("target %s input template is unterminated", target)
+	}
+	return strings.TrimSpace(template[:templateEnd])
+}
+
+func TestParseEventBridgeSESEventsMapsOnlyContractFeedback(t *testing.T) {
+	tests := []struct {
+		name               string
+		eventType          string
+		detail             string
+		wantSemantic       SemanticType
+		wantOutcome        notifications.ProviderOutcome
+		wantSuppression    SuppressionReason
+		wantPermanentState bool
+	}{
+		{name: "send", eventType: "Send", wantSemantic: SemanticSend, wantOutcome: notifications.ProviderOutcomeAccepted},
+		{name: "delivery", eventType: "Delivery", wantSemantic: SemanticDelivery, wantOutcome: notifications.ProviderOutcomeDeliveredToMailServer},
+		{name: "delay", eventType: "DeliveryDelay", detail: `,"deliveryDelay":{"delayType":"MailboxFull"}`, wantSemantic: SemanticDeliveryDelay, wantOutcome: notifications.ProviderOutcomeDelayed},
+		{name: "soft bounce", eventType: "Bounce", detail: `,"bounce":{"bounceType":"Transient","bouncedRecipients":[{"emailAddress":"never-trusted@example.com"}]}`, wantSemantic: SemanticSoftBounce, wantOutcome: notifications.ProviderOutcomeSoftBounced},
+		{name: "hard bounce", eventType: "Bounce", detail: `,"bounce":{"bounceType":"Permanent"}`, wantSemantic: SemanticHardBounce, wantOutcome: notifications.ProviderOutcomeHardBounced, wantSuppression: SuppressionHardBounce},
+		{name: "complaint", eventType: "Complaint", detail: `,"complaint":{"complaintFeedbackType":"abuse"}`, wantSemantic: SemanticComplaint, wantOutcome: notifications.ProviderOutcomeComplained, wantSuppression: SuppressionComplaint},
+		{name: "content reject", eventType: "Reject", detail: `,"reject":{"reason":"Bad content"}`, wantSemantic: SemanticReject, wantOutcome: notifications.ProviderOutcomeRejected, wantPermanentState: true},
+		{name: "recipient reject", eventType: "Reject", detail: `,"reject":{"reason":"Invalid recipient address"}`, wantSemantic: SemanticReject, wantOutcome: notifications.ProviderOutcomeRejected, wantSuppression: SuppressionRecipientReject, wantPermanentState: true},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			result, err := ParseEvent([]byte(eventJSON(test.eventType, test.detail)))
+			if err != nil {
+				t.Fatalf("ParseEvent() error = %v", err)
+			}
+			if result.Disposition != ParseProcess || result.Event.EventBridgeID != "evt_1" ||
+				result.Event.ProviderMessageID != "ses_message_1" || result.Event.DeliveryID != "del_1" ||
+				result.Event.AttemptID != "att_1" || result.Event.SemanticType != test.wantSemantic ||
+				result.Event.ProviderOutcome != test.wantOutcome || result.Event.SuppressionReason != test.wantSuppression ||
+				result.Event.PermanentFailure != test.wantPermanentState {
+				t.Fatalf("parsed = %#v", result)
+			}
+			if strings.Contains(fmt.Sprintf("%#v", result.Event), "never-trusted@example.com") {
+				t.Fatal("event retained an untrusted SES destination")
+			}
+		})
+	}
+}
+
+func TestParseEventBridgeSESOpenAndClickAsIgnoredNoOps(t *testing.T) {
+	for _, eventType := range []string{"Open", "Click"} {
+		result, err := ParseEvent([]byte(eventJSON(eventType, `,"open":{"ipAddress":"private"}`)))
+		if err != nil || result.Disposition != ParseIgnore || result.Event.EventBridgeID != "evt_1" {
+			t.Fatalf("%s result=%#v err=%v", eventType, result, err)
+		}
+	}
+}
+
+func TestParseEventBridgeSESRejectsMalformedIdentityAndUnknownEvents(t *testing.T) {
+	valid := eventJSON("Send", "")
+	tests := []string{
+		"{}",
+		strings.Replace(valid, `"id":"evt_1"`, `"id":""`, 1),
+		strings.Replace(valid, `"detail-type":"Email Send"`, `"detail-type":""`, 1),
+		strings.Replace(valid, `"source":"aws.ses"`, `"source":"other"`, 1),
+		strings.Replace(valid, `"messageId":"ses_message_1"`, `"messageId":""`, 1),
+		strings.Replace(valid, `"delivery_id":["del_1"]`, `"delivery_id":[]`, 1),
+		strings.Replace(valid, `"attempt_id":["att_1"]`, `"attempt_id":["att_1","att_2"]`, 1),
+		strings.Replace(valid, `"eventType":"Send"`, `"eventType":"RenderingFailure"`, 1),
+		eventJSON("Bounce", `,"bounce":{"bounceType":"Undetermined"}`),
+		valid + `{}`,
+	}
+	for index, input := range tests {
+		if result, err := ParseEvent([]byte(input)); err == nil || result.Disposition != ParseAwaitDLQ {
+			t.Fatalf("case %d result=%#v err=%v", index, result, err)
+		}
+	}
+}
+
+func TestEventValidationRejectsSemanticallyIncoherentFabricatedEvents(t *testing.T) {
+	canonical := []Event{
+		{EventBridgeID: "evt", ProviderMessageID: "ses", DeliveryID: "del", AttemptID: "att", SemanticType: SemanticSend, ProviderOutcome: notifications.ProviderOutcomeAccepted, AcceptedEvidence: true},
+		{EventBridgeID: "evt", ProviderMessageID: "ses", DeliveryID: "del", AttemptID: "att", SemanticType: SemanticDelivery, ProviderOutcome: notifications.ProviderOutcomeDeliveredToMailServer, AcceptedEvidence: true},
+		{EventBridgeID: "evt", ProviderMessageID: "ses", DeliveryID: "del", AttemptID: "att", SemanticType: SemanticDeliveryDelay, ProviderOutcome: notifications.ProviderOutcomeDelayed, AcceptedEvidence: true},
+		{EventBridgeID: "evt", ProviderMessageID: "ses", DeliveryID: "del", AttemptID: "att", SemanticType: SemanticSoftBounce, ProviderOutcome: notifications.ProviderOutcomeSoftBounced, AcceptedEvidence: true},
+		{EventBridgeID: "evt", ProviderMessageID: "ses", DeliveryID: "del", AttemptID: "att", SemanticType: SemanticHardBounce, ProviderOutcome: notifications.ProviderOutcomeHardBounced, SuppressionReason: SuppressionHardBounce, AcceptedEvidence: true},
+		{EventBridgeID: "evt", ProviderMessageID: "ses", DeliveryID: "del", AttemptID: "att", SemanticType: SemanticComplaint, ProviderOutcome: notifications.ProviderOutcomeComplained, SuppressionReason: SuppressionComplaint, AcceptedEvidence: true},
+		{EventBridgeID: "evt", ProviderMessageID: "ses", DeliveryID: "del", AttemptID: "att", SemanticType: SemanticReject, ProviderOutcome: notifications.ProviderOutcomeRejected, PermanentFailure: true},
+		{EventBridgeID: "evt", ProviderMessageID: "ses", DeliveryID: "del", AttemptID: "att", SemanticType: SemanticReject, ProviderOutcome: notifications.ProviderOutcomeRejected, SuppressionReason: SuppressionRecipientReject, PermanentFailure: true},
+	}
+	for index, event := range canonical {
+		if err := event.Validate(); err != nil {
+			t.Fatalf("canonical event %d rejected: %v", index, err)
+		}
+	}
+
+	invalid := []Event{
+		withEvent(canonical[0], func(event *Event) { event.ProviderOutcome = notifications.ProviderOutcomeRejected }),
+		withEvent(canonical[0], func(event *Event) { event.AcceptedEvidence = false }),
+		withEvent(canonical[1], func(event *Event) { event.PermanentFailure = true }),
+		withEvent(canonical[2], func(event *Event) { event.SuppressionReason = SuppressionHardBounce }),
+		withEvent(canonical[3], func(event *Event) { event.SuppressionReason = SuppressionHardBounce }),
+		withEvent(canonical[4], func(event *Event) { event.SuppressionReason = "" }),
+		withEvent(canonical[4], func(event *Event) { event.SuppressionReason = SuppressionComplaint }),
+		withEvent(canonical[5], func(event *Event) { event.SuppressionReason = SuppressionHardBounce }),
+		withEvent(canonical[6], func(event *Event) { event.AcceptedEvidence = true }),
+		withEvent(canonical[6], func(event *Event) { event.PermanentFailure = false }),
+		withEvent(canonical[6], func(event *Event) { event.SuppressionReason = SuppressionComplaint }),
+	}
+	for index, event := range invalid {
+		if err := event.Validate(); err == nil {
+			t.Fatalf("incoherent event %d accepted: %#v", index, event)
+		}
+	}
+}
+
+func withEvent(event Event, change func(*Event)) Event {
+	change(&event)
+	return event
+}
+
+func eventJSON(eventType, detail string) string {
+	return `{"version":"0","id":"evt_1","detail-type":"Email ` + eventType +
+		`","source":"aws.ses","account":"123","time":"2026-07-17T12:00:00Z","region":"sa-east-1","resources":[],"detail":{"eventType":"` + eventType +
+		`","mail":{"messageId":"ses_message_1","destination":["never-trusted@example.com"],"tags":{"delivery_id":["del_1"],"attempt_id":["att_1"]}}` + detail + `}}`
+}

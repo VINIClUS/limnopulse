@@ -20,3 +20,11 @@ class ConflictError(LimnopulseError):
 
 class TelemetryQueryError(LimnopulseError):
     """Telemetry backend could not satisfy a query."""
+
+
+class IdentityEmailError(LimnopulseError):
+    """Cognito did not provide a verified, usable ASCII email address."""
+
+
+class IdentityServiceUnavailableError(LimnopulseError):
+    """Cognito could not verify the current identity."""

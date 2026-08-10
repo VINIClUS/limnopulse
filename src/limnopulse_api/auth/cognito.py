@@ -5,8 +5,9 @@ from time import time
 from typing import Any
 
 import jwt
-from jwt import PyJWKClient
 from fastapi import Request
+from jwt import PyJWKClient
+from redis.exceptions import RedisError
 
 from limnopulse_api.auth.models import Principal
 from limnopulse_api.core.config import Settings
@@ -56,7 +57,7 @@ class JwksKeyStore:
 
         try:
             cached = await self.cache.get_json(self._cache_key(kid))
-        except Exception:
+        except (RedisError, TypeError, ValueError):
             return None
 
         if not isinstance(cached, dict):
@@ -77,8 +78,8 @@ class JwksKeyStore:
 
         try:
             await self.cache.set_json(self._cache_key(kid), jwk_data, self.cache_ttl_seconds)
-        except Exception:
-            pass
+        except (RedisError, TypeError, ValueError):
+            return
 
     def _cache_key(self, kid: str) -> str:
         return f"jwks:cognito:{self.cache_key_namespace}:{kid}"
@@ -147,7 +148,14 @@ class CognitoJwtAuthProvider:
             raise AuthError("expired cognito token")
 
         groups = tuple(claims.get("cognito:groups", ()))
-        return Principal(cognito_sub=sub, email=claims.get("email"), groups=groups)
+        scopes = frozenset(str(claims.get("scope", "")).split())
+        return Principal(
+            cognito_sub=sub,
+            email=claims.get("email"),
+            groups=groups,
+            access_token=token,
+            scopes=scopes,
+        )
 
 
 def build_cognito_key_store(

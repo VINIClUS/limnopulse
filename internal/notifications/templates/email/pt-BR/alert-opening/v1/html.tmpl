@@ -1,0 +1,21 @@
+<!doctype html>
+<html lang="pt-BR">
+<body>
+<h1>Alerta aberto</h1>
+<dl>
+<dt>Regra</dt><dd>{{.RuleName}}</dd>
+<dt>Severidade</dt><dd>{{.Severity}}</dd>
+<dt>Tenant</dt><dd>{{.TenantID}}</dd>
+<dt>Viveiro</dt><dd>{{.PondID}}</dd>
+{{if .DeviceID}}<dt>Dispositivo</dt><dd>{{.DeviceID}}</dd>{{else}}<dt>Escopo</dt><dd>viveiro inteiro</dd>{{end}}
+<dt>Métrica</dt><dd>{{.Metric}} ({{.Unit}})</dd>
+<dt>Condição</dt><dd>{{.Operator}} {{number .Threshold}} {{.Unit}}</dd>
+{{if .ObservedValue}}<dt>Valor observado</dt><dd>{{numberPtr .ObservedValue}} {{.Unit}}</dd>
+{{end}}<dt>Janela de avaliação</dt><dd>{{duration .EvaluationWindow}}</dd>
+<dt>Início da janela</dt><dd>{{utc .WindowStart}}</dd>
+<dt>Fim da janela</dt><dd>{{utc .WindowEnd}}</dd>
+<dt>Avaliado em</dt><dd>{{utc .EvaluatedAt}}</dd>
+<dt>ID do evento</dt><dd>{{.EventID}}</dd>
+</dl>
+</body>
+</html>

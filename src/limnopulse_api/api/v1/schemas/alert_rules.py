@@ -9,6 +9,7 @@ from limnopulse_api.domain.alerts import (
     AlertDuration,
     AlertMetric,
     AlertOperator,
+    AlertRuleName,
     AlertSeverity,
 )
 
@@ -19,7 +20,7 @@ class AlertRuleDefinition(BaseModel):
     pond_id: str
     device_id: str | None = None
     metric: AlertMetric
-    name: str = Field(min_length=1, max_length=120)
+    name: AlertRuleName
     operator: AlertOperator
     threshold: float = Field(allow_inf_nan=False)
     aggregation: AlertAggregation
@@ -55,7 +56,7 @@ class AlertRuleUpdate(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     expected_version: int = Field(ge=1)
-    name: str | None = Field(default=None, min_length=1, max_length=120)
+    name: AlertRuleName | None = None
     operator: AlertOperator | None = None
     threshold: float | None = Field(default=None, allow_inf_nan=False)
     aggregation: AlertAggregation | None = None

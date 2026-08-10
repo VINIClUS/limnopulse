@@ -1,6 +1,7 @@
+import re
+import unicodedata
 from collections.abc import Mapping
 from enum import StrEnum
-import re
 from typing import Annotated, Any, Self
 
 from pydantic import AfterValidator, BaseModel, ConfigDict, Field, field_validator, model_validator
@@ -61,12 +62,27 @@ def _validate_alert_duration(value: str) -> str:
 AlertDuration = Annotated[str, AfterValidator(_validate_alert_duration)]
 
 
+def _validate_alert_rule_name(value: str) -> str:
+    if any(unicodedata.category(character) == "Cc" for character in value):
+        raise ValueError("alert rule name must not contain control characters")
+    return value
+
+
+AlertRuleName = Annotated[
+    str,
+    Field(min_length=1, max_length=120),
+    AfterValidator(_validate_alert_rule_name),
+]
+
+
 class AlertRule(VersionedEntity):
     tenant_id: str
     rule_id: str
     pond_id: str
     device_id: str | None = None
     metric: AlertMetric
+    # Persisted rules predate the control-character boundary validation. Keep
+    # reads backwards compatible; create/update/replace schemas use AlertRuleName.
     name: str = Field(min_length=1, max_length=120)
     operator: AlertOperator
     threshold: float = Field(allow_inf_nan=False)

@@ -6,6 +6,8 @@ import (
 	"fmt"
 	"sort"
 	"time"
+
+	"github.com/VINIClUS/limnopulse/internal/notifications"
 )
 
 type Quality string
@@ -272,7 +274,11 @@ func EventID(rule Rule, confirmedOpenWindowEnd time.Time) string {
 }
 
 func OutboxID(eventID string, channel Channel, kind OutboxKind) string {
-	return "outbox_" + sha256Hex(eventID+"\x00"+string(channel)+"\x00"+string(kind))
+	return notifications.OutboxID(
+		eventID,
+		notifications.Channel(channel),
+		notifications.NotificationKind(kind),
+	)
 }
 
 func sha256Hex(value string) string {

@@ -28,24 +28,44 @@ output "dynamodb_audit_table" {
   value       = aws_dynamodb_table.audit.name
 }
 
-output "alerts_queue_url" {
-  description = "SQS alert queue URL for future workers."
-  value       = aws_sqs_queue.alerts.id
+output "notification_jobs_queue_url" {
+  description = "SQS_NOTIFICATION_JOBS_URL"
+  value       = aws_sqs_queue.notification_jobs.id
 }
 
-output "alerts_queue_arn" {
-  description = "SQS alert queue ARN for future workers."
-  value       = aws_sqs_queue.alerts.arn
+output "notification_jobs_queue_arn" {
+  description = "Notification jobs queue ARN."
+  value       = aws_sqs_queue.notification_jobs.arn
 }
 
-output "alerts_dlq_url" {
-  description = "SQS alert dead-letter queue URL."
-  value       = aws_sqs_queue.alerts_dlq.id
+output "notification_jobs_dlq_url" {
+  description = "Notification jobs dead-letter queue URL."
+  value       = aws_sqs_queue.notification_jobs_dlq.id
 }
 
-output "ses_email_identity_arn" {
-  description = "Optional SES identity ARN when ses_email_identity is configured."
-  value       = var.ses_email_identity == "" ? "" : aws_ses_email_identity.notifications[0].arn
+output "ses_events_queue_url" {
+  description = "SQS_SES_EVENTS_URL"
+  value       = aws_sqs_queue.ses_events.id
+}
+
+output "ses_events_queue_arn" {
+  description = "SES feedback queue ARN."
+  value       = aws_sqs_queue.ses_events.arn
+}
+
+output "ses_events_dlq_url" {
+  description = "SES feedback dead-letter queue URL."
+  value       = aws_sqs_queue.ses_events_dlq.id
+}
+
+output "ses_events_routing_dlq_url" {
+  description = "EventBridge SES routing dead-letter queue URL."
+  value       = aws_sqs_queue.ses_events_routing_dlq.id
+}
+
+output "ses_configuration_set_name" {
+  description = "SES_CONFIGURATION_SET_NAME"
+  value       = aws_sesv2_configuration_set.notifications.configuration_set_name
 }
 
 output "redis_url" {

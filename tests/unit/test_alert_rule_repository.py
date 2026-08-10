@@ -1,7 +1,7 @@
+import json
 from copy import deepcopy
 from datetime import UTC, datetime, timedelta
 from decimal import Decimal
-import json
 from typing import Any
 
 import pytest
@@ -252,6 +252,21 @@ async def test_list_rules_queries_alert_rule_prefix_without_scan() -> None:
         ":pk": "TENANT#tnt_1",
         ":sk_prefix": "ALERT_RULE#",
     }
+    assert client.scan_calls == 0
+
+
+@pytest.mark.asyncio
+async def test_list_rules_decodes_legacy_name_controls_without_backfill() -> None:
+    client = RecordingDynamoClient()
+    repository = make_repository(client)
+    legacy = repository._rule_to_item(make_rule())
+    legacy["name"] = "Oxigênio\r\nlegado"
+    client.seed("LimnopulseDomain", legacy)
+
+    rules = await repository.list_rules("tnt_1")
+
+    assert len(rules) == 1
+    assert rules[0].name == "Oxigênio\r\nlegado"
     assert client.scan_calls == 0
 
 

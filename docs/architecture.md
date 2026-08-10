@@ -1,7 +1,7 @@
 # Limnopulse Architecture
 
-**Version:** 1.1
-**Updated:** 2026-07-15
+**Version:** 1.2
+**Updated:** 2026-07-17
 
 Limnopulse is the successor to the AquaFarm prototype. AquaFarm names in historical material describe the predecessor only; all active resources, topics, buckets, code, and new documentation use the Limnopulse name.
 
@@ -12,10 +12,11 @@ Limnopulse is the successor to the AquaFarm prototype. AquaFarm names in histori
 | Phase 1 | Current | FastAPI, Cognito/dev authentication, tenant membership authorization, tenants, ponds, devices, DynamoDB, Redis cache-aside |
 | Phase 2A | Current | authorized InfluxDB telemetry reads |
 | Phase 2B/2C | Current local scaffold | MQTT, Telegraf, local registry enrichment, InfluxDB writes |
-| Phase 2D | Current scaffold | OpenTofu for DynamoDB, Cognito, SQS/DLQ, and optional SES identity |
+| Phase 2D | Current scaffold | OpenTofu for DynamoDB, Cognito and base cloud resources |
 | Phase 3A | Current | Alert Rule configuration, optimistic updates, replacement idempotency, transactional audit, TTL |
-| Phase 3B | Target | Go evaluator, InfluxDB window evaluation, Redis cooldown/deduplication, Alert Events |
-| Phase 3C | Target | SQS notification dispatcher, SES/Telegram delivery, retries, delivery records |
+| Phase 3B | Current | one-shot Go evaluator, 64-bucket due index, InfluxDB windows, durable Alert Events and notification outboxes |
+| Phase 3C-A | Current | one-shot outbox relay, SQS email jobs, continuous SES worker/feedback, durable deliveries and attempts |
+| Phase 3C-B | Target | Telegram delivery of currently deferred Telegram outboxes |
 
 “Current” means implemented in this repository. “Target” is architectural direction and must not be interpreted as a deployed capability.
 
@@ -33,16 +34,23 @@ flowchart LR
     API --> Redis[(Redis cache)]
     API --> Influx
 
-    Influx -. Phase 3B .-> Evaluator[Go Alert Evaluator]
-    Dynamo -. Phase 3B .-> Evaluator
-    Redis -. Phase 3B .-> Evaluator
-    Evaluator -. Phase 3C .-> Queue[SQS]
-    Queue -. Phase 3C .-> Dispatcher[Go Notification Dispatcher]
-    Dispatcher -.-> SES
-    Dispatcher -.-> Telegram
+    Influx --> Evaluator[One-shot Alert Evaluator]
+    Dynamo --> Evaluator
+    Redis --> Evaluator
+    Evaluator -->|AlertEvent + Outbox transaction| Dynamo
+    Dynamo --> Relay[One-shot Notification Relay]
+    Relay --> Jobs[SQS Notification Jobs]
+    Jobs --> Worker[Continuous Notification Worker]
+    Worker --> Dynamo
+    Worker --> SES
+    SES --> EventBridge
+    EventBridge --> Feedback[SQS SES Events]
+    Feedback --> Worker
+    Worker -. Phase 3C-B .-> Telegram
 ```
 
-Solid edges are present repository responsibilities or local scaffolds. Dotted edges are later alert phases.
+Solid edges are present repository responsibilities or local/cloud scaffolds.
+The dotted Telegram edge is a later slice.
 
 ## Canonical names
 
@@ -86,6 +94,11 @@ Core `LimnopulseDomain` keys:
 | Tenant member | `TENANT#<tenant_id>` | `MEMBER#<cognito_sub>` |
 | Alert Rule | `TENANT#<tenant_id>` | `ALERT_RULE#<rule_id>` |
 | Alert Rule replacement replay | `TENANT#<tenant_id>` | `IDEMPOTENCY#ALERT_RULE_REPLACE#<sha256>` |
+| Alert Event | `TENANT#<tenant_id>` | `ALERT_EVENT#<event_id>` |
+| Notification Outbox | `TENANT#<tenant_id>` | `NOTIFICATION_OUTBOX#<outbox_id>` |
+| Notification Delivery | `NOTIFICATION_OUTBOX#<outbox_id>` | `DELIVERY#<delivery_id>` |
+| Notification Attempt | `NOTIFICATION_DELIVERY#<delivery_id>` | `ATTEMPT#<attempt_id>` |
+| Email suppression | `EMAIL_IDENTITY#<sha256(normalized_email)>` | `DELIVERABILITY` |
 
 Critical list paths use `Query` or known-key reads. Application code does not use DynamoDB `Scan`.
 
@@ -133,22 +146,47 @@ Windows and durations use compact values from 60 seconds through 24 hours, such 
 
 Changing semantic identity uses the replace endpoint. One DynamoDB transaction disables and versions the old rule, links both records, creates the replacement, records audit, and stores a 24-hour replay result. The same `Idempotency-Key` and payload returns that result; a different payload with the same key returns `409`.
 
-## Phase 3B: evaluation target
+The domain table exposes three sparse GSIs: `AlertEvaluationByDue` for 64
+versioned evaluation buckets, `AlertEventsByTenantTime` for incident reads, and
+`NotificationRelayByAvailableAt` for 64 versioned notification relay buckets.
+Both one-shot processes discover work with paginated `Query`; they never Scan.
 
-The future Go evaluator will:
+## Phase 3B: evaluation
+
+The one-shot Go evaluator:
 
 1. read active rules from `LimnopulseDomain`;
 2. query bounded InfluxDB windows;
 3. apply aggregation/operator thresholds;
 4. use Redis only for cooldown and short deduplication;
-5. atomically create Alert Events;
-6. enqueue notification jobs.
+5. atomically creates Alert Events, transitions and NotificationOutboxes;
+6. exits and leaves scheduling to an external 60-second scheduler.
 
-Phase 3B does not change the Phase 3A API identity or replacement contract.
+One AlertEvent represents one continuous episode. Opening requires `duration`;
+recovery occurs on the first complete, sufficiently covered, fresh and valid
+clean window. No-data or query failure never resolves an incident. Phase 3B does
+not publish SQS and does not change the Phase 3A API identity or replacement
+contract.
 
-## Phase 3C: delivery target
+## Phase 3C-A: email delivery
 
-The future notification dispatcher will consume SQS with a DLQ, apply retry and permanent-failure policies, resolve verified preferences, send through SES and Telegram, and persist delivery attempts. WhatsApp, SMS, and mobile push remain later commercial/product decisions.
+The one-shot relay expands an email outbox into deterministic immutable
+deliveries, publishes compact SQS jobs, and conditionally records publication.
+The continuous worker uses fenced DynamoDB leases and attempt transactions,
+rechecks membership/suppression, rate limits SES calls, retries typed transient
+failures and reconciles SES feedback routed by EventBridge. Duplicate jobs are
+safe; DynamoDB, not SQS or Redis, owns identity and state.
+
+Opening and recovery are separate deliveries. A recovery delivery depends on a
+succeeded opening delivery and is cancelled when the opening was not sent.
+Hard bounce and complaint feedback create a hashed suppression record without a
+plain address. The normalized address and rendered content remain durable only
+on the Delivery snapshot; Attempt rows and telemetry do not duplicate them.
+
+The worker does not consume any DLQ automatically, and the EventBridge routing
+DLQ is not a worker input. Phase 3C-A exposes no public Delivery/Attempt API.
+Telegram remains deferred to Phase 3C-B. WhatsApp, SMS and mobile push remain
+later commercial/product decisions.
 
 ## Security boundaries
 
@@ -157,5 +195,9 @@ The future notification dispatcher will consume SQS with a DLQ, apply retry and 
 - Production MQTT requires TLS/mTLS, per-device credentials, and topic ACLs.
 - Tenant/pond/device target mismatches return `404` to avoid cross-tenant disclosure.
 - Conditional writes and expected versions prevent silent lost updates.
+- Notification jobs and SES events are at-least-once; deterministic identities,
+  leases, fencing and transactions make duplicate processing safe.
+- SES feedback associations trust only provider message ID plus exact
+  `delivery_id`/`attempt_id` tags; provider destination arrays are discarded.
 - Secrets, raw tokens, and idempotency keys are excluded from domain/audit records.
 - IAM, network exposure, real remote state, and secret management require environment-specific hardening before production deployment.
