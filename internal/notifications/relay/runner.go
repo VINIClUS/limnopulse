@@ -477,7 +477,7 @@ func (runner Runner) filterDisabledTelegramCandidates(
 	discoveryCutoff time.Time,
 	clock func() time.Time,
 ) ([]Candidate, int) {
-	if config.TelegramDeliveryEnabled || config.SQSTelegramQueueURL == "" || len(candidates) == 0 {
+	if config.TelegramDeliveryEnabled || !config.TelegramDeliveryConfigured || len(candidates) == 0 {
 		return candidates, 0
 	}
 	eligible := make([]Candidate, 0, len(candidates))

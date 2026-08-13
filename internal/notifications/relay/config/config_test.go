@@ -53,7 +53,7 @@ func TestLoadAcceptsRelayFlagsAndRequiredEnvironment(t *testing.T) {
 		loaded.DynamoDBEndpoint != "http://dynamodb:8000" ||
 		loaded.SQSQueueURL != "http://sqs:9324/queue/jobs" ||
 		loaded.SQSTelegramQueueURL != "http://sqs:9324/queue/telegram-jobs" ||
-		!loaded.TelegramDeliveryEnabled || loaded.WebURL != "https://app.example.com" ||
+		!loaded.TelegramDeliveryEnabled || !loaded.TelegramDeliveryConfigured || loaded.WebURL != "https://app.example.com" ||
 		loaded.SQSEndpoint != "http://sqs:9324" || loaded.OTLPEndpoint != "http://otel:4318" {
 		t.Fatalf("environment not loaded: %#v", loaded)
 	}
@@ -64,7 +64,7 @@ func TestLoadKeepsTelegramFeatureOffWithoutQueueAndRequiresDependenciesWhenEnabl
 	if err != nil {
 		t.Fatal(err)
 	}
-	if loaded.TelegramDeliveryEnabled || loaded.SQSTelegramQueueURL != "" {
+	if loaded.TelegramDeliveryEnabled || loaded.TelegramDeliveryConfigured || loaded.SQSTelegramQueueURL != "" {
 		t.Fatalf("Telegram defaults = %#v", loaded)
 	}
 	values := map[string]string{

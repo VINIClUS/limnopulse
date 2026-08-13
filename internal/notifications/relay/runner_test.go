@@ -227,7 +227,7 @@ func TestRunFiltersDisabledTelegramBeforeDiscoveryCap(t *testing.T) {
 		QueryParallelism: 1, WorkParallelism: 1, MaxWork: 1, FanoutPageSize: 1,
 		GlobalDeadline: 45 * time.Second, SoftDeadline: 40 * time.Second,
 		ItemTimeout: 10 * time.Second, LeaseTTL: 20 * time.Second,
-		TelegramDeliveryEnabled: false, SQSTelegramQueueURL: "telegram-queue",
+		TelegramDeliveryEnabled: false, TelegramDeliveryConfigured: true,
 	}
 
 	summary := runner.Run(context.Background(), config)

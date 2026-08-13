@@ -51,6 +51,11 @@ type RunConfig struct {
 	OTLPEndpoint            string
 	WebURL                  string
 	TelegramDeliveryEnabled bool
+	// TelegramDeliveryConfigured distinguishes legacy relay invocations from
+	// an explicit Phase 3C-B rollout. When explicitly disabled, discovery
+	// reloads candidate rows before its caps so indexed Telegram work cannot
+	// starve enabled channels.
+	TelegramDeliveryConfigured bool
 }
 
 func Load(args []string, lookup LookupEnv) (RunConfig, error) {
@@ -91,6 +96,7 @@ func Load(args []string, lookup LookupEnv) (RunConfig, error) {
 	telegramExplicit := false
 	if value, ok := lookup("TELEGRAM_DELIVERY_ENABLED"); ok {
 		telegramExplicit = true
+		config.TelegramDeliveryConfigured = true
 		parsed, parseErr := strconv.ParseBool(strings.TrimSpace(value))
 		if parseErr != nil {
 			return RunConfig{}, fmt.Errorf("TELEGRAM_DELIVERY_ENABLED must be true or false")
