@@ -13,6 +13,7 @@ import (
 	"github.com/VINIClUS/limnopulse/internal/notifications/feedback"
 	feedbackdynamo "github.com/VINIClUS/limnopulse/internal/notifications/feedback/dynamo"
 	"github.com/VINIClUS/limnopulse/internal/notifications/worker"
+	"github.com/aws/aws-sdk-go-v2/aws"
 	"github.com/aws/aws-sdk-go-v2/feature/dynamodb/attributevalue"
 	awssdk "github.com/aws/aws-sdk-go-v2/service/dynamodb"
 	"github.com/aws/aws-sdk-go-v2/service/dynamodb/types"
@@ -515,6 +516,116 @@ func TestAttemptTransactionsFenceLeaseAndNeverCopyRenderedContentOrEmail(t *test
 		if !strings.Contains(complete, required) {
 			t.Errorf("completion transaction missing %q: %s", required, complete)
 		}
+	}
+}
+
+func TestCompleteAttemptSuppressesRejectedTelegramDestinationInSameTransaction(t *testing.T) {
+	record := testTelegramRecord(t)
+	record.AttemptCount = 1
+	record.LastAttemptID = "att_telegram_1"
+	record.TelegramDestinationVersion = 5
+	client := &fakeClient{}
+
+	err := (Store{Table: "domain", Client: client}).CompleteAttempt(
+		context.Background(),
+		record,
+		worker.AttemptCompletion{
+			AttemptID: "att_telegram_1", CompletedAt: testNow(),
+			Outcome:                     notifications.AttemptOutcomePermanentFailed,
+			ErrorCategory:               string(worker.ErrorTelegramDestinationUnavailable),
+			NextState:                   notifications.DeliveryStatePermanentFailed,
+			SuppressTelegramDestination: true,
+		},
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(client.transactions) != 1 {
+		t.Fatalf("transactions = %d", len(client.transactions))
+	}
+	var suppression *types.Update
+	for _, operation := range client.transactions[0].TransactItems {
+		if operation.Update == nil {
+			continue
+		}
+		var key map[string]string
+		if err := attributevalue.UnmarshalMap(operation.Update.Key, &key); err != nil {
+			t.Fatal(err)
+		}
+		if key["PK"] == "TELEGRAM_DESTINATION#"+record.Delivery.DestinationID && key["SK"] == "META" {
+			suppression = operation.Update
+		}
+	}
+	if suppression == nil || !strings.Contains(*suppression.UpdateExpression, "#status = :suppressed") ||
+		!strings.Contains(*suppression.ConditionExpression, "#status = :active") ||
+		!strings.Contains(*suppression.ConditionExpression, "#version = :version") ||
+		!containsName(suppression.ExpressionAttributeNames, "suppression_reason") ||
+		decodeExpressionValues(t, suppression.ExpressionAttributeValues)[":reason"] != "provider_rejected" ||
+		fmt.Sprint(decodeExpressionValues(t, suppression.ExpressionAttributeValues)[":version"]) != "5" {
+		t.Fatalf("Telegram suppression update = %#v", suppression)
+	}
+}
+
+func TestCompleteAttemptCompletesRejectedTelegramAttemptWhenDestinationWasReactivated(t *testing.T) {
+	record := testTelegramRecord(t)
+	record.AttemptCount = 1
+	record.LastAttemptID = "att_telegram_1"
+	record.TelegramDestinationVersion = 5
+	client := &fakeClient{transactionErrors: []error{
+		&types.TransactionCanceledException{CancellationReasons: []types.CancellationReason{
+			{Code: aws.String("None")},
+			{Code: aws.String("None")},
+			{Code: aws.String("None")},
+			{Code: aws.String("ConditionalCheckFailed")},
+		}},
+	}}
+
+	err := (Store{Table: "domain", Client: client}).CompleteAttempt(
+		context.Background(),
+		record,
+		worker.AttemptCompletion{
+			AttemptID: "att_telegram_1", CompletedAt: testNow(),
+			Outcome:                     notifications.AttemptOutcomePermanentFailed,
+			ErrorCategory:               string(worker.ErrorTelegramDestinationUnavailable),
+			NextState:                   notifications.DeliveryStatePermanentFailed,
+			SuppressTelegramDestination: true,
+		},
+	)
+
+	if err != nil {
+		t.Fatalf("CompleteAttempt() error = %v", err)
+	}
+	if len(client.transactions) != 2 {
+		t.Fatalf("transactions = %d, want rejected transaction plus unsuppressed completion", len(client.transactions))
+	}
+	for _, operation := range client.transactions[1].TransactItems {
+		if operation.Update == nil {
+			continue
+		}
+		var key map[string]string
+		if err := attributevalue.UnmarshalMap(operation.Update.Key, &key); err != nil {
+			t.Fatal(err)
+		}
+		if key["PK"] == "TELEGRAM_DESTINATION#"+record.Delivery.DestinationID {
+			t.Fatalf("stale completion must not suppress reactivated destination: %#v", operation)
+		}
+	}
+}
+
+func TestBeginAttemptCarriesTelegramDestinationVersionToCompletion(t *testing.T) {
+	record := testTelegramRecord(t)
+	started, err := (Store{Table: "domain", Client: &fakeClient{}}).BeginAttempt(
+		context.Background(), record, worker.BeginAttemptRequest{
+			AttemptID: "att_telegram_1", StartedAt: testNow(),
+			LeaseRequiredUntil: testNow().Add(20 * time.Second),
+			GateFence:          testTelegramGateFence(record),
+		},
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if started.TelegramDestinationVersion != 5 {
+		t.Fatalf("Telegram destination version = %d", started.TelegramDestinationVersion)
 	}
 }
 
@@ -1114,6 +1225,42 @@ func testRecord(t *testing.T) worker.DeliveryRecord {
 		LeaseOwner: "worker_1", LeaseEpoch: 1, LeaseExpiresAt: testNow().Add(time.Minute)}
 }
 
+func testTelegramRecord(t *testing.T) worker.DeliveryRecord {
+	t.Helper()
+	now := testNow().Add(-time.Hour)
+	content, err := notifications.NewTelegramRenderedContent(
+		notifications.TemplateTelegramAlertOpeningV1,
+		notifications.LocalePTBR,
+		"Alerta simples",
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	deliveryID, err := notifications.NewDeliveryID(
+		"alert_1", notifications.NotificationKindOpening, notifications.ChannelTelegram, "user_1",
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	delivery, err := notifications.NewPendingDelivery(notifications.DeliveryParams{
+		TenantID: "tnt_1", OutboxID: "outbox_telegram_1", DeliveryID: deliveryID,
+		EventID: "alert_1", RuleID: "rule_1", Kind: notifications.NotificationKindOpening,
+		Channel: notifications.ChannelTelegram, RecipientID: "user_1",
+		DestinationID: "destination_hash", TelegramChatID: 123,
+		MembershipSnapshot: notifications.MembershipSnapshot{Role: "owner", Status: "active", Version: 1},
+		TelegramContent:    content, CreatedAt: now, UpdatedAt: now,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	snapshot := delivery.Snapshot()
+	snapshot.State = notifications.DeliveryStateProcessing
+	return worker.DeliveryRecord{
+		Delivery: snapshot, Revision: 3, LeaseOwner: "worker_1", LeaseEpoch: 1,
+		LeaseExpiresAt: testNow().Add(time.Minute),
+	}
+}
+
 func testSnapshot(t *testing.T) notifications.DeliverySnapshot {
 	t.Helper()
 	renderer, err := notifications.NewTemplateRenderer()
@@ -1253,6 +1400,21 @@ func testGateFence(t *testing.T, record worker.DeliveryRecord) worker.GateFence 
 		PreferenceMinimumSeverity:  "warning",
 		EventSeverity:              "critical",
 		DeliverabilityDependencies: []worker.DeliverabilityDependency{{Key: deliverabilityKey}},
+	}
+}
+
+func testTelegramGateFence(record worker.DeliveryRecord) worker.GateFence {
+	return worker.GateFence{
+		Channel:                    notifications.ChannelTelegram,
+		MembershipVersion:          2,
+		PreferenceVersion:          2,
+		PreferenceMinimumSeverity:  "warning",
+		EventSeverity:              "critical",
+		EventStatus:                "open",
+		TelegramDestinationID:      record.Delivery.DestinationID,
+		TelegramChatID:             record.Delivery.TelegramChatID,
+		TelegramBindingVersion:     4,
+		TelegramDestinationVersion: 5,
 	}
 }
 

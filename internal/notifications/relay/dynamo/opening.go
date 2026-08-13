@@ -57,9 +57,23 @@ func (store Store) ExpandIntent(
 		if preferenceErr != nil {
 			return relay.WorkResult{}, preferenceErr
 		}
-		if preference == nil || !preference.EmailEnabled || !preference.EmailVerified {
+		if preference == nil {
 			result.RecipientsFiltered++
 			continue
+		}
+		switch work.Channel {
+		case notifications.ChannelEmail:
+			if !preference.EmailEnabled || !preference.EmailVerified {
+				result.RecipientsFiltered++
+				continue
+			}
+		case notifications.ChannelTelegram:
+			if !preference.TelegramEnabled {
+				result.RecipientsFiltered++
+				continue
+			}
+		default:
+			return relay.WorkResult{}, work.Channel.Validate()
 		}
 		minimumSeverity, rankErr := severityRank(preference.MinimumSeverity)
 		if rankErr != nil {
@@ -70,12 +84,8 @@ func (store Store) ExpandIntent(
 			result.FilteredBySeverity++
 			continue
 		}
-		suppressed, deliverabilityErr := store.addressSuppressed(ctx, preference.EmailAddress)
-		if deliverabilityErr != nil {
-			return relay.WorkResult{}, deliverabilityErr
-		}
 		deliveryID, idErr := notifications.NewDeliveryID(
-			work.EventID, notifications.NotificationKindOpening, notifications.ChannelEmail, member.RecipientID,
+			work.EventID, notifications.NotificationKindOpening, work.Channel, member.RecipientID,
 		)
 		if idErr != nil {
 			return relay.WorkResult{}, idErr
@@ -83,25 +93,59 @@ func (store Store) ExpandIntent(
 		params := notifications.DeliveryParams{
 			TenantID: work.TenantID, OutboxID: work.OutboxID, DeliveryID: deliveryID,
 			EventID: work.EventID, RuleID: work.RuleID, Kind: notifications.NotificationKindOpening,
-			Channel: notifications.ChannelEmail, RecipientID: member.RecipientID,
-			NormalizedEmail: preference.EmailAddress,
+			Channel: work.Channel, RecipientID: member.RecipientID,
 			MembershipSnapshot: notifications.MembershipSnapshot{
 				Role: member.Role, Status: member.Status, Version: member.Version,
 			},
 			CreatedAt: request.RelayTime, UpdatedAt: request.RelayTime,
 		}
 		var delivery notifications.Delivery
-		if suppressed {
-			params.CancellationReason = notifications.CancellationReasonEmailSuppressed
-			delivery, err = notifications.NewCancelledDelivery(params)
-			result.DeliveriesCancelled++
-		} else {
+		switch work.Channel {
+		case notifications.ChannelEmail:
+			params.NormalizedEmail = preference.EmailAddress
+			suppressed, deliverabilityErr := store.addressSuppressed(ctx, preference.EmailAddress)
+			if deliverabilityErr != nil {
+				return relay.WorkResult{}, deliverabilityErr
+			}
+			if suppressed {
+				params.CancellationReason = notifications.CancellationReasonEmailSuppressed
+				delivery, err = notifications.NewCancelledDelivery(params)
+				result.DeliveriesCancelled++
+				break
+			}
 			renderer, rendererErr := store.renderer()
 			if rendererErr != nil {
 				return relay.WorkResult{}, rendererErr
 			}
 			params.Content, err = renderer.Render(
 				notifications.TemplateAlertOpeningV1, notifications.LocalePTBR, templateData,
+			)
+			if err == nil {
+				delivery, err = notifications.NewPendingDelivery(params)
+			}
+			result.DeliveriesCreated++
+		case notifications.ChannelTelegram:
+			destination, destinationErr := store.loadTelegramDestination(
+				ctx, work.TenantID, member.RecipientID,
+			)
+			if destinationErr != nil {
+				return relay.WorkResult{}, destinationErr
+			}
+			if destination == nil {
+				result.RecipientsFiltered++
+				continue
+			}
+			params.DestinationID = destination.DestinationID
+			params.TelegramChatID = destination.ChatID
+			if destination.Status == "suppressed" {
+				params.CancellationReason = notifications.CancellationReasonTelegramDestinationSuppressed
+				delivery, err = notifications.NewCancelledDelivery(params)
+				result.DeliveriesCancelled++
+				break
+			}
+			params.TelegramContent, err = notifications.RenderTelegramAlertForEnvironment(
+				notifications.NotificationKindOpening, templateData, store.WebURL,
+				store.AllowInsecureWebURL,
 			)
 			if err == nil {
 				delivery, err = notifications.NewPendingDelivery(params)

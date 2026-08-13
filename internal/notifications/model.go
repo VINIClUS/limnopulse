@@ -64,10 +64,13 @@ func NotificationKinds() []NotificationKind {
 
 type Channel string
 
-const ChannelEmail Channel = "email"
+const (
+	ChannelEmail    Channel = "email"
+	ChannelTelegram Channel = "telegram"
+)
 
 func (channel Channel) Validate() error {
-	if channel != ChannelEmail {
+	if channel != ChannelEmail && channel != ChannelTelegram {
 		return fmt.Errorf("unknown channel %q", channel)
 	}
 	return nil
@@ -82,7 +85,7 @@ func (channel *Channel) UnmarshalJSON(data []byte) error {
 }
 
 func Channels() []Channel {
-	return []Channel{ChannelEmail}
+	return []Channel{ChannelEmail, ChannelTelegram}
 }
 
 type EmailDeliverability string

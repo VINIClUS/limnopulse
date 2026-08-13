@@ -79,7 +79,8 @@ func (store Store) Reload(
 		item.RelayPK != candidate.RelayPK || item.RelaySK != candidate.RelaySK {
 		return relay.Work{}, false, nil
 	}
-	if item.RelaySchemaVersion != notifications.RelaySchemaVersion {
+	wantSchemaVersion, schemaErr := notifications.RelaySchemaVersionForChannel(item.Channel)
+	if schemaErr != nil || item.RelaySchemaVersion != wantSchemaVersion {
 		return relay.Work{}, false, fmt.Errorf("unsupported relay schema version")
 	}
 	_, markerExists := output.Item["relay_work_kind"]
@@ -137,7 +138,7 @@ func (store Store) Reload(
 		return relay.Work{}, false, candidate.Kind.Validate()
 	}
 	if itemID == "" || item.TenantID == "" || item.OutboxID == "" || item.EventID == "" || item.RuleID == "" ||
-		state == "" || item.Channel != notifications.ChannelEmail || item.Kind.Validate() != nil {
+		state == "" || item.Channel.Validate() != nil || item.Kind.Validate() != nil {
 		return relay.Work{}, false, fmt.Errorf("relay base item is incomplete")
 	}
 	wantIndex, err := notifications.BuildRelayIndexKey(candidate.Kind, item.TenantID, itemID, availableAt)
@@ -163,6 +164,7 @@ func (store Store) Reload(
 		OutboxID: item.OutboxID, DeliveryID: item.DeliveryID, EventID: item.EventID, RuleID: item.RuleID,
 		DependsOnOutboxID: item.DependsOnOutboxID, NotificationKind: item.Kind,
 		Channel: item.Channel, State: state, Revision: revision, Cursor: item.ExpansionCursor,
+		RelaySchemaVersion: item.RelaySchemaVersion,
 		ExpansionStartedAt: expansionStartedAt, RecipientsExamined: item.RecipientsExamined,
 		DeliveriesCreated: item.DeliveriesCreated, DeliveriesCancelled: item.DeliveriesCancelled,
 		RecipientsFiltered: item.RecipientsFiltered, LeaseOwner: item.RelayLeaseOwner,

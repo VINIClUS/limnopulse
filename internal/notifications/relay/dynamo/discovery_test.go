@@ -493,7 +493,7 @@ func TestReloadRejectsNoncanonicalBaseStorageKey(t *testing.T) {
 	}
 }
 
-func TestReloadRejectsIndexedTelegramWorkBeforeFanout(t *testing.T) {
+func TestReloadRejectsV1TelegramWorkAndAcceptsCanonicalV2(t *testing.T) {
 	relayTime := time.Date(2026, 7, 16, 12, 30, 0, 0, time.UTC)
 	available := relayTime.Add(-time.Minute)
 	indexKey, err := notifications.BuildRelayIndexKey(
@@ -522,6 +522,16 @@ func TestReloadRejectsIndexedTelegramWorkBeforeFanout(t *testing.T) {
 	work, current, err := store.Reload(context.Background(), candidate, relayTime)
 	if err == nil || current || work != (relay.Work{}) {
 		t.Fatalf("reload = %#v, current = %t, error = %v", work, current, err)
+	}
+
+	base["relay_schema_version"] = notifications.TelegramRelaySchemaVersion
+	store = Store{Table: "domain", Client: &fakeClient{
+		getOutputs: []*awssdk.GetItemOutput{{Item: marshalMap(t, base)}},
+	}}
+	work, current, err = store.Reload(context.Background(), candidate, relayTime)
+	if err != nil || !current || work.Channel != notifications.ChannelTelegram ||
+		work.RelaySchemaVersion != notifications.TelegramRelaySchemaVersion {
+		t.Fatalf("V2 reload = %#v, current = %t, error = %v", work, current, err)
 	}
 }
 

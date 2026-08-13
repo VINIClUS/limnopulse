@@ -34,12 +34,14 @@ def test_elasticmq_defines_notification_queues_and_redrive_deterministically() -
     for queue in (
         "limnopulse-notification-jobs",
         "limnopulse-notification-jobs-dlq",
+        "limnopulse-telegram-notification-jobs",
+        "limnopulse-telegram-notification-jobs-dlq",
         "limnopulse-ses-events",
         "limnopulse-ses-events-dlq",
         "limnopulse-ses-events-routing-dlq",
     ):
         assert f'"{queue}"' in config
-    assert config.count("maxReceiveCount = 8") == 2
+    assert config.count("maxReceiveCount = 8") == 3
 
 
 def test_notification_compose_processes_use_real_sdk_endpoints_and_safe_fake_sender() -> None:

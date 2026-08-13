@@ -40,9 +40,12 @@ func (store Store) ExpandDependency(
 	if err != nil {
 		return relay.WorkResult{}, err
 	}
-	renderer, err := store.renderer()
-	if err != nil {
-		return relay.WorkResult{}, err
+	var renderer *notifications.TemplateRenderer
+	if work.Channel == notifications.ChannelEmail {
+		renderer, err = store.renderer()
+		if err != nil {
+			return relay.WorkResult{}, err
+		}
 	}
 	result := relay.WorkResult{}
 	deliveries := make([]notifications.Delivery, 0, len(page.Deliveries))
@@ -50,7 +53,7 @@ func (store Store) ExpandDependency(
 	for _, opening := range page.Deliveries {
 		result.RecipientsExamined++
 		deliveryID, idErr := notifications.NewDeliveryID(
-			work.EventID, notifications.NotificationKindRecovery, notifications.ChannelEmail, opening.RecipientID,
+			work.EventID, notifications.NotificationKindRecovery, work.Channel, opening.RecipientID,
 		)
 		if idErr != nil {
 			return relay.WorkResult{}, idErr
@@ -58,9 +61,10 @@ func (store Store) ExpandDependency(
 		params := notifications.DeliveryParams{
 			TenantID: work.TenantID, OutboxID: work.OutboxID, DeliveryID: deliveryID,
 			EventID: work.EventID, RuleID: work.RuleID, Kind: notifications.NotificationKindRecovery,
-			Channel: notifications.ChannelEmail, DependsOnOutboxID: work.DependsOnOutboxID,
+			Channel: work.Channel, DependsOnOutboxID: work.DependsOnOutboxID,
 			DependsOnDeliveryID: opening.DeliveryID, RecipientID: opening.RecipientID,
-			NormalizedEmail: opening.NormalizedEmail,
+			NormalizedEmail: opening.NormalizedEmail, DestinationID: opening.DestinationID,
+			TelegramChatID: opening.TelegramChatID,
 			MembershipSnapshot: notifications.MembershipSnapshot{
 				Role: opening.Membership.Role, Status: opening.Membership.Status,
 				Version: opening.Membership.Version,
@@ -69,7 +73,12 @@ func (store Store) ExpandDependency(
 		}
 		state := notifications.DeliveryState(opening.State)
 		var delivery notifications.Delivery
-		if state == notifications.DeliveryStateUnknown || isNonterminalDelivery(state) {
+		if work.Channel == notifications.ChannelTelegram &&
+			(state == notifications.DeliveryStateUnknown || isNonterminalDelivery(state)) {
+			params.CancellationReason = notifications.CancellationReasonOpeningUnconfirmed
+			delivery, err = notifications.NewCancelledDelivery(params)
+			result.DeliveriesCancelled++
+		} else if state == notifications.DeliveryStateUnknown || isNonterminalDelivery(state) {
 			if localeErr := opening.Content.Locale.Validate(); localeErr != nil {
 				return relay.WorkResult{}, fmt.Errorf("opening delivery locale is invalid")
 			}
@@ -101,29 +110,57 @@ func (store Store) ExpandDependency(
 				delivery, err = notifications.NewCancelledDelivery(params)
 				result.DeliveriesCancelled++
 			} else {
-				suppressed, deliverabilityErr := store.addressSuppressed(ctx, opening.NormalizedEmail)
-				if deliverabilityErr != nil {
-					return relay.WorkResult{}, deliverabilityErr
-				}
-				if suppressed {
-					params.CancellationReason = notifications.CancellationReasonEmailSuppressed
-					delivery, err = notifications.NewCancelledDelivery(params)
-					result.DeliveriesCancelled++
+				if work.Channel == notifications.ChannelEmail {
+					suppressed, deliverabilityErr := store.addressSuppressed(ctx, opening.NormalizedEmail)
+					if deliverabilityErr != nil {
+						return relay.WorkResult{}, deliverabilityErr
+					}
+					if suppressed {
+						params.CancellationReason = notifications.CancellationReasonEmailSuppressed
+						delivery, err = notifications.NewCancelledDelivery(params)
+						result.DeliveriesCancelled++
+					} else {
+						if localeErr := opening.Content.Locale.Validate(); localeErr != nil {
+							return relay.WorkResult{}, fmt.Errorf("opening delivery locale is invalid")
+						}
+						params.Content, err = renderer.Render(
+							notifications.TemplateAlertRecoveryV1, opening.Content.Locale, templateData,
+						)
+						if err == nil {
+							delivery, err = notifications.NewPendingDelivery(params)
+						}
+						result.DeliveriesCreated++
+					}
 				} else {
-					if localeErr := opening.Content.Locale.Validate(); localeErr != nil {
-						return relay.WorkResult{}, fmt.Errorf("opening delivery locale is invalid")
-					}
-					params.Content, err = renderer.Render(
-						notifications.TemplateAlertRecoveryV1, opening.Content.Locale, templateData,
+					destination, destinationErr := store.loadTelegramDestination(
+						ctx, work.TenantID, opening.RecipientID,
 					)
-					if err == nil {
-						delivery, err = notifications.NewPendingDelivery(params)
+					if destinationErr != nil {
+						return relay.WorkResult{}, destinationErr
 					}
-					result.DeliveriesCreated++
+					if destination == nil || destination.DestinationID != opening.DestinationID ||
+						destination.ChatID != opening.TelegramChatID || destination.Status != "active" {
+						params.CancellationReason = notifications.CancellationReasonTelegramDestinationSuppressed
+						delivery, err = notifications.NewCancelledDelivery(params)
+						result.DeliveriesCancelled++
+					} else {
+						if localeErr := opening.Content.Locale.Validate(); localeErr != nil {
+							return relay.WorkResult{}, fmt.Errorf("opening delivery locale is invalid")
+						}
+						params.TelegramContent, err = notifications.RenderTelegramAlertForEnvironment(
+							notifications.NotificationKindRecovery, templateData, store.WebURL,
+							store.AllowInsecureWebURL,
+						)
+						if err == nil {
+							delivery, err = notifications.NewPendingDelivery(params)
+						}
+						result.DeliveriesCreated++
+					}
 				}
 			}
 		}
-		if err == nil && state == notifications.DeliveryStateSucceeded {
+		if err == nil && (state == notifications.DeliveryStateSucceeded ||
+			(work.Channel == notifications.ChannelTelegram && isNonterminalDelivery(state))) {
 			check, checkErr := store.openingDependencyCondition(opening)
 			if checkErr != nil {
 				return relay.WorkResult{}, checkErr

@@ -58,6 +58,10 @@ func (store Store) deliveryMutation(
 	availableAt time.Time,
 ) (*types.Update, error) {
 	snapshot := delivery.Snapshot()
+	relaySchemaVersion, err := notifications.RelaySchemaVersionForChannel(snapshot.Channel)
+	if err != nil {
+		return nil, err
+	}
 	key, err := notifications.DeliveryStorageKey(snapshot.OutboxID, snapshot.DeliveryID)
 	if err != nil {
 		return nil, err
@@ -67,11 +71,11 @@ func (store Store) deliveryMutation(
 		return nil, err
 	}
 	values := map[string]any{
-		":entity_type": "notification_delivery", ":relay_schema": notifications.RelaySchemaVersion,
+		":entity_type": "notification_delivery", ":relay_schema": relaySchemaVersion,
 		":tenant_id": snapshot.TenantID, ":outbox_id": snapshot.OutboxID,
 		":delivery_id": snapshot.DeliveryID, ":event_id": snapshot.EventID,
 		":rule_id": snapshot.RuleID, ":kind": string(snapshot.Kind), ":channel": string(snapshot.Channel),
-		":recipient_id": snapshot.RecipientID, ":email": snapshot.NormalizedEmail,
+		":recipient_id": snapshot.RecipientID,
 		":membership": map[string]any{
 			"role": snapshot.MembershipSnapshot.Role, "status": snapshot.MembershipSnapshot.Status,
 			"version": snapshot.MembershipSnapshot.Version,
@@ -87,9 +91,25 @@ func (store Store) deliveryMutation(
 		{"entity_type", ":entity_type"}, {"relay_schema_version", ":relay_schema"},
 		{"tenant_id", ":tenant_id"}, {"outbox_id", ":outbox_id"}, {"delivery_id", ":delivery_id"},
 		{"event_id", ":event_id"}, {"rule_id", ":rule_id"}, {"kind", ":kind"},
-		{"channel", ":channel"}, {"recipient_id", ":recipient_id"}, {"normalized_email", ":email"},
+		{"channel", ":channel"}, {"recipient_id", ":recipient_id"},
 		{"membership_snapshot", ":membership"}, {"state", ":state"},
 		{"delivery_revision", ":revision"}, {"created_at", ":created_at"}, {"updated_at", ":updated_at"},
+	}
+	destinationConditions := []string{}
+	if snapshot.Channel == notifications.ChannelEmail {
+		values[":email"] = snapshot.NormalizedEmail
+		fields = append(fields, struct{ name, value string }{"normalized_email", ":email"})
+		destinationConditions = append(destinationConditions, "#normalized_email = :email")
+	} else {
+		values[":destination_id"] = snapshot.DestinationID
+		values[":telegram_chat_id"] = snapshot.TelegramChatID
+		fields = append(fields,
+			struct{ name, value string }{"destination_id", ":destination_id"},
+			struct{ name, value string }{"telegram_chat_id", ":telegram_chat_id"},
+		)
+		destinationConditions = append(destinationConditions,
+			"#destination_id = :destination_id", "#telegram_chat_id = :telegram_chat_id",
+		)
 	}
 	dependencyConditions := []string{}
 	if snapshot.DependsOnOutboxID != "" || snapshot.DependsOnDeliveryID != "" {
@@ -107,11 +127,20 @@ func (store Store) deliveryMutation(
 	payloadCondition := "#cancellation_reason = :cancellation_reason"
 	if snapshot.State == notifications.DeliveryStatePending ||
 		snapshot.State == notifications.DeliveryStateWaitingDependency {
-		content := snapshot.Content
-		values[":content"] = map[string]any{
-			"template_id": string(content.TemplateID), "template_version": content.TemplateVersion,
-			"locale": string(content.Locale), "subject": content.Subject, "text": content.Text,
-			"html": content.HTML, "content_hash": content.ContentHash,
+		if snapshot.Channel == notifications.ChannelEmail {
+			content := snapshot.Content
+			values[":content"] = map[string]any{
+				"template_id": string(content.TemplateID), "template_version": content.TemplateVersion,
+				"locale": string(content.Locale), "subject": content.Subject, "text": content.Text,
+				"html": content.HTML, "content_hash": content.ContentHash,
+			}
+		} else {
+			content := snapshot.TelegramContent
+			values[":content"] = map[string]any{
+				"template_id": string(content.TemplateID), "template_version": content.TemplateVersion,
+				"locale": string(content.Locale), "body_text": content.BodyText,
+				"content_hash": content.ContentHash,
+			}
 		}
 		fields = append(fields, struct{ name, value string }{"content", ":content"})
 		if snapshot.State == notifications.DeliveryStatePending {
@@ -152,10 +181,11 @@ func (store Store) deliveryMutation(
 		"#entity_type = :entity_type", "#relay_schema_version = :relay_schema",
 		"#tenant_id = :tenant_id", "#outbox_id = :outbox_id", "#delivery_id = :delivery_id",
 		"#event_id = :event_id", "#rule_id = :rule_id", "#kind = :kind", "#channel = :channel",
-		"#recipient_id = :recipient_id", "#normalized_email = :email",
+		"#recipient_id = :recipient_id",
 		"#membership_snapshot = :membership", "#state = :state",
 		"#delivery_revision = :revision", "#created_at = :created_at", "#updated_at = :updated_at",
 	}
+	existingConditions = append(existingConditions, destinationConditions...)
 	if snapshot.State == notifications.DeliveryStatePending {
 		existingConditions = append(existingConditions, "#relay_work_kind = :relay_work_kind")
 	}
@@ -263,7 +293,11 @@ func fanoutToken(work relay.Work, deliveries []notifications.Delivery, nextCurso
 	}, "\x00")
 	for _, delivery := range deliveries {
 		snapshot := delivery.Snapshot()
-		canonical += "\x00" + snapshot.DeliveryID + "\x00" + string(snapshot.State) + "\x00" + snapshot.Content.ContentHash
+		contentHash := snapshot.Content.ContentHash
+		if snapshot.Channel == notifications.ChannelTelegram {
+			contentHash = snapshot.TelegramContent.ContentHash
+		}
+		canonical += "\x00" + snapshot.DeliveryID + "\x00" + string(snapshot.State) + "\x00" + contentHash
 	}
 	digest := sha256.Sum256([]byte(canonical))
 	return "nrel-" + hex.EncodeToString(digest[:])[:31]

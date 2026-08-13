@@ -26,6 +26,21 @@ func TestLoadRunConfigUsesBalancedLocalDefaults(t *testing.T) {
 	if config.ExpectedSampleInterval != 10*time.Second || config.MinimumCoverageRatio != 0.8 || config.MinimumPoints != 3 || config.AllowedLateness != 15*time.Second || config.MaximumSampleAge != 30*time.Second {
 		t.Fatalf("quality defaults = %#v", config)
 	}
+	if config.TelegramDeliveryEnabled {
+		t.Fatal("Telegram delivery writer must default off")
+	}
+}
+
+func TestLoadRunConfigParsesTelegramWriterFeatureFlag(t *testing.T) {
+	config, err := LoadRunConfig(nil, env(map[string]string{
+		"TELEGRAM_DELIVERY_ENABLED": "true",
+	}))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !config.TelegramDeliveryEnabled {
+		t.Fatal("Telegram delivery writer was not enabled")
+	}
 }
 
 func TestLoadRunConfigAppliesCLIOverEnvironment(t *testing.T) {
@@ -65,14 +80,19 @@ func TestStagingRequiresExplicitQualitySettings(t *testing.T) {
 	if _, err := LoadRunConfig(nil, env(map[string]string{"APP_ENV": "staging"})); err == nil {
 		t.Fatal("staging config succeeded without explicit quality settings")
 	}
-	config, err := LoadRunConfig(nil, env(map[string]string{
+	hosted := map[string]string{
 		"APP_ENV": "staging",
 		"ALERT_EVALUATOR_EXPECTED_SAMPLE_INTERVAL": "20s",
 		"ALERT_EVALUATOR_MIN_COVERAGE_RATIO":       "0.9",
 		"ALERT_EVALUATOR_MIN_POINTS":               "4",
 		"ALERT_EVALUATOR_ALLOWED_LATENESS":         "30s",
 		"ALERT_EVALUATOR_MAX_SAMPLE_AGE":           "1m",
-	}))
+	}
+	if _, err := LoadRunConfig(nil, env(hosted)); err == nil {
+		t.Fatal("staging config succeeded without explicit Telegram writer flag")
+	}
+	hosted["TELEGRAM_DELIVERY_ENABLED"] = "false"
+	config, err := LoadRunConfig(nil, env(hosted))
 	if err != nil {
 		t.Fatal(err)
 	}

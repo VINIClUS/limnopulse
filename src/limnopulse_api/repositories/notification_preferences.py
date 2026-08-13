@@ -5,6 +5,7 @@ from limnopulse_api.domain.notification_preferences import (
     EmailDeliverabilityRecord,
     NotificationPreference,
 )
+from limnopulse_api.domain.telegram import TelegramEligibilityFence
 
 
 class NotificationPreferenceRepository(Protocol):
@@ -28,5 +29,6 @@ class NotificationPreferenceRepository(Protocol):
         audit: AuditContext,
         *,
         previous: NotificationPreference | None,
+        telegram_fence: TelegramEligibilityFence | None = None,
     ) -> NotificationPreference:
         raise NotImplementedError

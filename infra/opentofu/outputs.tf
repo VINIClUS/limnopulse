@@ -43,6 +43,41 @@ output "notification_jobs_dlq_url" {
   value       = aws_sqs_queue.notification_jobs_dlq.id
 }
 
+output "telegram_notification_jobs_queue_url" {
+  description = "SQS_TELEGRAM_JOBS_URL"
+  value       = aws_sqs_queue.telegram_notification_jobs.id
+}
+
+output "telegram_notification_jobs_queue_arn" {
+  description = "Telegram notification jobs queue ARN."
+  value       = aws_sqs_queue.telegram_notification_jobs.arn
+}
+
+output "telegram_notification_jobs_dlq_url" {
+  description = "Telegram notification jobs dead-letter queue URL."
+  value       = aws_sqs_queue.telegram_notification_jobs_dlq.id
+}
+
+output "telegram_bot_token_secret_arn" {
+  description = "TELEGRAM_BOT_TOKEN_SECRET_ARN"
+  value       = aws_secretsmanager_secret.telegram_bot_token.arn
+}
+
+output "telegram_webhook_secret_arn" {
+  description = "TELEGRAM_WEBHOOK_SECRET_ARN"
+  value       = aws_secretsmanager_secret.telegram_webhook_secret.arn
+}
+
+output "telegram_worker_policy_arn" {
+  description = "IAM policy ARN to attach to the Telegram worker runtime role."
+  value       = aws_iam_policy.telegram_worker.arn
+}
+
+output "telegram_webhook_secret_reader_policy_arn" {
+  description = "IAM policy ARN to attach to the FastAPI runtime role."
+  value       = aws_iam_policy.telegram_webhook_secret_reader.arn
+}
+
 output "ses_events_queue_url" {
   description = "SQS_SES_EVENTS_URL"
   value       = aws_sqs_queue.ses_events.id

@@ -58,7 +58,27 @@ type preferenceSnapshot struct {
 	EmailEnabled    bool   `dynamodbav:"email_enabled"`
 	EmailAddress    string `dynamodbav:"email_address"`
 	EmailVerified   bool   `dynamodbav:"email_verified"`
+	TelegramEnabled bool   `dynamodbav:"telegram_enabled"`
 	MinimumSeverity string `dynamodbav:"minimum_severity"`
+}
+
+type telegramBindingSnapshot struct {
+	EntityType    string `dynamodbav:"entity_type"`
+	TenantID      string `dynamodbav:"tenant_id"`
+	RecipientID   string `dynamodbav:"recipient_id"`
+	DestinationID string `dynamodbav:"destination_id"`
+	Status        string `dynamodbav:"status"`
+	Version       int64  `dynamodbav:"version"`
+}
+
+type telegramDestinationSnapshot struct {
+	EntityType        string `dynamodbav:"entity_type"`
+	DestinationID     string `dynamodbav:"destination_id"`
+	RecipientID       string `dynamodbav:"recipient_id"`
+	ChatID            int64  `dynamodbav:"chat_id"`
+	Status            string `dynamodbav:"status"`
+	SuppressionReason string `dynamodbav:"suppression_reason"`
+	Version           int64  `dynamodbav:"version"`
 }
 
 type membershipPage struct {
@@ -160,14 +180,57 @@ func (store Store) loadPreference(
 		return nil, fmt.Errorf("decode notification preference: %w", err)
 	}
 	if preference.EntityType != "notification_preference" || preference.TenantID != tenantID ||
-		preference.RecipientID != recipientID || preference.EmailAddress == "" ||
-		!isASCII(preference.EmailAddress) {
+		preference.RecipientID != recipientID {
 		return nil, fmt.Errorf("notification preference is malformed")
+	}
+	if preference.EmailEnabled && (!preference.EmailVerified || preference.EmailAddress == "" ||
+		!isASCII(preference.EmailAddress)) {
+		return nil, fmt.Errorf("notification preference email snapshot is malformed")
 	}
 	if _, err := severityRank(preference.MinimumSeverity); err != nil {
 		return nil, fmt.Errorf("notification preference severity is invalid")
 	}
 	return &preference, nil
+}
+
+func (store Store) loadTelegramDestination(
+	ctx context.Context,
+	tenantID string,
+	recipientID string,
+) (*telegramDestinationSnapshot, error) {
+	bindingItem, err := store.getConsistent(
+		ctx, "TENANT#"+tenantID, "TELEGRAM_BINDING#USER#"+recipientID,
+	)
+	if err != nil || len(bindingItem) == 0 {
+		return nil, err
+	}
+	var binding telegramBindingSnapshot
+	if err := attributevalue.UnmarshalMap(bindingItem, &binding); err != nil {
+		return nil, fmt.Errorf("decode Telegram binding: %w", err)
+	}
+	if binding.EntityType != "telegram_binding" || binding.TenantID != tenantID ||
+		binding.RecipientID != recipientID || binding.DestinationID == "" ||
+		binding.Status != "verified" || binding.Version < 1 {
+		return nil, nil
+	}
+	destinationItem, err := store.getConsistent(
+		ctx, "TELEGRAM_DESTINATION#"+binding.DestinationID, "META",
+	)
+	if err != nil || len(destinationItem) == 0 {
+		return nil, err
+	}
+	var destination telegramDestinationSnapshot
+	if err := attributevalue.UnmarshalMap(destinationItem, &destination); err != nil {
+		return nil, fmt.Errorf("decode Telegram destination: %w", err)
+	}
+	if destination.EntityType != "telegram_destination" ||
+		destination.DestinationID != binding.DestinationID ||
+		destination.RecipientID != recipientID || destination.ChatID <= 0 ||
+		destination.Version < 1 ||
+		(destination.Status != "active" && destination.Status != "suppressed") {
+		return nil, fmt.Errorf("Telegram destination is malformed")
+	}
+	return &destination, nil
 }
 
 func (store Store) addressSuppressed(ctx context.Context, address string) (bool, error) {

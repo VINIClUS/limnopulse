@@ -3,6 +3,7 @@ from fastapi import APIRouter, HTTPException, Request
 from limnopulse_api.api.dependencies import (
     CognitoIdentityVerifierDep,
     NotificationPreferenceRepositoryDep,
+    TelegramBindingRepositoryDep,
     TenantAccessDep,
 )
 from limnopulse_api.api.v1.schemas.common import ErrorResponse
@@ -30,8 +31,13 @@ router = APIRouter(
 def _service(
     repository: NotificationPreferenceRepositoryDep,
     identity_verifier: CognitoIdentityVerifierDep | None = None,
+    telegram_repository: TelegramBindingRepositoryDep = None,
 ) -> NotificationPreferenceService:
-    return NotificationPreferenceService(repository, identity_verifier)
+    return NotificationPreferenceService(
+        repository,
+        identity_verifier,
+        telegram_repository=telegram_repository,
+    )
 
 
 def _response(view: NotificationPreferenceView) -> NotificationPreferenceResponse:
@@ -59,8 +65,9 @@ async def get_notification_preferences(
     tenant_id: str,
     access: TenantAccessDep,
     repository: NotificationPreferenceRepositoryDep,
+    telegram_repository: TelegramBindingRepositoryDep,
 ) -> NotificationPreferenceResponse:
-    view = await _service(repository).get(
+    view = await _service(repository, telegram_repository=telegram_repository).get(
         tenant_id,
         access.principal.cognito_sub,
     )
@@ -85,13 +92,19 @@ async def put_notification_preferences(
     access: TenantAccessDep,
     repository: NotificationPreferenceRepositoryDep,
     identity_verifier: CognitoIdentityVerifierDep,
+    telegram_repository: TelegramBindingRepositoryDep,
 ) -> NotificationPreferenceResponse:
     try:
-        view = await _service(repository, identity_verifier).put(
+        view = await _service(
+            repository,
+            identity_verifier,
+            telegram_repository,
+        ).put(
             tenant_id,
             access.principal,
             expected_version=payload.expected_version,
             email_enabled=payload.email_enabled,
+            telegram_enabled=payload.telegram_enabled,
             minimum_severity=payload.minimum_severity,
             audit=_audit_context(request, access),
         )
@@ -102,5 +115,10 @@ async def put_notification_preferences(
     except IdentityServiceUnavailableError as exc:
         raise HTTPException(status_code=503, detail="service unavailable") from exc
     except ConflictError as exc:
-        raise HTTPException(status_code=409, detail="version conflict") from exc
+        detail = (
+            "verified Telegram binding required"
+            if "Telegram binding" in str(exc)
+            else "version conflict"
+        )
+        raise HTTPException(status_code=409, detail=detail) from exc
     return _response(view)

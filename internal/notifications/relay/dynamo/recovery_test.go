@@ -97,6 +97,106 @@ func TestExpandDependencyChainsSucceededOpeningWithoutRecheckingPreference(t *te
 	}
 }
 
+func TestExpandTelegramDependencyUsesOpeningDestinationAndTelegramLocale(t *testing.T) {
+	relayTime := time.Date(2026, 8, 13, 13, 0, 0, 0, time.UTC)
+	work := recoveryWork(t, relayTime)
+	work.Channel = notifications.ChannelTelegram
+	work.RelaySchemaVersion = notifications.TelegramRelaySchemaVersion
+	destinationID := notificationsHashChatForTest("123")
+	client := &fakeClient{
+		queryOutputs: []*awssdk.QueryOutput{{Items: []map[string]types.AttributeValue{
+			telegramSucceededOpeningDelivery(t, relayTime, destinationID),
+		}}},
+		getOutputs: []*awssdk.GetItemOutput{
+			{Item: expandedOpeningOutbox(t)},
+			{Item: marshalMap(t, openingEvent(relayTime))},
+			{Item: activeMember(t, relayTime, "sub_1")},
+			{Item: marshalMap(t, map[string]any{
+				"entity_type": "telegram_binding", "tenant_id": "tnt_1", "recipient_id": "sub_1",
+				"destination_id": destinationID, "status": "verified", "version": int64(2),
+			})},
+			{Item: marshalMap(t, map[string]any{
+				"entity_type": "telegram_destination", "destination_id": destinationID,
+				"recipient_id": "sub_1", "chat_id": int64(123), "status": "active", "version": int64(3),
+			})},
+		},
+	}
+	result, err := (Store{
+		Table: "domain", Client: client, WebURL: "http://localhost:3000", AllowInsecureWebURL: true,
+	}).ExpandDependency(context.Background(), work, relay.ExpandRequest{RelayTime: relayTime, PageSize: 20})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if result.DeliveriesCreated != 1 || result.DeliveriesCancelled != 0 {
+		t.Fatalf("result = %#v", result)
+	}
+	var values map[string]any
+	if err := attributevalue.UnmarshalMap(
+		client.transactInputs[0].TransactItems[0].Update.ExpressionAttributeValues, &values,
+	); err != nil {
+		t.Fatal(err)
+	}
+	content, ok := values[":content"].(map[string]any)
+	if !ok || content["template_id"] != "telegram-alert-recovery/v1" ||
+		content["locale"] != "pt-BR" || values[":destination_id"] != destinationID ||
+		fmt.Sprint(values[":telegram_chat_id"]) != "123" {
+		t.Fatalf("Telegram recovery values = %#v", values)
+	}
+}
+
+func TestExpandTelegramDependencyFencesNonterminalOpeningBeforeCancellingRecovery(t *testing.T) {
+	relayTime := time.Date(2026, 8, 13, 13, 0, 0, 0, time.UTC)
+	work := recoveryWork(t, relayTime)
+	work.Channel = notifications.ChannelTelegram
+	work.RelaySchemaVersion = notifications.TelegramRelaySchemaVersion
+	destinationID := notificationsHashChatForTest("123")
+	var opening map[string]any
+	if err := attributevalue.UnmarshalMap(
+		telegramSucceededOpeningDelivery(t, relayTime, destinationID),
+		&opening,
+	); err != nil {
+		t.Fatal(err)
+	}
+	opening["state"] = string(notifications.DeliveryStateProcessing)
+	client := &fakeClient{
+		queryOutputs: []*awssdk.QueryOutput{{Items: []map[string]types.AttributeValue{
+			marshalMap(t, opening),
+		}}},
+		getOutputs: []*awssdk.GetItemOutput{
+			{Item: expandedOpeningOutbox(t)},
+			{Item: marshalMap(t, openingEvent(relayTime))},
+		},
+	}
+
+	result, err := (Store{Table: "domain", Client: client}).ExpandDependency(
+		context.Background(), work, relay.ExpandRequest{RelayTime: relayTime, PageSize: 20},
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if result.DeliveriesCreated != 0 || result.DeliveriesCancelled != 1 {
+		t.Fatalf("result = %#v", result)
+	}
+	var openingFence *types.ConditionCheck
+	for _, item := range client.transactInputs[0].TransactItems {
+		if item.ConditionCheck != nil {
+			openingFence = item.ConditionCheck
+			break
+		}
+	}
+	if openingFence == nil {
+		t.Fatalf("nonterminal Telegram recovery cancellation lacks opening fence: %#v", client.transactInputs[0])
+	}
+	var values map[string]any
+	if err := attributevalue.UnmarshalMap(openingFence.ExpressionAttributeValues, &values); err != nil {
+		t.Fatal(err)
+	}
+	if values[":state"] != string(notifications.DeliveryStateProcessing) ||
+		fmt.Sprint(values[":revision"]) != "1" {
+		t.Fatalf("nonterminal opening fence values = %#v", values)
+	}
+}
+
 func TestExpandDependencyCancelsInactiveMembershipWithoutRelayIndex(t *testing.T) {
 	relayTime := time.Date(2026, 7, 16, 13, 0, 0, 0, time.UTC)
 	inactive := activeMember(t, relayTime, "sub_1")
@@ -345,6 +445,41 @@ func succeededOpeningDelivery(t *testing.T, relayTime time.Time) map[string]type
 			"template_id": string(snapshot.TemplateID), "template_version": snapshot.TemplateVersion,
 			"locale": string(snapshot.Locale), "subject": snapshot.Subject, "text": snapshot.Text,
 			"html": snapshot.HTML, "content_hash": snapshot.ContentHash,
+		},
+	})
+}
+
+func telegramSucceededOpeningDelivery(
+	t *testing.T,
+	relayTime time.Time,
+	destinationID string,
+) map[string]types.AttributeValue {
+	t.Helper()
+	deliveryID, err := notifications.NewDeliveryID(
+		"event_1", notifications.NotificationKindOpening, notifications.ChannelTelegram, "sub_1",
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	content, err := notifications.NewTelegramRenderedContent(
+		notifications.TemplateTelegramAlertOpeningV1, notifications.LocalePTBR, "Alerta simples",
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	snapshot := content.Snapshot()
+	return marshalMap(t, map[string]any{
+		"PK": "NOTIFICATION_OUTBOX#opening_outbox", "SK": "DELIVERY#" + deliveryID,
+		"entity_type": "notification_delivery", "tenant_id": "tnt_1", "outbox_id": "opening_outbox",
+		"delivery_id": deliveryID, "event_id": "event_1", "rule_id": "rule_1",
+		"kind": "opening", "channel": "telegram", "recipient_id": "sub_1",
+		"destination_id": destinationID, "telegram_chat_id": int64(123), "state": "succeeded",
+		"delivery_revision":   int64(1),
+		"membership_snapshot": map[string]any{"role": "owner", "status": "active", "version": int64(7)},
+		"content": map[string]any{
+			"template_id": string(snapshot.TemplateID), "template_version": snapshot.TemplateVersion,
+			"locale": string(snapshot.Locale), "body_text": snapshot.BodyText,
+			"content_hash": snapshot.ContentHash,
 		},
 	})
 }

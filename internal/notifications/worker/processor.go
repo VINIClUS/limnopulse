@@ -170,10 +170,24 @@ func (processor Processor) Handle(ctx context.Context, message QueueMessage) Dec
 	}
 
 	limiterDone := processor.Metrics.BeginLimiterWait()
-	if err := processor.Limiter.Wait(limiterCtx); err != nil {
+	limiterErr := processor.waitForLimiter(limiterCtx, record.Delivery)
+	if limiterErr != nil {
 		limiterDone()
 		_ = stopLimiter()
-		return processor.deferClaim(ctx, record, processor.Now().UTC(), "limiter_cancelled", time.Minute)
+		category := "limiter_cancelled"
+		delay := time.Minute
+		var rateLimitErr *RateLimitError
+		if errors.As(limiterErr, &rateLimitErr) {
+			if rateLimitErr.Unavailable {
+				category = "limiter_unavailable"
+			} else {
+				category = "limiter_rate_limited"
+			}
+			if rateLimitErr.RetryAfter > 0 {
+				delay = rateLimitErr.RetryAfter
+			}
+		}
+		return processor.deferClaim(ctx, record, processor.Now().UTC(), category, delay)
 	}
 	limiterDone()
 	if limiterCtx.Err() != nil {
@@ -250,6 +264,43 @@ func (processor Processor) Handle(ctx context.Context, message QueueMessage) Dec
 	return processor.finishAttempt(ctx, record, attemptID, completedAt, result, sendErr)
 }
 
+func (processor Processor) waitForLimiter(
+	ctx context.Context,
+	delivery notifications.DeliverySnapshot,
+) error {
+	for {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+		var err error
+		if deliveryLimiter, ok := processor.Limiter.(DeliveryLimiter); ok {
+			err = deliveryLimiter.WaitFor(ctx, delivery)
+		} else {
+			err = processor.Limiter.Wait(ctx)
+		}
+		if err == nil {
+			return nil
+		}
+		var rateLimitErr *RateLimitError
+		if !errors.As(err, &rateLimitErr) {
+			return err
+		}
+		delay := rateLimitErr.RetryAfter
+		if delay <= 0 {
+			delay = time.Second
+		}
+		timer := time.NewTimer(delay)
+		select {
+		case <-ctx.Done():
+			if !timer.Stop() {
+				<-timer.C
+			}
+			return ctx.Err()
+		case <-timer.C:
+		}
+	}
+}
+
 func (processor Processor) completePreflightFailure(
 	ctx context.Context,
 	record DeliveryRecord,
@@ -297,6 +348,26 @@ func (processor Processor) completeInterrupted(
 	record DeliveryRecord,
 	now time.Time,
 ) Decision {
+	if record.Delivery.Channel == notifications.ChannelTelegram {
+		completion := AttemptCompletion{
+			AttemptID: record.StartedAttemptID, CompletedAt: now,
+			Outcome:            notifications.AttemptOutcomeAmbiguous,
+			ErrorCategory:      string(ErrorTelegramAmbiguous),
+			NextState:          notifications.DeliveryStateUnknown,
+			PossiblyAccepted:   true,
+			AmbiguousExhausted: true,
+		}
+		mutationCtx, cancel := mutationContext(ctx)
+		defer cancel()
+		if err := processor.Store.CompleteAttempt(mutationCtx, record, completion); err != nil {
+			if errors.Is(err, ErrConcurrentTerminal) {
+				return Decision{Action: ActionDelete}
+			}
+			return Decision{Action: ActionChangeVisibility, Visibility: time.Minute, ErrorCategory: "interrupted_attempt_recovery_failure"}
+		}
+		processor.Metrics.RecordUnknown()
+		return Decision{Action: ActionDelete, ErrorCategory: string(ErrorTelegramAmbiguous)}
+	}
 	delay := RetryDelay(record.AttemptCount, true, processor.JitterFraction())
 	completion := AttemptCompletion{
 		AttemptID: record.StartedAttemptID, CompletedAt: now,
@@ -331,6 +402,7 @@ func (processor Processor) finishAttempt(
 	metricSucceededAfterRetry := false
 	metricRetryCategory := SendErrorCategory("")
 	metricRetryAmbiguous := false
+	metricUnknown := false
 	if sendErr == nil {
 		if result.ProviderMessageID == "" {
 			sendErr = NewSendError(ErrorRetryableUnknown, errors.New("provider message ID is missing"))
@@ -360,6 +432,9 @@ func (processor Processor) finishAttempt(
 				completion.Outcome = notifications.AttemptOutcomeRetryable
 			}
 			plan, _ := processor.planDefinitiveFailure(record, providerErr.Category, now)
+			completion.SuppressTelegramDestination =
+				providerErr.Category == ErrorTelegramDestinationUnavailable &&
+					record.Delivery.Channel == notifications.ChannelTelegram
 			completion.NextState = plan.NextState
 			completion.NextAttemptAt = plan.NextAttemptAt
 			completion.PossiblyAccepted = plan.PossiblyAccepted
@@ -387,20 +462,30 @@ func (processor Processor) finishAttempt(
 				}
 			} else {
 				delay := RetryDelay(record.AttemptCount, false, processor.JitterFraction())
+				if providerErr.RetryAfter > delay {
+					delay = providerErr.RetryAfter
+				}
 				completion.NextState = notifications.DeliveryStateRetryableFailed
 				completion.NextAttemptAt = now.Add(delay)
 				decision = Decision{Action: ActionChangeVisibility, Visibility: normalizedVisibility(delay), ErrorCategory: string(providerErr.Category)}
 			}
 		case sendAmbiguous:
-			metricRetryCategory = providerErr.Category
-			metricRetryAmbiguous = true
-			delay := RetryDelay(record.AttemptCount, true, processor.JitterFraction())
 			completion.Outcome = notifications.AttemptOutcomeAmbiguous
-			completion.NextState = notifications.DeliveryStateRetryableFailed
-			completion.NextAttemptAt = now.Add(delay)
 			completion.PossiblyAccepted = true
-			completion.AmbiguousExhausted = record.AttemptCount >= MaxProviderCalls
-			decision = Decision{Action: ActionChangeVisibility, Visibility: normalizedVisibility(delay), ErrorCategory: string(providerErr.Category)}
+			if providerErr.NoAutomaticRetry {
+				completion.NextState = notifications.DeliveryStateUnknown
+				completion.AmbiguousExhausted = true
+				decision.Action = ActionDelete
+				metricUnknown = true
+			} else {
+				metricRetryCategory = providerErr.Category
+				metricRetryAmbiguous = true
+				delay := RetryDelay(record.AttemptCount, true, processor.JitterFraction())
+				completion.NextState = notifications.DeliveryStateRetryableFailed
+				completion.NextAttemptAt = now.Add(delay)
+				completion.AmbiguousExhausted = record.AttemptCount >= MaxProviderCalls
+				decision = Decision{Action: ActionChangeVisibility, Visibility: normalizedVisibility(delay), ErrorCategory: string(providerErr.Category)}
+			}
 		}
 	}
 	mutationCtx, cancel := mutationContext(ctx)
@@ -425,6 +510,9 @@ func (processor Processor) finishAttempt(
 	}
 	if metricRetryCategory != "" {
 		processor.Metrics.RecordRetry(metricRetryCategory, metricRetryAmbiguous)
+	}
+	if metricUnknown {
+		processor.Metrics.RecordUnknown()
 	}
 	return decision
 }

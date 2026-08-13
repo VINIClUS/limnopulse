@@ -8,10 +8,12 @@ import (
 type CancellationReason string
 
 const (
-	CancellationReasonCancelled                   CancellationReason = "cancelled"
-	CancellationReasonEmailSuppressed             CancellationReason = "email_suppressed"
-	CancellationReasonRecipientMembershipInactive CancellationReason = "recipient_membership_inactive"
-	CancellationReasonOpeningNotSucceeded         CancellationReason = "opening_delivery_not_succeeded"
+	CancellationReasonCancelled                     CancellationReason = "cancelled"
+	CancellationReasonEmailSuppressed               CancellationReason = "email_suppressed"
+	CancellationReasonRecipientMembershipInactive   CancellationReason = "recipient_membership_inactive"
+	CancellationReasonOpeningNotSucceeded           CancellationReason = "opening_delivery_not_succeeded"
+	CancellationReasonTelegramDestinationSuppressed CancellationReason = "telegram_destination_suppressed"
+	CancellationReasonOpeningUnconfirmed            CancellationReason = "opening_delivery_unconfirmed"
 )
 
 func (reason CancellationReason) Validate() error {
@@ -19,7 +21,9 @@ func (reason CancellationReason) Validate() error {
 	case CancellationReasonCancelled,
 		CancellationReasonEmailSuppressed,
 		CancellationReasonRecipientMembershipInactive,
-		CancellationReasonOpeningNotSucceeded:
+		CancellationReasonOpeningNotSucceeded,
+		CancellationReasonTelegramDestinationSuppressed,
+		CancellationReasonOpeningUnconfirmed:
 		return nil
 	default:
 		return fmt.Errorf("unknown delivery cancellation reason %q", reason)
@@ -94,8 +98,11 @@ type DeliveryParams struct {
 	DependsOnDeliveryID string
 	RecipientID         string
 	NormalizedEmail     string
+	DestinationID       string
+	TelegramChatID      int64
 	MembershipSnapshot  MembershipSnapshot
 	Content             RenderedContent
+	TelegramContent     TelegramRenderedContent
 	CancellationReason  CancellationReason
 	CreatedAt           time.Time
 	UpdatedAt           time.Time
@@ -113,8 +120,11 @@ type Delivery struct {
 	DependsOnDeliveryID string
 	RecipientID         string
 	NormalizedEmail     string
+	DestinationID       string
+	TelegramChatID      int64
 	MembershipSnapshot  MembershipSnapshot
 	Content             RenderedContent
+	TelegramContent     TelegramRenderedContent
 	cancellationReason  CancellationReason
 	CreatedAt           time.Time
 	UpdatedAt           time.Time
@@ -122,23 +132,26 @@ type Delivery struct {
 }
 
 type DeliverySnapshot struct {
-	TenantID            string                  `json:"tenant_id"`
-	OutboxID            string                  `json:"outbox_id"`
-	DeliveryID          string                  `json:"delivery_id"`
-	EventID             string                  `json:"event_id"`
-	RuleID              string                  `json:"rule_id"`
-	Kind                NotificationKind        `json:"kind"`
-	Channel             Channel                 `json:"channel"`
-	DependsOnOutboxID   string                  `json:"depends_on_outbox_id,omitempty"`
-	DependsOnDeliveryID string                  `json:"depends_on_delivery_id,omitempty"`
-	RecipientID         string                  `json:"recipient_id"`
-	NormalizedEmail     string                  `json:"normalized_email"`
-	MembershipSnapshot  MembershipSnapshot      `json:"membership_snapshot"`
-	State               DeliveryState           `json:"state"`
-	Content             RenderedContentSnapshot `json:"content"`
-	CancellationReason  CancellationReason      `json:"cancellation_reason,omitempty"`
-	CreatedAt           time.Time               `json:"created_at"`
-	UpdatedAt           time.Time               `json:"updated_at"`
+	TenantID            string                          `json:"tenant_id"`
+	OutboxID            string                          `json:"outbox_id"`
+	DeliveryID          string                          `json:"delivery_id"`
+	EventID             string                          `json:"event_id"`
+	RuleID              string                          `json:"rule_id"`
+	Kind                NotificationKind                `json:"kind"`
+	Channel             Channel                         `json:"channel"`
+	DependsOnOutboxID   string                          `json:"depends_on_outbox_id,omitempty"`
+	DependsOnDeliveryID string                          `json:"depends_on_delivery_id,omitempty"`
+	RecipientID         string                          `json:"recipient_id"`
+	NormalizedEmail     string                          `json:"normalized_email"`
+	DestinationID       string                          `json:"destination_id,omitempty"`
+	TelegramChatID      int64                           `json:"telegram_chat_id,omitempty"`
+	MembershipSnapshot  MembershipSnapshot              `json:"membership_snapshot"`
+	State               DeliveryState                   `json:"state"`
+	Content             RenderedContentSnapshot         `json:"content"`
+	TelegramContent     TelegramRenderedContentSnapshot `json:"telegram_content,omitzero"`
+	CancellationReason  CancellationReason              `json:"cancellation_reason,omitempty"`
+	CreatedAt           time.Time                       `json:"created_at"`
+	UpdatedAt           time.Time                       `json:"updated_at"`
 }
 
 func NewPendingDelivery(params DeliveryParams) (Delivery, error) {
@@ -172,8 +185,11 @@ func newDelivery(params DeliveryParams, state DeliveryState) (Delivery, error) {
 		DependsOnDeliveryID: params.DependsOnDeliveryID,
 		RecipientID:         params.RecipientID,
 		NormalizedEmail:     params.NormalizedEmail,
+		DestinationID:       params.DestinationID,
+		TelegramChatID:      params.TelegramChatID,
 		MembershipSnapshot:  params.MembershipSnapshot,
 		Content:             params.Content,
+		TelegramContent:     params.TelegramContent,
 		cancellationReason:  params.CancellationReason,
 		CreatedAt:           params.CreatedAt,
 		UpdatedAt:           params.UpdatedAt,
@@ -206,9 +222,12 @@ func (delivery Delivery) Snapshot() DeliverySnapshot {
 		DependsOnDeliveryID: delivery.DependsOnDeliveryID,
 		RecipientID:         delivery.RecipientID,
 		NormalizedEmail:     delivery.NormalizedEmail,
+		DestinationID:       delivery.DestinationID,
+		TelegramChatID:      delivery.TelegramChatID,
 		MembershipSnapshot:  delivery.MembershipSnapshot,
 		State:               delivery.state,
 		Content:             delivery.Content.Snapshot(),
+		TelegramContent:     delivery.TelegramContent.Snapshot(),
 		CancellationReason:  delivery.cancellationReason,
 		CreatedAt:           delivery.CreatedAt,
 		UpdatedAt:           delivery.UpdatedAt,
@@ -220,6 +239,14 @@ func RestoreDelivery(snapshot DeliverySnapshot) (Delivery, error) {
 	if snapshot.Content != (RenderedContentSnapshot{}) {
 		var err error
 		content, err = RestoreRenderedContent(snapshot.Content)
+		if err != nil {
+			return Delivery{}, err
+		}
+	}
+	var telegramContent TelegramRenderedContent
+	if snapshot.TelegramContent != (TelegramRenderedContentSnapshot{}) {
+		var err error
+		telegramContent, err = RestoreTelegramRenderedContent(snapshot.TelegramContent)
 		if err != nil {
 			return Delivery{}, err
 		}
@@ -236,8 +263,11 @@ func RestoreDelivery(snapshot DeliverySnapshot) (Delivery, error) {
 		DependsOnDeliveryID: snapshot.DependsOnDeliveryID,
 		RecipientID:         snapshot.RecipientID,
 		NormalizedEmail:     snapshot.NormalizedEmail,
+		DestinationID:       snapshot.DestinationID,
+		TelegramChatID:      snapshot.TelegramChatID,
 		MembershipSnapshot:  snapshot.MembershipSnapshot,
 		Content:             content,
+		TelegramContent:     telegramContent,
 		cancellationReason:  snapshot.CancellationReason,
 		CreatedAt:           snapshot.CreatedAt,
 		UpdatedAt:           snapshot.UpdatedAt,
@@ -345,13 +375,12 @@ func ReconcileDeliveryStateFromProvider(
 
 func (delivery Delivery) Validate() error {
 	for name, value := range map[string]string{
-		"tenant ID":        delivery.TenantID,
-		"outbox ID":        delivery.OutboxID,
-		"delivery ID":      delivery.DeliveryID,
-		"event ID":         delivery.EventID,
-		"rule ID":          delivery.RuleID,
-		"recipient ID":     delivery.RecipientID,
-		"normalized email": delivery.NormalizedEmail,
+		"tenant ID":    delivery.TenantID,
+		"outbox ID":    delivery.OutboxID,
+		"delivery ID":  delivery.DeliveryID,
+		"event ID":     delivery.EventID,
+		"rule ID":      delivery.RuleID,
+		"recipient ID": delivery.RecipientID,
 	} {
 		if err := validateIdentityField(name, value); err != nil {
 			return err
@@ -362,6 +391,26 @@ func (delivery Delivery) Validate() error {
 	}
 	if err := delivery.Channel.Validate(); err != nil {
 		return err
+	}
+	switch delivery.Channel {
+	case ChannelEmail:
+		if err := validateIdentityField("normalized email", delivery.NormalizedEmail); err != nil {
+			return err
+		}
+		if delivery.DestinationID != "" || delivery.TelegramChatID != 0 ||
+			delivery.TelegramContent != (TelegramRenderedContent{}) {
+			return fmt.Errorf("email delivery must not contain Telegram destination or content")
+		}
+	case ChannelTelegram:
+		if err := validateIdentityField("Telegram destination ID", delivery.DestinationID); err != nil {
+			return err
+		}
+		if delivery.TelegramChatID <= 0 {
+			return fmt.Errorf("Telegram delivery requires a positive private chat ID")
+		}
+		if delivery.NormalizedEmail != "" || delivery.Content != (RenderedContent{}) {
+			return fmt.Errorf("Telegram delivery must not contain email destination or content")
+		}
 	}
 	if err := delivery.state.Validate(); err != nil {
 		return err
@@ -401,26 +450,44 @@ func (delivery Delivery) Validate() error {
 				return err
 			}
 		}
+		if delivery.TelegramContent != (TelegramRenderedContent{}) {
+			if err := delivery.TelegramContent.Validate(); err != nil {
+				return err
+			}
+		}
 	} else {
 		if delivery.cancellationReason != "" {
 			return fmt.Errorf("non-cancelled delivery must not have a cancellation reason")
 		}
-		if err := delivery.Content.Validate(); err != nil {
+		if delivery.Channel == ChannelEmail {
+			if err := delivery.Content.Validate(); err != nil {
+				return err
+			}
+		} else if err := delivery.TelegramContent.Validate(); err != nil {
 			return err
 		}
 	}
-	if delivery.Content == (RenderedContent{}) {
+	if delivery.Content == (RenderedContent{}) && delivery.TelegramContent == (TelegramRenderedContent{}) {
 		if delivery.state != DeliveryStateCancelled {
 			return fmt.Errorf("non-cancelled delivery must have rendered content")
 		}
 		return nil
 	}
 	wantTemplateID := TemplateAlertOpeningV1
-	if delivery.Kind == NotificationKindRecovery {
-		wantTemplateID = TemplateAlertRecoveryV1
+	gotTemplateID := delivery.Content.TemplateID()
+	if delivery.Channel == ChannelTelegram {
+		wantTemplateID = TemplateTelegramAlertOpeningV1
+		gotTemplateID = delivery.TelegramContent.TemplateID()
 	}
-	if delivery.Content.TemplateID() != wantTemplateID {
-		return fmt.Errorf("template ID %q does not match notification kind %q", delivery.Content.TemplateID(), delivery.Kind)
+	if delivery.Kind == NotificationKindRecovery {
+		if delivery.Channel == ChannelTelegram {
+			wantTemplateID = TemplateTelegramAlertRecoveryV1
+		} else {
+			wantTemplateID = TemplateAlertRecoveryV1
+		}
+	}
+	if gotTemplateID != wantTemplateID {
+		return fmt.Errorf("template ID %q does not match notification kind %q", gotTemplateID, delivery.Kind)
 	}
 	return nil
 }

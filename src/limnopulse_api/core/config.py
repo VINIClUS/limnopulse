@@ -4,7 +4,6 @@ from typing import Literal
 from pydantic import Field, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
-
 AppEnv = Literal["local", "test", "staging", "prod"]
 AuthMode = Literal["dev", "cognito"]
 
@@ -32,11 +31,32 @@ class Settings(BaseSettings):
     membership_cache_ttl_seconds: int = Field(default=120, ge=60, le=300)
     device_cache_ttl_seconds: int = Field(default=1_800, ge=900, le=3_600)
     tenant_settings_cache_ttl_seconds: int = Field(default=1_800, ge=900, le=3_600)
+    telegram_bot_username: str = Field(
+        default="limnopulse_local_bot",
+        pattern=r"^[A-Za-z0-9_]{5,32}$",
+    )
+    telegram_webhook_secret: str | None = Field(
+        default=None,
+        min_length=1,
+        max_length=256,
+        pattern=r"^[A-Za-z0-9_-]+$",
+    )
+    telegram_webhook_secret_arn: str | None = None
+    telegram_webhook_secret_cache_ttl_seconds: int = Field(default=60, ge=5, le=300)
 
     @model_validator(mode="after")
     def validate_auth_mode_for_environment(self) -> "Settings":
         if self.auth_mode == "dev" and self.app_env not in {"local", "test"}:
             raise ValueError("AUTH_MODE=dev is only allowed when APP_ENV is local or test")
+        if self.app_env in {"staging", "prod"}:
+            if self.telegram_webhook_secret is not None:
+                raise ValueError(
+                    "TELEGRAM_WEBHOOK_SECRET is only allowed when APP_ENV is local or test"
+                )
+            if not self.telegram_webhook_secret_arn:
+                raise ValueError("TELEGRAM_WEBHOOK_SECRET_ARN is required")
+            if self.telegram_bot_username == "limnopulse_local_bot":
+                raise ValueError("TELEGRAM_BOT_USERNAME must be configured")
         return self
 
 

@@ -16,6 +16,7 @@ from limnopulse_api.domain.notification_preferences import (
     EmailDeliverabilityRecord,
     NotificationPreference,
 )
+from limnopulse_api.domain.telegram import TelegramEligibilityFence
 
 AUDIT_RETENTION = timedelta(days=90)
 
@@ -89,8 +90,11 @@ class DynamoNotificationPreferenceRepository:
         audit: AuditContext,
         *,
         previous: NotificationPreference | None,
+        telegram_fence: TelegramEligibilityFence | None = None,
     ) -> NotificationPreference:
         self._validate_change(preference, expected_version, previous)
+        if preference.telegram_enabled and telegram_fence is None:
+            raise ValueError("enabled Telegram preference requires an eligibility fence")
         now = self.clock()
         legacy_suppression_migration = await self._legacy_suppression_migration(
             preference,
@@ -135,6 +139,10 @@ class DynamoNotificationPreferenceRepository:
         ]
         if legacy_suppression_migration is not None:
             transaction_items.append(legacy_suppression_migration)
+        if telegram_fence is not None:
+            transaction_items.extend(
+                self._telegram_eligibility_conditions(preference, telegram_fence)
+            )
         try:
             await to_thread(
                 self.client.transact_write_items,
@@ -145,12 +153,93 @@ class DynamoNotificationPreferenceRepository:
             raise
         return preference
 
+    def _telegram_eligibility_conditions(
+        self,
+        preference: NotificationPreference,
+        fence: TelegramEligibilityFence,
+    ) -> list[dict[str, Any]]:
+        if fence.tenant_id != preference.tenant_id or fence.recipient_id != preference.cognito_sub:
+            raise ValueError("Telegram eligibility fence identity does not match preference")
+        binding_values = {
+            ":entity": "telegram_binding",
+            ":tenant_id": fence.tenant_id,
+            ":recipient_id": fence.recipient_id,
+            ":destination_id": fence.destination_id,
+            ":verified": "verified",
+            ":binding_version": fence.binding_version,
+        }
+        destination_values = {
+            ":entity": "telegram_destination",
+            ":recipient_id": fence.recipient_id,
+            ":destination_id": fence.destination_id,
+            ":chat_id": fence.chat_id,
+            ":active": "active",
+            ":destination_version": fence.destination_version,
+        }
+        return [
+            {
+                "ConditionCheck": {
+                    "TableName": self.domain_table_name,
+                    "Key": self._serialize_item(
+                        {
+                            "PK": f"TENANT#{fence.tenant_id}",
+                            "SK": f"TELEGRAM_BINDING#USER#{fence.recipient_id}",
+                        }
+                    ),
+                    "ConditionExpression": (
+                        "#entity = :entity AND #tenant_id = :tenant_id AND "
+                        "#recipient_id = :recipient_id AND #destination_id = :destination_id "
+                        "AND #status = :verified AND #version = :binding_version"
+                    ),
+                    "ExpressionAttributeNames": {
+                        "#entity": "entity_type",
+                        "#tenant_id": "tenant_id",
+                        "#recipient_id": "recipient_id",
+                        "#destination_id": "destination_id",
+                        "#status": "status",
+                        "#version": "version",
+                    },
+                    "ExpressionAttributeValues": self._serialize_values(binding_values),
+                }
+            },
+            {
+                "ConditionCheck": {
+                    "TableName": self.domain_table_name,
+                    "Key": self._serialize_item(
+                        {
+                            "PK": f"TELEGRAM_DESTINATION#{fence.destination_id}",
+                            "SK": "META",
+                        }
+                    ),
+                    "ConditionExpression": (
+                        "#entity = :entity AND #recipient_id = :recipient_id AND "
+                        "#destination_id = :destination_id AND #chat_id = :chat_id "
+                        "AND #status = :active AND #version = :destination_version"
+                    ),
+                    "ExpressionAttributeNames": {
+                        "#entity": "entity_type",
+                        "#recipient_id": "recipient_id",
+                        "#destination_id": "destination_id",
+                        "#chat_id": "chat_id",
+                        "#status": "status",
+                        "#version": "version",
+                    },
+                    "ExpressionAttributeValues": self._serialize_values(destination_values),
+                }
+            },
+        ]
+
     async def _legacy_suppression_migration(
         self,
         preference: NotificationPreference,
         previous: NotificationPreference | None,
     ) -> dict[str, Any] | None:
-        if previous is None or previous.email_address == preference.email_address:
+        if (
+            previous is None
+            or previous.email_address is None
+            or preference.email_address is None
+            or previous.email_address == preference.email_address
+        ):
             return None
         canonical_key = self._deliverability_key(previous.email_address)
         legacy_key = self._legacy_deliverability_key(previous.email_address)
@@ -229,8 +318,8 @@ class DynamoNotificationPreferenceRepository:
         return {
             **self._preference_key(preference.tenant_id, preference.cognito_sub),
             "entity_type": "notification_preference",
-            **preference.model_dump(mode="json"),
-            "schema_version": 1,
+            **preference.model_dump(mode="json", exclude_none=True),
+            "schema_version": 2,
         }
 
     def _audit_item(
@@ -258,8 +347,13 @@ class DynamoNotificationPreferenceRepository:
             "details": {
                 "email_enabled": preference.email_enabled,
                 "email_verified": preference.email_verified,
+                "telegram_enabled": preference.telegram_enabled,
                 "minimum_severity": preference.minimum_severity.value,
-                "email_hash": self._email_hash(preference.email_address),
+                "email_hash": (
+                    self._email_hash(preference.email_address)
+                    if preference.email_address is not None
+                    else None
+                ),
             },
             "ip": context.ip,
             "user_agent": context.user_agent,

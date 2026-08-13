@@ -25,6 +25,8 @@ type openingDelivery struct {
 	Channel         string `dynamodbav:"channel"`
 	RecipientID     string `dynamodbav:"recipient_id"`
 	NormalizedEmail string `dynamodbav:"normalized_email"`
+	DestinationID   string `dynamodbav:"destination_id"`
+	TelegramChatID  int64  `dynamodbav:"telegram_chat_id"`
 	State           string `dynamodbav:"state"`
 	Revision        int64  `dynamodbav:"delivery_revision"`
 	AvailableAt     string `dynamodbav:"available_at"`
@@ -65,6 +67,7 @@ func (store Store) requireExpandedOpening(
 		OutboxID        string `dynamodbav:"outbox_id"`
 		EventID         string `dynamodbav:"event_id"`
 		Kind            string `dynamodbav:"kind"`
+		Channel         string `dynamodbav:"channel"`
 		ExpansionStatus string `dynamodbav:"expansion_status"`
 		AvailableAt     string `dynamodbav:"available_at"`
 	}
@@ -73,7 +76,8 @@ func (store Store) requireExpandedOpening(
 	}
 	if opening.EntityType != "notification_outbox" || opening.TenantID != work.TenantID ||
 		opening.OutboxID != work.DependsOnOutboxID || opening.EventID != work.EventID ||
-		opening.Kind != "opening" {
+		opening.Kind != "opening" ||
+		(opening.Channel != "" && opening.Channel != string(work.Channel)) {
 		return fmt.Errorf("opening notification outbox identity is invalid")
 	}
 	if opening.ExpansionStatus == "expanded" {
@@ -135,11 +139,16 @@ func (store Store) queryOpeningDeliveries(
 		state := notifications.DeliveryState(delivery.State)
 		if delivery.EntityType != "notification_delivery" || delivery.TenantID != work.TenantID ||
 			delivery.OutboxID != work.DependsOnOutboxID || delivery.EventID != work.EventID ||
-			delivery.RuleID != work.RuleID || delivery.Kind != "opening" || delivery.Channel != "email" ||
+			delivery.RuleID != work.RuleID || delivery.Kind != "opening" || delivery.Channel != string(work.Channel) ||
 			delivery.PK != "NOTIFICATION_OUTBOX#"+work.DependsOnOutboxID ||
 			delivery.SK != "DELIVERY#"+delivery.DeliveryID || delivery.RecipientID == "" ||
-			delivery.NormalizedEmail == "" || state.Validate() != nil || delivery.Revision < 1 {
+			state.Validate() != nil || delivery.Revision < 1 {
 			return openingDeliveryPage{}, fmt.Errorf("opening delivery is malformed")
+		}
+		if (work.Channel == notifications.ChannelEmail && delivery.NormalizedEmail == "") ||
+			(work.Channel == notifications.ChannelTelegram &&
+				(delivery.DestinationID == "" || delivery.TelegramChatID <= 0)) {
+			return openingDeliveryPage{}, fmt.Errorf("opening delivery destination is malformed")
 		}
 		page.Deliveries = append(page.Deliveries, delivery)
 	}

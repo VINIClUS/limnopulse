@@ -14,9 +14,11 @@ from limnopulse_api.repositories.domain import DomainRepository
 from limnopulse_api.repositories.notification_preferences import (
     NotificationPreferenceRepository,
 )
+from limnopulse_api.repositories.telegram_bindings import TelegramBindingRepository
 from limnopulse_api.repositories.telemetry import TelemetryRepository
 from limnopulse_api.services.cognito_identity import CognitoIdentityVerifier
 from limnopulse_api.services.memberships import MembershipService
+from limnopulse_api.services.telegram_bindings import TelegramBindingService
 
 
 async def get_current_principal(request: Request) -> Principal:
@@ -72,6 +74,14 @@ def get_cognito_identity_verifier(request: Request) -> CognitoIdentityVerifier |
     return getattr(request.app.state, "cognito_identity_verifier", None)
 
 
+def get_telegram_binding_repository(request: Request) -> TelegramBindingRepository | None:
+    return getattr(request.app.state, "telegram_binding_repository", None)
+
+
+def get_telegram_binding_service(request: Request) -> TelegramBindingService:
+    return _get_state_dependency(request, "telegram_binding_service")
+
+
 DomainRepositoryDep = Annotated[DomainRepository, Depends(get_domain_repository)]
 AlertRuleRepositoryDep = Annotated[AlertRuleRepository, Depends(get_alert_rule_repository)]
 AlertEventRepositoryDep = Annotated[AlertEventRepository, Depends(get_alert_event_repository)]
@@ -83,6 +93,14 @@ NotificationPreferenceRepositoryDep = Annotated[
 CognitoIdentityVerifierDep = Annotated[
     CognitoIdentityVerifier | None,
     Depends(get_cognito_identity_verifier),
+]
+TelegramBindingRepositoryDep = Annotated[
+    TelegramBindingRepository | None,
+    Depends(get_telegram_binding_repository),
+]
+TelegramBindingServiceDep = Annotated[
+    TelegramBindingService,
+    Depends(get_telegram_binding_service),
 ]
 MembershipServiceDep = Annotated[MembershipService, Depends(get_membership_service)]
 

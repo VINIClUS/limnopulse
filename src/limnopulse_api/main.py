@@ -16,12 +16,18 @@ from limnopulse_api.adapters.notification_preferences import (
     DynamoNotificationPreferenceRepository,
 )
 from limnopulse_api.adapters.redis import RedisCacheRepository
+from limnopulse_api.adapters.telegram_bindings import DynamoTelegramBindingRepository
 from limnopulse_api.api.router import api_router
 from limnopulse_api.auth.providers import build_auth_provider
 from limnopulse_api.core.config import Settings, get_settings
 from limnopulse_api.core.errors import TelemetryQueryError
 from limnopulse_api.services.cognito_identity import CognitoIdentityVerifier, DevIdentityVerifier
 from limnopulse_api.services.memberships import MembershipService
+from limnopulse_api.services.telegram_bindings import TelegramBindingService
+from limnopulse_api.services.telegram_webhook_secret import (
+    SecretsManagerTelegramWebhookSecretVerifier,
+    StaticTelegramWebhookSecretVerifier,
+)
 
 
 def _dynamodb_client_kwargs(settings: Settings) -> dict[str, str]:
@@ -58,6 +64,9 @@ def create_app(settings: Settings | None = None) -> FastAPI:
                 "alert_rule_repository",
                 "alert_event_repository",
                 "notification_preference_repository",
+                "telegram_binding_repository",
+                "telegram_binding_service",
+                "telegram_webhook_secret_verifier",
                 "cognito_identity_verifier",
                 "cognito_client",
                 "membership_service",
@@ -97,6 +106,10 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             audit_table_name=resolved_settings.dynamodb_audit_table,
             client=dynamodb_client,
         )
+        app.state.telegram_binding_repository = DynamoTelegramBindingRepository(
+            table_name=resolved_settings.dynamodb_domain_table,
+            client=dynamodb_client,
+        )
         if resolved_settings.auth_mode == "dev":
             app.state.cognito_identity_verifier = DevIdentityVerifier()
         else:
@@ -111,6 +124,27 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             cache=app.state.cache_repository,
             membership_ttl_seconds=resolved_settings.membership_cache_ttl_seconds,
         )
+        app.state.telegram_binding_service = TelegramBindingService(
+            app.state.telegram_binding_repository,
+            app.state.membership_service,
+            bot_username=resolved_settings.telegram_bot_username,
+        )
+        if resolved_settings.app_env in {"local", "test"}:
+            app.state.telegram_webhook_secret_verifier = StaticTelegramWebhookSecretVerifier(
+                resolved_settings.telegram_webhook_secret or "local-telegram-webhook-secret"
+            )
+        else:
+            secrets_client = boto3.client(
+                "secretsmanager",
+                region_name=resolved_settings.aws_region,
+            )
+            app.state.telegram_webhook_secret_verifier = (
+                SecretsManagerTelegramWebhookSecretVerifier(
+                    secrets_client,
+                    resolved_settings.telegram_webhook_secret_arn or "",
+                    cache_ttl_seconds=(resolved_settings.telegram_webhook_secret_cache_ttl_seconds),
+                )
+            )
         app.state.auth_provider = build_auth_provider(
             resolved_settings,
             cache=app.state.cache_repository,

@@ -30,8 +30,9 @@ type Client interface {
 }
 
 type Store struct {
-	Table  string
-	Client Client
+	Table                   string
+	Client                  Client
+	TelegramDeliveryEnabled bool
 }
 
 func (store Store) QueryDue(ctx context.Context, request alertevaluator.DueRequest) (alertevaluator.DuePage, error) {
@@ -334,7 +335,8 @@ func (store Store) outboxPut(request alertevaluator.CommitRequest, outbox alerte
 	if request.Evaluation.Quality == alertevaluator.QualitySufficient {
 		values["evaluation_value"] = request.Evaluation.Value
 	}
-	if outbox.Channel == alertevaluator.ChannelEmail {
+	if outbox.Channel == alertevaluator.ChannelEmail ||
+		(outbox.Channel == alertevaluator.ChannelTelegram && store.TelegramDeliveryEnabled) {
 		workKind, err := notifications.ClassifyOutboxRelayWork(
 			notifications.NotificationKind(outbox.Kind),
 			notifications.OutboxStatus(outbox.Status),
@@ -351,12 +353,18 @@ func (store Store) outboxPut(request alertevaluator.CommitRequest, outbox alerte
 		if err != nil {
 			return nil, fmt.Errorf("build notification relay index key: %w", err)
 		}
-		values["relay_schema_version"] = notifications.RelaySchemaVersion
+		relaySchemaVersion := notifications.RelaySchemaVersion
+		if outbox.Channel == alertevaluator.ChannelTelegram {
+			relaySchemaVersion = notifications.TelegramRelaySchemaVersion
+		}
+		values["relay_schema_version"] = relaySchemaVersion
 		values["expansion_status"] = "pending"
 		values["available_at"] = createdAt
 		values["relay_work_kind"] = string(workKind)
 		values["relay_gsi_pk"] = relayKey.PartitionKey
 		values["relay_gsi_sk"] = relayKey.SortKey
+	} else if outbox.Channel == alertevaluator.ChannelTelegram {
+		values["expansion_status"] = "deferred_unsupported_channel"
 	}
 	item, err := attributevalue.MarshalMap(values)
 	if err != nil {

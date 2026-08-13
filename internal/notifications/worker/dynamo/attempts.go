@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"strings"
+	"time"
 
 	"github.com/VINIClUS/limnopulse/internal/notifications"
 	"github.com/VINIClUS/limnopulse/internal/notifications/worker"
@@ -33,12 +34,16 @@ func (store Store) BeginAttempt(
 		return worker.DeliveryRecord{}, err
 	}
 	encodedDeliveryKey, _ := attributevalue.MarshalMap(map[string]string{"PK": deliveryKey.PartitionKey, "SK": deliveryKey.SortKey})
+	contentHash := record.Delivery.Content.ContentHash
+	if record.Delivery.Channel == notifications.ChannelTelegram {
+		contentHash = record.Delivery.TelegramContent.ContentHash
+	}
 	encodedAttempt, err := attributevalue.MarshalMap(map[string]any{
 		"PK": attemptKey.PartitionKey, "SK": attemptKey.SortKey, "entity_type": "notification_attempt",
 		"delivery_id": record.Delivery.DeliveryID, "attempt_id": request.AttemptID,
 		"tenant_id": record.Delivery.TenantID, "outbox_id": record.Delivery.OutboxID,
 		"event_id": record.Delivery.EventID, "notification_kind": string(record.Delivery.Kind),
-		"channel": string(record.Delivery.Channel), "content_hash": record.Delivery.Content.ContentHash,
+		"channel": string(record.Delivery.Channel), "content_hash": contentHash,
 		"attempt_number": record.AttemptCount + 1, "started_at": fixedTime(request.StartedAt),
 		"outcome": string(notifications.AttemptOutcomeStarted), "possibly_accepted": false,
 	})
@@ -80,6 +85,9 @@ func (store Store) BeginAttempt(
 	record.Revision++
 	record.AttemptCount++
 	record.LastAttemptID = request.AttemptID
+	if record.Delivery.Channel == notifications.ChannelTelegram {
+		record.TelegramDestinationVersion = request.GateFence.TelegramDestinationVersion
+	}
 	record.Delivery.UpdatedAt = request.StartedAt.UTC()
 	return record, nil
 }
@@ -117,6 +125,91 @@ func (store Store) gateFenceConditions(
 		}}, nil
 	}
 	tenantKey := "TENANT#" + record.Delivery.TenantID
+	if record.Delivery.Channel == notifications.ChannelTelegram {
+		membership, err := condition(
+			tenantKey, "MEMBER#"+record.Delivery.RecipientID,
+			"#entity = :entity AND #tenant_id = :tenant_id AND #recipient_id = :recipient_id AND #status = :active AND #version = :version",
+			map[string]string{
+				"#entity": "entity_type", "#tenant_id": "tenant_id", "#recipient_id": "cognito_sub",
+				"#status": "status", "#version": "version",
+			},
+			map[string]any{
+				":entity": "tenant_member", ":tenant_id": record.Delivery.TenantID,
+				":recipient_id": record.Delivery.RecipientID, ":active": "active",
+				":version": fence.MembershipVersion,
+			},
+		)
+		if err != nil {
+			return nil, err
+		}
+		preference, err := condition(
+			tenantKey, "NOTIFICATION_PREFERENCE#USER#"+record.Delivery.RecipientID,
+			"#entity = :entity AND #tenant_id = :tenant_id AND #recipient_id = :recipient_id AND #version = :version AND #enabled = :enabled AND #minimum_severity = :minimum_severity",
+			map[string]string{
+				"#entity": "entity_type", "#tenant_id": "tenant_id", "#recipient_id": "cognito_sub",
+				"#version": "version", "#enabled": "telegram_enabled",
+				"#minimum_severity": "minimum_severity",
+			},
+			map[string]any{
+				":entity": "notification_preference", ":tenant_id": record.Delivery.TenantID,
+				":recipient_id": record.Delivery.RecipientID, ":version": fence.PreferenceVersion,
+				":enabled": true, ":minimum_severity": fence.PreferenceMinimumSeverity,
+			},
+		)
+		if err != nil {
+			return nil, err
+		}
+		binding, err := condition(
+			tenantKey, "TELEGRAM_BINDING#USER#"+record.Delivery.RecipientID,
+			"#entity = :entity AND #tenant_id = :tenant_id AND #recipient_id = :recipient_id AND #destination_id = :destination_id AND #status = :verified AND #version = :version",
+			map[string]string{
+				"#entity": "entity_type", "#tenant_id": "tenant_id", "#recipient_id": "recipient_id",
+				"#destination_id": "destination_id", "#status": "status", "#version": "version",
+			},
+			map[string]any{
+				":entity": "telegram_binding", ":tenant_id": record.Delivery.TenantID,
+				":recipient_id":   record.Delivery.RecipientID,
+				":destination_id": fence.TelegramDestinationID, ":verified": "verified",
+				":version": fence.TelegramBindingVersion,
+			},
+		)
+		if err != nil {
+			return nil, err
+		}
+		destination, err := condition(
+			"TELEGRAM_DESTINATION#"+fence.TelegramDestinationID, "META",
+			"#entity = :entity AND #recipient_id = :recipient_id AND #destination_id = :destination_id AND #chat_id = :chat_id AND #status = :active AND #version = :version",
+			map[string]string{
+				"#entity": "entity_type", "#recipient_id": "recipient_id", "#destination_id": "destination_id",
+				"#chat_id": "chat_id", "#status": "status", "#version": "version",
+			},
+			map[string]any{
+				":entity": "telegram_destination", ":recipient_id": record.Delivery.RecipientID,
+				":destination_id": fence.TelegramDestinationID, ":chat_id": fence.TelegramChatID,
+				":active": "active", ":version": fence.TelegramDestinationVersion,
+			},
+		)
+		if err != nil {
+			return nil, err
+		}
+		event, err := condition(
+			tenantKey, "ALERT_EVENT#"+record.Delivery.EventID,
+			"#entity = :entity AND #tenant_id = :tenant_id AND #event_id = :event_id AND #rule_id = :rule_id AND #severity = :severity AND #event_status = :event_status",
+			map[string]string{
+				"#entity": "entity_type", "#tenant_id": "tenant_id", "#event_id": "event_id",
+				"#rule_id": "rule_id", "#severity": "severity", "#event_status": "status",
+			},
+			map[string]any{
+				":entity": "alert_event", ":tenant_id": record.Delivery.TenantID,
+				":event_id": record.Delivery.EventID, ":rule_id": record.Delivery.RuleID,
+				":severity": fence.EventSeverity, ":event_status": fence.EventStatus,
+			},
+		)
+		if err != nil {
+			return nil, err
+		}
+		return []types.TransactWriteItem{membership, preference, binding, destination, event}, nil
+	}
 	membership, err := condition(
 		tenantKey, "MEMBER#"+record.Delivery.RecipientID,
 		"#entity = :entity AND #tenant_id = :tenant_id AND #recipient_id = :recipient_id AND #status = :active AND #version = :version",
@@ -209,6 +302,14 @@ func (store Store) completeAttempt(
 	}
 	if err := validateCompletion(completion); err != nil {
 		return err
+	}
+	if completion.SuppressTelegramDestination &&
+		(record.Delivery.Channel != notifications.ChannelTelegram ||
+			record.Delivery.DestinationID == "" || record.Delivery.TelegramChatID <= 0 ||
+			completion.Outcome != notifications.AttemptOutcomePermanentFailed ||
+			completion.NextState != notifications.DeliveryStatePermanentFailed ||
+			completion.ErrorCategory != string(worker.ErrorTelegramDestinationUnavailable)) {
+		return fmt.Errorf("invalid Telegram destination suppression")
 	}
 	deliveryKey, _ := notifications.DeliveryStorageKey(record.Delivery.OutboxID, record.Delivery.DeliveryID)
 	attemptKey, _ := notifications.AttemptStorageKey(record.Delivery.DeliveryID, completion.AttemptID)
@@ -321,8 +422,32 @@ func (store Store) completeAttempt(
 	if recoveryOperation != nil {
 		items = append(items, *recoveryOperation)
 	}
+	suppressionIndex := -1
+	if completion.SuppressTelegramDestination {
+		suppressionOperation, suppressionErr := store.telegramSuppressionOperation(record, completion.CompletedAt)
+		if suppressionErr != nil {
+			return suppressionErr
+		}
+		suppressionIndex = len(items)
+		items = append(items, suppressionOperation)
+	}
 	_, err = store.Client.TransactWriteItems(ctx, &awssdk.TransactWriteItemsInput{TransactItems: items})
 	if err != nil {
+		if telegramSuppressionFenceLost(err, suppressionIndex) {
+			// A later /start reactivated this destination after BeginAttempt. Keep
+			// that newer state, but do not turn a known provider rejection into an
+			// ambiguous interrupted attempt just because the optional suppression
+			// side effect is stale.
+			withoutSuppression := completion
+			withoutSuppression.SuppressTelegramDestination = false
+			return store.completeAttempt(
+				ctx,
+				record,
+				withoutSuppression,
+				allowDelayedFeedbackMerge,
+				allowRecoveryFenceRetry,
+			)
+		}
 		isRecoveryFenceConflict := allowRecoveryFenceRetry && recoveryOperation != nil &&
 			recoveryOperation.ConditionCheck != nil && isTransactionCanceled(err)
 		if allowDelayedFeedbackMerge {
@@ -359,6 +484,73 @@ func (store Store) completeAttempt(
 		return fmt.Errorf("persist notification attempt completion: %w", err)
 	}
 	return nil
+}
+
+func telegramSuppressionFenceLost(err error, suppressionIndex int) bool {
+	if suppressionIndex < 0 {
+		return false
+	}
+	var canceled *types.TransactionCanceledException
+	if !errors.As(err, &canceled) || len(canceled.CancellationReasons) != suppressionIndex+1 {
+		return false
+	}
+	for index, reason := range canceled.CancellationReasons {
+		if reason.Code == nil {
+			return false
+		}
+		if index == suppressionIndex {
+			if *reason.Code != "ConditionalCheckFailed" {
+				return false
+			}
+			continue
+		}
+		if *reason.Code != "None" {
+			return false
+		}
+	}
+	return true
+}
+
+func (store Store) telegramSuppressionOperation(
+	record worker.DeliveryRecord,
+	now time.Time,
+) (types.TransactWriteItem, error) {
+	if record.TelegramDestinationVersion < 1 {
+		return types.TransactWriteItem{}, fmt.Errorf("missing Telegram destination version")
+	}
+	key, err := attributevalue.MarshalMap(map[string]string{
+		"PK": "TELEGRAM_DESTINATION#" + record.Delivery.DestinationID,
+		"SK": "META",
+	})
+	if err != nil {
+		return types.TransactWriteItem{}, err
+	}
+	values, err := attributevalue.MarshalMap(map[string]any{
+		":entity": "telegram_destination", ":destination_id": record.Delivery.DestinationID,
+		":recipient_id": record.Delivery.RecipientID, ":chat_id": record.Delivery.TelegramChatID,
+		":active": "active", ":suppressed": "suppressed", ":reason": "provider_rejected",
+		":now": fixedTime(now), ":one": int64(1), ":version": record.TelegramDestinationVersion,
+	})
+	if err != nil {
+		return types.TransactWriteItem{}, err
+	}
+	return types.TransactWriteItem{Update: &types.Update{
+		TableName: aws.String(store.Table), Key: key,
+		UpdateExpression: aws.String(
+			"SET #status = :suppressed, #reason = if_not_exists(#reason, :reason), " +
+				"#suppressed_at = if_not_exists(#suppressed_at, :now), #updated_at = :now, #version = #version + :one",
+		),
+		ConditionExpression: aws.String(
+			"#entity = :entity AND #destination_id = :destination_id AND #recipient_id = :recipient_id " +
+				"AND #chat_id = :chat_id AND #version = :version AND (#status = :active OR #status = :suppressed)",
+		),
+		ExpressionAttributeNames: map[string]string{
+			"#entity": "entity_type", "#destination_id": "destination_id", "#recipient_id": "recipient_id",
+			"#chat_id": "chat_id", "#status": "status", "#reason": "suppression_reason",
+			"#suppressed_at": "suppressed_at", "#updated_at": "updated_at", "#version": "version",
+		},
+		ExpressionAttributeValues: values,
+	}}, nil
 }
 
 func (store Store) recoveryFenceRetryable(
@@ -603,7 +795,10 @@ func validateCompletion(completion worker.AttemptCompletion) error {
 			return fmt.Errorf("retryable attempt error category is required")
 		}
 	case notifications.AttemptOutcomeAmbiguous:
-		if completion.NextState != notifications.DeliveryStateRetryableFailed || !completion.PossiblyAccepted || completion.NextAttemptAt.IsZero() {
+		validRetry := completion.NextState == notifications.DeliveryStateRetryableFailed && !completion.NextAttemptAt.IsZero()
+		validUnknown := completion.NextState == notifications.DeliveryStateUnknown &&
+			completion.AmbiguousExhausted && completion.NextAttemptAt.IsZero()
+		if (!validRetry && !validUnknown) || !completion.PossiblyAccepted {
 			return fmt.Errorf("ambiguous attempt completion is invalid")
 		}
 	default:

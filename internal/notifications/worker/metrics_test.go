@@ -51,3 +51,11 @@ func TestMetricsSnapshotContainsOnlyAggregateNoPIIValues(t *testing.T) {
 		t.Fatalf("snapshot = %#v", snapshot)
 	}
 }
+
+func TestMetricsCountsTelegramRateLimitAsThrottling(t *testing.T) {
+	metrics := NewMetrics(25)
+	metrics.RecordRetry(ErrorTelegramRateLimited, false)
+	if snapshot := metrics.Snapshot(); snapshot.Retries != 1 || snapshot.Throttling != 1 {
+		t.Fatalf("snapshot = %#v", snapshot)
+	}
+}

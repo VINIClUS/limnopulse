@@ -119,7 +119,7 @@ func (recorder *Recorder) Retry(category worker.SendErrorCategory, ambiguous boo
 	if ambiguous {
 		recorder.counters["notification_worker_ambiguous_total"].Add(context.Background(), 1)
 	}
-	if category == worker.ErrorRetryableThrottling {
+	if category == worker.ErrorRetryableThrottling || category == worker.ErrorTelegramRateLimited {
 		recorder.counters["notification_worker_throttling_total"].Add(context.Background(), 1)
 	}
 	if category == worker.ErrorRetryableQuota {

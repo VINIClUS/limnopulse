@@ -32,8 +32,15 @@ func (store Store) Claim(
 	if err != nil {
 		return relay.Work{}, false, fmt.Errorf("marshal relay lease key: %w", err)
 	}
+	schemaVersion := work.RelaySchemaVersion
+	if schemaVersion == 0 {
+		schemaVersion, err = notifications.RelaySchemaVersionForChannel(work.Channel)
+		if err != nil {
+			return relay.Work{}, false, err
+		}
+	}
 	values := map[string]any{
-		":schema": notifications.RelaySchemaVersion, ":relay_work_kind": string(work.Kind),
+		":schema": schemaVersion, ":relay_work_kind": string(work.Kind),
 		":relay_pk": work.RelayPK, ":relay_sk": work.RelaySK,
 		":due": lease.DueThrough.UTC().Format(fixedUTCLayout), ":state": work.State,
 		":revision": work.Revision, ":owner": lease.Owner,

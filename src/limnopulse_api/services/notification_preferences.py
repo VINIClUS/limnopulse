@@ -10,14 +10,32 @@ from limnopulse_api.domain.notification_preferences import (
     EmailDeliverabilityRecord,
     NotificationPreference,
     NotificationPreferenceEmailView,
+    NotificationPreferenceTelegramView,
     NotificationPreferenceView,
     email_is_effectively_enabled,
     mask_email_address,
+)
+from limnopulse_api.domain.telegram import (
+    TelegramBinding,
+    TelegramBindingRequest,
+    TelegramDestination,
+    TelegramEligibilityFence,
+    telegram_binding_view,
+    telegram_is_effectively_enabled,
 )
 from limnopulse_api.repositories.notification_preferences import (
     NotificationPreferenceRepository,
 )
 from limnopulse_api.services.cognito_identity import VerifiedEmailIdentity
+
+
+class TelegramPreferenceRepository(Protocol):
+    async def get_current(
+        self,
+        tenant_id: str,
+        recipient_id: str,
+    ) -> tuple[TelegramBinding | None, TelegramBindingRequest | None, TelegramDestination | None]:
+        raise NotImplementedError
 
 
 def utc_now() -> datetime:
@@ -35,14 +53,17 @@ class NotificationPreferenceService:
         repository: NotificationPreferenceRepository,
         identity_verifier: IdentityVerifier | None = None,
         *,
+        telegram_repository: TelegramPreferenceRepository | None = None,
         clock: Callable[[], datetime] = utc_now,
     ) -> None:
         self.repository = repository
         self.identity_verifier = identity_verifier
+        self.telegram_repository = telegram_repository
         self.clock = clock
 
     async def get(self, tenant_id: str, cognito_sub: str) -> NotificationPreferenceView:
         preference = await self.repository.get(tenant_id, cognito_sub)
+        binding_state = await self._telegram_state(tenant_id, cognito_sub)
         if preference is None:
             return NotificationPreferenceView(
                 configured=False,
@@ -55,13 +76,16 @@ class NotificationPreferenceService:
                     suppression_reason=None,
                     effective_enabled=False,
                 ),
+                telegram=self._telegram_view(False, *binding_state),
                 minimum_severity=AlertSeverity.CRITICAL,
             )
 
-        deliverability_record = await self.repository.get_email_deliverability(
-            preference.email_address
-        )
-        return self._view(preference, deliverability_record)
+        deliverability_record = None
+        if preference.email_address is not None:
+            deliverability_record = await self.repository.get_email_deliverability(
+                preference.email_address
+            )
+        return self._view(preference, deliverability_record, binding_state)
 
     async def put(
         self,
@@ -70,6 +94,7 @@ class NotificationPreferenceService:
         *,
         expected_version: int | None,
         email_enabled: bool,
+        telegram_enabled: bool | None = None,
         minimum_severity: AlertSeverity,
         audit: AuditContext,
     ) -> NotificationPreferenceView:
@@ -80,11 +105,72 @@ class NotificationPreferenceService:
         elif existing is None or existing.version != expected_version:
             raise ConflictError("notification preference version conflict")
 
+        desired_telegram_enabled = (
+            False
+            if existing is None and telegram_enabled is None
+            else (
+                existing.telegram_enabled
+                if telegram_enabled is None and existing is not None
+                else bool(telegram_enabled)
+            )
+        )
+        binding_state = await self._telegram_state(tenant_id, principal.cognito_sub)
+        binding, _, destination = binding_state
+        telegram_fence = None
+        if desired_telegram_enabled and not telegram_is_effectively_enabled(
+            True,
+            binding,
+            destination,
+        ):
+            raise ConflictError("verified Telegram binding required")
+        if desired_telegram_enabled:
+            assert binding is not None
+            assert destination is not None
+            telegram_fence = TelegramEligibilityFence(
+                tenant_id=tenant_id,
+                recipient_id=principal.cognito_sub,
+                destination_id=destination.destination_id,
+                chat_id=destination.chat_id,
+                binding_version=binding.version,
+                destination_version=destination.version,
+            )
+
         identity = None
-        if expected_version is None or email_enabled:
+        if email_enabled or (existing is None and telegram_enabled is None):
             if self.identity_verifier is None:
                 raise IdentityServiceUnavailableError("identity verifier unavailable")
             identity = await self.identity_verifier.verify(principal)
+
+        desired_email_address = (
+            identity.address
+            if identity is not None
+            else (existing.email_address if existing is not None else None)
+        )
+        desired_email_verified = (
+            identity.verified
+            if identity is not None
+            else (existing.email_verified if existing is not None else False)
+        )
+        desired_identity_source = (
+            identity.identity_source
+            if identity is not None
+            else (existing.identity_source if existing is not None else None)
+        )
+        if (
+            existing is not None
+            and existing.email_enabled is email_enabled
+            and existing.email_address == desired_email_address
+            and existing.email_verified is desired_email_verified
+            and existing.identity_source == desired_identity_source
+            and existing.telegram_enabled is desired_telegram_enabled
+            and existing.minimum_severity is minimum_severity
+        ):
+            deliverability_record = None
+            if existing.email_address is not None:
+                deliverability_record = await self.repository.get_email_deliverability(
+                    existing.email_address
+                )
+            return self._view(existing, deliverability_record, binding_state)
 
         now = self.clock()
         preference = NotificationPreference(
@@ -92,12 +178,15 @@ class NotificationPreferenceService:
             cognito_sub=principal.cognito_sub,
             version=1 if expected_version is None else expected_version + 1,
             email_enabled=email_enabled,
-            email_address=(identity.address if identity is not None else existing.email_address),
-            email_verified=(identity.verified if identity is not None else existing.email_verified),
-            checked_at=(identity.checked_at if identity is not None else existing.checked_at),
-            identity_source=(
-                identity.identity_source if identity is not None else existing.identity_source
+            email_address=desired_email_address,
+            email_verified=desired_email_verified,
+            checked_at=(
+                identity.checked_at
+                if identity is not None
+                else (existing.checked_at if existing is not None else None)
             ),
+            identity_source=desired_identity_source,
+            telegram_enabled=desired_telegram_enabled,
             minimum_severity=minimum_severity,
             created_at=(
                 existing.created_at
@@ -106,12 +195,16 @@ class NotificationPreferenceService:
             ),
             updated_at=now,
         )
-        deliverability_record = await self.repository.get_email_deliverability(
-            preference.email_address
-        )
+        deliverability_record = None
+        if preference.email_address is not None:
+            deliverability_record = await self.repository.get_email_deliverability(
+                preference.email_address
+            )
         if (
             deliverability_record is None
             and existing is not None
+            and preference.email_address is not None
+            and existing.email_address is not None
             and existing.email_address != preference.email_address
             and existing.email_address.lower() == preference.email_address.lower()
         ):
@@ -123,13 +216,19 @@ class NotificationPreferenceService:
             expected_version,
             audit,
             previous=existing,
+            telegram_fence=telegram_fence,
         )
-        return self._view(saved, deliverability_record)
+        return self._view(saved, deliverability_record, binding_state)
 
     def _view(
         self,
         preference: NotificationPreference,
         deliverability_record: EmailDeliverabilityRecord | None,
+        binding_state: tuple[
+            TelegramBinding | None,
+            TelegramBindingRequest | None,
+            TelegramDestination | None,
+        ],
     ) -> NotificationPreferenceView:
         deliverability = (
             deliverability_record.deliverability
@@ -141,7 +240,11 @@ class NotificationPreferenceService:
             version=preference.version,
             email=NotificationPreferenceEmailView(
                 enabled=preference.email_enabled,
-                address=mask_email_address(preference.email_address),
+                address=(
+                    mask_email_address(preference.email_address)
+                    if preference.email_address is not None
+                    else None
+                ),
                 verified=preference.email_verified,
                 deliverability=deliverability,
                 suppression_reason=(
@@ -154,5 +257,35 @@ class NotificationPreferenceService:
                     deliverability,
                 ),
             ),
+            telegram=self._telegram_view(preference.telegram_enabled, *binding_state),
             minimum_severity=preference.minimum_severity,
         )
+
+    async def _telegram_state(
+        self,
+        tenant_id: str,
+        recipient_id: str,
+    ) -> tuple[TelegramBinding | None, TelegramBindingRequest | None, TelegramDestination | None]:
+        if self.telegram_repository is None:
+            return None, None, None
+        binding, pending, destination = await self.telegram_repository.get_current(
+            tenant_id,
+            recipient_id,
+        )
+        return binding, pending, destination
+
+    def _telegram_view(
+        self,
+        enabled: bool,
+        binding: TelegramBinding | None,
+        pending: TelegramBindingRequest | None,
+        destination: TelegramDestination | None,
+    ) -> NotificationPreferenceTelegramView:
+        view = telegram_binding_view(
+            enabled=enabled,
+            binding=binding,
+            pending=pending,
+            destination=destination,
+            now=self.clock().astimezone(UTC).replace(microsecond=0),
+        )
+        return NotificationPreferenceTelegramView.from_binding_view(enabled, view)

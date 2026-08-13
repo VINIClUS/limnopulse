@@ -7,10 +7,12 @@ This directory contains the OpenTofu scaffold for cloud infrastructure. Docker C
 - DynamoDB domain and audit tables with on-demand billing, `PK` / `SK` string
   keys, alert indexes, and the sparse `NotificationRelayByAvailableAt` GSI.
 - Cognito User Pool and app client for user authentication.
-- Encrypted notification-jobs and SES-events queues with redrive after eight
-  receives, plus jobs, feedback, and EventBridge-routing DLQs.
+- Encrypted email jobs, Telegram jobs and SES-events queues with redrive after
+  eight receives, plus jobs, feedback, and EventBridge-routing DLQs.
 - SESv2 configuration set and EventBridge routing for Send, Delivery,
   DeliveryDelay, Bounce, Complaint, and Reject feedback.
+- Separate Telegram bot-token and webhook-secret containers with no secret
+  versions in state, plus least-privilege worker and FastAPI IAM policies.
 - Placeholder variables for Redis and InfluxDB cloud endpoints.
 
 ## Not Included Yet
@@ -23,7 +25,8 @@ This directory contains the OpenTofu scaffold for cloud infrastructure. Docker C
   chosen per environment, not a generic stack default.
 - Container orchestration, the external 60-second relay/evaluator schedulers,
   worker autoscaling, dashboards or alarms.
-- Telegram, WhatsApp, SMS, or mobile push delivery.
+- Telegram container orchestration, webhook registration and secret values.
+- WhatsApp, SMS, or mobile push delivery.
 
 ## Local Validation
 
@@ -48,3 +51,5 @@ external relay schedule.
 
 The full order, rollback, DLQ handling and PII constraints are documented in
 [Phase 3C-A notification operations](../../docs/notifications-phase-3c-a.md).
+Telegram uses a separate queue, worker, secrets and staged feature flags; see
+[Phase 3C-B Telegram operations](../../docs/notifications-phase-3c-b.md).

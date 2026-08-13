@@ -533,7 +533,53 @@ func TestProcessorLimiterCancellationDefersWithoutAttempt(t *testing.T) {
 	}
 }
 
+func TestProcessorSharedLimiterWaitsWithoutSpendingTheQueueMessage(t *testing.T) {
+	store := &fakeStore{acquire: claimedRecord(t, 0), gate: GateResult{Allowed: true}}
+	processor := testProcessor(store, &fakeSender{result: SendResult{ProviderMessageID: "message_1"}})
+	limiter := &fakeDeliveryLimiter{errs: []error{
+		&RateLimitError{RetryAfter: time.Millisecond},
+		nil,
+	}}
+	processor.Limiter = limiter
+
+	decision := processor.Handle(context.Background(), validMessage(t))
+	if decision.Action != ActionDelete || store.deferred != 0 || store.begun != 1 ||
+		limiter.delivery.DeliveryID == "" || limiter.calls != 2 {
+		t.Fatalf("limiter decision=%#v store=%#v limiter=%#v", decision, store, limiter)
+	}
+}
+
 func TestProcessorRetryAndAmbiguousExhaustionUseVisibilityWithoutSixthCall(t *testing.T) {
+	t.Run("Telegram rate limit honors provider retry-after floor", func(t *testing.T) {
+		store := &fakeStore{acquire: claimedRecord(t, 0), gate: GateResult{Allowed: true}}
+		rateLimited := NewSendError(ErrorTelegramRateLimited, errors.New("rate limited"))
+		rateLimited.RetryAfter = 2 * time.Minute
+		sender := &fakeSender{err: rateLimited}
+
+		decision := testProcessor(store, sender).Handle(context.Background(), validMessage(t))
+		if decision.Action != ActionChangeVisibility || decision.Visibility != 2*time.Minute ||
+			store.completion == nil ||
+			!store.completion.NextAttemptAt.Equal(time.Date(2026, 7, 16, 15, 2, 0, 0, time.UTC)) {
+			t.Fatalf("rate-limit decision=%#v completion=%#v", decision, store.completion)
+		}
+	})
+
+	t.Run("Telegram ambiguous response becomes unknown without automatic resend", func(t *testing.T) {
+		store := &fakeStore{acquire: claimedRecord(t, 0), gate: GateResult{Allowed: true}}
+		ambiguous := NewSendError(ErrorTelegramAmbiguous, context.DeadlineExceeded)
+		ambiguous.NoAutomaticRetry = true
+		sender := &fakeSender{err: ambiguous}
+
+		decision := testProcessor(store, sender).Handle(context.Background(), validMessage(t))
+		if decision.Action != ActionDelete || sender.calls != 1 || store.completion == nil ||
+			store.completion.Outcome != notifications.AttemptOutcomeAmbiguous ||
+			store.completion.NextState != notifications.DeliveryStateUnknown ||
+			!store.completion.PossiblyAccepted || !store.completion.AmbiguousExhausted ||
+			!store.completion.NextAttemptAt.IsZero() {
+			t.Fatalf("ambiguous Telegram decision=%#v completion=%#v sends=%d", decision, store.completion, sender.calls)
+		}
+	})
+
 	t.Run("fifth confirmed retry is permanent", func(t *testing.T) {
 		store := &fakeStore{acquire: claimedRecord(t, 4), gate: GateResult{Allowed: true}}
 		sender := &fakeSender{err: NewSendError(ErrorRetryableService, errors.New("unavailable"))}
@@ -598,6 +644,29 @@ func TestProcessorExpiredStartedAttemptBecomesAmbiguousWithoutImmediateSES(t *te
 	}
 }
 
+func TestProcessorExpiredStartedTelegramAttemptBecomesUnknownWithoutRetry(t *testing.T) {
+	acquired := claimedRecord(t, 1)
+	acquired.Record.Delivery = validTelegramDeliverySnapshot(t)
+	acquired.Record.StartedAttemptID = "att_interrupted"
+	store := &fakeStore{acquire: acquired, gate: GateResult{Allowed: true}}
+	sender := &fakeSender{}
+	processor := testProcessor(store, sender)
+	processor.Metrics = NewMetrics(0)
+
+	decision := processor.Handle(context.Background(), validMessage(t))
+
+	if decision.Action != ActionDelete || sender.calls != 0 || store.completion == nil ||
+		store.completion.AttemptID != "att_interrupted" ||
+		store.completion.Outcome != notifications.AttemptOutcomeAmbiguous ||
+		store.completion.NextState != notifications.DeliveryStateUnknown ||
+		store.completion.ErrorCategory != string(ErrorTelegramAmbiguous) ||
+		!store.completion.PossiblyAccepted || !store.completion.AmbiguousExhausted ||
+		!store.completion.NextAttemptAt.IsZero() || processor.Metrics.Snapshot().Unknown != 1 {
+		t.Fatalf("interrupted Telegram decision=%#v completion=%#v sends=%d metrics=%#v",
+			decision, store.completion, sender.calls, processor.Metrics.Snapshot())
+	}
+}
+
 func TestProcessorFatalSystemicLeavesMessageAndStopsWorker(t *testing.T) {
 	store := &fakeStore{acquire: claimedRecord(t, 0), gate: GateResult{Allowed: true}}
 	sender := &fakeSender{err: NewSendError(ErrorFatalCredentials, errors.New("credentials"))}
@@ -606,6 +675,20 @@ func TestProcessorFatalSystemicLeavesMessageAndStopsWorker(t *testing.T) {
 		!store.completion.AwaitingIntervention ||
 		store.completion.NextState != notifications.DeliveryStateRetryableFailed {
 		t.Fatalf("fatal decision=%#v completion=%#v", decision, store.completion)
+	}
+}
+
+func TestProcessorPermanentlyRejectedTelegramDestinationIsSuppressedAtomically(t *testing.T) {
+	acquired := claimedRecord(t, 0)
+	acquired.Record.Delivery = validTelegramDeliverySnapshot(t)
+	store := &fakeStore{acquire: acquired, gate: GateResult{Allowed: true, Fence: workerTelegramFence()}}
+	sender := &fakeSender{err: NewSendError(ErrorTelegramDestinationUnavailable, errors.New("blocked"))}
+
+	decision := testProcessor(store, sender).Handle(context.Background(), validMessage(t))
+	if decision.Action != ActionDelete || store.completion == nil ||
+		!store.completion.SuppressTelegramDestination ||
+		store.completion.NextState != notifications.DeliveryStatePermanentFailed {
+		t.Fatalf("Telegram permanent decision=%#v completion=%#v", decision, store.completion)
 	}
 }
 
@@ -767,6 +850,26 @@ type fakeLimiter struct {
 	calls  int
 	err    error
 	onWait func()
+}
+
+type fakeDeliveryLimiter struct {
+	delivery notifications.DeliverySnapshot
+	err      error
+	errs     []error
+	calls    int
+}
+
+func (limiter *fakeDeliveryLimiter) Wait(context.Context) error {
+	return errors.New("legacy wait called")
+}
+
+func (limiter *fakeDeliveryLimiter) WaitFor(_ context.Context, delivery notifications.DeliverySnapshot) error {
+	limiter.delivery = delivery
+	limiter.calls++
+	if index := limiter.calls - 1; index < len(limiter.errs) {
+		return limiter.errs[index]
+	}
+	return limiter.err
 }
 
 func (limiter *fakeLimiter) Wait(context.Context) error {
@@ -936,6 +1039,49 @@ func validDeliverySnapshot(t *testing.T) notifications.DeliverySnapshot {
 	snapshot := delivery.Snapshot()
 	snapshot.State = notifications.DeliveryStateProcessing
 	return snapshot
+}
+
+func validTelegramDeliverySnapshot(t *testing.T) notifications.DeliverySnapshot {
+	t.Helper()
+	now := time.Date(2026, 7, 16, 14, 0, 0, 0, time.UTC)
+	content, err := notifications.NewTelegramRenderedContent(
+		notifications.TemplateTelegramAlertOpeningV1,
+		notifications.LocalePTBR,
+		"Alerta simples",
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	deliveryID, err := notifications.NewDeliveryID(
+		"alert_1", notifications.NotificationKindOpening, notifications.ChannelTelegram, "user_1",
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	delivery, err := notifications.NewPendingDelivery(notifications.DeliveryParams{
+		TenantID: "tnt_1", OutboxID: "outbox_telegram_1", DeliveryID: deliveryID,
+		EventID: "alert_1", RuleID: "rule_1", Kind: notifications.NotificationKindOpening,
+		Channel: notifications.ChannelTelegram, RecipientID: "user_1",
+		DestinationID: "destination_hash", TelegramChatID: 123,
+		MembershipSnapshot: notifications.MembershipSnapshot{Role: "owner", Status: "active", Version: 1},
+		TelegramContent:    content, CreatedAt: now, UpdatedAt: now,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	snapshot := delivery.Snapshot()
+	snapshot.State = notifications.DeliveryStateProcessing
+	return snapshot
+}
+
+func workerTelegramFence() GateFence {
+	return GateFence{
+		Channel: notifications.ChannelTelegram, MembershipVersion: 2, PreferenceVersion: 2,
+		PreferenceMinimumSeverity: "warning", EventSeverity: "critical",
+		EventStatus:           "open",
+		TelegramDestinationID: "destination_hash", TelegramChatID: 123,
+		TelegramBindingVersion: 2, TelegramDestinationVersion: 3,
+	}
 }
 
 func appendSequence(current, next string) string {

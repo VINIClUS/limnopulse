@@ -70,6 +70,8 @@ type laneStore struct {
 	queries        []DueRequest
 	onQuery        func(DueRequest)
 	processedKinds []notifications.WorkKind
+	claimedIDs     []string
+	channels       map[string]notifications.Channel
 }
 
 func TestRunRejectsFutureRelayTimeBeforeDiscovery(t *testing.T) {
@@ -173,11 +175,15 @@ func TestRunInterleavesLaneCursorsBeforeDiscoveryCutoff(t *testing.T) {
 }
 
 func (store *laneStore) Reload(_ context.Context, candidate Candidate, _ time.Time) (Work, bool, error) {
+	channel := notifications.ChannelEmail
+	if configured, ok := store.channels[candidate.PK+"#"+candidate.SK]; ok {
+		channel = configured
+	}
 	work := Work{
 		Candidate: candidate, TenantID: "tnt_1", ItemID: candidate.SK,
 		OutboxID: "outbox_1", EventID: "event_1", RuleID: "rule_1",
 		NotificationKind: notifications.NotificationKindOpening,
-		Channel:          notifications.ChannelEmail, State: "pending", Revision: 1,
+		Channel:          channel, State: "pending", Revision: 1,
 	}
 	switch candidate.Kind {
 	case notifications.WorkKindIntent:
@@ -192,7 +198,67 @@ func (store *laneStore) Reload(_ context.Context, candidate Candidate, _ time.Ti
 	return work, true, nil
 }
 
-func (*laneStore) Claim(_ context.Context, work Work, lease LeaseRequest) (Work, bool, error) {
+func TestRunFiltersDisabledTelegramBeforeDiscoveryCap(t *testing.T) {
+	start := time.Date(2026, 7, 16, 13, 0, 0, 0, time.UTC)
+	const bucket = 0
+	telegram := laneCandidateInBucket(
+		t, notifications.WorkKindDelivery, "telegram", bucket, start.Add(-2*time.Minute),
+	)
+	email := laneCandidateInBucket(
+		t, notifications.WorkKindDelivery, "email", bucket, start.Add(-time.Minute),
+	)
+	store := &laneStore{
+		pages: map[lanePageKey][]DuePage{
+			{kind: notifications.WorkKindDelivery, bucket: bucket}: {
+				{Candidates: []Candidate{telegram}, NextToken: "telegram-page"},
+				{Candidates: []Candidate{email}},
+			},
+		},
+		channels: map[string]notifications.Channel{
+			telegram.PK + "#" + telegram.SK: notifications.ChannelTelegram,
+		},
+	}
+	runner := Runner{
+		Store: store, Publisher: fakePublisher{}, Clock: func() time.Time { return start },
+		IDFactory: func() string { return "run_disabled_telegram" },
+	}
+	config := relayconfig.RunConfig{
+		Shard: bucket, ShardCount: notifications.RelayBucketCount,
+		QueryParallelism: 1, WorkParallelism: 1, MaxWork: 1, FanoutPageSize: 1,
+		GlobalDeadline: 45 * time.Second, SoftDeadline: 40 * time.Second,
+		ItemTimeout: 10 * time.Second, LeaseTTL: 20 * time.Second,
+		TelegramDeliveryEnabled: false, TelegramDeliveryConfigured: true,
+	}
+
+	summary := runner.Run(context.Background(), config)
+
+	if summary.ExitCode != ExitSuccess || summary.WorkProcessed != 1 ||
+		summary.DeliveriesProcessed != 1 || summary.WorkSkipped != 1 ||
+		summary.CapReached || !summary.ScopeCompleted {
+		t.Fatalf("summary = %#v", summary)
+	}
+	if len(store.processedKinds) != 1 || store.processedKinds[0] != notifications.WorkKindDelivery {
+		t.Fatalf("processed kinds = %#v", store.processedKinds)
+	}
+	if len(store.claimedIDs) != 1 || store.claimedIDs[0] != email.SK {
+		t.Fatalf("claimed work = %#v, want only email %q", store.claimedIDs, email.SK)
+	}
+	advanced := false
+	for _, query := range store.queries {
+		if query.Kind == notifications.WorkKindDelivery && query.NextToken == "telegram-page" {
+			advanced = true
+			break
+		}
+	}
+	if !advanced {
+		t.Fatalf("disabled Telegram page did not advance discovery: %#v", store.queries)
+	}
+}
+
+func (store *laneStore) Claim(_ context.Context, work Work, lease LeaseRequest) (Work, bool, error) {
+	store.mu.Lock()
+	store.claimedIDs = append(store.claimedIDs, work.ItemID)
+	store.mu.Unlock()
 	work.LeaseOwner = lease.Owner
 	work.LeaseEpoch++
 	return work, true, nil
@@ -703,6 +769,35 @@ func TestRunNeverClaimsWithLeaseTimestampAtOrAfterSoftDeadline(t *testing.T) {
 	if store.reloads != 1 || store.claims != 1 || len(store.claimRequests) != 1 ||
 		!store.claimRequests[0].Now.Equal(start) || !store.claimRequests[0].Now.Before(start.Add(40*time.Second)) {
 		t.Fatalf("summary = %#v, reloads = %d, claims = %d", summary, store.reloads, store.claims)
+	}
+}
+
+func TestProcessCandidateSkipsTelegramWorkBeforeClaimWhenDeliveryIsDisabled(t *testing.T) {
+	start := time.Date(2026, 8, 13, 18, 0, 0, 0, time.UTC)
+	candidate := Candidate{
+		PK: "TENANT#tnt_1", SK: "NOTIFICATION_OUTBOX#telegram_outbox",
+		Kind: notifications.WorkKindIntent, AvailableAt: start.Add(-time.Minute),
+	}
+	store := &publicationStore{
+		candidate: candidate,
+		work: Work{
+			Candidate: candidate, TenantID: "tnt_1", ItemID: "telegram_outbox",
+			OutboxID: "telegram_outbox", EventID: "event_1", RuleID: "rule_1",
+			NotificationKind: notifications.NotificationKindOpening, Channel: notifications.ChannelTelegram,
+			State: "pending",
+		},
+	}
+	runner := Runner{Store: store, Clock: func() time.Time { return start }}
+
+	result := runner.processCandidate(
+		context.Background(), candidate,
+		relayconfig.RunConfig{ItemTimeout: time.Second, LeaseTTL: time.Second},
+		start, start.Add(time.Minute), "run_1", func() time.Time { return start },
+	)
+
+	if result.skipped != 1 || result.withError != 0 || store.claims != 0 ||
+		len(store.rescheduled) != 0 || len(store.queued) != 0 {
+		t.Fatalf("result=%#v claims=%d rescheduled=%#v queued=%#v", result, store.claims, store.rescheduled, store.queued)
 	}
 }
 

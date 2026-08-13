@@ -11,33 +11,34 @@ import (
 type LookupEnv func(string) (string, bool)
 
 type RunConfig struct {
-	AppEnv                 string
-	EvaluationTime         *time.Time
-	Shard                  int
-	ShardCount             int
-	GlobalDeadline         time.Duration
-	DrainGrace             time.Duration
-	PerRuleTimeout         time.Duration
-	LeaseTTL               time.Duration
-	EvaluationParallelism  int
-	QueryParallelism       int
-	MaxRules               int
-	PageSize               int
-	ExpectedSampleInterval time.Duration
-	MinimumCoverageRatio   float64
-	MinimumPoints          int
-	AllowedLateness        time.Duration
-	MaximumSampleAge       time.Duration
-	SystemicErrorThreshold int
-	OTLPFlushTimeout       time.Duration
-	AWSRegion              string
-	DynamoDBTable          string
-	DynamoDBEndpoint       string
-	InfluxDBURL            string
-	InfluxDBToken          string
-	InfluxDBOrg            string
-	InfluxDBBucket         string
-	OTLPEndpoint           string
+	AppEnv                  string
+	EvaluationTime          *time.Time
+	Shard                   int
+	ShardCount              int
+	GlobalDeadline          time.Duration
+	DrainGrace              time.Duration
+	PerRuleTimeout          time.Duration
+	LeaseTTL                time.Duration
+	EvaluationParallelism   int
+	QueryParallelism        int
+	MaxRules                int
+	PageSize                int
+	ExpectedSampleInterval  time.Duration
+	MinimumCoverageRatio    float64
+	MinimumPoints           int
+	AllowedLateness         time.Duration
+	MaximumSampleAge        time.Duration
+	SystemicErrorThreshold  int
+	TelegramDeliveryEnabled bool
+	OTLPFlushTimeout        time.Duration
+	AWSRegion               string
+	DynamoDBTable           string
+	DynamoDBEndpoint        string
+	InfluxDBURL             string
+	InfluxDBToken           string
+	InfluxDBOrg             string
+	InfluxDBBucket          string
+	OTLPEndpoint            string
 }
 
 func defaultRunConfig() RunConfig {
@@ -77,6 +78,7 @@ func LoadRunConfig(args []string, lookup LookupEnv) (RunConfig, error) {
 	if err := applyEnvironment(&config, lookup, qualityExplicit); err != nil {
 		return RunConfig{}, err
 	}
+	_, telegramDeliveryExplicit := lookup("TELEGRAM_DELIVERY_ENABLED")
 
 	fs := flag.NewFlagSet("alert-evaluator run", flag.ContinueOnError)
 	fs.SetOutput(io.Discard)
@@ -114,7 +116,7 @@ func LoadRunConfig(args []string, lookup LookupEnv) (RunConfig, error) {
 		parsed = parsed.UTC()
 		config.EvaluationTime = &parsed
 	}
-	if err := validateRunConfig(config, qualityExplicit); err != nil {
+	if err := validateRunConfig(config, qualityExplicit, telegramDeliveryExplicit); err != nil {
 		return RunConfig{}, err
 	}
 	return config, nil
@@ -190,13 +192,24 @@ func applyEnvironment(config *RunConfig, lookup LookupEnv, explicit map[string]b
 		}
 		config.MinimumCoverageRatio = parsed
 	}
+	if value, ok := lookup("TELEGRAM_DELIVERY_ENABLED"); ok {
+		parsed, err := strconv.ParseBool(value)
+		if err != nil {
+			return fmt.Errorf("TELEGRAM_DELIVERY_ENABLED: %w", err)
+		}
+		config.TelegramDeliveryEnabled = parsed
+	}
 	for flagName, envName := range qualityFlagToEnv {
 		_, explicit[flagName] = lookup(envName)
 	}
 	return nil
 }
 
-func validateRunConfig(config RunConfig, qualityExplicit map[string]bool) error {
+func validateRunConfig(
+	config RunConfig,
+	qualityExplicit map[string]bool,
+	telegramDeliveryExplicit bool,
+) error {
 	if _, err := ValidateShard(config.Shard, config.ShardCount); err != nil {
 		return err
 	}
@@ -219,6 +232,9 @@ func validateRunConfig(config RunConfig, qualityExplicit map[string]bool) error 
 		return fmt.Errorf("APP_ENV must be local, test, staging or prod")
 	}
 	if config.AppEnv == "staging" || config.AppEnv == "prod" {
+		if !telegramDeliveryExplicit {
+			return fmt.Errorf("TELEGRAM_DELIVERY_ENABLED must be explicit in %s", config.AppEnv)
+		}
 		for flagName := range qualityFlagToEnv {
 			if !qualityExplicit[flagName] {
 				return fmt.Errorf("%s must be explicit in %s", flagName, config.AppEnv)

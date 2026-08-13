@@ -2,6 +2,8 @@ package dynamo
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"fmt"
 	"strings"
 	"testing"
@@ -149,6 +151,112 @@ func TestExpandIntentCreatesRenderedPendingDeliveryAndCompletesPageAtomically(t 
 	if outboxValues[":relay_work_kind"] != string(notifications.WorkKindIntent) {
 		t.Fatalf("outbox values = %#v", outboxValues)
 	}
+}
+
+func TestFanoutTokenChangesWhenTelegramContentChanges(t *testing.T) {
+	now := time.Date(2026, 8, 13, 18, 0, 0, 0, time.UTC)
+	deliveryID, err := notifications.NewDeliveryID(
+		"event_1", notifications.NotificationKindOpening, notifications.ChannelTelegram, "sub_1",
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	newDelivery := func(body string) notifications.Delivery {
+		content, contentErr := notifications.NewTelegramRenderedContent(
+			notifications.TemplateTelegramAlertOpeningV1, notifications.LocalePTBR, body,
+		)
+		if contentErr != nil {
+			t.Fatal(contentErr)
+		}
+		delivery, deliveryErr := notifications.NewPendingDelivery(notifications.DeliveryParams{
+			TenantID: "tnt_1", OutboxID: "outbox_1", DeliveryID: deliveryID,
+			EventID: "event_1", RuleID: "rule_1", Kind: notifications.NotificationKindOpening,
+			Channel: notifications.ChannelTelegram, RecipientID: "sub_1",
+			DestinationID: "destination_1", TelegramChatID: 123,
+			MembershipSnapshot: notifications.MembershipSnapshot{Role: "member", Status: "active", Version: 1},
+			TelegramContent:    content, CreatedAt: now, UpdatedAt: now,
+		})
+		if deliveryErr != nil {
+			t.Fatal(deliveryErr)
+		}
+		return delivery
+	}
+	work := relay.Work{Candidate: relay.Candidate{PK: "TENANT#tnt_1", SK: "NOTIFICATION_OUTBOX#outbox_1"}, LeaseEpoch: 1, Revision: 1}
+
+	first := fanoutToken(work, []notifications.Delivery{newDelivery("first content")}, "")
+	second := fanoutToken(work, []notifications.Delivery{newDelivery("second content")}, "")
+
+	if first == second {
+		t.Fatalf("Telegram fanout token did not change: %q", first)
+	}
+}
+
+func TestExpandTelegramIntentUsesVerifiedActiveDestinationAndPlainSnapshot(t *testing.T) {
+	relayTime := time.Date(2026, 8, 13, 12, 30, 0, 0, time.UTC)
+	work := openingWork(t, relayTime)
+	work.Channel = notifications.ChannelTelegram
+	work.RelaySchemaVersion = notifications.TelegramRelaySchemaVersion
+	destinationID := notificationsHashChatForTest("123")
+	preference := map[string]any{
+		"PK": "TENANT#tnt_1", "SK": "NOTIFICATION_PREFERENCE#USER#sub_1",
+		"entity_type": "notification_preference", "tenant_id": "tnt_1", "cognito_sub": "sub_1",
+		"version": int64(1), "email_enabled": false, "telegram_enabled": true,
+		"minimum_severity": "warning",
+	}
+	client := &fakeClient{
+		queryOutputs: []*awssdk.QueryOutput{{Items: []map[string]types.AttributeValue{
+			activeMember(t, relayTime, "sub_1"),
+		}}},
+		getOutputs: []*awssdk.GetItemOutput{
+			{Item: marshalMap(t, openingEvent(relayTime))},
+			{Item: marshalMap(t, preference)},
+			{Item: marshalMap(t, map[string]any{
+				"entity_type": "telegram_binding", "tenant_id": "tnt_1", "recipient_id": "sub_1",
+				"destination_id": destinationID, "status": "verified", "version": int64(1),
+			})},
+			{Item: marshalMap(t, map[string]any{
+				"entity_type": "telegram_destination", "destination_id": destinationID,
+				"recipient_id": "sub_1", "chat_id": int64(123), "status": "active", "version": int64(1),
+			})},
+		},
+	}
+	store := Store{
+		Table: "domain", Client: client, WebURL: "http://localhost:3000",
+		AllowInsecureWebURL: true,
+	}
+	result, err := store.ExpandIntent(context.Background(), work, relay.ExpandRequest{
+		RelayTime: relayTime, PageSize: 20,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if result.DeliveriesCreated != 1 || result.RecipientsFiltered != 0 {
+		t.Fatalf("result = %#v", result)
+	}
+	update := client.transactInputs[0].TransactItems[0].Update
+	var values map[string]any
+	if err := attributevalue.UnmarshalMap(update.ExpressionAttributeValues, &values); err != nil {
+		t.Fatal(err)
+	}
+	if fmt.Sprint(values[":relay_schema"]) != "2" || values[":destination_id"] != destinationID ||
+		fmt.Sprint(values[":telegram_chat_id"]) != "123" {
+		t.Fatalf("Telegram delivery values = %#v", values)
+	}
+	content, ok := values[":content"].(map[string]any)
+	if !ok || content["body_text"] == "" || content["locale"] != "pt-BR" ||
+		content["subject"] != nil || content["html"] != nil {
+		t.Fatalf("Telegram snapshot = %#v", content)
+	}
+	condition := aws.ToString(update.ConditionExpression)
+	if strings.Contains(condition, "#normalized_email") ||
+		!strings.Contains(condition, "#destination_id = :destination_id") {
+		t.Fatalf("Telegram replay fence = %s", condition)
+	}
+}
+
+func notificationsHashChatForTest(value string) string {
+	hash := sha256.Sum256([]byte(value))
+	return hex.EncodeToString(hash[:])
 }
 
 func TestAddressSuppressedReadsLegacyCasedKeyDuringRollout(t *testing.T) {

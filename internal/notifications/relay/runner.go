@@ -128,6 +128,7 @@ func (runner Runner) Run(parent context.Context, config relayconfig.RunConfig) R
 	}
 	candidates := discovery.candidates
 	summary.Backlog = len(candidates)
+	summary.WorkSkipped += discovery.skipped
 	for _, candidate := range candidates {
 		age := relayTime.Sub(candidate.AvailableAt)
 		if seconds := int64(age / time.Second); seconds > summary.OldestBacklogAgeSeconds {
@@ -243,7 +244,7 @@ func (runner Runner) discover(
 			}
 			end := min(offset+config.QueryParallelism, len(baseKinds))
 			_, stopped, err := runner.queryDiscoveryWave(
-				ctx, lanes, baseKinds[offset:end], config, relayTime,
+				ctx, lanes, baseKinds[offset:end], config, relayTime, discoveryCutoff, clock,
 			)
 			if err != nil {
 				return discoveryResult{}, err
@@ -268,7 +269,7 @@ func (runner Runner) discover(
 				kinds[index] = notifications.WorkKindDelivery
 			}
 			queried, stopped, err := runner.queryDiscoveryWave(
-				ctx, lanes, kinds, config, relayTime,
+				ctx, lanes, kinds, config, relayTime, discoveryCutoff, clock,
 			)
 			if err != nil {
 				return discoveryResult{}, err
@@ -297,6 +298,7 @@ func (runner Runner) discover(
 	} {
 		lane := lanes[kind]
 		result.candidates = append(result.candidates, lane.candidates...)
+		result.skipped += lane.skipped
 		if lane.capReached {
 			result.capReached = true
 			result.complete = false
@@ -307,6 +309,7 @@ func (runner Runner) discover(
 
 type discoveryResult struct {
 	candidates      []Candidate
+	skipped         int
 	complete        bool
 	capReached      bool
 	deadlineReached bool
@@ -325,6 +328,7 @@ type discoveryLane struct {
 	cursors    []*discoveryCursor
 	nextCursor int
 	candidates []Candidate
+	skipped    int
 	capReached bool
 }
 
@@ -396,6 +400,8 @@ func (runner Runner) queryDiscoveryWave(
 	kinds []notifications.WorkKind,
 	config relayconfig.RunConfig,
 	relayTime time.Time,
+	discoveryCutoff time.Time,
+	clock func() time.Time,
 ) (int, bool, error) {
 	queries := make([]dueQueryResult, 0, len(kinds))
 	for _, kind := range kinds {
@@ -430,12 +436,16 @@ func (runner Runner) queryDiscoveryWave(
 			}
 			return 0, false, result.err
 		}
+		candidates, skipped := runner.filterDisabledTelegramCandidates(
+			ctx, result.page.Candidates, config, relayTime, discoveryCutoff, clock,
+		)
+		lane.skipped += skipped
 		remaining := config.MaxWork - len(lane.candidates)
-		if len(result.page.Candidates) > remaining {
-			lane.candidates = append(lane.candidates, result.page.Candidates[:remaining]...)
+		if len(candidates) > remaining {
+			lane.candidates = append(lane.candidates, candidates[:remaining]...)
 			lane.capReached = true
 		} else {
-			lane.candidates = append(lane.candidates, result.page.Candidates...)
+			lane.candidates = append(lane.candidates, candidates...)
 		}
 		if result.page.NextToken == "" {
 			result.cursor.done = true
@@ -452,6 +462,46 @@ func (runner Runner) queryDiscoveryWave(
 		}
 	}
 	return len(queries), stopped, nil
+}
+
+// filterDisabledTelegramCandidates reloads only when Telegram is disabled so
+// candidates of that channel cannot consume a discovery lane or the global
+// work cap. The work is reloaded again before claim, preserving the existing
+// conditional lease boundary while letting a paginated Query advance past a
+// disabled Telegram backlog.
+func (runner Runner) filterDisabledTelegramCandidates(
+	ctx context.Context,
+	candidates []Candidate,
+	config relayconfig.RunConfig,
+	relayTime time.Time,
+	discoveryCutoff time.Time,
+	clock func() time.Time,
+) ([]Candidate, int) {
+	if config.TelegramDeliveryEnabled || !config.TelegramDeliveryConfigured || len(candidates) == 0 {
+		return candidates, 0
+	}
+	eligible := make([]Candidate, 0, len(candidates))
+	skipped := 0
+	for index, candidate := range candidates {
+		if discoveryStopped(ctx, discoveryCutoff, clock) {
+			return append(eligible, candidates[index:]...), skipped
+		}
+		itemCtx, cancel := context.WithTimeout(ctx, config.ItemTimeout)
+		work, current, err := runner.Store.Reload(itemCtx, candidate, relayTime)
+		cancel()
+		if err != nil {
+			// Keep invalid or unavailable items in the normal path so their
+			// failure remains observable in the run summary and retry logic.
+			eligible = append(eligible, candidate)
+			continue
+		}
+		if !current || work.Channel == notifications.ChannelTelegram {
+			skipped++
+			continue
+		}
+		eligible = append(eligible, candidate)
+	}
+	return eligible, skipped
 }
 
 type candidateResult struct {
@@ -488,6 +538,9 @@ func (runner Runner) processCandidate(
 		return candidateResult{withError: 1, category: "reload"}
 	}
 	if !current {
+		return candidateResult{skipped: 1}
+	}
+	if work.Channel == notifications.ChannelTelegram && !config.TelegramDeliveryEnabled {
 		return candidateResult{skipped: 1}
 	}
 	now := clock().UTC()

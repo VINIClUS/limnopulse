@@ -10,6 +10,10 @@ cognito_client_name    = "limnopulse-app"
 
 notification_jobs_queue_name = "limnopulse-notification-jobs"
 notification_jobs_dlq_name   = "limnopulse-notification-jobs-dlq"
+telegram_notification_jobs_queue_name = "limnopulse-telegram-notification-jobs"
+telegram_notification_jobs_dlq_name   = "limnopulse-telegram-notification-jobs-dlq"
+telegram_bot_token_secret_name        = "limnopulse/telegram/bot-token"
+telegram_webhook_secret_name          = "limnopulse/telegram/webhook-secret"
 
 ses_events_queue_name        = "limnopulse-ses-events"
 ses_events_dlq_name           = "limnopulse-ses-events-dlq"

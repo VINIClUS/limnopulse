@@ -3,6 +3,7 @@ package notifications
 import (
 	"encoding/json"
 	"reflect"
+	"strings"
 	"testing"
 )
 
@@ -49,6 +50,29 @@ func TestDeliveryJobJSONContainsIdentifiersOnly(t *testing.T) {
 	}
 	if TraceparentMessageAttribute != "traceparent" {
 		t.Fatalf("traceparent attribute name = %q", TraceparentMessageAttribute)
+	}
+}
+
+func TestTelegramDeliveryJobUsesSameCompactPIIFreeEnvelope(t *testing.T) {
+	job, err := NewDeliveryJob(
+		"tnt_1", "outbox_1", "del_1", "alert_1",
+		NotificationKindOpening, ChannelTelegram,
+	)
+	if err != nil {
+		t.Fatalf("NewDeliveryJob() error = %v", err)
+	}
+	body, err := json.Marshal(job)
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := `{"schema_version":1,"message_type":"notification.delivery","tenant_id":"tnt_1","outbox_id":"outbox_1","delivery_id":"del_1","event_id":"alert_1","kind":"opening","channel":"telegram"}`
+	if string(body) != want {
+		t.Fatalf("Telegram job = %s, want %s", body, want)
+	}
+	for _, forbidden := range []string{"chat_id", "destination_id", "body_text", "token"} {
+		if strings.Contains(string(body), forbidden) {
+			t.Fatalf("Telegram job contains %q: %s", forbidden, body)
+		}
 	}
 }
 

@@ -14,7 +14,20 @@ def test_expected_version_is_required_but_nullable_and_severity_defaults_to_crit
 
     assert payload.expected_version is None
     assert payload.email_enabled is True
+    assert payload.telegram_enabled is None
     assert payload.minimum_severity is AlertSeverity.CRITICAL
+
+
+def test_telegram_omitted_is_distinct_from_explicit_false() -> None:
+    omitted = NotificationPreferenceUpdate.model_validate(
+        {"expected_version": 1, "email_enabled": False}
+    )
+    disabled = NotificationPreferenceUpdate.model_validate(
+        {"expected_version": 1, "email_enabled": False, "telegram_enabled": False}
+    )
+
+    assert omitted.telegram_enabled is None
+    assert disabled.telegram_enabled is False
 
 
 @pytest.mark.parametrize(
