@@ -119,7 +119,10 @@ binding and migration are verified.
    Exercise `/start` with a disposable binding, then enable/disable the
    preference through the Cognito-authenticated API.
 5. Deploy the evaluator, relay and worker binaries with Telegram flags still
-   false. Verify the worker has only its queue, data-plane and bot-secret IAM.
+   false. Keep `SQS_TELEGRAM_JOBS_URL` configured on the relay even while its
+   flag is false, so it can recognize indexed Telegram rows before they consume
+   discovery caps; it still never claims or publishes them. Verify the worker
+   has only its queue, data-plane and bot-secret IAM.
 6. Run `notifications backfill-telegram` for explicit tenant batches. It never
    uses DynamoDB Scan; it uses paginated `Query` and conditional updates:
 
