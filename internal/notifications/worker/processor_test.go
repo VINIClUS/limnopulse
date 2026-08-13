@@ -533,16 +533,18 @@ func TestProcessorLimiterCancellationDefersWithoutAttempt(t *testing.T) {
 	}
 }
 
-func TestProcessorSharedLimiterUsesDeliveryAndDefersWithoutAttempt(t *testing.T) {
+func TestProcessorSharedLimiterWaitsWithoutSpendingTheQueueMessage(t *testing.T) {
 	store := &fakeStore{acquire: claimedRecord(t, 0), gate: GateResult{Allowed: true}}
-	processor := testProcessor(store, &fakeSender{})
-	limiter := &fakeDeliveryLimiter{err: &RateLimitError{RetryAfter: 37 * time.Second}}
+	processor := testProcessor(store, &fakeSender{result: SendResult{ProviderMessageID: "message_1"}})
+	limiter := &fakeDeliveryLimiter{errs: []error{
+		&RateLimitError{RetryAfter: time.Millisecond},
+		nil,
+	}}
 	processor.Limiter = limiter
 
 	decision := processor.Handle(context.Background(), validMessage(t))
-	if decision.Action != ActionChangeVisibility || decision.Visibility != 37*time.Second ||
-		decision.ErrorCategory != "limiter_rate_limited" || store.deferred != 1 ||
-		store.begun != 0 || limiter.delivery.DeliveryID == "" {
+	if decision.Action != ActionDelete || store.deferred != 0 || store.begun != 1 ||
+		limiter.delivery.DeliveryID == "" || limiter.calls != 2 {
 		t.Fatalf("limiter decision=%#v store=%#v limiter=%#v", decision, store, limiter)
 	}
 }
@@ -853,6 +855,8 @@ type fakeLimiter struct {
 type fakeDeliveryLimiter struct {
 	delivery notifications.DeliverySnapshot
 	err      error
+	errs     []error
+	calls    int
 }
 
 func (limiter *fakeDeliveryLimiter) Wait(context.Context) error {
@@ -861,6 +865,10 @@ func (limiter *fakeDeliveryLimiter) Wait(context.Context) error {
 
 func (limiter *fakeDeliveryLimiter) WaitFor(_ context.Context, delivery notifications.DeliverySnapshot) error {
 	limiter.delivery = delivery
+	limiter.calls++
+	if index := limiter.calls - 1; index < len(limiter.errs) {
+		return limiter.errs[index]
+	}
 	return limiter.err
 }
 

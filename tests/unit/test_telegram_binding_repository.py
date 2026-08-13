@@ -200,6 +200,8 @@ async def test_consume_fences_membership_token_destination_binding_and_update_de
         "SK": "META",
     }
     assert "recipient_id" in destination_update["ExpressionAttributeNames"].values()
+    assert "#last_update_id = :update_id" in destination_update["UpdateExpression"]
+    assert "#last_update_id < :update_id" in destination_update["ConditionExpression"]
     assert binding["PK"] == "TENANT#tnt_1"
     assert binding["SK"] == "TELEGRAM_BINDING#USER#sub_1"
     assert binding["destination_id"] == TelegramDestination.id_for_chat(123)
@@ -331,7 +333,121 @@ async def test_stop_uses_hashed_key_and_never_revokes_bindings() -> None:
     assert len(operations) == 2
     update = operations[1]["Update"]
     assert client.decode(update["Key"])["PK"] == f"TELEGRAM_DESTINATION#{destination_id}"
+    assert "#last_update_id = :update_id" in update["UpdateExpression"]
+    assert "#last_update_id < :update_id" in update["ConditionExpression"]
     assert "TELEGRAM_BINDING" not in repr(operations)
+
+
+@pytest.mark.asyncio
+async def test_stop_advances_ordering_fence_when_destination_is_already_suppressed() -> None:
+    client = RecordingDynamoClient()
+    destination_id = TelegramDestination.id_for_chat(123)
+    client.seed(
+        {
+            "PK": f"TELEGRAM_DESTINATION#{destination_id}",
+            "SK": "META",
+            "entity_type": "telegram_destination",
+            "destination_id": destination_id,
+            "recipient_id": "sub_1",
+            "chat_id": 123,
+            "status": "suppressed",
+            "suppression_reason": "user_stop",
+            "stopped_at": NOW.isoformat(),
+            "last_update_id": 56,
+            "version": 2,
+            "created_at": NOW.isoformat(),
+            "updated_at": NOW.isoformat(),
+            "schema_version": 1,
+        }
+    )
+    repository = DynamoTelegramBindingRepository("domain", client)
+
+    applied = await repository.stop(chat_id=123, sender_id=123, update_id=57, now=NOW)
+
+    assert applied is True
+    update = client.transact_write_items_calls[0]["TransactItems"][1]["Update"]
+    assert "#last_update_id = :update_id" in update["UpdateExpression"]
+    assert "#last_update_id < :update_id" in update["ConditionExpression"]
+
+
+@pytest.mark.asyncio
+async def test_stop_ignores_an_update_older_than_the_destination_fence() -> None:
+    client = RecordingDynamoClient()
+    destination_id = TelegramDestination.id_for_chat(123)
+    client.seed(
+        {
+            "PK": f"TELEGRAM_DESTINATION#{destination_id}",
+            "SK": "META",
+            "entity_type": "telegram_destination",
+            "destination_id": destination_id,
+            "recipient_id": "sub_1",
+            "chat_id": 123,
+            "status": "active",
+            "last_update_id": 57,
+            "version": 2,
+            "created_at": NOW.isoformat(),
+            "updated_at": NOW.isoformat(),
+            "schema_version": 1,
+        }
+    )
+    repository = DynamoTelegramBindingRepository("domain", client)
+
+    applied = await repository.stop(chat_id=123, sender_id=123, update_id=56, now=NOW)
+
+    assert applied is False
+    assert client.transact_write_items_calls == []
+
+
+@pytest.mark.asyncio
+async def test_revoke_does_not_require_token_row_after_expired_token_ttl() -> None:
+    client = RecordingDynamoClient()
+    destination_id = TelegramDestination.id_for_chat(123)
+    client.seed(
+        {
+            "PK": "TENANT#tnt_1",
+            "SK": "TELEGRAM_BINDING#USER#sub_1",
+            "entity_type": "telegram_binding",
+            "tenant_id": "tnt_1",
+            "recipient_id": "sub_1",
+            "destination_id": destination_id,
+            "status": "verified",
+            "verified_at": NOW.isoformat(),
+            "revoked_at": None,
+            "version": 1,
+            "created_at": NOW.isoformat(),
+            "updated_at": NOW.isoformat(),
+            "schema_version": 1,
+        }
+    )
+    expired = request().model_copy(
+        update={
+            "request_id": "expired_request",
+            "token_hash": sha256(b"expired-token").hexdigest(),
+            "expires_at": NOW - timedelta(seconds=1),
+        }
+    )
+    client.seed(
+        {
+            "PK": "TENANT#tnt_1",
+            "SK": "TELEGRAM_BINDING_REQUEST#USER#sub_1",
+            "entity_type": "telegram_binding_request",
+            **expired.model_dump(mode="json", exclude={"expires_at"}),
+            "expires_at": int(expired.expires_at.timestamp()),
+            "schema_version": 1,
+        }
+    )
+    repository = DynamoTelegramBindingRepository("domain", client)
+
+    await repository.revoke("tnt_1", "sub_1", NOW)
+
+    operations = client.transact_write_items_calls[0]["TransactItems"]
+    assert len(operations) == 2
+    assert all(
+        client.decode(operation["Update"]["Key"])["PK"]
+        != f"TELEGRAM_BINDING_TOKEN#{expired.token_hash}"
+        for operation in operations
+        if "Update" in operation
+    )
 
 
 @pytest.mark.asyncio

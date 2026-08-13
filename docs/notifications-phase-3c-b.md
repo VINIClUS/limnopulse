@@ -26,6 +26,10 @@ not change `telegram_enabled`. Enabling the preference remains an authenticated,
 optimistically locked API operation that requires an active membership and
 verified binding.
 
+The destination stores the greatest applied Telegram `update_id`. A webhook
+command with an older ID is acknowledged without changing state, so delayed
+`/start` cannot reactivate a destination after a newer `/stop` (and vice versa).
+
 Webhook secret and bot token use separate Secrets Manager secrets and IAM
 policies. OpenTofu creates only secret containers; populate values through the
 approved secret-management process so no secret version enters source, plan or
@@ -61,6 +65,11 @@ suppresses the destination; 5xx is retryable; lost or malformed confirmation
 ends durably as `unknown` after one provider call and is not automatically
 resent. Duplicate SQS messages remain safe through leases, revisions,
 deterministic identity and conditional transactions.
+
+When the Redis global or destination bucket is empty—or Redis is temporarily
+unavailable—the worker waits while its lease guard renews and retries the
+limiter. It does not change SQS visibility for limiter contention, preserving
+the queue receive budget for actual poison messages.
 
 ## Local execution
 

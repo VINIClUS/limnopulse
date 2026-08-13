@@ -58,34 +58,32 @@ func TestRedisLimiterAtomicallyUsesGlobalAndDestinationBuckets(t *testing.T) {
 	}
 }
 
-func TestRedisLimiterReturnsDurableDeferralHints(t *testing.T) {
-	tests := []struct {
-		name        string
-		result      any
-		err         error
-		wantDelay   time.Duration
-		unavailable bool
-	}{
-		{name: "rate denied", result: []any{int64(0), int64(2500)}, wantDelay: 2500 * time.Millisecond},
-		{name: "Redis unavailable", err: errors.New("connection refused"), wantDelay: 11 * time.Second, unavailable: true},
+func TestRedisLimiterReturnsRateLimitHints(t *testing.T) {
+	client := &fakeRedisEvaler{result: []any{int64(0), int64(2500)}}
+	limiter, err := NewRedisLimiter(client, RedisLimiterConfig{
+		BotToken: "secret", GlobalRate: 20, GlobalBurst: 20,
+		DestinationRate: 1, DestinationBurst: 1, UnavailableRetryAfter: 11 * time.Second,
+	})
+	if err != nil {
+		t.Fatal(err)
 	}
-	for _, test := range tests {
-		t.Run(test.name, func(t *testing.T) {
-			client := &fakeRedisEvaler{result: test.result, err: test.err}
-			limiter, err := NewRedisLimiter(client, RedisLimiterConfig{
-				BotToken: "secret", GlobalRate: 20, GlobalBurst: 20,
-				DestinationRate: 1, DestinationBurst: 1, UnavailableRetryAfter: 11 * time.Second,
-			})
-			if err != nil {
-				t.Fatal(err)
-			}
-			err = limiter.WaitFor(context.Background(), telegramSendRequest(t).Delivery)
-			var rateErr *worker.RateLimitError
-			if !errors.As(err, &rateErr) || rateErr.RetryAfter != test.wantDelay ||
-				rateErr.Unavailable != test.unavailable {
-				t.Fatalf("WaitFor error = %#v", err)
-			}
-		})
+	err = limiter.WaitFor(context.Background(), telegramSendRequest(t).Delivery)
+	var rateErr *worker.RateLimitError
+	if !errors.As(err, &rateErr) || rateErr.RetryAfter != 2500*time.Millisecond || rateErr.Unavailable {
+		t.Fatalf("WaitFor error = %#v", err)
+	}
+
+	client = &fakeRedisEvaler{err: errors.New("connection refused")}
+	limiter, err = NewRedisLimiter(client, RedisLimiterConfig{
+		BotToken: "secret", GlobalRate: 20, GlobalBurst: 20,
+		DestinationRate: 1, DestinationBurst: 1, UnavailableRetryAfter: 11 * time.Second,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	err = limiter.WaitFor(context.Background(), telegramSendRequest(t).Delivery)
+	if !errors.As(err, &rateErr) || rateErr.RetryAfter != 11*time.Second || !rateErr.Unavailable {
+		t.Fatalf("WaitFor error = %#v", err)
 	}
 }
 

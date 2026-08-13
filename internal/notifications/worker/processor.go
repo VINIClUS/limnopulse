@@ -170,12 +170,7 @@ func (processor Processor) Handle(ctx context.Context, message QueueMessage) Dec
 	}
 
 	limiterDone := processor.Metrics.BeginLimiterWait()
-	var limiterErr error
-	if deliveryLimiter, ok := processor.Limiter.(DeliveryLimiter); ok {
-		limiterErr = deliveryLimiter.WaitFor(limiterCtx, record.Delivery)
-	} else {
-		limiterErr = processor.Limiter.Wait(limiterCtx)
-	}
+	limiterErr := processor.waitForLimiter(limiterCtx, record.Delivery)
 	if limiterErr != nil {
 		limiterDone()
 		_ = stopLimiter()
@@ -267,6 +262,43 @@ func (processor Processor) Handle(ctx context.Context, message QueueMessage) Dec
 	cancelProvider()
 	completedAt := processor.Now().UTC()
 	return processor.finishAttempt(ctx, record, attemptID, completedAt, result, sendErr)
+}
+
+func (processor Processor) waitForLimiter(
+	ctx context.Context,
+	delivery notifications.DeliverySnapshot,
+) error {
+	for {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+		var err error
+		if deliveryLimiter, ok := processor.Limiter.(DeliveryLimiter); ok {
+			err = deliveryLimiter.WaitFor(ctx, delivery)
+		} else {
+			err = processor.Limiter.Wait(ctx)
+		}
+		if err == nil {
+			return nil
+		}
+		var rateLimitErr *RateLimitError
+		if !errors.As(err, &rateLimitErr) {
+			return err
+		}
+		delay := rateLimitErr.RetryAfter
+		if delay <= 0 {
+			delay = time.Second
+		}
+		timer := time.NewTimer(delay)
+		select {
+		case <-ctx.Done():
+			if !timer.Stop() {
+				<-timer.C
+			}
+			return ctx.Err()
+		case <-timer.C:
+		}
+	}
 }
 
 func (processor Processor) completePreflightFailure(

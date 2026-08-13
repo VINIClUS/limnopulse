@@ -233,13 +233,16 @@ class DynamoTelegramBindingRepository:
                         "SET #entity_type = :entity_type, #schema_version = :schema_version, "
                         "#destination_id = :destination_id, #recipient_id = :recipient_id, "
                         "#chat_id = :chat_id, #status = :active, "
+                        "#last_update_id = :update_id, "
                         "#version = if_not_exists(#version, :zero) + :one, "
                         "#created_at = if_not_exists(#created_at, :now), #updated_at = :now "
                         "REMOVE #suppression_reason, #stopped_at"
                     ),
                     "ConditionExpression": (
-                        "attribute_not_exists(#recipient_id) OR "
-                        "(#recipient_id = :recipient_id AND #chat_id = :chat_id)"
+                        "(attribute_not_exists(#recipient_id) OR "
+                        "(#recipient_id = :recipient_id AND #chat_id = :chat_id)) "
+                        "AND (attribute_not_exists(#last_update_id) "
+                        "OR #last_update_id < :update_id)"
                     ),
                     "ExpressionAttributeNames": {
                         "#entity_type": "entity_type",
@@ -248,6 +251,7 @@ class DynamoTelegramBindingRepository:
                         "#recipient_id": "recipient_id",
                         "#chat_id": "chat_id",
                         "#status": "status",
+                        "#last_update_id": "last_update_id",
                         "#version": "version",
                         "#created_at": "created_at",
                         "#updated_at": "updated_at",
@@ -262,6 +266,7 @@ class DynamoTelegramBindingRepository:
                             ":recipient_id": request.recipient_id,
                             ":chat_id": chat_id,
                             ":active": TelegramDestinationStatus.ACTIVE.value,
+                            ":update_id": update_id,
                             ":zero": 0,
                             ":one": 1,
                             ":now": now.isoformat(),
@@ -342,25 +347,36 @@ class DynamoTelegramBindingRepository:
                 destination = self._destination_from_item(item)
                 if destination.chat_id != chat_id:
                     return False
+                if destination.last_update_id >= update_id:
+                    return False
                 shape = f"{destination.status.value}:{destination.version}"
                 applied = True
                 if destination.status is TelegramDestinationStatus.SUPPRESSED:
                     operations.append(
                         {
-                            "ConditionCheck": {
+                            "Update": {
                                 "TableName": self.table_name,
                                 "Key": self._serialize(self._destination_key(destination_id)),
+                                "UpdateExpression": (
+                                    "SET #last_update_id = :update_id, #updated_at = :now"
+                                ),
                                 "ConditionExpression": (
-                                    "#status = :suppressed AND #version = :version"
+                                    "#status = :suppressed AND #version = :version "
+                                    "AND (attribute_not_exists(#last_update_id) "
+                                    "OR #last_update_id < :update_id)"
                                 ),
                                 "ExpressionAttributeNames": {
                                     "#status": "status",
                                     "#version": "version",
+                                    "#last_update_id": "last_update_id",
+                                    "#updated_at": "updated_at",
                                 },
                                 "ExpressionAttributeValues": self._serialize(
                                     {
                                         ":suppressed": (TelegramDestinationStatus.SUPPRESSED.value),
                                         ":version": destination.version,
+                                        ":update_id": update_id,
+                                        ":now": now.isoformat(),
                                     }
                                 ),
                             }
@@ -375,17 +391,21 @@ class DynamoTelegramBindingRepository:
                                 "UpdateExpression": (
                                     "SET #status = :suppressed, "
                                     "#suppression_reason = :reason, #stopped_at = :now, "
-                                    "#updated_at = :now, #version = #version + :one"
+                                    "#updated_at = :now, #last_update_id = :update_id, "
+                                    "#version = #version + :one"
                                 ),
                                 "ConditionExpression": (
                                     "#recipient_id = :recipient_id AND #chat_id = :chat_id "
-                                    "AND #status = :active AND #version = :version"
+                                    "AND #status = :active AND #version = :version "
+                                    "AND (attribute_not_exists(#last_update_id) "
+                                    "OR #last_update_id < :update_id)"
                                 ),
                                 "ExpressionAttributeNames": {
                                     "#status": "status",
                                     "#suppression_reason": "suppression_reason",
                                     "#stopped_at": "stopped_at",
                                     "#updated_at": "updated_at",
+                                    "#last_update_id": "last_update_id",
                                     "#version": "version",
                                     "#recipient_id": "recipient_id",
                                     "#chat_id": "chat_id",
@@ -400,6 +420,7 @@ class DynamoTelegramBindingRepository:
                                         ":recipient_id": destination.recipient_id,
                                         ":chat_id": chat_id,
                                         ":version": destination.version,
+                                        ":update_id": update_id,
                                     }
                                 ),
                             }
@@ -479,10 +500,10 @@ class DynamoTelegramBindingRepository:
                     }
                 )
             if request is not None and request.status is TelegramBindingStatus.PENDING:
-                for key in (
-                    self._token_key(request.token_hash),
-                    self._request_pointer_key(tenant_id, recipient_id),
-                ):
+                keys = [self._request_pointer_key(tenant_id, recipient_id)]
+                if request.expires_at > now:
+                    keys.insert(0, self._token_key(request.token_hash))
+                for key in keys:
                     operations.append(
                         {
                             "Update": {

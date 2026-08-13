@@ -68,6 +68,7 @@ class TelegramDestination(BaseModel):
     status: TelegramDestinationStatus
     suppression_reason: str | None = None
     stopped_at: datetime | None = None
+    last_update_id: int = Field(default=0, ge=0)
     version: int = Field(ge=1)
     created_at: datetime
     updated_at: datetime
