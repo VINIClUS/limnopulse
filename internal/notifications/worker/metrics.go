@@ -118,7 +118,7 @@ func (metrics *Metrics) RecordRetry(category SendErrorCategory, ambiguous bool) 
 	if ambiguous {
 		metrics.ambiguous.Add(1)
 	}
-	if category == ErrorRetryableThrottling {
+	if category == ErrorRetryableThrottling || category == ErrorTelegramRateLimited {
 		metrics.throttling.Add(1)
 	}
 	if category == ErrorRetryableQuota {

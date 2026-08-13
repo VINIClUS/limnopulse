@@ -1,7 +1,7 @@
 # Limnopulse Architecture
 
-**Version:** 1.2
-**Updated:** 2026-07-17
+**Version:** 1.3
+**Updated:** 2026-08-13
 
 Limnopulse is the successor to the AquaFarm prototype. AquaFarm names in historical material describe the predecessor only; all active resources, topics, buckets, code, and new documentation use the Limnopulse name.
 
@@ -16,7 +16,7 @@ Limnopulse is the successor to the AquaFarm prototype. AquaFarm names in histori
 | Phase 3A | Current | Alert Rule configuration, optimistic updates, replacement idempotency, transactional audit, TTL |
 | Phase 3B | Current | one-shot Go evaluator, 64-bucket due index, InfluxDB windows, durable Alert Events and notification outboxes |
 | Phase 3C-A | Current | one-shot outbox relay, SQS email jobs, continuous SES worker/feedback, durable deliveries and attempts |
-| Phase 3C-B | Target | Telegram delivery of currently deferred Telegram outboxes |
+| Phase 3C-B | Current | FastAPI Telegram binding/webhook, isolated queue/worker, durable snapshots/attempts, Redis rate limit |
 
 “Current” means implemented in this repository. “Target” is architectural direction and must not be interpreted as a deployed capability.
 
@@ -39,18 +39,23 @@ flowchart LR
     Redis --> Evaluator
     Evaluator -->|AlertEvent + Outbox transaction| Dynamo
     Dynamo --> Relay[One-shot Notification Relay]
-    Relay --> Jobs[SQS Notification Jobs]
-    Jobs --> Worker[Continuous Notification Worker]
-    Worker --> Dynamo
-    Worker --> SES
+    Relay --> EmailJobs[SQS Email Jobs]
+    Relay --> TelegramJobs[SQS Telegram Jobs]
+    EmailJobs --> EmailWorker[Continuous Email Worker]
+    TelegramJobs --> TelegramWorker[Continuous Telegram Worker]
+    EmailWorker --> Dynamo
+    TelegramWorker --> Dynamo
+    EmailWorker --> SES
+    TelegramWorker --> Telegram[Telegram Bot API]
     SES --> EventBridge
     EventBridge --> Feedback[SQS SES Events]
-    Feedback --> Worker
-    Worker -. Phase 3C-B .-> Telegram
+    Feedback --> EmailWorker
+    TelegramWebhook[Telegram Webhook] -->|secret header| API
 ```
 
-Solid edges are present repository responsibilities or local/cloud scaffolds.
-The dotted Telegram edge is a later slice.
+All shown edges are present repository responsibilities or local/cloud
+scaffolds. Cloud container orchestration and webhook registration remain
+environment-specific deployment work.
 
 ## Canonical names
 
@@ -99,6 +104,11 @@ Core `LimnopulseDomain` keys:
 | Notification Delivery | `NOTIFICATION_OUTBOX#<outbox_id>` | `DELIVERY#<delivery_id>` |
 | Notification Attempt | `NOTIFICATION_DELIVERY#<delivery_id>` | `ATTEMPT#<attempt_id>` |
 | Email suppression | `EMAIL_IDENTITY#<sha256(normalized_email)>` | `DELIVERABILITY` |
+| Telegram binding | `TENANT#<tenant_id>` | `TELEGRAM_BINDING#USER#<recipient_id>` |
+| Telegram binding request | `TENANT#<tenant_id>` | `TELEGRAM_BINDING_REQUEST#USER#<recipient_id>` |
+| Telegram binding token | `TELEGRAM_BINDING_TOKEN#<sha256(token)>` | `META` |
+| Telegram destination | `TELEGRAM_DESTINATION#<sha256(chat_id)>` | `META` |
+| Telegram update dedupe | `TELEGRAM_UPDATE#<update_id>` | `META` |
 
 Critical list paths use `Query` or known-key reads. Application code does not use DynamoDB `Scan`.
 
@@ -185,8 +195,26 @@ on the Delivery snapshot; Attempt rows and telemetry do not duplicate them.
 
 The worker does not consume any DLQ automatically, and the EventBridge routing
 DLQ is not a worker input. Phase 3C-A exposes no public Delivery/Attempt API.
-Telegram remains deferred to Phase 3C-B. WhatsApp, SMS and mobile push remain
-later commercial/product decisions.
+
+## Phase 3C-B: Telegram binding and delivery
+
+FastAPI exposes a Cognito-exempt `POST /webhooks/telegram` whose Telegram secret
+header is checked before the bounded body. A separate one-time token establishes
+a durable verified binding; authenticated preference updates retain active
+tenant membership and optimistic locking. The webhook never enables delivery.
+
+The relay expands Telegram schema-v2 outboxes into immutable plain-text
+Deliveries and sends compact, chat-ID-free jobs to a dedicated queue. The
+Telegram worker rechecks membership, preference, binding, destination and Alert
+Event state, transactionally fences each Attempt, uses Redis only for atomic
+global/destination rate limiting, and calls Bot API `sendMessage` without parse
+mode or link preview. Definite destination failures suppress the destination;
+unconfirmed sends become terminal `unknown` without automatic resend.
+
+Deferred Telegram outboxes are migrated through explicit-tenant paginated
+`Query` with `notifications backfill-telegram`; no Scan is used. Email remains
+schema v1 and keeps its prior identity, queue, SES and feedback semantics.
+WhatsApp, SMS and mobile push remain later commercial/product decisions.
 
 ## Security boundaries
 
@@ -200,4 +228,8 @@ later commercial/product decisions.
 - SES feedback associations trust only provider message ID plus exact
   `delivery_id`/`attempt_id` tags; provider destination arrays are discarded.
 - Secrets, raw tokens, and idempotency keys are excluded from domain/audit records.
+- Telegram webhook secret, binding token and Cognito token have disjoint trust
+  boundaries; only the binding-token digest is stored.
+- Private Telegram chat IDs and rendered text remain only on durable Delivery
+  snapshots and never enter jobs, logs or metrics.
 - IAM, network exposure, real remote state, and secret management require environment-specific hardening before production deployment.

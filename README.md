@@ -77,7 +77,8 @@ PATCH accepts `expected_version` plus at least one mutable field. Tenant, pond, 
 
 Phase 3B evaluates rules and transactionally stores opening and recovery
 outboxes. Phase 3C-A relays eligible email outboxes to SQS and delivers them
-through SES; Telegram declarations remain deferred for Phase 3C-B.
+through SES. Phase 3C-B adds verified Telegram binding and a separate Telegram
+queue/worker without changing the email delivery contract.
 
 ## Alert Events and Evaluation
 
@@ -125,6 +126,39 @@ See [Phase 3C-A notification operations](docs/notifications-phase-3c-a.md) for
 cloud rollout order, relay backfill, SES prerequisites, replay, metrics, DLQ
 recovery, rollback and PII limits.
 
+## Telegram Notifications
+
+Phase 3C-B keeps Telegram enrollment in FastAPI and delivery in its own Go
+worker. The public `POST /webhooks/telegram` route authenticates Telegram with
+`X-Telegram-Bot-Api-Secret-Token`; it does not use Cognito and does not enable a
+preference. `/start <token>` only verifies the separate binding. Issuing the
+one-time token and changing `telegram_enabled` remain tenant-scoped,
+Cognito-authenticated operations with active membership checks.
+Hosted FastAPI requires an environment-specific `TELEGRAM_BOT_USERNAME`; the
+`limnopulse_local_bot` default is accepted only in local and test environments.
+
+```text
+GET    /v1/tenants/{tenant_id}/me/telegram-binding
+POST   /v1/tenants/{tenant_id}/me/telegram-binding-token
+DELETE /v1/tenants/{tenant_id}/me/telegram-binding
+POST   /webhooks/telegram
+```
+
+For local delivery, start the dedicated queue consumer and WireMock Bot API:
+
+```bash
+docker compose --profile notifications up -d \
+  redis dynamodb-local elasticmq telegram-bot-api-fake \
+  telegram-notification-worker
+docker compose --profile notifications run --rm notification-relay
+```
+
+DynamoDB owns binding, destination, preferences, deliveries, attempts and
+idempotency. Redis is only a fail-closed Telegram rate limiter. Telegram jobs
+contain no chat ID or rendered message, and Telegram jobs never enter the email
+queue. See [Phase 3C-B Telegram operations](docs/notifications-phase-3c-b.md)
+for secrets, backfill, rollout, rollback, retry semantics and DLQ handling.
+
 ## Local Telemetry Ingestion
 
 Phase 2B adds a local MQTT-to-InfluxDB scaffold:
@@ -171,8 +205,9 @@ tofu validate
 ```
 
 The scaffold covers DynamoDB on-demand tables and alert/notification indexes,
-Cognito User Pool/client, encrypted notification and SES-feedback queues with
-three DLQs, an SESv2 configuration set, and EventBridge feedback routing.
+Cognito User Pool/client, encrypted email, Telegram and SES-feedback queues with
+their DLQs, an SESv2 configuration set, EventBridge feedback routing, Telegram
+secret containers and least-privilege runtime policies.
 `backend.example.hcl` is a placeholder for a future real remote-state setup; do
 not use it for local validation. SES identities and production sending access
 are account operations outside this generic stack. Redis cloud, InfluxDB managed
@@ -188,7 +223,7 @@ go test -race ./...
 ```
 
 The multiprocess notification suite is opt-in because it requires healthy local
-DynamoDB and ElasticMQ services:
+DynamoDB, ElasticMQ, Redis and WireMock services:
 
 ```bash
 RUN_NOTIFICATION_INTEGRATION=1 \

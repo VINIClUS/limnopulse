@@ -280,6 +280,66 @@ func TestBackfillRelayApplyWritesCanonicalEmailAndTelegramFieldsIdempotently(t *
 	}
 }
 
+func TestBackfillRelayEnablesDeferredTelegramOutboxesByTenantQueryIdempotently(t *testing.T) {
+	email := legacyOutbox("outbox_email_untouched", "email", "ready")
+	telegram := legacyOutbox("outbox_telegram_enable", "telegram", "ready")
+	telegram["expansion_status"] = "deferred_unsupported_channel"
+	client := &fakeClient{queryOutputs: []*awssdk.QueryOutput{{Items: []map[string]types.AttributeValue{
+		mustMarshalMap(t, email), mustMarshalMap(t, telegram),
+	}}}}
+
+	summary, err := (Store{Table: "domain", Client: client}).BackfillRelay(
+		context.Background(),
+		BackfillOptions{
+			Tenants: []string{"tnt_1"}, Apply: true, PageSize: 25,
+			TargetChannel: notifications.ChannelTelegram,
+		},
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if summary.RowsQueried != 2 || summary.RowsNeedingUpdate != 1 || summary.Updated != 1 ||
+		summary.RowFailures != 0 || len(client.updateInputs) != 1 || client.scanCalls != 0 {
+		t.Fatalf("summary=%#v updates=%#v scans=%d", summary, client.updateInputs, client.scanCalls)
+	}
+	update := client.updateInputs[0]
+	values := unmarshalValues(t, update.ExpressionAttributeValues)
+	createdAt, _ := time.Parse(fixedUTCLayout, telegram["created_at"].(string))
+	wantIndex, err := notifications.BuildRelayIndexKey(
+		notifications.WorkKindIntent, "tnt_1", "outbox_telegram_enable", createdAt,
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if fmt.Sprint(values[":relay_schema_version"]) != "2" || values[":expansion_status"] != "pending" ||
+		values[":relay_work_kind"] != string(notifications.WorkKindIntent) ||
+		values[":relay_gsi_pk"] != wantIndex.PartitionKey || values[":relay_gsi_sk"] != wantIndex.SortKey ||
+		!strings.Contains(aws.ToString(update.ConditionExpression), ":deferred") {
+		t.Fatalf("Telegram enable update=%s values=%#v", aws.ToString(update.UpdateExpression), values)
+	}
+
+	canonical := cloneMap(telegram)
+	canonical["relay_schema_version"] = int64(2)
+	canonical["expansion_status"] = "pending"
+	canonical["available_at"] = telegram["created_at"]
+	canonical["relay_work_kind"] = string(notifications.WorkKindIntent)
+	canonical["relay_gsi_pk"] = wantIndex.PartitionKey
+	canonical["relay_gsi_sk"] = wantIndex.SortKey
+	secondClient := &fakeClient{queryOutputs: []*awssdk.QueryOutput{{Items: []map[string]types.AttributeValue{
+		mustMarshalMap(t, canonical),
+	}}}}
+	second, err := (Store{Table: "domain", Client: secondClient}).BackfillRelay(
+		context.Background(),
+		BackfillOptions{
+			Tenants: []string{"tnt_1"}, Apply: true, PageSize: 25,
+			TargetChannel: notifications.ChannelTelegram,
+		},
+	)
+	if err != nil || second.Noop != 1 || second.RowsNeedingUpdate != 0 || len(secondClient.updateInputs) != 0 {
+		t.Fatalf("idempotent summary=%#v updates=%#v err=%v", second, secondClient.updateInputs, err)
+	}
+}
+
 func TestBackfillRelayUpgradesOnlyMissingWorkKindOnCanonicalV1EmailRows(t *testing.T) {
 	ready := canonicalEmailOutbox(
 		t, legacyOutbox("outbox_ready", "email", "ready"), notifications.WorkKindIntent,

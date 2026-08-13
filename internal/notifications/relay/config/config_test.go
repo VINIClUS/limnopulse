@@ -12,6 +12,9 @@ func TestLoadAcceptsRelayFlagsAndRequiredEnvironment(t *testing.T) {
 		"DYNAMODB_DOMAIN_TABLE":       "domain",
 		"DYNAMODB_ENDPOINT_URL":       "http://dynamodb:8000",
 		"SQS_NOTIFICATION_JOBS_URL":   "http://sqs:9324/queue/jobs",
+		"SQS_TELEGRAM_JOBS_URL":       "http://sqs:9324/queue/telegram-jobs",
+		"TELEGRAM_DELIVERY_ENABLED":   "true",
+		"LIMNOPULSE_WEB_URL":          "https://app.example.com",
 		"SQS_ENDPOINT_URL":            "http://sqs:9324",
 		"OTEL_EXPORTER_OTLP_ENDPOINT": "http://otel:4318",
 	}
@@ -49,8 +52,28 @@ func TestLoadAcceptsRelayFlagsAndRequiredEnvironment(t *testing.T) {
 	if loaded.AWSRegion != "sa-east-1" || loaded.DynamoDBTable != "domain" ||
 		loaded.DynamoDBEndpoint != "http://dynamodb:8000" ||
 		loaded.SQSQueueURL != "http://sqs:9324/queue/jobs" ||
+		loaded.SQSTelegramQueueURL != "http://sqs:9324/queue/telegram-jobs" ||
+		!loaded.TelegramDeliveryEnabled || loaded.WebURL != "https://app.example.com" ||
 		loaded.SQSEndpoint != "http://sqs:9324" || loaded.OTLPEndpoint != "http://otel:4318" {
 		t.Fatalf("environment not loaded: %#v", loaded)
+	}
+}
+
+func TestLoadKeepsTelegramFeatureOffWithoutQueueAndRequiresDependenciesWhenEnabled(t *testing.T) {
+	loaded, err := Load(nil, requiredLookup())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if loaded.TelegramDeliveryEnabled || loaded.SQSTelegramQueueURL != "" {
+		t.Fatalf("Telegram defaults = %#v", loaded)
+	}
+	values := map[string]string{
+		"AWS_REGION": "us-east-1", "DYNAMODB_DOMAIN_TABLE": "domain",
+		"SQS_NOTIFICATION_JOBS_URL": "email", "TELEGRAM_DELIVERY_ENABLED": "true",
+	}
+	_, err = Load(nil, func(key string) (string, bool) { value, ok := values[key]; return value, ok })
+	if err == nil || !strings.Contains(err.Error(), "SQS_TELEGRAM_JOBS_URL") {
+		t.Fatalf("enabled Telegram missing queue error = %v", err)
 	}
 }
 

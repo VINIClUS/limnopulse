@@ -8,6 +8,7 @@ import signal
 import struct
 import subprocess
 import time
+import urllib.request
 import uuid
 from collections.abc import Callable, Iterator
 from dataclasses import dataclass
@@ -27,6 +28,7 @@ from scripts.dev.publish_ses_event import build_ses_event, publish_event
 ROOT = Path(__file__).resolve().parents[2]
 RUN_INTEGRATION = os.getenv("RUN_NOTIFICATION_INTEGRATION") == "1"
 SQS_ENDPOINT = "http://127.0.0.1:9324"
+TELEGRAM_FAKE_ENDPOINT = "http://127.0.0.1:8089"
 
 
 pytestmark = pytest.mark.skipif(
@@ -46,6 +48,8 @@ class Runtime:
     events_url: str
     events_dlq_url: str
     routing_dlq_url: str
+    telegram_jobs_url: str
+    telegram_jobs_dlq_url: str
 
 
 def _aws_client(service: str, endpoint: str) -> Any:
@@ -63,12 +67,17 @@ def _create_queue_set(sqs: Any, prefix: str) -> dict[str, str]:
     jobs_dlq_url = sqs.create_queue(QueueName=f"{prefix}-jobs-dlq")["QueueUrl"]
     events_dlq_url = sqs.create_queue(QueueName=f"{prefix}-events-dlq")["QueueUrl"]
     routing_dlq_url = sqs.create_queue(QueueName=f"{prefix}-routing-dlq")["QueueUrl"]
+    telegram_jobs_dlq_url = sqs.create_queue(QueueName=f"{prefix}-telegram-jobs-dlq")["QueueUrl"]
     jobs_dlq_arn = sqs.get_queue_attributes(QueueUrl=jobs_dlq_url, AttributeNames=["QueueArn"])[
         "Attributes"
     ]["QueueArn"]
     events_dlq_arn = sqs.get_queue_attributes(QueueUrl=events_dlq_url, AttributeNames=["QueueArn"])[
         "Attributes"
     ]["QueueArn"]
+    telegram_jobs_dlq_arn = sqs.get_queue_attributes(
+        QueueUrl=telegram_jobs_dlq_url,
+        AttributeNames=["QueueArn"],
+    )["Attributes"]["QueueArn"]
     # Ephemeral test queues disable their queue-level wait as well as the
     # worker flag. ElasticMQ otherwise applies the 20-second queue default to
     # an explicit zero and can retain a cancelled receive between processes.
@@ -91,12 +100,26 @@ def _create_queue_set(sqs: Any, prefix: str) -> dict[str, str]:
             ),
         },
     )["QueueUrl"]
+    telegram_jobs_url = sqs.create_queue(
+        QueueName=f"{prefix}-telegram-jobs",
+        Attributes={
+            **common,
+            "RedrivePolicy": json.dumps(
+                {
+                    "deadLetterTargetArn": telegram_jobs_dlq_arn,
+                    "maxReceiveCount": "8",
+                }
+            ),
+        },
+    )["QueueUrl"]
     return {
         "jobs_url": jobs_url,
         "jobs_dlq_url": jobs_dlq_url,
         "events_url": events_url,
         "events_dlq_url": events_dlq_url,
         "routing_dlq_url": routing_dlq_url,
+        "telegram_jobs_url": telegram_jobs_url,
+        "telegram_jobs_dlq_url": telegram_jobs_dlq_url,
     }
 
 
@@ -132,6 +155,8 @@ def runtime(notification_binary: Path) -> Iterator[Runtime]:
         "limnopulse-ses-events",
         "limnopulse-ses-events-dlq",
         "limnopulse-ses-events-routing-dlq",
+        "limnopulse-telegram-notification-jobs",
+        "limnopulse-telegram-notification-jobs-dlq",
     }
     assert required_queue_names <= queue_names
     queue_urls = _create_queue_set(sqs, f"limnopulse-it-{suffix}")
@@ -180,7 +205,11 @@ def _relay_index(kind: str, tenant_id: str, item_id: str, at: datetime) -> tuple
 
 
 def _delivery_id(event_id: str, kind: str, recipient_id: str) -> str:
-    canonical = f"limnopulse:delivery:v1\0{event_id}\0{kind}\0email\0{recipient_id}"
+    return _channel_delivery_id(event_id, kind, "email", recipient_id)
+
+
+def _channel_delivery_id(event_id: str, kind: str, channel: str, recipient_id: str) -> str:
+    canonical = f"limnopulse:delivery:v1\0{event_id}\0{kind}\0{channel}\0{recipient_id}"
     return "del_" + hashlib.sha256(canonical.encode()).hexdigest()
 
 
@@ -199,6 +228,21 @@ def _content_hash(
         subject,
         text,
         html,
+    ):
+        encoded = field.encode()
+        digest.update(struct.pack(">Q", len(encoded)))
+        digest.update(encoded)
+    return digest.hexdigest()
+
+
+def _telegram_content_hash(template_id: str, body_text: str) -> str:
+    digest = hashlib.sha256()
+    for field in (
+        "limnopulse:rendered-telegram:v1",
+        template_id,
+        "1",
+        "pt-BR",
+        body_text,
     ):
         encoded = field.encode()
         digest.update(struct.pack(">Q", len(encoded)))
@@ -257,6 +301,36 @@ def _start_worker(
     )
 
 
+def _start_telegram_worker(runtime: Runtime) -> subprocess.Popen[str]:
+    environment = _base_environment(runtime, "success")
+    environment.update(
+        {
+            "SQS_TELEGRAM_JOBS_URL": runtime.telegram_jobs_url,
+            "REDIS_ADDR": "127.0.0.1:6379",
+            "TELEGRAM_DELIVERY_ENABLED": "true",
+            "TELEGRAM_BOT_TOKEN": "123456:local-integration-token",
+            "TELEGRAM_BOT_API_BASE_URL": TELEGRAM_FAKE_ENDPOINT,
+            "TELEGRAM_GLOBAL_RATE": "100",
+            "TELEGRAM_GLOBAL_BURST": "10",
+            "TELEGRAM_DESTINATION_RATE": "100",
+            "TELEGRAM_DESTINATION_BURST": "10",
+        }
+    )
+    return subprocess.Popen(
+        [
+            str(runtime.binary),
+            "telegram-worker",
+            "--send-concurrency=1",
+            "--receive-wait=0s",
+        ],
+        cwd=ROOT,
+        env=environment,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+    )
+
+
 def _stop_worker(process: subprocess.Popen[str]) -> dict[str, Any]:
     if process.poll() is None:
         process.send_signal(signal.SIGTERM)
@@ -304,12 +378,13 @@ def _wait_for(
     timeout: float = 20,
 ) -> Any:
     deadline = time.monotonic() + timeout
+    value: Any = None
     while time.monotonic() < deadline:
         value = read()
         if predicate(value):
             return value
         time.sleep(0.1)
-    pytest.fail(f"condition not met within {timeout}s")
+    pytest.fail(f"condition not met within {timeout}s; last value={value!r}")
 
 
 def _read_item(runtime: Runtime, pk: str, sk: str) -> dict[str, Any]:
@@ -365,6 +440,32 @@ def _put_direct_delivery(
     ambiguous_exhausted: bool = False,
 ) -> None:
     assert delivery_id == _delivery_id(event_id, "opening", recipient_id)
+    runtime.table.put_item(
+        Item={
+            "PK": f"TENANT#{tenant_id}",
+            "SK": f"NOTIFICATION_PREFERENCE#USER#{recipient_id}",
+            "entity_type": "notification_preference",
+            "tenant_id": tenant_id,
+            "cognito_sub": recipient_id,
+            "version": 1,
+            "email_enabled": True,
+            "email_address": email,
+            "email_verified": True,
+            "minimum_severity": "warning",
+        }
+    )
+    runtime.table.put_item(
+        Item={
+            "PK": f"TENANT#{tenant_id}",
+            "SK": f"ALERT_EVENT#{event_id}",
+            "entity_type": "alert_event",
+            "tenant_id": tenant_id,
+            "event_id": event_id,
+            "rule_id": "rule_local",
+            "severity": "critical",
+            "status": "open",
+        }
+    )
     subject, text, html = "Local alert", "Local alert body", "<p>Local alert body</p>"
     item: dict[str, Any] = {
         "PK": f"NOTIFICATION_OUTBOX#{outbox_id}",
@@ -440,6 +541,184 @@ def _send_job(
     )
 
 
+def _wiremock_requests() -> list[dict[str, Any]]:
+    try:
+        with urllib.request.urlopen(
+            f"{TELEGRAM_FAKE_ENDPOINT}/__admin/requests",
+            timeout=2,
+        ) as response:
+            return json.load(response).get("requests", [])
+    except OSError as error:
+        pytest.fail(
+            "Telegram integration requires `docker compose --profile notifications "
+            "up -d dynamodb-local elasticmq redis telegram-bot-api-fake`: "
+            f"{error}"
+        )
+
+
+def _reset_wiremock() -> None:
+    request = urllib.request.Request(
+        f"{TELEGRAM_FAKE_ENDPOINT}/__admin/requests",
+        method="DELETE",
+    )
+    try:
+        with urllib.request.urlopen(request, timeout=2):
+            pass
+    except OSError as error:
+        pytest.fail(f"could not reset the local Telegram fake: {error}")
+
+
+def _seed_direct_telegram_delivery(runtime: Runtime, now: datetime) -> dict[str, str]:
+    tenant_id = "tnt_telegram_integration"
+    recipient_id = "user_telegram_integration"
+    outbox_id = "outbox_telegram_integration"
+    event_id = "evt_telegram_integration"
+    rule_id = "rule_telegram_integration"
+    delivery_id = _channel_delivery_id(event_id, "opening", "telegram", recipient_id)
+    chat_id = 123456789
+    destination_id = hashlib.sha256(str(chat_id).encode("ascii")).hexdigest()
+    body_text = "Alerta critico no viveiro Local Pond\nhttps://app.example.test/alerts/evt_telegram_integration"
+    _put_membership(runtime, tenant_id, recipient_id, now - timedelta(hours=1))
+    runtime.table.put_item(
+        Item={
+            "PK": f"TENANT#{tenant_id}",
+            "SK": f"NOTIFICATION_PREFERENCE#USER#{recipient_id}",
+            "entity_type": "notification_preference",
+            "tenant_id": tenant_id,
+            "cognito_sub": recipient_id,
+            "version": 1,
+            "email_enabled": False,
+            "telegram_enabled": True,
+            "minimum_severity": "warning",
+        }
+    )
+    runtime.table.put_item(
+        Item={
+            "PK": f"TENANT#{tenant_id}",
+            "SK": f"TELEGRAM_BINDING#USER#{recipient_id}",
+            "entity_type": "telegram_binding",
+            "tenant_id": tenant_id,
+            "recipient_id": recipient_id,
+            "destination_id": destination_id,
+            "status": "verified",
+            "version": 1,
+            "verified_at": _fixed(now),
+            "created_at": _fixed(now),
+            "updated_at": _fixed(now),
+        }
+    )
+    runtime.table.put_item(
+        Item={
+            "PK": f"TELEGRAM_DESTINATION#{destination_id}",
+            "SK": "META",
+            "entity_type": "telegram_destination",
+            "destination_id": destination_id,
+            "recipient_id": recipient_id,
+            "chat_id": chat_id,
+            "status": "active",
+            "version": 1,
+            "created_at": _fixed(now),
+            "updated_at": _fixed(now),
+        }
+    )
+    runtime.table.put_item(
+        Item={
+            "PK": f"TENANT#{tenant_id}",
+            "SK": f"ALERT_EVENT#{event_id}",
+            "entity_type": "alert_event",
+            "tenant_id": tenant_id,
+            "event_id": event_id,
+            "rule_id": rule_id,
+            "severity": "critical",
+            "status": "open",
+        }
+    )
+    runtime.table.put_item(
+        Item={
+            "PK": f"NOTIFICATION_OUTBOX#{outbox_id}",
+            "SK": f"DELIVERY#{delivery_id}",
+            "entity_type": "notification_delivery",
+            "relay_schema_version": 2,
+            "tenant_id": tenant_id,
+            "outbox_id": outbox_id,
+            "delivery_id": delivery_id,
+            "event_id": event_id,
+            "rule_id": rule_id,
+            "kind": "opening",
+            "channel": "telegram",
+            "recipient_id": recipient_id,
+            "destination_id": destination_id,
+            "telegram_chat_id": chat_id,
+            "membership_snapshot": {"role": "owner", "status": "active", "version": 1},
+            "state": "queued",
+            "content": {
+                "template_id": "telegram-alert-opening/v1",
+                "template_version": 1,
+                "locale": "pt-BR",
+                "body_text": body_text,
+                "content_hash": _telegram_content_hash(
+                    "telegram-alert-opening/v1",
+                    body_text,
+                ),
+            },
+            "created_at": _fixed(now),
+            "updated_at": _fixed(now),
+            "delivery_revision": 1,
+            "attempt_count": 0,
+        }
+    )
+    job = {
+        "schema_version": 1,
+        "message_type": "notification.delivery",
+        "tenant_id": tenant_id,
+        "outbox_id": outbox_id,
+        "delivery_id": delivery_id,
+        "event_id": event_id,
+        "kind": "opening",
+        "channel": "telegram",
+    }
+    serialized_job = json.dumps(job, separators=(",", ":"))
+    assert str(chat_id) not in serialized_job
+    runtime.sqs.send_message(
+        QueueUrl=runtime.telegram_jobs_url,
+        MessageBody=serialized_job,
+    )
+    return {"outbox_id": outbox_id, "delivery_id": delivery_id, "body_text": body_text}
+
+
+def test_telegram_worker_sends_once_through_dedicated_queue_and_local_fake(
+    runtime: Runtime,
+) -> None:
+    _reset_wiremock()
+    identity = _seed_direct_telegram_delivery(
+        runtime,
+        datetime.now(UTC).replace(microsecond=0),
+    )
+    worker = _start_telegram_worker(runtime)
+    try:
+        succeeded = _wait_delivery(
+            runtime,
+            identity["outbox_id"],
+            identity["delivery_id"],
+            "succeeded",
+        )
+        assert succeeded["attempt_count"] == 1
+        assert succeeded["provider_message_id"] == "42"
+        requests = _wait_for(
+            _wiremock_requests,
+            lambda values: len(values) == 1,
+        )
+        request_body = json.loads(base64.b64decode(requests[0]["request"]["bodyAsBase64"]))
+        assert request_body["text"] == identity["body_text"]
+        assert request_body["link_preview_options"] == {"is_disabled": True}
+        summary = _stop_worker(worker)
+        assert summary["messages_received"] == 1
+        assert summary["messages_deleted"] == 1
+    finally:
+        if worker.poll() is None:
+            _stop_worker(worker)
+
+
 def _seed_opening_and_recovery(runtime: Runtime, now: datetime) -> dict[str, str]:
     tenant_id = "tnt_integration_flow"
     recipient_id = "user_integration_flow"
@@ -456,6 +735,7 @@ def _seed_opening_and_recovery(runtime: Runtime, now: datetime) -> dict[str, str
             "entity_type": "notification_preference",
             "tenant_id": tenant_id,
             "cognito_sub": recipient_id,
+            "version": 1,
             "email_enabled": True,
             "email_address": email,
             "email_verified": True,
@@ -583,10 +863,16 @@ def test_multiprocess_happy_path_recovery_dependency_feedback_and_suppression(
     finally:
         if worker.poll() is None:
             _stop_worker(worker)
+        else:
+            stdout, stderr = worker.communicate(timeout=5)
+            pytest.fail(
+                f"notification worker exited early with code {worker.returncode}; "
+                f"stdout={stdout!r} stderr={stderr!r}"
+            )
 
 
 def test_crash_republication_and_duplicate_job_create_one_attempt(runtime: Runtime) -> None:
-    now = datetime.now(UTC).replace(microsecond=0)
+    now = datetime.now(UTC).replace(microsecond=0) - timedelta(minutes=1)
     tenant, recipient = "tnt_republication", "user_republication"
     outbox, event = "outbox_republication", "evt_republication"
     delivery = _delivery_id(event, "opening", recipient)
@@ -711,7 +997,9 @@ def test_retry_ambiguous_confirmation_and_no_feedback_unknown(runtime: Runtime) 
         succeeded_after_retry = _wait_delivery(runtime, retry[0], retry[1], "succeeded")
         assert succeeded_after_retry["attempt_count"] == 2
         assert succeeded_after_retry["last_attempt_id"] != first_attempt_id
-        assert succeeded_after_retry["provider_attempt_id"] == succeeded_after_retry["last_attempt_id"]
+        assert (
+            succeeded_after_retry["provider_attempt_id"] == succeeded_after_retry["last_attempt_id"]
+        )
         attempts = runtime.table.query(
             KeyConditionExpression="PK = :pk AND begins_with(SK, :attempt)",
             ExpressionAttributeValues={
@@ -745,11 +1033,14 @@ def test_retry_ambiguous_confirmation_and_no_feedback_unknown(runtime: Runtime) 
         retry_summary = _stop_worker(retry_success_worker)
         assert retry_summary["messages_deleted"] >= 2
         assert retry_summary["visibility_changed"] == 0
-        assert _read_item(
-            runtime,
-            f"NOTIFICATION_OUTBOX#{retry[0]}",
-            f"DELIVERY#{retry[1]}",
-        )["attempt_count"] == 2
+        assert (
+            _read_item(
+                runtime,
+                f"NOTIFICATION_OUTBOX#{retry[0]}",
+                f"DELIVERY#{retry[1]}",
+            )["attempt_count"]
+            == 2
+        )
     finally:
         if retry_success_worker.poll() is None:
             _stop_worker(retry_success_worker)
@@ -873,8 +1164,7 @@ def test_retry_ambiguous_confirmation_and_no_feedback_unknown(runtime: Runtime) 
             },
             UpdateExpression="SET next_attempt_at = :due",
             ConditionExpression=(
-                "#state = :retryable AND provider_outcome = :delayed "
-                "AND attempt_count = :one"
+                "#state = :retryable AND provider_outcome = :delayed AND attempt_count = :one"
             ),
             ExpressionAttributeNames={"#state": "state"},
             ExpressionAttributeValues={

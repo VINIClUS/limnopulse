@@ -318,6 +318,40 @@ func TestCommitRecoveryAddsDependencyRelayIndexOnlyToEmailOutbox(t *testing.T) {
 	}
 }
 
+func TestCommitIndexesTelegramOutboxWithV2OnlyWhenWriterEnabled(t *testing.T) {
+	client := &fakeClient{}
+	store := Store{Table: "domain", Client: client, TelegramDeliveryEnabled: true}
+	slot := time.Date(2026, 8, 13, 12, 0, 0, 0, time.UTC)
+	work, err := workFromItem(ruleItemWithLease())
+	if err != nil {
+		t.Fatal(err)
+	}
+	work.Rule.Duration = time.Minute
+	evaluation := alertevaluator.Evaluation{
+		Slot: slot, Quality: alertevaluator.QualitySufficient, Breached: true, Value: 4.2,
+	}
+	decision := alertevaluator.Decide(work.Rule.Rule, alertevaluator.State{}, evaluation, time.Minute)
+	if err := store.Commit(context.Background(), alertevaluator.CommitRequest{
+		Work: work, Evaluation: evaluation, Decision: decision,
+		Slot: slot, NextDue: slot.Add(time.Minute),
+	}); err != nil {
+		t.Fatal(err)
+	}
+	telegram := unmarshalItem(t, client.transactInput.TransactItems[5].Put.Item)
+	wantRelay, err := notifications.BuildRelayIndexKey(
+		notifications.WorkKindIntent, work.Rule.TenantID, decision.Outboxes[1].OutboxID, slot,
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if fmt.Sprint(telegram["relay_schema_version"]) != "2" ||
+		telegram["expansion_status"] != "pending" ||
+		telegram["relay_gsi_pk"] != wantRelay.PartitionKey ||
+		telegram["relay_gsi_sk"] != wantRelay.SortKey {
+		t.Fatalf("Telegram v2 relay fields = %#v", telegram)
+	}
+}
+
 func TestCommitStoresEvaluationValueOnlyForSufficientQuality(t *testing.T) {
 	qualities := []struct {
 		name      string

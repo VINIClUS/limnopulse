@@ -5,6 +5,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"net/http"
 	"os"
 	"path/filepath"
@@ -17,6 +18,7 @@ import (
 	"github.com/VINIClUS/limnopulse/internal/notifications/feedback"
 	"github.com/VINIClUS/limnopulse/internal/notifications/relay"
 	relayconfig "github.com/VINIClUS/limnopulse/internal/notifications/relay/config"
+	telegramworkerconfig "github.com/VINIClUS/limnopulse/internal/notifications/telegramworker/config"
 	"github.com/VINIClUS/limnopulse/internal/notifications/worker"
 	workerconfig "github.com/VINIClUS/limnopulse/internal/notifications/worker/config"
 	"github.com/aws/aws-sdk-go-v2/aws"
@@ -25,6 +27,35 @@ import (
 	awssdk "github.com/aws/aws-sdk-go-v2/service/dynamodb"
 	"github.com/aws/aws-sdk-go-v2/service/dynamodb/types"
 )
+
+func TestTelegramWorkerLoadsDedicatedConfigWithoutLeakingSecrets(t *testing.T) {
+	environment := map[string]string{
+		"APP_ENV": "test", "TELEGRAM_DELIVERY_ENABLED": "true", "AWS_REGION": "us-east-1",
+		"DYNAMODB_DOMAIN_TABLE": "private-domain", "SQS_TELEGRAM_JOBS_URL": "private-telegram-queue",
+		"REDIS_ADDR": "private-redis:6379", "REDIS_PASSWORD": "private-redis-password",
+		"TELEGRAM_BOT_TOKEN": "private-bot-token",
+	}
+	var captured telegramworkerconfig.RunConfig
+	var output bytes.Buffer
+	exit := runMain(context.Background(), []string{"telegram-worker", "--send-concurrency=6"}, dependencies{
+		Output:    &output,
+		LookupEnv: func(key string) (string, bool) { value, ok := environment[key]; return value, ok },
+		RunTelegramWorker: func(_ context.Context, config telegramworkerconfig.RunConfig) (worker.RunSummary, error) {
+			captured = config
+			return worker.RunSummary{Result: "success", ExitCode: 0, Graceful: true}, nil
+		},
+	})
+	if exit != 0 || captured.SendConcurrency != 6 || captured.SQSQueueURL != "private-telegram-queue" {
+		t.Fatalf("exit=%d config=%#v output=%s", exit, captured, output.String())
+	}
+	for _, secret := range []string{
+		"private-domain", "private-telegram-queue", "private-redis", "private-redis-password", "private-bot-token",
+	} {
+		if strings.Contains(output.String(), secret) {
+			t.Fatalf("Telegram worker summary leaked %q: %s", secret, output.String())
+		}
+	}
+}
 
 func TestWorkerLoadsContinuousConfigAndReturnsGracefulExitWithoutPII(t *testing.T) {
 	privateQueue := "http://sqs:9324/queue/private-jobs"
@@ -413,6 +444,35 @@ func TestBackfillRelayResolvesTenantFlagsAndFilesInFirstSeenOrderBeforeAWS(t *te
 	}
 }
 
+func TestBackfillTelegramUsesExplicitTenantQueryAndEnablesV2Relay(t *testing.T) {
+	client := &fakeDynamo{queryOutput: &awssdk.QueryOutput{Items: []map[string]types.AttributeValue{
+		commandOutbox(t, map[string]any{
+			"PK": "TENANT#private_tenant", "SK": "NOTIFICATION_OUTBOX#private_outbox",
+			"entity_type": "notification_outbox", "tenant_id": "private_tenant", "outbox_id": "private_outbox",
+			"channel": "telegram", "kind": "opening", "status": "ready",
+			"created_at":       "2026-07-15T12:00:45.000000000Z",
+			"expansion_status": "deferred_unsupported_channel",
+		}),
+	}}}
+	var output bytes.Buffer
+	exit := runMain(context.Background(), []string{
+		"backfill-telegram", "--tenant", "private_tenant", "--apply",
+	}, dependencies{
+		Output: &output, LookupEnv: func(string) (string, bool) { return "", false },
+		LoadDynamo: func(context.Context, string, string) (notificationdynamo.Client, error) {
+			return client, nil
+		},
+	})
+	if exit != 0 || len(client.queryInputs) != 1 || len(client.updateInputs) != 1 {
+		t.Fatalf("exit=%d queries=%d updates=%d output=%s", exit, len(client.queryInputs), len(client.updateInputs), output.String())
+	}
+	values := unmarshalCommandValues(t, client.updateInputs[0].ExpressionAttributeValues)
+	if fmt.Sprint(values[":relay_schema_version"]) != "2" || values[":expansion_status"] != "pending" ||
+		strings.Contains(output.String(), "private_") {
+		t.Fatalf("values=%#v output=%s", values, output.String())
+	}
+}
+
 func TestBackfillRelayRejectsInvalidScopeAndPageSizeBeforeAWS(t *testing.T) {
 	directory := t.TempDir()
 	emptyFile := filepath.Join(directory, "empty.txt")
@@ -670,4 +730,13 @@ func commandOutbox(t *testing.T, value map[string]any) map[string]types.Attribut
 		t.Fatal(err)
 	}
 	return item
+}
+
+func unmarshalCommandValues(t *testing.T, values map[string]types.AttributeValue) map[string]any {
+	t.Helper()
+	var decoded map[string]any
+	if err := attributevalue.UnmarshalMap(values, &decoded); err != nil {
+		t.Fatal(err)
+	}
+	return decoded
 }

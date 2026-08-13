@@ -26,6 +26,34 @@ resource "aws_sqs_queue_redrive_allow_policy" "notification_jobs_dlq" {
   })
 }
 
+resource "aws_sqs_queue" "telegram_notification_jobs_dlq" {
+  name                      = var.telegram_notification_jobs_dlq_name
+  message_retention_seconds = 1209600
+  sqs_managed_sse_enabled   = true
+}
+
+resource "aws_sqs_queue" "telegram_notification_jobs" {
+  name                       = var.telegram_notification_jobs_queue_name
+  visibility_timeout_seconds = 60
+  message_retention_seconds  = 345600
+  receive_wait_time_seconds  = 20
+  sqs_managed_sse_enabled    = true
+
+  redrive_policy = jsonencode({
+    deadLetterTargetArn = aws_sqs_queue.telegram_notification_jobs_dlq.arn
+    maxReceiveCount     = 8
+  })
+}
+
+resource "aws_sqs_queue_redrive_allow_policy" "telegram_notification_jobs_dlq" {
+  queue_url = aws_sqs_queue.telegram_notification_jobs_dlq.id
+
+  redrive_allow_policy = jsonencode({
+    redrivePermission = "byQueue"
+    sourceQueueArns   = [aws_sqs_queue.telegram_notification_jobs.arn]
+  })
+}
+
 resource "aws_sqs_queue" "ses_events_dlq" {
   name                      = var.ses_events_dlq_name
   message_retention_seconds = 1209600

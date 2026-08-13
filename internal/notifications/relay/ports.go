@@ -65,6 +65,7 @@ type Work struct {
 	DependsOnOutboxID   string
 	NotificationKind    notifications.NotificationKind
 	Channel             notifications.Channel
+	RelaySchemaVersion  int64
 	State               string
 	Revision            int64
 	Cursor              string

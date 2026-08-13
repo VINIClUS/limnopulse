@@ -17,7 +17,9 @@ type Client interface {
 }
 
 type Store struct {
-	Table    string
-	Client   Client
-	Renderer *notifications.TemplateRenderer
+	Table               string
+	Client              Client
+	Renderer            *notifications.TemplateRenderer
+	WebURL              string
+	AllowInsecureWebURL bool
 }

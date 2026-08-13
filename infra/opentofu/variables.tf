@@ -52,6 +52,30 @@ variable "notification_jobs_dlq_name" {
   default     = "limnopulse-notification-jobs-dlq"
 }
 
+variable "telegram_notification_jobs_queue_name" {
+  description = "SQS queue name consumed only by the Telegram notification worker."
+  type        = string
+  default     = "limnopulse-telegram-notification-jobs"
+}
+
+variable "telegram_notification_jobs_dlq_name" {
+  description = "Dead-letter queue name for Telegram notification jobs."
+  type        = string
+  default     = "limnopulse-telegram-notification-jobs-dlq"
+}
+
+variable "telegram_bot_token_secret_name" {
+  description = "Secrets Manager container name for the Telegram bot token; the value is populated out of band."
+  type        = string
+  default     = "limnopulse/telegram/bot-token"
+}
+
+variable "telegram_webhook_secret_name" {
+  description = "Secrets Manager container name for the Telegram webhook secret; the value is populated out of band."
+  type        = string
+  default     = "limnopulse/telegram/webhook-secret"
+}
+
 variable "ses_events_queue_name" {
   description = "SQS queue name consumed by the SES feedback worker."
   type        = string

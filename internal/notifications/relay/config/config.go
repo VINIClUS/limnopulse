@@ -4,6 +4,7 @@ import (
 	"flag"
 	"fmt"
 	"io"
+	"strconv"
 	"strings"
 	"time"
 
@@ -40,12 +41,16 @@ type RunConfig struct {
 	SQSRequestTimeout time.Duration
 	OTLPFlushTimeout  time.Duration
 
-	AWSRegion        string
-	DynamoDBTable    string
-	DynamoDBEndpoint string
-	SQSQueueURL      string
-	SQSEndpoint      string
-	OTLPEndpoint     string
+	AWSRegion               string
+	AppEnv                  string
+	DynamoDBTable           string
+	DynamoDBEndpoint        string
+	SQSQueueURL             string
+	SQSTelegramQueueURL     string
+	SQSEndpoint             string
+	OTLPEndpoint            string
+	WebURL                  string
+	TelegramDeliveryEnabled bool
 }
 
 func Load(args []string, lookup LookupEnv) (RunConfig, error) {
@@ -62,6 +67,7 @@ func Load(args []string, lookup LookupEnv) (RunConfig, error) {
 		LeaseTTL:          LeaseTTL,
 		SQSRequestTimeout: SQSRequestTimeout,
 		OTLPFlushTimeout:  OTLPFlushTimeout,
+		AppEnv:            "local",
 	}
 	if lookup == nil {
 		lookup = func(string) (string, bool) { return "", false }
@@ -69,15 +75,27 @@ func Load(args []string, lookup LookupEnv) (RunConfig, error) {
 	var err error
 	for key, target := range map[string]*string{
 		"AWS_REGION":                  &config.AWSRegion,
+		"APP_ENV":                     &config.AppEnv,
 		"DYNAMODB_DOMAIN_TABLE":       &config.DynamoDBTable,
 		"DYNAMODB_ENDPOINT_URL":       &config.DynamoDBEndpoint,
 		"SQS_NOTIFICATION_JOBS_URL":   &config.SQSQueueURL,
+		"SQS_TELEGRAM_JOBS_URL":       &config.SQSTelegramQueueURL,
 		"SQS_ENDPOINT_URL":            &config.SQSEndpoint,
 		"OTEL_EXPORTER_OTLP_ENDPOINT": &config.OTLPEndpoint,
+		"LIMNOPULSE_WEB_URL":          &config.WebURL,
 	} {
 		if value, ok := lookup(key); ok {
 			*target = strings.TrimSpace(value)
 		}
+	}
+	telegramExplicit := false
+	if value, ok := lookup("TELEGRAM_DELIVERY_ENABLED"); ok {
+		telegramExplicit = true
+		parsed, parseErr := strconv.ParseBool(strings.TrimSpace(value))
+		if parseErr != nil {
+			return RunConfig{}, fmt.Errorf("TELEGRAM_DELIVERY_ENABLED must be true or false")
+		}
+		config.TelegramDeliveryEnabled = parsed
 	}
 	for _, required := range []struct {
 		name  string
@@ -124,6 +142,26 @@ func Load(args []string, lookup LookupEnv) (RunConfig, error) {
 	}
 	if config.FanoutPageSize < 1 || config.FanoutPageSize > 99 {
 		return RunConfig{}, fmt.Errorf("fanout-page-size must be between 1 and 99")
+	}
+	if config.AppEnv != "local" && config.AppEnv != "test" &&
+		config.AppEnv != "staging" && config.AppEnv != "prod" {
+		return RunConfig{}, fmt.Errorf("APP_ENV must be local, test, staging or prod")
+	}
+	if (config.AppEnv == "staging" || config.AppEnv == "prod") && !telegramExplicit {
+		return RunConfig{}, fmt.Errorf("TELEGRAM_DELIVERY_ENABLED must be explicit in hosted environments")
+	}
+	if config.TelegramDeliveryEnabled {
+		if config.SQSTelegramQueueURL == "" {
+			return RunConfig{}, fmt.Errorf("SQS_TELEGRAM_JOBS_URL is required when Telegram delivery is enabled")
+		}
+		if config.WebURL == "" {
+			return RunConfig{}, fmt.Errorf("LIMNOPULSE_WEB_URL is required when Telegram delivery is enabled")
+		}
+		if _, urlErr := notifications.BuildAlertEventURL(
+			config.WebURL, "tenant", "event", config.AppEnv == "local" || config.AppEnv == "test",
+		); urlErr != nil {
+			return RunConfig{}, fmt.Errorf("LIMNOPULSE_WEB_URL is invalid")
+		}
 	}
 	return config, nil
 }

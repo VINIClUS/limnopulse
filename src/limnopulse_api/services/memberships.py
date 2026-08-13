@@ -23,7 +23,7 @@ class MembershipService:
         if self.cache is not None:
             try:
                 cached = await self.cache.get_json(cache_key)
-            except Exception:
+            except Exception:  # noqa: BLE001 - cache is a best-effort optimization.
                 cached = None
             else:
                 membership = self._membership_from_cached(cached, cognito_sub, tenant_id)
@@ -41,9 +41,12 @@ class MembershipService:
                     [membership.model_dump(mode="json")],
                     self.membership_ttl_seconds,
                 )
-            except Exception:
+            except Exception:  # noqa: BLE001, S110 - cache failure must not deny access.
                 pass
         return membership
+
+    async def is_active(self, recipient_id: str, tenant_id: str) -> bool:
+        return await self.get_active_membership(recipient_id, tenant_id) is not None
 
     def _membership_from_cached(
         self,

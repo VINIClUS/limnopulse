@@ -166,14 +166,19 @@ def test_notification_queues_and_ses_eventbridge_boundary_are_safe_by_default() 
     for resource in (
         "notification_jobs",
         "notification_jobs_dlq",
+        "telegram_notification_jobs",
+        "telegram_notification_jobs_dlq",
         "ses_events",
         "ses_events_dlq",
         "ses_events_routing_dlq",
     ):
         assert f'resource "aws_sqs_queue" "{resource}"' in queues
-    assert len(re.findall(r"sqs_managed_sse_enabled\s+=\s+true", queues)) == 5
-    assert len(re.findall(r"maxReceiveCount\s+=\s+8", queues)) == 2
+    assert len(re.findall(r"sqs_managed_sse_enabled\s+=\s+true", queues)) == 7
+    assert len(re.findall(r"maxReceiveCount\s+=\s+8", queues)) == 3
     assert 'resource "aws_sqs_queue_redrive_allow_policy" "notification_jobs_dlq"' in queues
+    assert (
+        'resource "aws_sqs_queue_redrive_allow_policy" "telegram_notification_jobs_dlq"' in queues
+    )
     assert 'resource "aws_sqs_queue_redrive_allow_policy" "ses_events_dlq"' in queues
     assert 'resource "aws_sqs_queue_policy" "ses_events"' in queues
     assert 'resource "aws_sqs_queue_policy" "ses_events_routing_dlq"' in queues
@@ -244,12 +249,8 @@ def test_ses_eventbridge_targets_emit_only_parseable_non_pii_feedback() -> None:
                 "bounceType": "Permanent",
                 "bouncedRecipients": [{"emailAddress": "recipient@example.test"}],
             },
-            "complaint": {
-                "complainedRecipients": [{"emailAddress": "recipient@example.test"}]
-            },
-            "deliveryDelay": {
-                "delayedRecipients": [{"emailAddress": "recipient@example.test"}]
-            },
+            "complaint": {"complainedRecipients": [{"emailAddress": "recipient@example.test"}]},
+            "deliveryDelay": {"delayedRecipients": [{"emailAddress": "recipient@example.test"}]},
             "reject": {"reason": "Bad content"},
         },
     }

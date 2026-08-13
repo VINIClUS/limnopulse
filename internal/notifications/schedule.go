@@ -2,7 +2,21 @@ package notifications
 
 import "fmt"
 
-const RelaySchemaVersion int64 = 1
+const (
+	RelaySchemaVersion         int64 = 1
+	TelegramRelaySchemaVersion int64 = 2
+)
+
+func RelaySchemaVersionForChannel(channel Channel) (int64, error) {
+	switch channel {
+	case ChannelEmail:
+		return RelaySchemaVersion, nil
+	case ChannelTelegram:
+		return TelegramRelaySchemaVersion, nil
+	default:
+		return 0, channel.Validate()
+	}
+}
 
 type OutboxStatus string
 

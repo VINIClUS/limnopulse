@@ -15,9 +15,11 @@ import (
 )
 
 const (
-	TemplateAlertOpeningV1  TemplateID = "alert-opening/v1"
-	TemplateAlertRecoveryV1 TemplateID = "alert-recovery/v1"
-	LocalePTBR              Locale     = "pt-BR"
+	TemplateAlertOpeningV1          TemplateID = "alert-opening/v1"
+	TemplateAlertRecoveryV1         TemplateID = "alert-recovery/v1"
+	TemplateTelegramAlertOpeningV1  TemplateID = "telegram-alert-opening/v1"
+	TemplateTelegramAlertRecoveryV1 TemplateID = "telegram-alert-recovery/v1"
+	LocalePTBR                      Locale     = "pt-BR"
 
 	MaxEmailSubjectRunes = 180
 	MaxEmailTextBytes    = 64 * 1024
@@ -33,7 +35,8 @@ type Locale string
 
 func (templateID TemplateID) Version() (int, error) {
 	switch templateID {
-	case TemplateAlertOpeningV1, TemplateAlertRecoveryV1:
+	case TemplateAlertOpeningV1, TemplateAlertRecoveryV1,
+		TemplateTelegramAlertOpeningV1, TemplateTelegramAlertRecoveryV1:
 		return 1, nil
 	default:
 		return 0, fmt.Errorf("unknown template ID %q", templateID)

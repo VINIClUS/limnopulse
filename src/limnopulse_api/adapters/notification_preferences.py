@@ -150,7 +150,12 @@ class DynamoNotificationPreferenceRepository:
         preference: NotificationPreference,
         previous: NotificationPreference | None,
     ) -> dict[str, Any] | None:
-        if previous is None or previous.email_address == preference.email_address:
+        if (
+            previous is None
+            or previous.email_address is None
+            or preference.email_address is None
+            or previous.email_address == preference.email_address
+        ):
             return None
         canonical_key = self._deliverability_key(previous.email_address)
         legacy_key = self._legacy_deliverability_key(previous.email_address)
@@ -229,8 +234,8 @@ class DynamoNotificationPreferenceRepository:
         return {
             **self._preference_key(preference.tenant_id, preference.cognito_sub),
             "entity_type": "notification_preference",
-            **preference.model_dump(mode="json"),
-            "schema_version": 1,
+            **preference.model_dump(mode="json", exclude_none=True),
+            "schema_version": 2,
         }
 
     def _audit_item(
@@ -258,8 +263,13 @@ class DynamoNotificationPreferenceRepository:
             "details": {
                 "email_enabled": preference.email_enabled,
                 "email_verified": preference.email_verified,
+                "telegram_enabled": preference.telegram_enabled,
                 "minimum_severity": preference.minimum_severity.value,
-                "email_hash": self._email_hash(preference.email_address),
+                "email_hash": (
+                    self._email_hash(preference.email_address)
+                    if preference.email_address is not None
+                    else None
+                ),
             },
             "ip": context.ip,
             "user_agent": context.user_agent,

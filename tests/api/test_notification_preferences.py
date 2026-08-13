@@ -18,6 +18,12 @@ from limnopulse_api.domain.notification_preferences import (
     NotificationPreference,
 )
 from limnopulse_api.domain.roles import TenantRole
+from limnopulse_api.domain.telegram import (
+    TelegramBinding,
+    TelegramBindingStatus,
+    TelegramDestination,
+    TelegramDestinationStatus,
+)
 from limnopulse_api.main import create_app
 from limnopulse_api.services.cognito_identity import (
     COGNITO_GET_USER_SCOPE,
@@ -137,6 +143,48 @@ class FailingIdentityVerifier:
         raise AssertionError("GET/disable must not call Cognito")
 
 
+class FakeTelegramBindingRepository:
+    def __init__(self, *, verified: bool, active: bool = True) -> None:
+        destination_id = TelegramDestination.id_for_chat(123)
+        self.binding = (
+            TelegramBinding(
+                tenant_id="tnt_1",
+                recipient_id="sub_1",
+                destination_id=destination_id,
+                status=TelegramBindingStatus.VERIFIED,
+                verified_at=NOW,
+                revoked_at=None,
+                version=1,
+                created_at=NOW,
+                updated_at=NOW,
+            )
+            if verified
+            else None
+        )
+        self.destination = (
+            TelegramDestination(
+                destination_id=destination_id,
+                recipient_id="sub_1",
+                chat_id=123,
+                status=(
+                    TelegramDestinationStatus.ACTIVE
+                    if active
+                    else TelegramDestinationStatus.SUPPRESSED
+                ),
+                suppression_reason=None if active else "user_stop",
+                stopped_at=None if active else NOW,
+                version=1,
+                created_at=NOW,
+                updated_at=NOW,
+            )
+            if verified
+            else None
+        )
+
+    async def get_current(self, tenant_id: str, recipient_id: str):
+        return self.binding, None, self.destination
+
+
 def cognito_attributes(
     *,
     sub: str = "sub_1",
@@ -175,14 +223,66 @@ def build_app(
     *,
     auth_provider: StaticAuthProvider | None = None,
     membership_active: bool = True,
+    telegram_repository: FakeTelegramBindingRepository | None = None,
 ):
     app = create_app(Settings(app_env="test", auth_mode="dev"))
     app.state.auth_provider = auth_provider or StaticAuthProvider()
     app.state.membership_service = FakeMembershipService(active=membership_active)
     app.state.notification_preference_repository = repository
+    if telegram_repository is not None:
+        app.state.telegram_binding_repository = telegram_repository
     if identity_verifier is not None:
         app.state.cognito_identity_verifier = identity_verifier
     return app
+
+
+def test_put_can_create_telegram_only_without_cognito_email() -> None:
+    repository = InMemoryNotificationPreferenceRepository()
+    verifier = FailingIdentityVerifier()
+    app = build_app(
+        repository,
+        verifier,
+        telegram_repository=FakeTelegramBindingRepository(verified=True),
+    )
+
+    response = TestClient(app).put(
+        PATH,
+        json={
+            "expected_version": None,
+            "email_enabled": False,
+            "telegram_enabled": True,
+            "minimum_severity": "warning",
+        },
+    )
+
+    assert response.status_code == 200
+    assert response.json()["telegram"]["enabled"] is True
+    assert response.json()["telegram"]["effective_enabled"] is True
+    assert verifier.calls == 0
+    assert repository.preference is not None
+    assert repository.preference.email_address is None
+
+
+def test_put_telegram_enable_without_binding_returns_explicit_409_without_mutation() -> None:
+    repository = InMemoryNotificationPreferenceRepository()
+    app = build_app(
+        repository,
+        FailingIdentityVerifier(),
+        telegram_repository=FakeTelegramBindingRepository(verified=False),
+    )
+
+    response = TestClient(app).put(
+        PATH,
+        json={
+            "expected_version": None,
+            "email_enabled": False,
+            "telegram_enabled": True,
+        },
+    )
+
+    assert response.status_code == 409
+    assert response.json() == {"detail": "verified Telegram binding required"}
+    assert repository.save_calls == []
 
 
 def test_get_default_is_read_only_and_returns_exact_unconfigured_shape() -> None:
@@ -201,6 +301,15 @@ def test_get_default_is_read_only_and_returns_exact_unconfigured_shape() -> None
             "verified": False,
             "deliverability": "unknown",
             "suppression_reason": None,
+            "effective_enabled": False,
+        },
+        "telegram": {
+            "enabled": False,
+            "status": "absent",
+            "version": None,
+            "verified_at": None,
+            "pending_request_id": None,
+            "pending_expires_at": None,
             "effective_enabled": False,
         },
         "minimum_severity": "critical",

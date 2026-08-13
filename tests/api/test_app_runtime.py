@@ -12,12 +12,17 @@ from limnopulse_api.adapters.notification_preferences import (
     DynamoNotificationPreferenceRepository,
 )
 from limnopulse_api.adapters.redis import RedisCacheRepository
+from limnopulse_api.adapters.telegram_bindings import DynamoTelegramBindingRepository
 from limnopulse_api.auth.cognito import CognitoJwtAuthProvider
 from limnopulse_api.auth.models import Principal
 from limnopulse_api.core.config import Settings
 from limnopulse_api.main import create_app
 from limnopulse_api.services.cognito_identity import CognitoIdentityVerifier, DevIdentityVerifier
 from limnopulse_api.services.memberships import MembershipService
+from limnopulse_api.services.telegram_bindings import TelegramBindingService
+from limnopulse_api.services.telegram_webhook_secret import (
+    StaticTelegramWebhookSecretVerifier,
+)
 
 TEST_ISSUER = "https://cognito-idp.us-east-1.amazonaws.com/pool_1"
 
@@ -179,6 +184,19 @@ def test_app_lifespan_wires_runtime_dependencies(monkeypatch) -> None:
         assert isinstance(app.state.membership_service, MembershipService)
         assert app.state.membership_service.domain_repository is app.state.domain_repository
         assert app.state.membership_service.cache is app.state.cache_repository
+        assert isinstance(
+            app.state.telegram_binding_repository,
+            DynamoTelegramBindingRepository,
+        )
+        assert app.state.telegram_binding_repository.client is fake_dynamo
+        assert isinstance(app.state.telegram_binding_service, TelegramBindingService)
+        assert app.state.telegram_binding_service.repository is (
+            app.state.telegram_binding_repository
+        )
+        assert isinstance(
+            app.state.telegram_webhook_secret_verifier,
+            StaticTelegramWebhookSecretVerifier,
+        )
         assert influx_calls == [
             {
                 "url": "http://localhost:8086",

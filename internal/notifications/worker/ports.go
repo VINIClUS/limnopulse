@@ -63,12 +63,18 @@ type GateResult struct {
 // BeginAttempt condition-checks it atomically with recording the started
 // Attempt, so an eligibility change after CheckGates cannot reach the provider.
 type GateFence struct {
+	Channel                    notifications.Channel
 	MembershipVersion          int64
 	PreferenceVersion          int64
 	PreferenceEmailAddress     string
 	PreferenceMinimumSeverity  string
 	EventSeverity              string
+	EventStatus                string
 	DeliverabilityDependencies []DeliverabilityDependency
+	TelegramDestinationID      string
+	TelegramChatID             int64
+	TelegramBindingVersion     int64
+	TelegramDestinationVersion int64
 }
 
 type DeliverabilityDependency struct {
@@ -78,9 +84,23 @@ type DeliverabilityDependency struct {
 }
 
 func (fence GateFence) IsComplete() bool {
+	channel := fence.Channel
+	if channel == "" {
+		channel = notifications.ChannelEmail
+	}
 	if fence.MembershipVersion < 1 || fence.PreferenceVersion < 1 ||
-		fence.PreferenceEmailAddress == "" || strings.ContainsRune(fence.PreferenceEmailAddress, '\x00') ||
 		!isGateSeverity(fence.PreferenceMinimumSeverity) || !isGateSeverity(fence.EventSeverity) ||
+		channel.Validate() != nil {
+		return false
+	}
+	if channel == notifications.ChannelTelegram {
+		return fence.TelegramDestinationID != "" &&
+			!strings.ContainsRune(fence.TelegramDestinationID, '\x00') &&
+			fence.TelegramChatID > 0 && fence.TelegramBindingVersion > 0 &&
+			fence.TelegramDestinationVersion > 0 && isTelegramEventStatus(fence.EventStatus) &&
+			fence.PreferenceEmailAddress == "" && len(fence.DeliverabilityDependencies) == 0
+	}
+	if fence.PreferenceEmailAddress == "" || strings.ContainsRune(fence.PreferenceEmailAddress, '\x00') ||
 		len(fence.DeliverabilityDependencies) < 1 || len(fence.DeliverabilityDependencies) > 2 {
 		return false
 	}
@@ -102,6 +122,10 @@ func (fence GateFence) IsComplete() bool {
 	return true
 }
 
+func isTelegramEventStatus(value string) bool {
+	return value == "open" || value == "acknowledged" || value == "resolved"
+}
+
 func isGateSeverity(value string) bool {
 	return value == "warning" || value == "critical"
 }
@@ -120,17 +144,18 @@ type BeginAttemptRequest struct {
 }
 
 type AttemptCompletion struct {
-	AttemptID            string
-	CompletedAt          time.Time
-	Outcome              notifications.AttemptOutcome
-	ErrorCategory        string
-	ProviderMessageID    string
-	ProviderOutcome      notifications.ProviderOutcome
-	NextState            notifications.DeliveryState
-	NextAttemptAt        time.Time
-	PossiblyAccepted     bool
-	AmbiguousExhausted   bool
-	AwaitingIntervention bool
+	AttemptID                   string
+	CompletedAt                 time.Time
+	Outcome                     notifications.AttemptOutcome
+	ErrorCategory               string
+	ProviderMessageID           string
+	ProviderOutcome             notifications.ProviderOutcome
+	NextState                   notifications.DeliveryState
+	NextAttemptAt               time.Time
+	PossiblyAccepted            bool
+	AmbiguousExhausted          bool
+	AwaitingIntervention        bool
+	SuppressTelegramDestination bool
 }
 
 type PreflightFailureCompletion struct {
@@ -203,8 +228,29 @@ type EmailSender interface {
 	Send(context.Context, SendRequest) (SendResult, error)
 }
 
+type Sender = EmailSender
+
 type Limiter interface {
 	Wait(context.Context) error
+}
+
+// DeliveryLimiter allows a shared limiter to apply both provider-wide and
+// destination-specific budgets without exposing raw destinations in errors or
+// metrics. Implementations must not consume a provider-call attempt.
+type DeliveryLimiter interface {
+	WaitFor(context.Context, notifications.DeliverySnapshot) error
+}
+
+type RateLimitError struct {
+	RetryAfter  time.Duration
+	Unavailable bool
+}
+
+func (err *RateLimitError) Error() string {
+	if err.Unavailable {
+		return "notification rate limiter unavailable"
+	}
+	return "notification rate limit exceeded"
 }
 
 type LeaseGuard interface {
@@ -214,23 +260,29 @@ type LeaseGuard interface {
 type SendErrorCategory string
 
 const (
-	ErrorPermanentRecipient         SendErrorCategory = "permanent_bad_recipient"
-	ErrorProviderCallLimitExhausted SendErrorCategory = "provider_call_limit_exhausted"
-	ErrorRetryableThrottling        SendErrorCategory = "retryable_throttling"
-	ErrorRetryableQuota             SendErrorCategory = "retryable_daily_quota"
-	ErrorRetryableService           SendErrorCategory = "retryable_service_unavailable"
-	ErrorRetryableUnknown           SendErrorCategory = "retryable_unknown"
-	ErrorAmbiguousTimeout           SendErrorCategory = "ambiguous_timeout"
-	ErrorAmbiguousConnectionReset   SendErrorCategory = "ambiguous_connection_reset"
-	ErrorFatalAccountSuspended      SendErrorCategory = "fatal_account_suspended"
-	ErrorFatalFromIdentity          SendErrorCategory = "fatal_from_identity"
-	ErrorFatalConfigurationSet      SendErrorCategory = "fatal_configuration_set"
-	ErrorFatalCredentials           SendErrorCategory = "fatal_credentials"
+	ErrorPermanentRecipient             SendErrorCategory = "permanent_bad_recipient"
+	ErrorProviderCallLimitExhausted     SendErrorCategory = "provider_call_limit_exhausted"
+	ErrorRetryableThrottling            SendErrorCategory = "retryable_throttling"
+	ErrorRetryableQuota                 SendErrorCategory = "retryable_daily_quota"
+	ErrorRetryableService               SendErrorCategory = "retryable_service_unavailable"
+	ErrorRetryableUnknown               SendErrorCategory = "retryable_unknown"
+	ErrorAmbiguousTimeout               SendErrorCategory = "ambiguous_timeout"
+	ErrorAmbiguousConnectionReset       SendErrorCategory = "ambiguous_connection_reset"
+	ErrorFatalAccountSuspended          SendErrorCategory = "fatal_account_suspended"
+	ErrorFatalFromIdentity              SendErrorCategory = "fatal_from_identity"
+	ErrorFatalConfigurationSet          SendErrorCategory = "fatal_configuration_set"
+	ErrorFatalCredentials               SendErrorCategory = "fatal_credentials"
+	ErrorTelegramRateLimited            SendErrorCategory = "telegram_rate_limited"
+	ErrorTelegramDestinationUnavailable SendErrorCategory = "telegram_destination_unavailable"
+	ErrorTelegramCredentials            SendErrorCategory = "telegram_invalid_credentials"
+	ErrorTelegramAmbiguous              SendErrorCategory = "telegram_ambiguous_send"
 )
 
 type SendError struct {
-	Category SendErrorCategory
-	err      error
+	Category         SendErrorCategory
+	RetryAfter       time.Duration
+	NoAutomaticRetry bool
+	err              error
 }
 
 func NewSendError(category SendErrorCategory, err error) *SendError {
@@ -238,21 +290,23 @@ func NewSendError(category SendErrorCategory, err error) *SendError {
 }
 
 func (err *SendError) Error() string {
-	return fmt.Sprintf("email provider call failed (%s)", err.Category)
+	return fmt.Sprintf("notification provider call failed (%s)", err.Category)
 }
 
 func (err *SendError) Unwrap() error { return err.err }
 
 func (category SendErrorCategory) disposition() sendDisposition {
 	switch category {
-	case ErrorPermanentRecipient, ErrorProviderCallLimitExhausted:
+	case ErrorPermanentRecipient, ErrorProviderCallLimitExhausted,
+		ErrorTelegramDestinationUnavailable:
 		return sendPermanent
-	case ErrorAmbiguousTimeout, ErrorAmbiguousConnectionReset:
+	case ErrorAmbiguousTimeout, ErrorAmbiguousConnectionReset, ErrorTelegramAmbiguous:
 		return sendAmbiguous
 	case ErrorFatalAccountSuspended, ErrorFatalFromIdentity,
-		ErrorFatalConfigurationSet, ErrorFatalCredentials:
+		ErrorFatalConfigurationSet, ErrorFatalCredentials, ErrorTelegramCredentials:
 		return sendFatal
-	case ErrorRetryableThrottling, ErrorRetryableQuota, ErrorRetryableService, ErrorRetryableUnknown:
+	case ErrorRetryableThrottling, ErrorRetryableQuota, ErrorRetryableService, ErrorRetryableUnknown,
+		ErrorTelegramRateLimited:
 		return sendRetryable
 	default:
 		return sendInvalid

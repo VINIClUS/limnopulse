@@ -20,6 +20,7 @@ import (
 	relaydynamo "github.com/VINIClUS/limnopulse/internal/notifications/relay/dynamo"
 	relaysqs "github.com/VINIClUS/limnopulse/internal/notifications/relay/sqs"
 	relaytelemetry "github.com/VINIClUS/limnopulse/internal/notifications/relay/telemetry"
+	telegramworkerconfig "github.com/VINIClUS/limnopulse/internal/notifications/telegramworker/config"
 	"github.com/VINIClUS/limnopulse/internal/notifications/worker"
 	workerconfig "github.com/VINIClUS/limnopulse/internal/notifications/worker/config"
 	"github.com/aws/aws-sdk-go-v2/aws"
@@ -41,13 +42,15 @@ const (
 type loadDynamoFunc func(context.Context, string, string) (notificationdynamo.Client, error)
 type runRelayFunc func(context.Context, relayconfig.RunConfig) (relay.RunSummary, error)
 type runWorkerFunc func(context.Context, workerconfig.RunConfig) (worker.RunSummary, error)
+type runTelegramWorkerFunc func(context.Context, telegramworkerconfig.RunConfig) (worker.RunSummary, error)
 
 type dependencies struct {
-	Output     io.Writer
-	LookupEnv  func(string) (string, bool)
-	LoadDynamo loadDynamoFunc
-	RunRelay   runRelayFunc
-	RunWorker  runWorkerFunc
+	Output            io.Writer
+	LookupEnv         func(string) (string, bool)
+	LoadDynamo        loadDynamoFunc
+	RunRelay          runRelayFunc
+	RunWorker         runWorkerFunc
+	RunTelegramWorker runTelegramWorkerFunc
 }
 
 type commandResult struct {
@@ -91,11 +94,12 @@ func main() {
 
 func defaultDependencies() dependencies {
 	return dependencies{
-		Output:     os.Stdout,
-		LookupEnv:  os.LookupEnv,
-		LoadDynamo: loadDynamo,
-		RunRelay:   executeRelay,
-		RunWorker:  executeWorker,
+		Output:            os.Stdout,
+		LookupEnv:         os.LookupEnv,
+		LoadDynamo:        loadDynamo,
+		RunRelay:          executeRelay,
+		RunWorker:         executeWorker,
+		RunTelegramWorker: executeTelegramWorker,
 	}
 }
 
@@ -106,10 +110,14 @@ func runMain(ctx context.Context, args []string, deps dependencies) int {
 	switch args[0] {
 	case "worker":
 		return runWorkerCommand(ctx, args[1:], deps)
+	case "telegram-worker":
+		return runTelegramWorkerCommand(ctx, args[1:], deps)
 	case "relay":
 		return runRelayCommand(ctx, args[1:], deps)
 	case "backfill-relay":
 		return runBackfillRelay(ctx, args[1:], deps)
+	case "backfill-telegram":
+		return runBackfillTelegram(ctx, args[1:], deps)
 	default:
 		return writeFatal(deps.Output, "configuration")
 	}
@@ -133,7 +141,23 @@ func runRelayCommand(ctx context.Context, args []string, deps dependencies) int 
 }
 
 func runBackfillRelay(ctx context.Context, args []string, deps dependencies) int {
-	fs := flag.NewFlagSet("notifications backfill-relay", flag.ContinueOnError)
+	return runBackfill(ctx, args, deps, "", "notifications backfill-relay")
+}
+
+func runBackfillTelegram(ctx context.Context, args []string, deps dependencies) int {
+	return runBackfill(
+		ctx, args, deps, notifications.ChannelTelegram, "notifications backfill-telegram",
+	)
+}
+
+func runBackfill(
+	ctx context.Context,
+	args []string,
+	deps dependencies,
+	targetChannel notifications.Channel,
+	commandName string,
+) int {
+	fs := flag.NewFlagSet(commandName, flag.ContinueOnError)
 	fs.SetOutput(io.Discard)
 	var sources []tenantSource
 	var apply bool
@@ -171,6 +195,7 @@ func runBackfillRelay(ctx context.Context, args []string, deps dependencies) int
 		runCtx,
 		notificationdynamo.BackfillOptions{
 			Tenants: tenants, Apply: apply, PageSize: pageSize, MaxRows: maxRows,
+			TargetChannel: targetChannel,
 		},
 	)
 	if err != nil {
@@ -338,10 +363,19 @@ func executeRelay(ctx context.Context, config relayconfig.RunConfig) (relay.RunS
 	runner := relay.Runner{
 		Store: relaydynamo.Store{
 			Table: config.DynamoDBTable, Client: dynamoClient, Renderer: renderer,
+			WebURL:              config.WebURL,
+			AllowInsecureWebURL: config.AppEnv == "local" || config.AppEnv == "test",
 		},
-		Publisher: relaysqs.Publisher{
-			Client: sqsClient, QueueURL: config.SQSQueueURL,
-			RequestTimeout: config.SQSRequestTimeout,
+		Publisher: relaysqs.Router{
+			TelegramEnabled: config.TelegramDeliveryEnabled,
+			Email: relaysqs.Publisher{
+				Client: sqsClient, QueueURL: config.SQSQueueURL,
+				RequestTimeout: config.SQSRequestTimeout,
+			},
+			Telegram: relaysqs.Publisher{
+				Client: sqsClient, QueueURL: config.SQSTelegramQueueURL,
+				RequestTimeout: config.SQSRequestTimeout,
+			},
 		},
 	}
 	summary := runner.Run(ctx, config)

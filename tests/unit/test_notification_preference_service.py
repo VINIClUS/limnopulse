@@ -10,6 +10,13 @@ from limnopulse_api.domain.notification_preferences import (
     EmailDeliverabilityRecord,
     NotificationPreference,
 )
+from limnopulse_api.domain.telegram import (
+    TelegramBinding,
+    TelegramBindingRequest,
+    TelegramBindingStatus,
+    TelegramDestination,
+    TelegramDestinationStatus,
+)
 from limnopulse_api.services.cognito_identity import VerifiedEmailIdentity
 from limnopulse_api.services.notification_preferences import NotificationPreferenceService
 
@@ -62,6 +69,55 @@ class FakeNotificationPreferenceRepository:
         self.save_calls.append((preference, expected_version, audit, previous))
         self.preference = preference
         return preference
+
+
+class FakeTelegramBindingRepository:
+    def __init__(
+        self,
+        *,
+        verified: bool = False,
+        active: bool = True,
+    ) -> None:
+        destination_id = TelegramDestination.id_for_chat(123)
+        self.binding = (
+            TelegramBinding(
+                tenant_id="tnt_1",
+                recipient_id="sub_1",
+                destination_id=destination_id,
+                status=TelegramBindingStatus.VERIFIED,
+                verified_at=NOW,
+                revoked_at=None,
+                version=1,
+                created_at=NOW,
+                updated_at=NOW,
+            )
+            if verified
+            else None
+        )
+        self.destination = (
+            TelegramDestination(
+                destination_id=destination_id,
+                recipient_id="sub_1",
+                chat_id=123,
+                status=(
+                    TelegramDestinationStatus.ACTIVE
+                    if active
+                    else TelegramDestinationStatus.SUPPRESSED
+                ),
+                suppression_reason=None if active else "user_stop",
+                stopped_at=None if active else NOW,
+                version=1,
+                created_at=NOW,
+                updated_at=NOW,
+            )
+            if verified
+            else None
+        )
+        self.calls: list[tuple[str, str]] = []
+
+    async def get_current(self, tenant_id: str, recipient_id: str):
+        self.calls.append((tenant_id, recipient_id))
+        return self.binding, None, self.destination
 
 
 class DeliverabilityMustPrecedeCommitRepository(FakeNotificationPreferenceRepository):
@@ -134,11 +190,208 @@ def make_preference(**updates: object) -> NotificationPreference:
         "checked_at": NOW,
         "identity_source": "cognito_get_user",
         "minimum_severity": AlertSeverity.WARNING,
+        "telegram_enabled": False,
         "created_at": NOW,
         "updated_at": NOW,
     }
     values.update(updates)
     return NotificationPreference.model_validate(values)
+
+
+@pytest.mark.asyncio
+async def test_telegram_only_create_requires_binding_and_does_not_call_cognito() -> None:
+    repository = FakeNotificationPreferenceRepository()
+    telegram = FakeTelegramBindingRepository(verified=True)
+    verifier = FakeIdentityVerifier(error=AssertionError("Telegram-only must not call Cognito"))
+
+    result = await NotificationPreferenceService(
+        repository,
+        verifier,
+        telegram_repository=telegram,
+        clock=lambda: NOW,
+    ).put(
+        "tnt_1",
+        PRINCIPAL,
+        expected_version=None,
+        email_enabled=False,
+        telegram_enabled=True,
+        minimum_severity=AlertSeverity.WARNING,
+        audit=AUDIT,
+    )
+
+    saved = repository.save_calls[0][0]
+    assert verifier.calls == []
+    assert saved.email_address is None
+    assert saved.telegram_enabled is True
+    assert result.telegram.status == "verified"
+    assert result.telegram.effective_enabled is True
+
+
+@pytest.mark.asyncio
+async def test_legacy_email_disabled_create_still_captures_cognito_identity() -> None:
+    repository = FakeNotificationPreferenceRepository()
+    verifier = FakeIdentityVerifier()
+
+    result = await NotificationPreferenceService(
+        repository,
+        verifier,
+        clock=lambda: NOW,
+    ).put(
+        "tnt_1",
+        PRINCIPAL,
+        expected_version=None,
+        email_enabled=False,
+        telegram_enabled=None,
+        minimum_severity=AlertSeverity.WARNING,
+        audit=AUDIT,
+    )
+
+    saved = repository.save_calls[0][0]
+    assert verifier.calls == [PRINCIPAL]
+    assert saved.email_enabled is False
+    assert saved.email_address == "verified@example.com"
+    assert saved.email_verified is True
+    assert saved.checked_at == NOW
+    assert saved.identity_source == "cognito_get_user"
+    assert result.email.address == "v***d@example.com"
+
+
+@pytest.mark.asyncio
+async def test_email_enable_without_verified_email_is_rejected() -> None:
+    repository = FakeNotificationPreferenceRepository()
+    verifier = FakeIdentityVerifier(error=IdentityEmailError("unverified"))
+
+    with pytest.raises(IdentityEmailError):
+        await NotificationPreferenceService(repository, verifier).put(
+            "tnt_1",
+            PRINCIPAL,
+            expected_version=None,
+            email_enabled=True,
+            telegram_enabled=False,
+            minimum_severity=AlertSeverity.CRITICAL,
+            audit=AUDIT,
+        )
+
+    assert repository.save_calls == []
+
+
+@pytest.mark.asyncio
+async def test_telegram_enable_without_verified_binding_is_conflict() -> None:
+    repository = FakeNotificationPreferenceRepository()
+    verifier = FakeIdentityVerifier(error=AssertionError("must not call Cognito"))
+
+    with pytest.raises(ConflictError):
+        await NotificationPreferenceService(
+            repository,
+            verifier,
+            telegram_repository=FakeTelegramBindingRepository(),
+        ).put(
+            "tnt_1",
+            PRINCIPAL,
+            expected_version=None,
+            email_enabled=False,
+            telegram_enabled=True,
+            minimum_severity=AlertSeverity.CRITICAL,
+            audit=AUDIT,
+        )
+
+    assert verifier.calls == []
+    assert repository.save_calls == []
+
+
+@pytest.mark.asyncio
+async def test_legacy_email_disabled_row_defaults_telegram_disabled() -> None:
+    preference = NotificationPreference.model_validate(
+        {
+            key: value
+            for key, value in make_preference(email_enabled=False).model_dump().items()
+            if key != "telegram_enabled"
+        }
+    )
+    repository = FakeNotificationPreferenceRepository(preference)
+
+    result = await NotificationPreferenceService(repository).get("tnt_1", "sub_1")
+
+    assert result.telegram.enabled is False
+    assert result.telegram.effective_enabled is False
+
+
+@pytest.mark.asyncio
+async def test_expired_binding_request_is_not_reported_as_pending() -> None:
+    repository = FakeNotificationPreferenceRepository()
+
+    class ExpiredRequestRepository:
+        async def get_current(self, tenant_id: str, recipient_id: str):
+            return (
+                None,
+                TelegramBindingRequest(
+                    request_id="request_expired",
+                    tenant_id=tenant_id,
+                    recipient_id=recipient_id,
+                    token_hash="a" * 64,
+                    status=TelegramBindingStatus.PENDING,
+                    expires_at=NOW,
+                    created_at=NOW,
+                ),
+                None,
+            )
+
+    result = await NotificationPreferenceService(
+        repository,
+        telegram_repository=ExpiredRequestRepository(),
+        clock=lambda: NOW,
+    ).get("tnt_1", "sub_1")
+
+    assert result.telegram.status == "absent"
+    assert result.telegram.pending_request_id is None
+    assert result.telegram.pending_expires_at is None
+
+
+@pytest.mark.asyncio
+async def test_telegram_only_update_does_not_call_cognito() -> None:
+    repository = FakeNotificationPreferenceRepository(make_preference(email_enabled=False))
+    verifier = FakeIdentityVerifier(error=AssertionError("Telegram-only must not call Cognito"))
+
+    result = await NotificationPreferenceService(
+        repository,
+        verifier,
+        telegram_repository=FakeTelegramBindingRepository(verified=True),
+        clock=lambda: NOW,
+    ).put(
+        "tnt_1",
+        PRINCIPAL,
+        expected_version=2,
+        email_enabled=False,
+        telegram_enabled=True,
+        minimum_severity=AlertSeverity.WARNING,
+        audit=AUDIT,
+    )
+
+    assert verifier.calls == []
+    assert result.version == 3
+
+
+@pytest.mark.asyncio
+async def test_omitted_telegram_preserves_value_and_noop_does_not_write() -> None:
+    existing = make_preference(email_enabled=False, telegram_enabled=True)
+    repository = FakeNotificationPreferenceRepository(existing)
+
+    result = await NotificationPreferenceService(
+        repository,
+        telegram_repository=FakeTelegramBindingRepository(verified=True),
+    ).put(
+        "tnt_1",
+        PRINCIPAL,
+        expected_version=2,
+        email_enabled=False,
+        telegram_enabled=None,
+        minimum_severity=AlertSeverity.WARNING,
+        audit=AUDIT,
+    )
+
+    assert result.version == 2
+    assert result.telegram.enabled is True
+    assert repository.save_calls == []
 
 
 @pytest.mark.asyncio
@@ -160,6 +413,15 @@ async def test_get_returns_unconfigured_defaults_without_cognito_or_deliverabili
             "verified": False,
             "deliverability": "unknown",
             "suppression_reason": None,
+            "effective_enabled": False,
+        },
+        "telegram": {
+            "enabled": False,
+            "status": "absent",
+            "version": None,
+            "verified_at": None,
+            "pending_request_id": None,
+            "pending_expires_at": None,
             "effective_enabled": False,
         },
         "minimum_severity": "critical",
@@ -204,10 +466,7 @@ async def test_get_treats_absent_deliverability_record_as_allowed_unknown() -> N
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("email_enabled", [True, False])
-async def test_create_always_verifies_cognito_and_conditionally_creates_version_one(
-    email_enabled: bool,
-) -> None:
+async def test_email_create_verifies_cognito_and_conditionally_creates_version_one() -> None:
     repository = FakeNotificationPreferenceRepository()
     verifier = FakeIdentityVerifier()
 
@@ -219,7 +478,7 @@ async def test_create_always_verifies_cognito_and_conditionally_creates_version_
         "tnt_1",
         PRINCIPAL,
         expected_version=None,
-        email_enabled=email_enabled,
+        email_enabled=True,
         minimum_severity=AlertSeverity.WARNING,
         audit=AUDIT,
     )
@@ -230,7 +489,7 @@ async def test_create_always_verifies_cognito_and_conditionally_creates_version_
     assert audit == AUDIT
     assert previous is None
     assert saved.version == 1
-    assert saved.email_enabled is email_enabled
+    assert saved.email_enabled is True
     assert saved.email_address == "verified@example.com"
     assert saved.email_verified is True
     assert saved.checked_at == NOW

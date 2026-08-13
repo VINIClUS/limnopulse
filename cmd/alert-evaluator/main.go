@@ -59,7 +59,10 @@ func runEvaluator(ctx context.Context, args []string) int {
 	influxClient := influxdb2.NewClient(config.InfluxDBURL, config.InfluxDBToken)
 	defer influxClient.Close()
 	runner := alertevaluator.Runner{
-		Store: dynamoadapter.Store{Table: config.DynamoDBTable, Client: dynamoClient},
+		Store: dynamoadapter.Store{
+			Table: config.DynamoDBTable, Client: dynamoClient,
+			TelegramDeliveryEnabled: config.TelegramDeliveryEnabled,
+		},
 		Windows: influxadapter.WindowReader{
 			Bucket:  config.InfluxDBBucket,
 			Querier: influxadapter.ClientQuerier{API: influxClient.QueryAPI(config.InfluxDBOrg)},

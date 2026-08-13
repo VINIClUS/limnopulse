@@ -31,7 +31,7 @@ func TestNotificationEnumsExposeOnlyContractValues(t *testing.T) {
 		{
 			name: "channels",
 			got:  stringsOf(Channels()),
-			want: []string{"email"},
+			want: []string{"email", "telegram"},
 		},
 		{
 			name: "email deliverability",

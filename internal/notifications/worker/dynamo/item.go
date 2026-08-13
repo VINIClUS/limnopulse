@@ -26,6 +26,8 @@ type deliveryItem struct {
 	DependsOnDeliveryID    string                           `dynamodbav:"depends_on_delivery_id"`
 	RecipientID            string                           `dynamodbav:"recipient_id"`
 	NormalizedEmail        string                           `dynamodbav:"normalized_email"`
+	DestinationID          string                           `dynamodbav:"destination_id"`
+	TelegramChatID         int64                            `dynamodbav:"telegram_chat_id"`
 	MembershipSnapshot     notifications.MembershipSnapshot `dynamodbav:"membership_snapshot"`
 	State                  notifications.DeliveryState      `dynamodbav:"state"`
 	Content                contentItem                      `dynamodbav:"content"`
@@ -55,6 +57,7 @@ type contentItem struct {
 	Locale          notifications.Locale     `dynamodbav:"locale"`
 	Subject         string                   `dynamodbav:"subject"`
 	Text            string                   `dynamodbav:"text"`
+	BodyText        string                   `dynamodbav:"body_text"`
 	HTML            string                   `dynamodbav:"html"`
 	ContentHash     string                   `dynamodbav:"content_hash"`
 }
@@ -76,7 +79,8 @@ func decodeDelivery(item map[string]types.AttributeValue) (deliveryItem, worker.
 	if err := attributevalue.UnmarshalMap(item, &stored); err != nil {
 		return deliveryItem{}, worker.DeliveryRecord{}, fmt.Errorf("decode notification delivery: %w", err)
 	}
-	if stored.EntityType != "notification_delivery" || stored.RelaySchemaVersion != notifications.RelaySchemaVersion ||
+	wantSchemaVersion, schemaErr := notifications.RelaySchemaVersionForChannel(stored.Channel)
+	if schemaErr != nil || stored.EntityType != "notification_delivery" || stored.RelaySchemaVersion != wantSchemaVersion ||
 		stored.PK != "NOTIFICATION_OUTBOX#"+stored.OutboxID || stored.SK != "DELIVERY#"+stored.DeliveryID ||
 		stored.DeliveryRevision < 1 || stored.AttemptCount < 0 || stored.AttemptCount > worker.MaxProviderCalls ||
 		stored.DeliveryLeaseEpoch < 0 {
@@ -98,6 +102,7 @@ func decodeDelivery(item map[string]types.AttributeValue) (deliveryItem, worker.
 		EventID: stored.EventID, RuleID: stored.RuleID, Kind: stored.Kind, Channel: stored.Channel,
 		DependsOnOutboxID: stored.DependsOnOutboxID, DependsOnDeliveryID: stored.DependsOnDeliveryID,
 		RecipientID: stored.RecipientID, NormalizedEmail: stored.NormalizedEmail,
+		DestinationID: stored.DestinationID, TelegramChatID: stored.TelegramChatID,
 		MembershipSnapshot: stored.MembershipSnapshot, State: stored.State,
 		Content: notifications.RenderedContentSnapshot{
 			TemplateID: stored.Content.TemplateID, TemplateVersion: stored.Content.TemplateVersion,
@@ -105,6 +110,14 @@ func decodeDelivery(item map[string]types.AttributeValue) (deliveryItem, worker.
 			HTML: stored.Content.HTML, ContentHash: stored.Content.ContentHash,
 		},
 		CancellationReason: stored.CancellationReason, CreatedAt: createdAt, UpdatedAt: updatedAt,
+	}
+	if stored.Channel == notifications.ChannelTelegram {
+		snapshot.Content = notifications.RenderedContentSnapshot{}
+		snapshot.TelegramContent = notifications.TelegramRenderedContentSnapshot{
+			TemplateID: stored.Content.TemplateID, TemplateVersion: stored.Content.TemplateVersion,
+			Locale: stored.Content.Locale, BodyText: stored.Content.BodyText,
+			ContentHash: stored.Content.ContentHash,
+		}
 	}
 	if _, err := notifications.RestoreDelivery(snapshot); err != nil {
 		return deliveryItem{}, worker.DeliveryRecord{}, fmt.Errorf("validate notification delivery: %w", err)

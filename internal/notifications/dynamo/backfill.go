@@ -27,10 +27,11 @@ type Store struct {
 }
 
 type BackfillOptions struct {
-	Tenants  []string
-	Apply    bool
-	PageSize int
-	MaxRows  int
+	Tenants       []string
+	Apply         bool
+	PageSize      int
+	MaxRows       int
+	TargetChannel notifications.Channel
 }
 
 type BackfillSummary struct {
@@ -90,6 +91,7 @@ const (
 	migrationUpdateWorkKind
 	migrationUpdateRelayIndex
 	migrationUpdateTelegram
+	migrationEnableTelegram
 	migrationSchemaConflict
 )
 
@@ -113,6 +115,9 @@ func (store Store) BackfillRelay(ctx context.Context, options BackfillOptions) (
 	}
 	if options.PageSize < 1 {
 		return summary, fmt.Errorf("page size must be positive")
+	}
+	if options.TargetChannel != "" && options.TargetChannel != notifications.ChannelTelegram {
+		return summary, fmt.Errorf("backfill target channel is invalid")
 	}
 	maxRows := options.MaxRows
 	if maxRows == 0 {
@@ -169,7 +174,7 @@ func (store Store) BackfillRelay(ctx context.Context, options BackfillOptions) (
 					return summary, nil
 				}
 				summary.RowsQueried++
-				kind, migration, err := classifyRelayOutbox(item, tenantID)
+				kind, migration, err := classifyRelayOutbox(item, tenantID, options.TargetChannel)
 				if err != nil {
 					summary.DecodeFailures++
 					summary.RowFailures++
@@ -202,6 +207,9 @@ func (store Store) BackfillRelay(ctx context.Context, options BackfillOptions) (
 					} else {
 						summary.Updated++
 					}
+				}
+				if options.TargetChannel != "" {
+					continue
 				}
 				if stopped, deliveryErr := store.backfillRelayDeliveries(
 					ctx, options.PageSize, maxRows, &summary, migration.Outbox,
@@ -338,6 +346,7 @@ func isConditionalCheckFailed(err error) bool {
 func classifyRelayOutbox(
 	item map[string]types.AttributeValue,
 	tenantID string,
+	targetChannel notifications.Channel,
 ) (migrationKind, relayMigration, error) {
 	var outbox relayOutbox
 	if err := attributevalue.UnmarshalMap(item, &outbox); err != nil {
@@ -351,6 +360,39 @@ func classifyRelayOutbox(
 
 	migration := relayMigration{Outbox: outbox}
 	hasRelay := hasAnyRelayField(item)
+	if targetChannel == notifications.ChannelTelegram {
+		if outbox.Channel != string(notifications.ChannelTelegram) {
+			return migrationNoop, migration, nil
+		}
+		workKind, err := notifications.ClassifyOutboxRelayWork(
+			outbox.Kind,
+			notifications.OutboxStatus(outbox.Status),
+		)
+		if err != nil {
+			return migrationNoop, relayMigration{}, fmt.Errorf("Telegram outbox kind or status is unsupported")
+		}
+		createdAt, err := time.Parse(fixedUTCLayout, outbox.CreatedAt)
+		if err != nil || createdAt.UTC().Format(fixedUTCLayout) != outbox.CreatedAt {
+			return migrationNoop, relayMigration{}, fmt.Errorf("Telegram outbox created_at is not canonical")
+		}
+		migration.Expansion = "pending"
+		migration.AvailableAt = outbox.CreatedAt
+		migration.WorkKind = workKind
+		migration.RelayIndexKey, err = notifications.BuildRelayIndexKey(
+			workKind, outbox.TenantID, outbox.OutboxID, createdAt,
+		)
+		if err != nil {
+			return migrationNoop, relayMigration{}, fmt.Errorf("build Telegram relay index key: %w", err)
+		}
+		if isCanonicalRelayOutbox(item, migration, notifications.TelegramRelaySchemaVersion) ||
+			isExpandedRelayOutbox(item, workKind, notifications.TelegramRelaySchemaVersion) {
+			return migrationNoop, migration, nil
+		}
+		if !hasRelay || isCanonicalTelegram(item) {
+			return migrationEnableTelegram, migration, nil
+		}
+		return migrationSchemaConflict, migration, nil
+	}
 	if _, exists := item["relay_schema_version"]; exists &&
 		!numberAttributeEquals(item, "relay_schema_version", notifications.RelaySchemaVersion) {
 		return migrationSchemaConflict, migration, nil
@@ -432,7 +474,15 @@ func hasAnyRelayField(item map[string]types.AttributeValue) bool {
 }
 
 func isCanonicalEmail(item map[string]types.AttributeValue, migration relayMigration) bool {
-	return numberAttributeEquals(item, "relay_schema_version", notifications.RelaySchemaVersion) &&
+	return isCanonicalRelayOutbox(item, migration, notifications.RelaySchemaVersion)
+}
+
+func isCanonicalRelayOutbox(
+	item map[string]types.AttributeValue,
+	migration relayMigration,
+	schemaVersion int64,
+) bool {
+	return numberAttributeEquals(item, "relay_schema_version", schemaVersion) &&
 		stringAttributeEquals(item, "expansion_status", migration.Expansion) &&
 		stringAttributeEquals(item, "available_at", migration.AvailableAt) &&
 		stringAttributeEquals(item, "relay_work_kind", string(migration.WorkKind)) &&
@@ -441,7 +491,15 @@ func isCanonicalEmail(item map[string]types.AttributeValue, migration relayMigra
 }
 
 func isExpandedEmail(item map[string]types.AttributeValue, workKind notifications.WorkKind) bool {
-	if !numberAttributeEquals(item, "relay_schema_version", notifications.RelaySchemaVersion) ||
+	return isExpandedRelayOutbox(item, workKind, notifications.RelaySchemaVersion)
+}
+
+func isExpandedRelayOutbox(
+	item map[string]types.AttributeValue,
+	workKind notifications.WorkKind,
+	schemaVersion int64,
+) bool {
+	if !numberAttributeEquals(item, "relay_schema_version", schemaVersion) ||
 		!stringAttributeEquals(item, "expansion_status", "expanded") ||
 		!stringAttributeEquals(item, "relay_work_kind", string(workKind)) {
 		return false
@@ -589,6 +647,22 @@ func (store Store) updateRelayOutbox(
 		updateExpression = "SET #relay_schema_version = :relay_schema_version, #expansion_status = :expansion_status, " +
 			"#available_at = :available_at, #relay_work_kind = :relay_work_kind, " +
 			"#relay_gsi_pk = :relay_gsi_pk, #relay_gsi_sk = :relay_gsi_sk"
+	} else if kind == migrationEnableTelegram {
+		valueMap[":relay_schema_version"] = notifications.TelegramRelaySchemaVersion
+		valueMap[":available_at"] = migration.AvailableAt
+		valueMap[":relay_work_kind"] = string(migration.WorkKind)
+		valueMap[":relay_gsi_pk"] = migration.RelayIndexKey.PartitionKey
+		valueMap[":relay_gsi_sk"] = migration.RelayIndexKey.SortKey
+		valueMap[":deferred"] = "deferred_unsupported_channel"
+		updateExpression = "SET #relay_schema_version = :relay_schema_version, #expansion_status = :expansion_status, " +
+			"#available_at = :available_at, #relay_work_kind = :relay_work_kind, " +
+			"#relay_gsi_pk = :relay_gsi_pk, #relay_gsi_sk = :relay_gsi_sk"
+		conditionExpression = "#tenant_id = :expected_tenant_id AND #outbox_id = :expected_outbox_id AND " +
+			"#channel = :expected_channel AND #status = :expected_status AND #created_at = :expected_created_at AND " +
+			"attribute_not_exists(#relay_schema_version) AND " +
+			"(attribute_not_exists(#expansion_status) OR #expansion_status = :deferred) AND " +
+			"attribute_not_exists(#available_at) AND attribute_not_exists(#relay_work_kind) AND " +
+			"attribute_not_exists(#relay_gsi_pk) AND attribute_not_exists(#relay_gsi_sk)"
 	} else if kind == migrationUpdateWorkKind {
 		delete(valueMap, ":expansion_status")
 		valueMap[":relay_work_kind"] = string(migration.WorkKind)

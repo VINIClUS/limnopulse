@@ -84,7 +84,10 @@ class RecordingDynamoClient:
                 check = operation["ConditionCheck"]
                 key = self._decode(check["Key"])
                 existing = candidate.get((check["TableName"], key["PK"], key["SK"]))
-                if "attribute_not_exists" in check.get("ConditionExpression", "") and existing is not None:
+                if (
+                    "attribute_not_exists" in check.get("ConditionExpression", "")
+                    and existing is not None
+                ):
                     raise TransactionFailure()
                 continue
             if "Update" in operation:
@@ -163,6 +166,59 @@ async def test_get_reads_exact_tenant_user_key_and_deserializes_preference() -> 
     assert client.get_item_calls[0]["ConsistentRead"] is True
     assert client.get_item_thread_ids[0] != event_loop_thread
     assert client.transact_write_items_calls == []
+
+
+@pytest.mark.asyncio
+async def test_get_keeps_v1_email_only_row_compatible_with_telegram_disabled() -> None:
+    client = RecordingDynamoClient()
+    legacy = preference_item(email_enabled=False)
+    legacy.pop("telegram_enabled", None)
+    legacy["schema_version"] = 1
+    client.seed("domain", legacy)
+    repository = DynamoNotificationPreferenceRepository("domain", "audit", client)
+
+    preference = await repository.get("tnt_1", "sub_1")
+
+    assert preference is not None
+    assert preference.telegram_enabled is False
+
+
+@pytest.mark.asyncio
+async def test_save_telegram_only_v2_row_omits_absent_email_snapshot() -> None:
+    client = RecordingDynamoClient()
+    repository = DynamoNotificationPreferenceRepository(
+        "domain",
+        "audit",
+        client,
+        clock=lambda: NOW,
+    )
+    preference = NotificationPreference(
+        tenant_id="tnt_1",
+        cognito_sub="sub_1",
+        version=1,
+        email_enabled=False,
+        telegram_enabled=True,
+        minimum_severity=AlertSeverity.WARNING,
+        created_at=NOW,
+        updated_at=NOW,
+    )
+
+    await repository.save(
+        preference,
+        None,
+        AuditContext(actor_id="sub_1"),
+        previous=None,
+    )
+
+    transaction = client.transact_write_items_calls[0]["TransactItems"]
+    stored = client._decode(transaction[0]["Put"]["Item"])
+    audit = client._decode(transaction[1]["Put"]["Item"])
+    assert stored["schema_version"] == 2
+    assert stored["telegram_enabled"] is True
+    assert "email_address" not in stored
+    assert "checked_at" not in stored
+    assert audit["details"]["telegram_enabled"] is True
+    assert audit["details"]["email_hash"] is None
 
 
 @pytest.mark.asyncio
@@ -481,6 +537,7 @@ async def test_create_conditionally_persists_preference_and_redacted_audit_atomi
     assert audit["details"] == {
         "email_enabled": True,
         "email_verified": True,
+        "telegram_enabled": False,
         "minimum_severity": "critical",
         "email_hash": sha256(b"verified@example.com").hexdigest(),
     }
