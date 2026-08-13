@@ -16,9 +16,12 @@ from urllib.parse import urlencode
 from urllib.request import Request, urlopen
 from uuid import uuid4
 
+ROOT = Path(__file__).resolve().parents[2]
+if str(ROOT) not in sys.path:
+    sys.path.insert(0, str(ROOT))
+
 from scripts.dev.publish_sample_reading import DEFAULT_TOPIC, publish
 
-ROOT = Path(__file__).resolve().parents[2]
 MARKER_PATH = Path(os.environ.get("LAB_MARKER_PATH", "/etc/vinisantana-lab"))
 API_URL = os.environ.get("LIMNOPULSE_LAB_API_URL", "http://127.0.0.1:8000")
 TENANT_ID = "tnt_local_001"
@@ -171,7 +174,13 @@ def main() -> int:
         for sequence, offset in enumerate(sample_offsets(), start=1):
             measured_at = window_start + timedelta(seconds=offset)
             payload = sample_payload(measured_at.isoformat().replace("+00:00", "Z"), sequence)
-            publish("127.0.0.1", 1883, DEFAULT_TOPIC, json.dumps(payload).encode("utf-8"))
+            publish(
+                "127.0.0.1",
+                1883,
+                DEFAULT_TOPIC,
+                json.dumps(payload).encode("utf-8"),
+                f"limnopulse-lab-smoke-{sequence}",
+            )
             sequences.add(sequence)
 
         wait_for_readings(

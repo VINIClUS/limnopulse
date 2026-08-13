@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import os
 import subprocess
+import sys
 from pathlib import Path
 
 import yaml
@@ -128,6 +129,20 @@ def test_lab_hooks_refuse_to_run_without_the_guest_marker(tmp_path: Path) -> Non
         assert "lab marker" in completed.stderr.lower()
 
 
+def test_lab_smoke_runs_as_a_script_from_the_product_root(tmp_path: Path) -> None:
+    completed = subprocess.run(
+        [sys.executable, str(LAB / "smoke.py")],
+        cwd=ROOT,
+        env=os.environ | {"LAB_MARKER_PATH": str(tmp_path / "missing-marker")},
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+
+    assert completed.returncode == 7
+    assert "lab marker" in completed.stderr.lower()
+
+
 def test_lab_deploy_uses_only_local_runtime_commands(tmp_path: Path) -> None:
     completed = _run_hook(tmp_path, "deploy")
 
@@ -181,3 +196,27 @@ def test_lab_smoke_builds_a_synthetic_breaching_rule_and_stable_window() -> None
     assert sample_payload("2026-08-13T12:01:10Z", 3)["do_mg_l"] == 4.0
     assert sample_payload("2026-08-13T12:01:10Z", 3)["seq"] == 3
     assert sample_offsets() == (5, 15, 25, 35, 45, 55)
+
+
+def test_lab_smoke_uses_a_distinct_mqtt_client_for_each_sample(monkeypatch) -> None:
+    from ops.lab import smoke
+
+    published: list[tuple[str, bytes]] = []
+    monkeypatch.setattr(smoke, "publish", lambda _host, _port, _topic, payload, client_id: published.append((client_id, payload)))
+    monkeypatch.setattr(smoke, "wait_for_health", lambda: None)
+    monkeypatch.setattr(smoke, "request_json", lambda *_args, **_kwargs: {"rule_id": "rule-1"})
+    monkeypatch.setattr(smoke, "wait_for_readings", lambda *_args: None)
+    monkeypatch.setattr(smoke, "run_evaluator", lambda _time: None)
+    monkeypatch.setattr(smoke, "matching_open_events", lambda _rule_id: [{"status": "open"}])
+    monkeypatch.setattr(smoke, "require_lab_marker", lambda: None)
+    monkeypatch.setattr(smoke, "evaluation_time", lambda: "2026-08-13T12:02:00Z")
+
+    assert smoke.main() == 0
+    assert [client_id for client_id, _payload in published] == [
+        "limnopulse-lab-smoke-1",
+        "limnopulse-lab-smoke-2",
+        "limnopulse-lab-smoke-3",
+        "limnopulse-lab-smoke-4",
+        "limnopulse-lab-smoke-5",
+        "limnopulse-lab-smoke-6",
+    ]
