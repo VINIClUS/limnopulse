@@ -22,22 +22,23 @@ const (
 )
 
 type DeliveryRecord struct {
-	Delivery             notifications.DeliverySnapshot
-	Revision             int64
-	AttemptCount         int
-	LastAttemptID        string
-	StartedAttemptID     string
-	LeaseOwner           string
-	LeaseEpoch           int64
-	LeaseExpiresAt       time.Time
-	NextAttemptAt        time.Time
-	ProviderOutcome      notifications.ProviderOutcome
-	ProviderMessageID    string
-	ProviderAttemptID    string
-	PossiblyAccepted     bool
-	AmbiguousExhausted   bool
-	AwaitingIntervention bool
-	AwaitingDLQ          bool
+	Delivery                   notifications.DeliverySnapshot
+	Revision                   int64
+	AttemptCount               int
+	LastAttemptID              string
+	StartedAttemptID           string
+	LeaseOwner                 string
+	LeaseEpoch                 int64
+	LeaseExpiresAt             time.Time
+	NextAttemptAt              time.Time
+	ProviderOutcome            notifications.ProviderOutcome
+	ProviderMessageID          string
+	ProviderAttemptID          string
+	PossiblyAccepted           bool
+	AmbiguousExhausted         bool
+	AwaitingIntervention       bool
+	AwaitingDLQ                bool
+	TelegramDestinationVersion int64
 }
 
 type AcquireResult struct {

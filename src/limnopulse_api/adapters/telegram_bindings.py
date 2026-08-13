@@ -55,7 +55,11 @@ class DynamoTelegramBindingRepository:
                 }
             )
         operations: list[dict[str, Any]] = [{"Put": token_put}, {"Put": pointer_put}]
-        if previous is not None and previous.status is TelegramBindingStatus.PENDING:
+        if (
+            previous is not None
+            and previous.status is TelegramBindingStatus.PENDING
+            and previous.expires_at > request.created_at
+        ):
             operations.append(
                 {
                     "Update": {

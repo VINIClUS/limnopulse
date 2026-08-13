@@ -159,7 +159,8 @@ func (store Store) ExpandDependency(
 				}
 			}
 		}
-		if err == nil && state == notifications.DeliveryStateSucceeded {
+		if err == nil && (state == notifications.DeliveryStateSucceeded ||
+			(work.Channel == notifications.ChannelTelegram && isNonterminalDelivery(state))) {
 			check, checkErr := store.openingDependencyCondition(opening)
 			if checkErr != nil {
 				return relay.WorkResult{}, checkErr

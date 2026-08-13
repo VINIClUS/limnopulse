@@ -522,6 +522,7 @@ func TestCompleteAttemptSuppressesRejectedTelegramDestinationInSameTransaction(t
 	record := testTelegramRecord(t)
 	record.AttemptCount = 1
 	record.LastAttemptID = "att_telegram_1"
+	record.TelegramDestinationVersion = 5
 	client := &fakeClient{}
 
 	err := (Store{Table: "domain", Client: client}).CompleteAttempt(
@@ -556,9 +557,28 @@ func TestCompleteAttemptSuppressesRejectedTelegramDestinationInSameTransaction(t
 	}
 	if suppression == nil || !strings.Contains(*suppression.UpdateExpression, "#status = :suppressed") ||
 		!strings.Contains(*suppression.ConditionExpression, "#status = :active") ||
+		!strings.Contains(*suppression.ConditionExpression, "#version = :version") ||
 		!containsName(suppression.ExpressionAttributeNames, "suppression_reason") ||
-		decodeExpressionValues(t, suppression.ExpressionAttributeValues)[":reason"] != "provider_rejected" {
+		decodeExpressionValues(t, suppression.ExpressionAttributeValues)[":reason"] != "provider_rejected" ||
+		fmt.Sprint(decodeExpressionValues(t, suppression.ExpressionAttributeValues)[":version"]) != "5" {
 		t.Fatalf("Telegram suppression update = %#v", suppression)
+	}
+}
+
+func TestBeginAttemptCarriesTelegramDestinationVersionToCompletion(t *testing.T) {
+	record := testTelegramRecord(t)
+	started, err := (Store{Table: "domain", Client: &fakeClient{}}).BeginAttempt(
+		context.Background(), record, worker.BeginAttemptRequest{
+			AttemptID: "att_telegram_1", StartedAt: testNow(),
+			LeaseRequiredUntil: testNow().Add(20 * time.Second),
+			GateFence:          testTelegramGateFence(record),
+		},
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if started.TelegramDestinationVersion != 5 {
+		t.Fatalf("Telegram destination version = %d", started.TelegramDestinationVersion)
 	}
 }
 
@@ -1333,6 +1353,21 @@ func testGateFence(t *testing.T, record worker.DeliveryRecord) worker.GateFence 
 		PreferenceMinimumSeverity:  "warning",
 		EventSeverity:              "critical",
 		DeliverabilityDependencies: []worker.DeliverabilityDependency{{Key: deliverabilityKey}},
+	}
+}
+
+func testTelegramGateFence(record worker.DeliveryRecord) worker.GateFence {
+	return worker.GateFence{
+		Channel:                    notifications.ChannelTelegram,
+		MembershipVersion:          2,
+		PreferenceVersion:          2,
+		PreferenceMinimumSeverity:  "warning",
+		EventSeverity:              "critical",
+		EventStatus:                "open",
+		TelegramDestinationID:      record.Delivery.DestinationID,
+		TelegramChatID:             record.Delivery.TelegramChatID,
+		TelegramBindingVersion:     4,
+		TelegramDestinationVersion: 5,
 	}
 }
 

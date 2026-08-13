@@ -144,6 +144,59 @@ func TestExpandTelegramDependencyUsesOpeningDestinationAndTelegramLocale(t *test
 	}
 }
 
+func TestExpandTelegramDependencyFencesNonterminalOpeningBeforeCancellingRecovery(t *testing.T) {
+	relayTime := time.Date(2026, 8, 13, 13, 0, 0, 0, time.UTC)
+	work := recoveryWork(t, relayTime)
+	work.Channel = notifications.ChannelTelegram
+	work.RelaySchemaVersion = notifications.TelegramRelaySchemaVersion
+	destinationID := notificationsHashChatForTest("123")
+	var opening map[string]any
+	if err := attributevalue.UnmarshalMap(
+		telegramSucceededOpeningDelivery(t, relayTime, destinationID),
+		&opening,
+	); err != nil {
+		t.Fatal(err)
+	}
+	opening["state"] = string(notifications.DeliveryStateProcessing)
+	client := &fakeClient{
+		queryOutputs: []*awssdk.QueryOutput{{Items: []map[string]types.AttributeValue{
+			marshalMap(t, opening),
+		}}},
+		getOutputs: []*awssdk.GetItemOutput{
+			{Item: expandedOpeningOutbox(t)},
+			{Item: marshalMap(t, openingEvent(relayTime))},
+		},
+	}
+
+	result, err := (Store{Table: "domain", Client: client}).ExpandDependency(
+		context.Background(), work, relay.ExpandRequest{RelayTime: relayTime, PageSize: 20},
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if result.DeliveriesCreated != 0 || result.DeliveriesCancelled != 1 {
+		t.Fatalf("result = %#v", result)
+	}
+	var openingFence *types.ConditionCheck
+	for _, item := range client.transactInputs[0].TransactItems {
+		if item.ConditionCheck != nil {
+			openingFence = item.ConditionCheck
+			break
+		}
+	}
+	if openingFence == nil {
+		t.Fatalf("nonterminal Telegram recovery cancellation lacks opening fence: %#v", client.transactInputs[0])
+	}
+	var values map[string]any
+	if err := attributevalue.UnmarshalMap(openingFence.ExpressionAttributeValues, &values); err != nil {
+		t.Fatal(err)
+	}
+	if values[":state"] != string(notifications.DeliveryStateProcessing) ||
+		fmt.Sprint(values[":revision"]) != "1" {
+		t.Fatalf("nonterminal opening fence values = %#v", values)
+	}
+}
+
 func TestExpandDependencyCancelsInactiveMembershipWithoutRelayIndex(t *testing.T) {
 	relayTime := time.Date(2026, 7, 16, 13, 0, 0, 0, time.UTC)
 	inactive := activeMember(t, relayTime, "sub_1")

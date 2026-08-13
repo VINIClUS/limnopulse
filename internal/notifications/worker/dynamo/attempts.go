@@ -85,6 +85,9 @@ func (store Store) BeginAttempt(
 	record.Revision++
 	record.AttemptCount++
 	record.LastAttemptID = request.AttemptID
+	if record.Delivery.Channel == notifications.ChannelTelegram {
+		record.TelegramDestinationVersion = request.GateFence.TelegramDestinationVersion
+	}
 	record.Delivery.UpdatedAt = request.StartedAt.UTC()
 	return record, nil
 }
@@ -470,6 +473,9 @@ func (store Store) telegramSuppressionOperation(
 	record worker.DeliveryRecord,
 	now time.Time,
 ) (types.TransactWriteItem, error) {
+	if record.TelegramDestinationVersion < 1 {
+		return types.TransactWriteItem{}, fmt.Errorf("missing Telegram destination version")
+	}
 	key, err := attributevalue.MarshalMap(map[string]string{
 		"PK": "TELEGRAM_DESTINATION#" + record.Delivery.DestinationID,
 		"SK": "META",
@@ -481,7 +487,7 @@ func (store Store) telegramSuppressionOperation(
 		":entity": "telegram_destination", ":destination_id": record.Delivery.DestinationID,
 		":recipient_id": record.Delivery.RecipientID, ":chat_id": record.Delivery.TelegramChatID,
 		":active": "active", ":suppressed": "suppressed", ":reason": "provider_rejected",
-		":now": fixedTime(now), ":one": int64(1),
+		":now": fixedTime(now), ":one": int64(1), ":version": record.TelegramDestinationVersion,
 	})
 	if err != nil {
 		return types.TransactWriteItem{}, err
@@ -494,7 +500,7 @@ func (store Store) telegramSuppressionOperation(
 		),
 		ConditionExpression: aws.String(
 			"#entity = :entity AND #destination_id = :destination_id AND #recipient_id = :recipient_id " +
-				"AND #chat_id = :chat_id AND (#status = :active OR #status = :suppressed)",
+				"AND #chat_id = :chat_id AND #version = :version AND (#status = :active OR #status = :suppressed)",
 		),
 		ExpressionAttributeNames: map[string]string{
 			"#entity": "entity_type", "#destination_id": "destination_id", "#recipient_id": "recipient_id",

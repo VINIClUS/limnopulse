@@ -131,12 +131,33 @@ def test_webhook_returns_generic_success_for_unsupported_or_invalid_token() -> N
     assert service.calls == []
 
 
+def test_webhook_acknowledges_valid_updates_without_a_message() -> None:
+    service = RecordingBindingService()
+    client = build_client(service)
+
+    response = client.post(
+        PATH,
+        json={
+            "update_id": 13,
+            "edited_message": {
+                "message_id": 20,
+                "date": 1_786_620_000,
+            },
+        },
+        headers={"X-Telegram-Bot-Api-Secret-Token": SECRET},
+    )
+
+    assert response.status_code == 200
+    assert response.json() == {"ok": True}
+    assert service.calls == []
+
+
 def test_webhook_rejects_malformed_envelope_and_non_private_chat() -> None:
     service = RecordingBindingService()
     client = build_client(service)
     headers = {"X-Telegram-Bot-Api-Secret-Token": SECRET}
 
-    malformed = client.post(PATH, json={"update_id": 1}, headers=headers)
+    malformed = client.post(PATH, json={"message": {}}, headers=headers)
     group = telegram_update("/stop")
     group["message"]["chat"]["type"] = "group"
     non_private = client.post(PATH, json=group, headers=headers)

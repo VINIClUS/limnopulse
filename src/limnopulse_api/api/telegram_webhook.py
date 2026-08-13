@@ -54,7 +54,7 @@ class TelegramUpdate(BaseModel):
     model_config = ConfigDict(extra="ignore")
 
     update_id: int = Field(ge=0)
-    message: TelegramMessage
+    message: TelegramMessage | None = None
 
 
 def _state_dependency(request: Request, name: str):
@@ -65,6 +65,8 @@ def _state_dependency(request: Request, name: str):
 
 
 def _command(update: TelegramUpdate) -> BindingCommand | None:
+    if update.message is None:
+        return None
     text = update.message.text.strip()
     if text == "/stop":
         return BindingCommand(

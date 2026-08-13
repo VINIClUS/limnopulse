@@ -130,6 +130,35 @@ async def test_issue_writes_hash_only_lookup_and_current_pointer_atomically() ->
 
 
 @pytest.mark.asyncio
+async def test_issue_replaces_an_expired_pointer_after_its_token_ttl_has_removed_lookup() -> None:
+    client = RecordingDynamoClient()
+    expired = request().model_copy(
+        update={
+            "request_id": "expired_request",
+            "token_hash": sha256(b"expired-token").hexdigest(),
+            "expires_at": NOW - timedelta(seconds=1),
+        }
+    )
+    client.seed(
+        {
+            "PK": "TENANT#tnt_1",
+            "SK": "TELEGRAM_BINDING_REQUEST#USER#sub_1",
+            "entity_type": "telegram_binding_request",
+            **expired.model_dump(mode="json", exclude={"expires_at"}),
+            "expires_at": int(expired.expires_at.timestamp()),
+            "schema_version": 1,
+        }
+    )
+    repository = DynamoTelegramBindingRepository("domain", client)
+
+    await repository.issue(request())
+
+    operations = client.transact_write_items_calls[0]["TransactItems"]
+    assert len(operations) == 2
+    assert all("Update" not in operation for operation in operations)
+
+
+@pytest.mark.asyncio
 async def test_consume_fences_membership_token_destination_binding_and_update_dedupe() -> None:
     client = RecordingDynamoClient()
     client.seed(token_item())
