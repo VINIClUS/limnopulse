@@ -1,0 +1,63 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd -P)"
+# shellcheck source=ops/lab/lib.sh
+source "$SCRIPT_DIR/lib.sh"
+
+require_lab_marker
+for command in docker python3 sudo; do
+  require_command "$command"
+done
+
+ROOT="$(lab_root)"
+ENV_FILE="${LAB_ENV_FILE:-$ROOT/.env}"
+UNIT_NAME="limnopulse-lab-api.service"
+UNIT_PATH="/etc/systemd/system/$UNIT_NAME"
+
+if [[ ! -f "$ROOT/uv.lock" ]]; then
+  fail "uv.lock is required; create and review it before provisioning the lab" 3
+fi
+
+if [[ "$ENV_FILE" == "$ROOT"/* || "$ENV_FILE" == "$ROOT/.env" ]]; then
+  install -m 600 "$ROOT/.env.example" "$ENV_FILE"
+else
+  fail "LAB_ENV_FILE must be inside the LimnoPulse checkout" 9
+fi
+
+cd -- "$ROOT"
+ensure_lab_uv
+UV_BIN="$(lab_uv)"
+"$UV_BIN" sync --locked --no-dev
+docker compose up -d redis dynamodb-local influxdb mqtt-broker telegraf elasticmq
+wait_for_compose_services redis dynamodb-local influxdb mqtt-broker telegraf elasticmq
+"$UV_BIN" run --locked python scripts/dev/init_dynamodb.py
+"$UV_BIN" run --locked python scripts/dev/seed_local.py
+
+UNIT_TMP="$(mktemp)"
+trap 'rm -f "$UNIT_TMP"' EXIT
+cat >"$UNIT_TMP" <<EOF
+[Unit]
+Description=LimnoPulse API for the Debian VPS lab
+After=docker.service
+Requires=docker.service
+
+[Service]
+Type=simple
+User=vagrant
+WorkingDirectory=$ROOT
+Environment=APP_ENV=local
+Environment=AUTH_MODE=dev
+ExecStart=$ROOT/.venv/bin/uvicorn limnopulse_api.main:app --host 0.0.0.0 --port 8000
+Restart=on-failure
+RestartSec=2
+
+[Install]
+WantedBy=multi-user.target
+EOF
+
+sudo install -m 644 "$UNIT_TMP" "$UNIT_PATH"
+sudo systemctl daemon-reload
+sudo systemctl enable --now limnopulse-lab-api.service
+wait_for_http http://127.0.0.1:8000/readyz
+printf 'limnopulse lab: deploy complete\n'

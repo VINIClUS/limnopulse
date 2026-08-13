@@ -1,0 +1,20 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd -P)"
+# shellcheck source=ops/lab/lib.sh
+source "$SCRIPT_DIR/lib.sh"
+
+require_lab_marker
+for command in docker sudo; do
+  require_command "$command"
+done
+
+ROOT="$(lab_root)"
+cd -- "$ROOT"
+
+sudo systemctl disable --now limnopulse-lab-api.service || true
+sudo rm -f /etc/systemd/system/limnopulse-lab-api.service
+sudo systemctl daemon-reload
+docker compose down --volumes --remove-orphans
+printf 'limnopulse lab: reset complete\n'

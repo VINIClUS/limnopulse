@@ -1,0 +1,26 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd -P)"
+# shellcheck source=ops/lab/lib.sh
+source "$SCRIPT_DIR/lib.sh"
+
+require_lab_marker
+for command in docker curl sudo; do
+  require_command "$command"
+done
+
+ROOT="$(lab_root)"
+cd -- "$ROOT"
+
+for service in redis dynamodb-local influxdb mqtt-broker telegraf elasticmq; do
+  docker compose ps --status running --services | grep -Fx "$service" >/dev/null || \
+    fail "Compose service is not running: $service" 7
+done
+
+sudo systemctl is-active --quiet limnopulse-lab-api.service || \
+  fail "LimnoPulse API systemd unit is not active" 7
+wait_for_http http://127.0.0.1:8000/healthz
+wait_for_http http://127.0.0.1:8000/readyz
+"$ROOT/.venv/bin/python" ops/lab/smoke.py
+printf 'limnopulse lab: verification complete\n'
