@@ -152,6 +152,24 @@ def test_webhook_acknowledges_valid_updates_without_a_message() -> None:
     assert service.calls == []
 
 
+def test_webhook_acknowledges_private_media_message_without_text() -> None:
+    service = RecordingBindingService()
+    client = build_client(service)
+    media_update = telegram_update("/stop", update_id=14)
+    del media_update["message"]["text"]
+    media_update["message"]["photo"] = [{"file_id": "photo_1"}]
+
+    response = client.post(
+        PATH,
+        json=media_update,
+        headers={"X-Telegram-Bot-Api-Secret-Token": SECRET},
+    )
+
+    assert response.status_code == 200
+    assert response.json() == {"ok": True}
+    assert service.calls == []
+
+
 def test_webhook_rejects_malformed_envelope_and_non_private_chat() -> None:
     service = RecordingBindingService()
     client = build_client(service)

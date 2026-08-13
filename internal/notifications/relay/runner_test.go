@@ -706,6 +706,35 @@ func TestRunNeverClaimsWithLeaseTimestampAtOrAfterSoftDeadline(t *testing.T) {
 	}
 }
 
+func TestProcessCandidateSkipsTelegramWorkBeforeClaimWhenDeliveryIsDisabled(t *testing.T) {
+	start := time.Date(2026, 8, 13, 18, 0, 0, 0, time.UTC)
+	candidate := Candidate{
+		PK: "TENANT#tnt_1", SK: "NOTIFICATION_OUTBOX#telegram_outbox",
+		Kind: notifications.WorkKindIntent, AvailableAt: start.Add(-time.Minute),
+	}
+	store := &publicationStore{
+		candidate: candidate,
+		work: Work{
+			Candidate: candidate, TenantID: "tnt_1", ItemID: "telegram_outbox",
+			OutboxID: "telegram_outbox", EventID: "event_1", RuleID: "rule_1",
+			NotificationKind: notifications.NotificationKindOpening, Channel: notifications.ChannelTelegram,
+			State: "pending",
+		},
+	}
+	runner := Runner{Store: store, Clock: func() time.Time { return start }}
+
+	result := runner.processCandidate(
+		context.Background(), candidate,
+		relayconfig.RunConfig{ItemTimeout: time.Second, LeaseTTL: time.Second},
+		start, start.Add(time.Minute), "run_1", func() time.Time { return start },
+	)
+
+	if result.skipped != 1 || result.withError != 0 || store.claims != 0 ||
+		len(store.rescheduled) != 0 || len(store.queued) != 0 {
+		t.Fatalf("result=%#v claims=%d rescheduled=%#v queued=%#v", result, store.claims, store.rescheduled, store.queued)
+	}
+}
+
 func TestCandidatePriorityFavorsDeliveryWithoutStarvingIntentOrDependency(t *testing.T) {
 	candidates := make([]Candidate, 0, 12)
 	for index := range 10 {

@@ -340,6 +340,40 @@ func TestBackfillRelayEnablesDeferredTelegramOutboxesByTenantQueryIdempotently(t
 	}
 }
 
+func TestBackfillRelaySkipsCanonicalTelegramSchemaV2Outboxes(t *testing.T) {
+	telegram := legacyOutbox("outbox_telegram_canonical", "telegram", "ready")
+	createdAt, err := time.Parse(fixedUTCLayout, telegram["created_at"].(string))
+	if err != nil {
+		t.Fatal(err)
+	}
+	index, err := notifications.BuildRelayIndexKey(
+		notifications.WorkKindIntent, "tnt_1", "outbox_telegram_canonical", createdAt,
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	telegram["relay_schema_version"] = notifications.TelegramRelaySchemaVersion
+	telegram["expansion_status"] = "pending"
+	telegram["available_at"] = telegram["created_at"]
+	telegram["relay_work_kind"] = string(notifications.WorkKindIntent)
+	telegram["relay_gsi_pk"] = index.PartitionKey
+	telegram["relay_gsi_sk"] = index.SortKey
+	client := &fakeClient{queryOutputs: []*awssdk.QueryOutput{{Items: []map[string]types.AttributeValue{
+		mustMarshalMap(t, telegram),
+	}}}}
+
+	summary, err := (Store{Table: "domain", Client: client}).BackfillRelay(
+		context.Background(), BackfillOptions{Tenants: []string{"tnt_1"}, Apply: true, PageSize: 25},
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if summary.Noop != 1 || summary.SchemaConflicts != 0 || summary.RowFailures != 0 ||
+		summary.RowsNeedingUpdate != 0 || len(client.updateInputs) != 0 {
+		t.Fatalf("summary=%#v updates=%#v", summary, client.updateInputs)
+	}
+}
+
 func TestBackfillRelayUpgradesOnlyMissingWorkKindOnCanonicalV1EmailRows(t *testing.T) {
 	ready := canonicalEmailOutbox(
 		t, legacyOutbox("outbox_ready", "email", "ready"), notifications.WorkKindIntent,

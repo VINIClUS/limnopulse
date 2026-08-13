@@ -490,6 +490,9 @@ func (runner Runner) processCandidate(
 	if !current {
 		return candidateResult{skipped: 1}
 	}
+	if work.Channel == notifications.ChannelTelegram && !config.TelegramDeliveryEnabled {
+		return candidateResult{skipped: 1}
+	}
 	now := clock().UTC()
 	if !now.Before(softDeadline) {
 		return candidateResult{remaining: 1, deadline: true}

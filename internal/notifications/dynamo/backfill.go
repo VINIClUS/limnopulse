@@ -360,6 +360,33 @@ func classifyRelayOutbox(
 
 	migration := relayMigration{Outbox: outbox}
 	hasRelay := hasAnyRelayField(item)
+	if targetChannel == "" && outbox.Channel == string(notifications.ChannelTelegram) &&
+		numberAttributeEquals(item, "relay_schema_version", notifications.TelegramRelaySchemaVersion) {
+		workKind, err := notifications.ClassifyOutboxRelayWork(
+			outbox.Kind,
+			notifications.OutboxStatus(outbox.Status),
+		)
+		if err != nil {
+			return migrationNoop, relayMigration{}, fmt.Errorf("Telegram outbox kind or status is unsupported")
+		}
+		createdAt, err := time.Parse(fixedUTCLayout, outbox.CreatedAt)
+		if err != nil || createdAt.UTC().Format(fixedUTCLayout) != outbox.CreatedAt {
+			return migrationNoop, relayMigration{}, fmt.Errorf("Telegram outbox created_at is not canonical")
+		}
+		migration.Expansion = "pending"
+		migration.AvailableAt = outbox.CreatedAt
+		migration.WorkKind = workKind
+		migration.RelayIndexKey, err = notifications.BuildRelayIndexKey(
+			workKind, outbox.TenantID, outbox.OutboxID, createdAt,
+		)
+		if err != nil {
+			return migrationNoop, relayMigration{}, fmt.Errorf("build Telegram relay index key: %w", err)
+		}
+		if isCanonicalRelayOutbox(item, migration, notifications.TelegramRelaySchemaVersion) ||
+			isExpandedRelayOutbox(item, workKind, notifications.TelegramRelaySchemaVersion) {
+			return migrationNoop, migration, nil
+		}
+	}
 	if targetChannel == notifications.ChannelTelegram {
 		if outbox.Channel != string(notifications.ChannelTelegram) {
 			return migrationNoop, migration, nil

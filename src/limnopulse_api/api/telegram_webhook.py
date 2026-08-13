@@ -41,7 +41,7 @@ class TelegramMessage(BaseModel):
     sender: TelegramSender = Field(alias="from")
     chat: TelegramChat
     date: int = Field(ge=0)
-    text: str = Field(min_length=1, max_length=4_096)
+    text: str | None = Field(default=None, min_length=1, max_length=4_096)
 
     @model_validator(mode="after")
     def validate_private_sender(self) -> "TelegramMessage":
@@ -65,7 +65,7 @@ def _state_dependency(request: Request, name: str):
 
 
 def _command(update: TelegramUpdate) -> BindingCommand | None:
-    if update.message is None:
+    if update.message is None or update.message.text is None:
         return None
     text = update.message.text.strip()
     if text == "/stop":
