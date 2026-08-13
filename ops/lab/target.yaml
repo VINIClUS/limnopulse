@@ -1,0 +1,39 @@
+apiVersion: lab.vinisantana.dev/v1alpha1
+kind: LabTarget
+metadata:
+  name: limnopulse
+  ownerRepository: limnopulse
+spec:
+  guestProfile: limnopulse-medium
+  baseline:
+    capability: debian-container-host
+  hooks:
+    deploy:
+      path: ops/lab/deploy
+      timeoutSeconds: 1200
+    verify:
+      path: ops/lab/verify
+      timeoutSeconds: 300
+    reset:
+      path: ops/lab/reset
+      timeoutSeconds: 300
+  services:
+    - name: api
+      guestPort: 8000
+      preferredHostPort: 18000
+      health:
+        type: http
+        path: /healthz
+        expectedStatus: 200
+  dataPolicy:
+    productionDataAllowed: false
+    syntheticFixturesOnly: true
+    emulatedCapabilities:
+      - dynamodb
+      - sqs
+      - email-sender
+    omittedCapabilities:
+      - cognito
+      - ses
+      - eventbridge
+      - production-mqtt

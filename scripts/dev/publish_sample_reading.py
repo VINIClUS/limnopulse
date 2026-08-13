@@ -40,9 +40,15 @@ def _publish_packet(topic: str, payload: bytes) -> bytes:
     return bytes([0x30]) + _remaining_length_bytes(len(remaining)) + remaining
 
 
-def publish(host: str, port: int, topic: str, payload: bytes) -> None:
+def publish(
+    host: str,
+    port: int,
+    topic: str,
+    payload: bytes,
+    client_id: str = "limnopulse-local-publisher",
+) -> None:
     with socket.create_connection((host, port), timeout=10) as sock:
-        sock.sendall(_connect_packet("limnopulse-local-publisher"))
+        sock.sendall(_connect_packet(client_id))
         connack = sock.recv(4)
         if connack != b"\x20\x02\x00\x00":
             raise RuntimeError(f"mqtt connect failed: {connack!r}")

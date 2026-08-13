@@ -191,7 +191,7 @@ curl -H "X-Dev-User-Sub: local-user-001" \
   "http://127.0.0.1:8000/v1/tenants/tnt_local_001/ponds/pond_local_001/readings?start=2026-07-09T00:00:00Z&stop=2026-07-10T00:00:00Z&limit=10"
 ```
 
-The local Mosquitto service uses anonymous access bound to `127.0.0.1:1883` for development only. Production MQTT still needs TLS/mTLS, per-device credentials, and broker ACL hardening before exposure.
+The local Mosquitto service uses anonymous access and is published only on host loopback at `127.0.0.1:1883` for development. It remains reachable by the local Compose services. Production MQTT still needs TLS/mTLS, per-device credentials, and broker ACL hardening before exposure.
 
 ## Cloud Infrastructure
 

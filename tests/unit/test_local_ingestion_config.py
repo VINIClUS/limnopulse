@@ -22,6 +22,7 @@ def test_compose_includes_local_mqtt_broker_and_telegraf_services() -> None:
 
     telegraf = services["telegraf"]
     assert telegraf["image"] == "telegraf:1.32-alpine"
+    assert telegraf["restart"] == "unless-stopped"
     assert set(telegraf["depends_on"]) == {"mqtt-broker", "influxdb"}
     assert "./infra/telegraf/telegraf.conf:/etc/telegraf/telegraf.conf:ro" in telegraf[
         "volumes"
@@ -37,7 +38,8 @@ def test_compose_includes_local_mqtt_broker_and_telegraf_services() -> None:
 def test_mosquitto_config_is_local_only_and_non_persistent() -> None:
     config = (ROOT / "infra/mqtt/mosquitto.conf").read_text()
 
-    assert "listener 1883 127.0.0.1" in config
+    assert "listener 1883" in config
+    assert "127.0.0.1" not in config
     assert "allow_anonymous true" in config
     assert "persistence false" in config
     assert "password_file" not in config
