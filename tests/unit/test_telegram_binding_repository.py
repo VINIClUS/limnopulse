@@ -69,6 +69,17 @@ class DestinationConditionRace(Exception):
     }
 
 
+class StopFenceOrderRace(Exception):
+    response: ClassVar[dict[str, Any]] = {
+        "Error": {"Code": "TransactionCanceledException"},
+        "CancellationReasons": [
+            {"Code": "None"},
+            {"Code": "None"},
+            {"Code": "ConditionalCheckFailed"},
+        ],
+    }
+
+
 class ConflictingDynamoClient(RecordingDynamoClient):
     def __init__(
         self,
@@ -178,13 +189,14 @@ async def test_consume_fences_membership_token_destination_binding_and_update_de
     assert call["ClientRequestToken"].startswith("tgupdate-")
     assert len(call["ClientRequestToken"]) <= 36
     operations = call["TransactItems"]
-    assert len(operations) == 6
+    assert len(operations) == 7
     dedupe = client.decode(operations[0]["Put"]["Item"])
     membership = client.decode(operations[1]["ConditionCheck"]["Key"])
     token_update = operations[2]["Update"]
-    pointer_update = operations[3]["Update"]
-    destination_update = operations[4]["Update"]
-    binding = client.decode(operations[5]["Put"]["Item"])
+    stop_fence = operations[3]["ConditionCheck"]
+    pointer_update = operations[4]["Update"]
+    destination_update = operations[5]["Update"]
+    binding = client.decode(operations[6]["Put"]["Item"])
     assert dedupe["PK"] == "TELEGRAM_UPDATE#55"
     assert dedupe["expires_at"] == int((NOW + timedelta(days=8)).timestamp())
     assert membership == {"PK": "USER#sub_1", "SK": "TENANT#tnt_1"}
@@ -194,6 +206,13 @@ async def test_consume_fences_membership_token_destination_binding_and_update_de
         "SK": "TELEGRAM_BINDING_REQUEST#USER#sub_1",
     }
     assert "#status = :pending" in pointer_update["ConditionExpression"]
+    assert client.decode(stop_fence["Key"]) == {
+        "PK": f"TELEGRAM_DESTINATION#{TelegramDestination.id_for_chat(123)}",
+        "SK": "STOP_FENCE",
+    }
+    assert stop_fence["ConditionExpression"] == (
+        "attribute_not_exists(#last_update_id) OR #last_update_id < :update_id"
+    )
     destination_key = client.decode(destination_update["Key"])
     assert destination_key == {
         "PK": f"TELEGRAM_DESTINATION#{TelegramDestination.id_for_chat(123)}",
@@ -451,7 +470,7 @@ async def test_revoke_does_not_require_token_row_after_expired_token_ttl() -> No
 
 
 @pytest.mark.asyncio
-async def test_stop_without_destination_dedupes_update_and_fences_absence() -> None:
+async def test_stop_without_destination_persists_ordering_tombstone() -> None:
     client = RecordingDynamoClient()
     repository = DynamoTelegramBindingRepository("domain", client)
 
@@ -464,7 +483,7 @@ async def test_stop_without_destination_dedupes_update_and_fences_absence() -> N
 
     assert applied is False
     operations = client.transact_write_items_calls[0]["TransactItems"]
-    assert len(operations) == 2
+    assert len(operations) == 3
     assert client.decode(operations[0]["Put"]["Item"])["PK"] == "TELEGRAM_UPDATE#58"
     absence = operations[1]["ConditionCheck"]
     assert client.decode(absence["Key"])["PK"] == (
@@ -473,6 +492,31 @@ async def test_stop_without_destination_dedupes_update_and_fences_absence() -> N
     assert absence["ConditionExpression"] == (
         "attribute_not_exists(PK) AND attribute_not_exists(SK)"
     )
+    tombstone = operations[2]["Update"]
+    assert client.decode(tombstone["Key"]) == {
+        "PK": f"TELEGRAM_DESTINATION#{TelegramDestination.id_for_chat(123)}",
+        "SK": "STOP_FENCE",
+    }
+    assert "#last_update_id = :update_id" in tombstone["UpdateExpression"]
+    assert tombstone["ConditionExpression"] == (
+        "attribute_not_exists(#last_update_id) OR #last_update_id < :update_id"
+    )
+
+
+@pytest.mark.asyncio
+async def test_stop_without_destination_acknowledges_an_older_stop_fence() -> None:
+    client = ConflictingDynamoClient(failures=1, error=StopFenceOrderRace)
+    repository = DynamoTelegramBindingRepository("domain", client)
+
+    applied = await repository.stop(
+        chat_id=123,
+        sender_id=123,
+        update_id=57,
+        now=NOW,
+    )
+
+    assert applied is False
+    assert len(client.transact_write_items_calls) == 1
 
 
 @pytest.mark.asyncio

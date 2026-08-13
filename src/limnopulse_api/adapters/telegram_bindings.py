@@ -203,6 +203,22 @@ class DynamoTelegramBindingRepository:
                 }
             },
             {
+                "ConditionCheck": {
+                    "TableName": self.table_name,
+                    "Key": self._serialize(self._stop_fence_key(destination_id)),
+                    "ConditionExpression": (
+                        "attribute_not_exists(#last_update_id) "
+                        "OR #last_update_id < :update_id"
+                    ),
+                    "ExpressionAttributeNames": {
+                        "#last_update_id": "last_update_id",
+                    },
+                    "ExpressionAttributeValues": self._serialize(
+                        {":update_id": update_id}
+                    ),
+                }
+            },
+            {
                 "Update": {
                     "TableName": self.table_name,
                     "Key": self._serialize(
@@ -343,6 +359,42 @@ class DynamoTelegramBindingRepository:
                         }
                     }
                 )
+                operations.append(
+                    {
+                        "Update": {
+                            "TableName": self.table_name,
+                            "Key": self._serialize(self._stop_fence_key(destination_id)),
+                            "UpdateExpression": (
+                                "SET #entity_type = :entity_type, "
+                                "#schema_version = :schema_version, "
+                                "#destination_id = :destination_id, "
+                                "#last_update_id = :update_id, #updated_at = :now, "
+                                "#created_at = if_not_exists(#created_at, :now)"
+                            ),
+                            "ConditionExpression": (
+                                "attribute_not_exists(#last_update_id) "
+                                "OR #last_update_id < :update_id"
+                            ),
+                            "ExpressionAttributeNames": {
+                                "#entity_type": "entity_type",
+                                "#schema_version": "schema_version",
+                                "#destination_id": "destination_id",
+                                "#last_update_id": "last_update_id",
+                                "#updated_at": "updated_at",
+                                "#created_at": "created_at",
+                            },
+                            "ExpressionAttributeValues": self._serialize(
+                                {
+                                    ":entity_type": "telegram_destination_stop_fence",
+                                    ":schema_version": 1,
+                                    ":destination_id": destination_id,
+                                    ":update_id": update_id,
+                                    ":now": now.isoformat(),
+                                }
+                            ),
+                        }
+                    }
+                )
             else:
                 destination = self._destination_from_item(item)
                 if destination.chat_id != chat_id:
@@ -437,6 +489,8 @@ class DynamoTelegramBindingRepository:
                 if conditional_indexes is not None and (
                     -1 in conditional_indexes or 0 in conditional_indexes
                 ):
+                    return False
+                if item is None and 2 in conditional_indexes:
                     return False
                 if conditional_indexes is not None:
                     last_conflict = exc
@@ -648,6 +702,9 @@ class DynamoTelegramBindingRepository:
 
     def _destination_key(self, destination_id: str) -> dict[str, str]:
         return {"PK": f"TELEGRAM_DESTINATION#{destination_id}", "SK": "META"}
+
+    def _stop_fence_key(self, destination_id: str) -> dict[str, str]:
+        return {"PK": f"TELEGRAM_DESTINATION#{destination_id}", "SK": "STOP_FENCE"}
 
     def _binding_history_key(
         self,

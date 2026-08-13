@@ -29,6 +29,8 @@ verified binding.
 The destination stores the greatest applied Telegram `update_id`. A webhook
 command with an older ID is acknowledged without changing state, so delayed
 `/start` cannot reactivate a destination after a newer `/stop` (and vice versa).
+When `/stop` arrives before any destination exists, a durable per-chat stop
+fence stores that ID and the later `/start` transaction must exceed it.
 
 Webhook secret and bot token use separate Secrets Manager secrets and IAM
 policies. OpenTofu creates only secret containers; populate values through the
