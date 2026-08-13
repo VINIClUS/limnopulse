@@ -422,15 +422,32 @@ func (store Store) completeAttempt(
 	if recoveryOperation != nil {
 		items = append(items, *recoveryOperation)
 	}
+	suppressionIndex := -1
 	if completion.SuppressTelegramDestination {
 		suppressionOperation, suppressionErr := store.telegramSuppressionOperation(record, completion.CompletedAt)
 		if suppressionErr != nil {
 			return suppressionErr
 		}
+		suppressionIndex = len(items)
 		items = append(items, suppressionOperation)
 	}
 	_, err = store.Client.TransactWriteItems(ctx, &awssdk.TransactWriteItemsInput{TransactItems: items})
 	if err != nil {
+		if telegramSuppressionFenceLost(err, suppressionIndex) {
+			// A later /start reactivated this destination after BeginAttempt. Keep
+			// that newer state, but do not turn a known provider rejection into an
+			// ambiguous interrupted attempt just because the optional suppression
+			// side effect is stale.
+			withoutSuppression := completion
+			withoutSuppression.SuppressTelegramDestination = false
+			return store.completeAttempt(
+				ctx,
+				record,
+				withoutSuppression,
+				allowDelayedFeedbackMerge,
+				allowRecoveryFenceRetry,
+			)
+		}
 		isRecoveryFenceConflict := allowRecoveryFenceRetry && recoveryOperation != nil &&
 			recoveryOperation.ConditionCheck != nil && isTransactionCanceled(err)
 		if allowDelayedFeedbackMerge {
@@ -467,6 +484,31 @@ func (store Store) completeAttempt(
 		return fmt.Errorf("persist notification attempt completion: %w", err)
 	}
 	return nil
+}
+
+func telegramSuppressionFenceLost(err error, suppressionIndex int) bool {
+	if suppressionIndex < 0 {
+		return false
+	}
+	var canceled *types.TransactionCanceledException
+	if !errors.As(err, &canceled) || len(canceled.CancellationReasons) != suppressionIndex+1 {
+		return false
+	}
+	for index, reason := range canceled.CancellationReasons {
+		if reason.Code == nil {
+			return false
+		}
+		if index == suppressionIndex {
+			if *reason.Code != "ConditionalCheckFailed" {
+				return false
+			}
+			continue
+		}
+		if *reason.Code != "None" {
+			return false
+		}
+	}
+	return true
 }
 
 func (store Store) telegramSuppressionOperation(

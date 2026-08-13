@@ -13,6 +13,7 @@ import (
 	"github.com/VINIClUS/limnopulse/internal/notifications/feedback"
 	feedbackdynamo "github.com/VINIClUS/limnopulse/internal/notifications/feedback/dynamo"
 	"github.com/VINIClUS/limnopulse/internal/notifications/worker"
+	"github.com/aws/aws-sdk-go-v2/aws"
 	"github.com/aws/aws-sdk-go-v2/feature/dynamodb/attributevalue"
 	awssdk "github.com/aws/aws-sdk-go-v2/service/dynamodb"
 	"github.com/aws/aws-sdk-go-v2/service/dynamodb/types"
@@ -562,6 +563,52 @@ func TestCompleteAttemptSuppressesRejectedTelegramDestinationInSameTransaction(t
 		decodeExpressionValues(t, suppression.ExpressionAttributeValues)[":reason"] != "provider_rejected" ||
 		fmt.Sprint(decodeExpressionValues(t, suppression.ExpressionAttributeValues)[":version"]) != "5" {
 		t.Fatalf("Telegram suppression update = %#v", suppression)
+	}
+}
+
+func TestCompleteAttemptCompletesRejectedTelegramAttemptWhenDestinationWasReactivated(t *testing.T) {
+	record := testTelegramRecord(t)
+	record.AttemptCount = 1
+	record.LastAttemptID = "att_telegram_1"
+	record.TelegramDestinationVersion = 5
+	client := &fakeClient{transactionErrors: []error{
+		&types.TransactionCanceledException{CancellationReasons: []types.CancellationReason{
+			{Code: aws.String("None")},
+			{Code: aws.String("None")},
+			{Code: aws.String("None")},
+			{Code: aws.String("ConditionalCheckFailed")},
+		}},
+	}}
+
+	err := (Store{Table: "domain", Client: client}).CompleteAttempt(
+		context.Background(),
+		record,
+		worker.AttemptCompletion{
+			AttemptID: "att_telegram_1", CompletedAt: testNow(),
+			Outcome:                     notifications.AttemptOutcomePermanentFailed,
+			ErrorCategory:               string(worker.ErrorTelegramDestinationUnavailable),
+			NextState:                   notifications.DeliveryStatePermanentFailed,
+			SuppressTelegramDestination: true,
+		},
+	)
+
+	if err != nil {
+		t.Fatalf("CompleteAttempt() error = %v", err)
+	}
+	if len(client.transactions) != 2 {
+		t.Fatalf("transactions = %d, want rejected transaction plus unsuppressed completion", len(client.transactions))
+	}
+	for _, operation := range client.transactions[1].TransactItems {
+		if operation.Update == nil {
+			continue
+		}
+		var key map[string]string
+		if err := attributevalue.UnmarshalMap(operation.Update.Key, &key); err != nil {
+			t.Fatal(err)
+		}
+		if key["PK"] == "TELEGRAM_DESTINATION#"+record.Delivery.DestinationID {
+			t.Fatalf("stale completion must not suppress reactivated destination: %#v", operation)
+		}
 	}
 }
 
