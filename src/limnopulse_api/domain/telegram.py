@@ -79,6 +79,17 @@ class TelegramDestination(BaseModel):
         return sha256(str(chat_id).encode("ascii")).hexdigest()
 
 
+class TelegramEligibilityFence(BaseModel):
+    model_config = ConfigDict(frozen=True)
+
+    tenant_id: str
+    recipient_id: str
+    destination_id: str
+    chat_id: int = Field(gt=0)
+    binding_version: int = Field(ge=1)
+    destination_version: int = Field(ge=1)
+
+
 class TelegramBindingView(BaseModel):
     model_config = ConfigDict(frozen=True)
 

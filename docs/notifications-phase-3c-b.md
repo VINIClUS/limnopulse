@@ -114,6 +114,11 @@ binding and migration are verified.
 6. Run `notifications backfill-telegram` for explicit tenant batches. It never
    uses DynamoDB Scan; it uses paginated `Query` and conditional updates:
 
+   Pause the evaluator scheduler before the final backfill. While delivery is
+   disabled, new Telegram outboxes are marked `deferred_unsupported_channel`;
+   pausing the evaluator prevents a new deferred opening from appearing after
+   the final clean dry-run and before relay/evaluator activation.
+
    ```bash
    notifications backfill-telegram --tenant-file tenants.txt --max-rows 10000 --timeout 5m
    notifications backfill-telegram --tenant-file tenants.txt --apply --max-rows 10000 --timeout 5m
@@ -122,6 +127,8 @@ binding and migration are verified.
 
    Continue bounded idempotent batches until the dry-run reports zero rows
    needing update. Investigate schema conflicts rather than overwriting them.
+   Keep the evaluator paused until the relay and evaluator flags are enabled in
+   the next step.
 7. Start the Telegram worker with `TELEGRAM_DELIVERY_ENABLED=true` while relay
    and evaluator remain false. Confirm Redis and Bot API health, zero DLQ input,
    and graceful shutdown behavior.

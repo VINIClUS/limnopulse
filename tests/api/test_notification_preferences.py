@@ -106,6 +106,7 @@ class InMemoryNotificationPreferenceRepository:
         audit: AuditContext,
         *,
         previous: NotificationPreference | None,
+        telegram_fence: object = None,
     ) -> NotificationPreference:
         if expected_version is None:
             if self.preference is not None:

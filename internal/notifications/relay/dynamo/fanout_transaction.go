@@ -293,7 +293,11 @@ func fanoutToken(work relay.Work, deliveries []notifications.Delivery, nextCurso
 	}, "\x00")
 	for _, delivery := range deliveries {
 		snapshot := delivery.Snapshot()
-		canonical += "\x00" + snapshot.DeliveryID + "\x00" + string(snapshot.State) + "\x00" + snapshot.Content.ContentHash
+		contentHash := snapshot.Content.ContentHash
+		if snapshot.Channel == notifications.ChannelTelegram {
+			contentHash = snapshot.TelegramContent.ContentHash
+		}
+		canonical += "\x00" + snapshot.DeliveryID + "\x00" + string(snapshot.State) + "\x00" + contentHash
 	}
 	digest := sha256.Sum256([]byte(canonical))
 	return "nrel-" + hex.EncodeToString(digest[:])[:31]

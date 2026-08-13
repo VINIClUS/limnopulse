@@ -363,6 +363,8 @@ func (store Store) outboxPut(request alertevaluator.CommitRequest, outbox alerte
 		values["relay_work_kind"] = string(workKind)
 		values["relay_gsi_pk"] = relayKey.PartitionKey
 		values["relay_gsi_sk"] = relayKey.SortKey
+	} else if outbox.Channel == alertevaluator.ChannelTelegram {
+		values["expansion_status"] = "deferred_unsupported_channel"
 	}
 	item, err := attributevalue.MarshalMap(values)
 	if err != nil {

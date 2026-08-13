@@ -107,10 +107,25 @@ func (sender Sender) Send(
 		return worker.SendResult{}, worker.NewSendError(worker.ErrorTelegramDestinationUnavailable, errors.New("Telegram destination rejected"))
 	case response.StatusCode >= 500:
 		return worker.SendResult{}, worker.NewSendError(worker.ErrorRetryableService, errors.New("Telegram service unavailable"))
-	case response.StatusCode >= 400 && response.StatusCode < 500 && response.StatusCode != http.StatusTooManyRequests:
+	case response.StatusCode >= 400 && response.StatusCode < 500 &&
+		response.StatusCode != http.StatusTooManyRequests && response.StatusCode != http.StatusBadRequest:
 		return worker.SendResult{}, worker.NewSendError(worker.ErrorFatalConfigurationSet, errors.New("Telegram request rejected"))
 	}
 	responseBody, readErr := io.ReadAll(io.LimitReader(response.Body, maxResponseBytes+1))
+	if response.StatusCode == http.StatusBadRequest {
+		if readErr != nil || len(responseBody) > maxResponseBytes {
+			return worker.SendResult{}, worker.NewSendError(worker.ErrorFatalConfigurationSet, errors.New("Telegram request rejected"))
+		}
+		var decoded telegramResponse
+		if json.Unmarshal(responseBody, &decoded) == nil &&
+			isTelegramDestinationRejection(decoded.Description) {
+			return worker.SendResult{}, worker.NewSendError(
+				worker.ErrorTelegramDestinationUnavailable,
+				errors.New("Telegram destination rejected"),
+			)
+		}
+		return worker.SendResult{}, worker.NewSendError(worker.ErrorFatalConfigurationSet, errors.New("Telegram request rejected"))
+	}
 	if response.StatusCode == http.StatusTooManyRequests {
 		sendErr := worker.NewSendError(worker.ErrorTelegramRateLimited, errors.New("Telegram rate limit"))
 		var decoded telegramResponse
@@ -151,6 +166,13 @@ func (sender Sender) Send(
 		sendErr.NoAutomaticRetry = true
 		return worker.SendResult{}, sendErr
 	}
+}
+
+func isTelegramDestinationRejection(description string) bool {
+	normalized := strings.ToLower(strings.TrimSpace(description))
+	return strings.Contains(normalized, "chat not found") ||
+		strings.Contains(normalized, "chat is deactivated") ||
+		strings.Contains(normalized, "user is deactivated")
 }
 
 func (sender Sender) apiBaseURL() (string, error) {

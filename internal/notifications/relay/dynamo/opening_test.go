@@ -153,6 +153,44 @@ func TestExpandIntentCreatesRenderedPendingDeliveryAndCompletesPageAtomically(t 
 	}
 }
 
+func TestFanoutTokenChangesWhenTelegramContentChanges(t *testing.T) {
+	now := time.Date(2026, 8, 13, 18, 0, 0, 0, time.UTC)
+	deliveryID, err := notifications.NewDeliveryID(
+		"event_1", notifications.NotificationKindOpening, notifications.ChannelTelegram, "sub_1",
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	newDelivery := func(body string) notifications.Delivery {
+		content, contentErr := notifications.NewTelegramRenderedContent(
+			notifications.TemplateTelegramAlertOpeningV1, notifications.LocalePTBR, body,
+		)
+		if contentErr != nil {
+			t.Fatal(contentErr)
+		}
+		delivery, deliveryErr := notifications.NewPendingDelivery(notifications.DeliveryParams{
+			TenantID: "tnt_1", OutboxID: "outbox_1", DeliveryID: deliveryID,
+			EventID: "event_1", RuleID: "rule_1", Kind: notifications.NotificationKindOpening,
+			Channel: notifications.ChannelTelegram, RecipientID: "sub_1",
+			DestinationID: "destination_1", TelegramChatID: 123,
+			MembershipSnapshot: notifications.MembershipSnapshot{Role: "member", Status: "active", Version: 1},
+			TelegramContent:    content, CreatedAt: now, UpdatedAt: now,
+		})
+		if deliveryErr != nil {
+			t.Fatal(deliveryErr)
+		}
+		return delivery
+	}
+	work := relay.Work{Candidate: relay.Candidate{PK: "TENANT#tnt_1", SK: "NOTIFICATION_OUTBOX#outbox_1"}, LeaseEpoch: 1, Revision: 1}
+
+	first := fanoutToken(work, []notifications.Delivery{newDelivery("first content")}, "")
+	second := fanoutToken(work, []notifications.Delivery{newDelivery("second content")}, "")
+
+	if first == second {
+		t.Fatalf("Telegram fanout token did not change: %q", first)
+	}
+}
+
 func TestExpandTelegramIntentUsesVerifiedActiveDestinationAndPlainSnapshot(t *testing.T) {
 	relayTime := time.Date(2026, 8, 13, 12, 30, 0, 0, time.UTC)
 	work := openingWork(t, relayTime)

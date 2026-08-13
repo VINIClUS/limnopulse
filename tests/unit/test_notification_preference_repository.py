@@ -18,6 +18,7 @@ from limnopulse_api.domain.notification_preferences import (
     EmailDeliverability,
     NotificationPreference,
 )
+from limnopulse_api.domain.telegram import TelegramEligibilityFence
 
 NOW = datetime(2026, 7, 16, 12, 0, tzinfo=UTC)
 
@@ -208,6 +209,14 @@ async def test_save_telegram_only_v2_row_omits_absent_email_snapshot() -> None:
         None,
         AuditContext(actor_id="sub_1"),
         previous=None,
+        telegram_fence=TelegramEligibilityFence(
+            tenant_id="tnt_1",
+            recipient_id="sub_1",
+            destination_id="destination_1",
+            chat_id=123,
+            binding_version=2,
+            destination_version=3,
+        ),
     )
 
     transaction = client.transact_write_items_calls[0]["TransactItems"]
@@ -219,6 +228,22 @@ async def test_save_telegram_only_v2_row_omits_absent_email_snapshot() -> None:
     assert "checked_at" not in stored
     assert audit["details"]["telegram_enabled"] is True
     assert audit["details"]["email_hash"] is None
+    binding_fence = transaction[2]["ConditionCheck"]
+    destination_fence = transaction[3]["ConditionCheck"]
+    assert client._decode(binding_fence["Key"]) == {
+        "PK": "TENANT#tnt_1",
+        "SK": "TELEGRAM_BINDING#USER#sub_1",
+    }
+    assert client._decode(destination_fence["Key"]) == {
+        "PK": "TELEGRAM_DESTINATION#destination_1",
+        "SK": "META",
+    }
+    assert "#status = :verified" in binding_fence["ConditionExpression"]
+    assert "#status = :active" in destination_fence["ConditionExpression"]
+    assert client._decode(binding_fence["ExpressionAttributeValues"])[":binding_version"] == 2
+    assert (
+        client._decode(destination_fence["ExpressionAttributeValues"])[":destination_version"] == 3
+    )
 
 
 @pytest.mark.asyncio

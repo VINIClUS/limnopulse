@@ -23,6 +23,7 @@ def test_phase3cb_runbook_records_safe_rollout_backfill_and_rollback() -> None:
     for phrase in (
         "never uses DynamoDB Scan",
         "TELEGRAM_DELIVERY_ENABLED=false",
+        "Pause the evaluator scheduler before the final backfill",
         "turn off Telegram on the relay and evaluator first",
         "Never run an automatic Telegram DLQ consumer",
         "DynamoDB remains authoritative",

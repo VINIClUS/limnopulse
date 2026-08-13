@@ -88,6 +88,7 @@ func TestSenderClassifiesTelegramResponseMatrix(t *testing.T) {
 		{name: "rate limit", status: 429, body: `{"ok":false,"error_code":429,"parameters":{"retry_after":7}}`, category: worker.ErrorTelegramRateLimited, retryAfter: 7 * time.Second},
 		{name: "blocked", status: 403, body: `{"ok":false,"error_code":403,"description":"Forbidden"}`, category: worker.ErrorTelegramDestinationUnavailable},
 		{name: "credential", status: 401, body: `{"ok":false,"error_code":401}`, category: worker.ErrorTelegramCredentials},
+		{name: "chat not found is a destination verdict", status: 400, body: `{"ok":false,"error_code":400,"description":"Bad Request: chat not found"}`, category: worker.ErrorTelegramDestinationUnavailable},
 		{name: "bad request is not a destination verdict", status: 400, body: `{"ok":false,"error_code":400}`, category: worker.ErrorFatalConfigurationSet},
 		{name: "not found is not a destination verdict", status: 404, body: `{"ok":false,"error_code":404}`, category: worker.ErrorFatalConfigurationSet},
 		{name: "service", status: 500, body: `{"ok":false,"error_code":500}`, category: worker.ErrorRetryableService},

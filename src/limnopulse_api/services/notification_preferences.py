@@ -19,6 +19,7 @@ from limnopulse_api.domain.telegram import (
     TelegramBinding,
     TelegramBindingRequest,
     TelegramDestination,
+    TelegramEligibilityFence,
     telegram_binding_view,
     telegram_is_effectively_enabled,
 )
@@ -115,12 +116,24 @@ class NotificationPreferenceService:
         )
         binding_state = await self._telegram_state(tenant_id, principal.cognito_sub)
         binding, _, destination = binding_state
+        telegram_fence = None
         if desired_telegram_enabled and not telegram_is_effectively_enabled(
             True,
             binding,
             destination,
         ):
             raise ConflictError("verified Telegram binding required")
+        if desired_telegram_enabled:
+            assert binding is not None
+            assert destination is not None
+            telegram_fence = TelegramEligibilityFence(
+                tenant_id=tenant_id,
+                recipient_id=principal.cognito_sub,
+                destination_id=destination.destination_id,
+                chat_id=destination.chat_id,
+                binding_version=binding.version,
+                destination_version=destination.version,
+            )
 
         identity = None
         if email_enabled or (existing is None and telegram_enabled is None):
@@ -203,6 +216,7 @@ class NotificationPreferenceService:
             expected_version,
             audit,
             previous=existing,
+            telegram_fence=telegram_fence,
         )
         return self._view(saved, deliverability_record, binding_state)
 

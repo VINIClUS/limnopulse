@@ -1,4 +1,5 @@
 from datetime import UTC, datetime
+from typing import Any
 
 import pytest
 
@@ -33,6 +34,7 @@ class FakeNotificationPreferenceRepository:
         self.deliverability = deliverability
         self.get_calls: list[tuple[str, str]] = []
         self.deliverability_calls: list[str] = []
+        self.telegram_fences: list[Any] = []
         self.save_calls: list[
             tuple[
                 NotificationPreference,
@@ -60,6 +62,7 @@ class FakeNotificationPreferenceRepository:
         audit: AuditContext,
         *,
         previous: NotificationPreference | None,
+        telegram_fence: Any = None,
     ) -> NotificationPreference:
         if expected_version is None:
             if self.preference is not None:
@@ -67,6 +70,7 @@ class FakeNotificationPreferenceRepository:
         elif self.preference is None or self.preference.version != expected_version:
             raise ConflictError("preference version conflict")
         self.save_calls.append((preference, expected_version, audit, previous))
+        self.telegram_fences.append(telegram_fence)
         self.preference = preference
         return preference
 
@@ -223,6 +227,9 @@ async def test_telegram_only_create_requires_binding_and_does_not_call_cognito()
     assert verifier.calls == []
     assert saved.email_address is None
     assert saved.telegram_enabled is True
+    assert repository.telegram_fences[0] is not None
+    assert repository.telegram_fences[0].binding_version == 1
+    assert repository.telegram_fences[0].destination_version == 1
     assert result.telegram.status == "verified"
     assert result.telegram.effective_enabled is True
 

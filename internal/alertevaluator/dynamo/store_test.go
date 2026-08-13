@@ -226,7 +226,10 @@ func TestCommitOpeningAtomicallyWritesEventTransitionAndOutboxes(t *testing.T) {
 		t.Fatalf("email outbox identity or field set changed = %#v", email)
 	}
 
-	for _, field := range []string{"relay_schema_version", "expansion_status", "available_at", "relay_work_kind", "relay_gsi_pk", "relay_gsi_sk"} {
+	if telegram["expansion_status"] != "deferred_unsupported_channel" {
+		t.Fatalf("disabled Telegram opening outbox = %#v", telegram)
+	}
+	for _, field := range []string{"relay_schema_version", "available_at", "relay_work_kind", "relay_gsi_pk", "relay_gsi_sk"} {
 		if _, exists := telegram[field]; exists {
 			t.Fatalf("telegram outbox unexpectedly has %s: %#v", field, telegram)
 		}
@@ -234,7 +237,7 @@ func TestCommitOpeningAtomicallyWritesEventTransitionAndOutboxes(t *testing.T) {
 	if telegram["channel"] != "telegram" || telegram["kind"] != "opening" || telegram["status"] != "ready" {
 		t.Fatalf("telegram outbox changed = %#v", telegram)
 	}
-	if len(telegram) != 16 || telegram["outbox_id"] != decision.Outboxes[1].OutboxID ||
+	if len(telegram) != 17 || telegram["outbox_id"] != decision.Outboxes[1].OutboxID ||
 		telegram["event_id"] != decision.EventID || telegram["rule_id"] != work.Rule.RuleID ||
 		telegram["created_at"] != alertevaluator.FixedUTCTimestamp(slot) {
 		t.Fatalf("telegram outbox identity or field set changed = %#v", telegram)
@@ -304,7 +307,10 @@ func TestCommitRecoveryAddsDependencyRelayIndexOnlyToEmailOutbox(t *testing.T) {
 		t.Fatalf("email recovery identity or field set changed = %#v", email)
 	}
 
-	for _, field := range []string{"relay_schema_version", "expansion_status", "available_at", "relay_work_kind", "relay_gsi_pk", "relay_gsi_sk"} {
+	if telegram["expansion_status"] != "deferred_unsupported_channel" {
+		t.Fatalf("disabled Telegram recovery outbox = %#v", telegram)
+	}
+	for _, field := range []string{"relay_schema_version", "available_at", "relay_work_kind", "relay_gsi_pk", "relay_gsi_sk"} {
 		if _, exists := telegram[field]; exists {
 			t.Fatalf("telegram recovery unexpectedly has %s: %#v", field, telegram)
 		}
@@ -312,7 +318,7 @@ func TestCommitRecoveryAddsDependencyRelayIndexOnlyToEmailOutbox(t *testing.T) {
 	if telegram["status"] != "blocked" || telegram["depends_on_outbox_id"] != "outbox_open_telegram" {
 		t.Fatalf("telegram recovery changed = %#v", telegram)
 	}
-	if len(telegram) != 16 || telegram["outbox_id"] != decision.Outboxes[1].OutboxID ||
+	if len(telegram) != 17 || telegram["outbox_id"] != decision.Outboxes[1].OutboxID ||
 		telegram["event_id"] != decision.ResolvedEventID || telegram["kind"] != "recovery" {
 		t.Fatalf("telegram recovery identity or field set changed = %#v", telegram)
 	}
@@ -349,6 +355,38 @@ func TestCommitIndexesTelegramOutboxWithV2OnlyWhenWriterEnabled(t *testing.T) {
 		telegram["relay_gsi_pk"] != wantRelay.PartitionKey ||
 		telegram["relay_gsi_sk"] != wantRelay.SortKey {
 		t.Fatalf("Telegram v2 relay fields = %#v", telegram)
+	}
+}
+
+func TestCommitMarksDisabledTelegramOutboxForBackfill(t *testing.T) {
+	client := &fakeClient{}
+	store := Store{Table: "domain", Client: client}
+	slot := time.Date(2026, 8, 13, 12, 0, 0, 0, time.UTC)
+	work, err := workFromItem(ruleItemWithLease())
+	if err != nil {
+		t.Fatal(err)
+	}
+	work.Rule.Duration = time.Minute
+	evaluation := alertevaluator.Evaluation{
+		Slot: slot, Quality: alertevaluator.QualitySufficient, Breached: true, Value: 4.2,
+	}
+	decision := alertevaluator.Decide(work.Rule.Rule, alertevaluator.State{}, evaluation, time.Minute)
+	if err := store.Commit(context.Background(), alertevaluator.CommitRequest{
+		Work: work, Evaluation: evaluation, Decision: decision,
+		Slot: slot, NextDue: slot.Add(time.Minute),
+	}); err != nil {
+		t.Fatal(err)
+	}
+	telegram := unmarshalItem(t, client.transactInput.TransactItems[5].Put.Item)
+	if telegram["expansion_status"] != "deferred_unsupported_channel" {
+		t.Fatalf("disabled Telegram outbox = %#v", telegram)
+	}
+	for _, field := range []string{
+		"relay_schema_version", "available_at", "relay_work_kind", "relay_gsi_pk", "relay_gsi_sk",
+	} {
+		if _, exists := telegram[field]; exists {
+			t.Fatalf("disabled Telegram outbox unexpectedly has %s: %#v", field, telegram)
+		}
 	}
 }
 
