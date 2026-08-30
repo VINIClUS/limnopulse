@@ -238,6 +238,16 @@ DynamoDB remains authoritative for tenant access. The deployment seeds one
 demo tenant, one site/pond, one synthetic device and reviewed demo accounts
 through an idempotent operation that cannot overwrite another tenant.
 
+That operation also seeds one deterministic, enabled `active` alert rule for
+the synthetic device. It uses a one-minute duration and a threshold/window
+matched to the versioned telemetry fixture so one sufficient complete window
+breaches on the first evaluation. Its `next_evaluation_at`, evaluation bucket
+and `AlertEvaluationByDue` keys make it due no later than the release smoke
+evaluation time. Re-running the seed preserves the same identifiers and cannot
+overwrite user-authored rules. The rule's notification outbox may exercise the
+durable domain contract, but the disabled relay and delivery providers cannot
+send it.
+
 All UI and API text identifies measurements, alerts and delivery outcomes as
 synthetic/demo data. No clinical or municipal operating data is copied into the
 environment.
@@ -481,7 +491,9 @@ OIDC. Application promotion is a separate `workflow_dispatch` that:
 6. updates one-shot timer image references;
 7. uploads and verifies the immutable frontend
    `releases/<release_id>/` unit, then replaces root `index.html` last;
-8. publishes one synthetic sample and validates alert/read flow;
+8. publishes the matching synthetic sample, waits until its window is eligible,
+   invokes the due seeded rule and verifies one evaluated rule plus the expected
+   incident/read flow;
 9. records redacted evidence.
 
 Merge to `main` never automatically deploys production. GitHub paid spending is
@@ -611,6 +623,9 @@ Controls:
 - Influx retention, backup and isolated restore;
 - unknown MQTT device drop and trusted enrichment;
 - evaluator fencing, duplicate schedule and timeout behavior;
+- deterministic seed creates an enabled, active, indexed due rule whose
+  threshold/window fixture opens the expected synthetic incident on the first
+  sufficient evaluation without sending a notification;
 - CDN private origin, immutable release-prefix upload, last-write
   `index.html` cutover, matching-unit SPA rollback and CSP; no service worker is
   registered or served;
@@ -633,7 +648,8 @@ Controls:
   ports;
 - PKCE login resolves only the seeded membership;
 - a synthetic MQTT sample reaches InfluxDB and is retrievable through FastAPI;
-- one evaluator run creates or updates the expected synthetic incident state;
+- one evaluator run discovers the seeded due rule, evaluates it and creates the
+  expected synthetic incident state;
 - no provider call, email, Telegram message, Push or SMS occurs;
 - backup checksum/upload and previous API/frontend rollback succeed;
 - logs, traces, plans and artifacts reveal no secret or synthetic payload body.
