@@ -32,7 +32,8 @@ This document composes:
 
 The production profile is named `portfolio-demo`. It preserves V4 domain
 boundaries and durable semantics but intentionally disables commercial and
-provider features whose prerequisites, costs or safety work are incomplete.
+notification/delivery features whose prerequisites, costs or safety work are
+incomplete.
 
 ### 2.1 Enabled
 
@@ -43,8 +44,8 @@ provider features whose prerequisites, costs or safety work are incomplete.
 - Cognito OIDC login;
 - internal-only MQTT/Telegraf synthetic ingestion;
 - one-shot Go alert evaluation;
-- base SQS/DLQ infrastructure with producers/providers disabled until their
-  product gates pass;
+- base SQS/DLQ infrastructure with producers and notification/delivery
+  providers disabled until their product gates pass;
 - static production frontend contract;
 - observability, backups and deployment rollback.
 
@@ -61,8 +62,9 @@ provider features whose prerequisites, costs or safety work are incomplete.
 - multi-region infrastructure;
 - any patient, employee, customer or other personal data.
 
-Disabled means no resource, secret container, worker, schedule or provider API
-call is created. It is stronger than a UI feature flag.
+Disabled means no resource, secret container, worker, schedule or outbound
+notification/delivery API call is created. It is stronger than a UI feature
+flag.
 
 ## 3. Current repository gaps and release gates
 
@@ -82,7 +84,11 @@ Production is blocked until application-owned work supplies:
 5. runtime feature flags that fail closed for SES, Telegram, Push, SMS, Redis,
    Stripe, AWS IoT and commands;
 6. OpenTofu feature boundaries that omit disabled resources entirely;
-7. CI gates for Python, Go, frontend, OCI and OpenTofu artifacts.
+7. a `portfolio-demo` startup gate proving that the API and one-shot jobs start
+   without Redis, Telegram or any of their secrets, clients, routes, workers or
+   schedules; with caching disabled, membership and other ordinary reads use
+   DynamoDB directly rather than constructing or probing a Redis client;
+8. CI gates for Python, Go, frontend, OCI and OpenTofu artifacts.
 
 Infrastructure must not generate a generic placeholder website: the content at
 `limnopulse.com` must be versioned product code with its own tests and release
@@ -145,15 +151,25 @@ resource, the subscription is tracked by signed deployment evidence and drift
 checks rather than an OpenTofu provisioner. Any failure stops rollout; no
 pay-as-you-go fallback or paid upgrade occurs implicitly.
 
-Hashed assets use one-year immutable caching. Entry points, manifests, runtime
-configuration and service workers use no-cache/bounded revalidation. Deployment
-uploads assets first and switches the entrypoint last. Rollback restores the
-prior S3 object version and invalidates only entrypoints.
+Every release-coupled object -- hashed assets, manifests and public runtime
+configuration -- is uploaded below the immutable prefix
+`releases/<release_id>/`. Those objects use one-year immutable caching and are
+never overwritten. The initial production profile has no service worker; adding
+one later requires a separate design for atomic service-worker update and
+rollback semantics.
+
+Only root `index.html` is a mutable release pointer. It uses no-cache/bounded
+revalidation and references one release prefix for all assets, its manifest and
+runtime configuration. Deployment completely uploads and verifies the new
+release prefix before replacing `index.html` last. Rollback atomically restores
+the prior version of `index.html`, which therefore selects the matching prior
+release as one unit, and invalidates only that entrypoint. Release-prefix
+lifecycle policy must retain every release still eligible for rollback.
 
 The bundle receives only public configuration:
 
 - API base URL;
-- Cognito issuer, User Pool client ID and region;
+- Cognito issuer, User Pool client ID, authorization base URL and region;
 - release ID;
 - explicit `portfolio-demo` feature capabilities.
 
@@ -176,20 +192,46 @@ Required container controls:
 - redacted JSON stdout and optional local metrics;
 - read-only mount of the temporary LimnoPulse AWS credential directory, so
   atomic host-side refreshes remain visible;
+- after each successful Roles Anywhere renewal, a graceful API
+  restart/recreation that drains in-flight requests and starts a new process
+  against the new credential files before the old credential lifetime expires;
+  existing boto3 clients are not assumed to reread a replaced shared
+  credentials file;
 - no access to CnesData networks, files or credentials.
 
 Production never sets `AUTH_MODE=dev` or accepts `X-Dev-*` identity headers.
 Local endpoint overrides for DynamoDB, SQS, Cognito or Influx are rejected when
-`APP_ENV=production` except the declared internal InfluxDB URL.
+`APP_ENV=prod` except the declared internal InfluxDB URL. `prod` is the only
+production environment value used by Compose, Python and Go runtime contracts.
 
-The API has no direct provider calls in the demo profile. Ordinary reads remain
-available if an optional disabled notification provider is unavailable.
+Because the site and API are different origins, the API release gate requires
+CORS with the sole allowed origin `https://limnopulse.com`, methods
+`GET`, `POST`, `PUT`, `PATCH`, `DELETE` and `OPTIONS`, and request headers
+`Authorization`, `Content-Type` and `Idempotency-Key`. Origins, methods and
+headers do not use wildcards, credentials/cookies are not allowed, and no other
+production origin is admitted implicitly.
+
+The API has no direct notification/delivery provider calls in the demo profile.
+Ordinary reads remain available if an optional disabled notification provider
+is unavailable.
 
 ## 8. Cognito and tenancy
 
 The deployment creates one Cognito User Pool and a public Authorization Code +
-PKCE SPA client with exact callback/logout URLs. It has no client secret, SMS,
-social provider or machine-to-machine client.
+PKCE SPA client with exact callback/logout URLs. It also provisions the managed
+User Pool domain prefix `limnopulse-portfolio-demo` in `us-east-2`. Provisioning
+fails closed if that exact prefix is unavailable; rollout does not silently
+choose another domain. The immutable frontend runtime configuration exposes the
+issuer, User Pool client ID and authorization base URL needed to construct the
+`/oauth2/authorize` request. The client has no client secret, SMS, social
+provider or machine-to-machine flow.
+
+Public self-registration is disabled with
+`admin_create_user_config.allow_admin_create_user_only = true`. The idempotent
+seed operation creates only reviewed demo users with Cognito messages
+suppressed, then sets a permanent password through an administrative path. That
+password is generated, stored and delivered outside the frontend bundle,
+release artifacts, logs and source control.
 
 Cognito establishes identity only. The existing active-membership check in
 DynamoDB remains authoritative for tenant access. The deployment seeds one
@@ -235,7 +277,7 @@ However:
 
 - notification relay scheduling is disabled;
 - SES and Telegram workers are not deployed;
-- no fake-success sender may run under `APP_ENV=production`;
+- no fake-success sender may run under `APP_ENV=prod`;
 - no message is presented as delivered without a real approved provider result;
 - only deployment canary messages with an explicit non-domain schema may test
   send/receive/DLQ mechanics, and they are removed without mutating a
@@ -243,7 +285,8 @@ However:
 
 Email/Telegram queues beyond the base lane, SES/EventBridge resources and
 Telegram Secrets Manager containers are omitted until a separate approved
-provider rollout. The OpenTofu structure uses explicit booleans with safe
+notification/delivery provider rollout. The OpenTofu structure uses explicit
+booleans with safe
 defaults; disabling a provider creates zero related resources.
 
 ## 11. InfluxDB
@@ -267,14 +310,19 @@ V4 migration. The deployment does not stop dual-write or delete an old bucket.
 
 ## 12. Internal synthetic ingestion
 
-Mosquitto listens on loopback for host access and only on the private LimnoPulse
-container network for Telegraf. It is not routed by Nginx or Cloudflare.
+Mosquitto is reachable exclusively on the private LimnoPulse Compose network.
+It publishes no host port, including loopback, and is not routed by Nginx or
+Cloudflare. The systemd timer invokes the one-shot synthetic publisher as a
+Compose run/job attached to that same network; host-side diagnostics do not use
+`localhost:1883`.
 
 The production synthetic profile:
 
-- disables anonymous access except for an isolated, container-network-only
-  synthetic publisher identity implemented through broker ACLs;
-- permits only the exact synthetic topic prefix;
+- sets `allow_anonymous false` and authenticates two separate principals with
+  distinct secrets: the one-shot publisher may only write the exact synthetic
+  topic prefix, while Telegraf may only read/subscribe to that prefix;
+- denies publisher reads/subscriptions, Telegraf writes and all access to other
+  topics through default-deny broker ACLs;
 - uses a versioned fixture with no tenant/site identifiers supplied by the
   device payload;
 - enriches through the trusted registry before InfluxDB write;
@@ -294,14 +342,16 @@ The existing alert evaluator remains one-shot and externally scheduled.
 - a host-local lock prevents overlapping runs;
 - the container receives only temporary AWS credentials and an InfluxDB
   application token;
+- each one-shot process starts only after a successful Roles Anywhere renewal
+  and loads the then-current credential files at process startup;
 - concurrency and evaluation batch sizes are bounded;
 - timeout/exit code distinguishes success, retryable dependency failure and
   terminal configuration failure;
 - repeated schedules preserve the existing fencing and idempotency semantics;
 - failures alert without starting a second uncontrolled loop.
 
-No permanent notification worker, relay, Redis or provider process runs in the
-initial profile.
+No permanent notification worker, relay, Redis or notification/delivery
+provider process runs in the initial profile.
 
 ## 14. Production Compose contract
 
@@ -330,8 +380,13 @@ No static AWS key exists in GitHub, Compose or a persistent `.env` file.
 - GitHub workflows use OIDC.
 - VPS services consume a host-renewed temporary credential directory from the
   LimnoPulse Roles Anywhere profile.
-- Runtime secrets use SSM SecureString under
-  `/personal/prod/limnopulse/runtime/` and `/influx/`.
+- General runtime secrets use SSM SecureString under
+  `/personal/prod/limnopulse/runtime/`; InfluxDB secrets use the complete
+  `/personal/prod/limnopulse/influx/` namespace.
+- The distinct Mosquitto publisher and Telegraf credentials use
+  `/personal/prod/limnopulse/runtime/mqtt/publisher/password` and
+  `/personal/prod/limnopulse/runtime/mqtt/telegraf/password` respectively and
+  are rendered only to the service that owns each principal.
 - InfluxDB admin/bootstrap values are read only by the initialization/backup
   boundary; the API gets a narrower token.
 - Disabled Stripe, SES, Telegram, Push, SMS, AWS IoT and vendor secrets do not
@@ -375,11 +430,15 @@ State uses `limnopulse/prod/opentofu.tfstate` in the shared private versioned S3
 backend with native locking. The public repository contains no backend bucket,
 AWS account ID, Cloudflare ID or state.
 
-All resources carry `Project=limnopulse`, `Environment=prod`,
-`ManagedBy=opentofu`, `Owner=vinisantana`.
+All resources that support tags carry `Project=limnopulse`, `Environment=prod`,
+`ManagedBy=opentofu`, `Owner=vinisantana`; untaggable resource types are
+validated through naming, policy and inventory checks instead.
 
 Policy denies NAT Gateway, ALB, RDS/Aurora, OpenSearch, ElastiCache, AWS IoT,
-Global Tables, paid messaging resources and unapproved provider infrastructure.
+Global Tables, paid messaging resources and unapproved notification/delivery
+provider infrastructure. Here and elsewhere, "provider" in a feature gate means
+an outbound notification/delivery provider such as SES, Telegram, Push or SMS;
+it does not mean the AWS/OpenTofu infrastructure provider plugin.
 
 ## 17. CI/CD
 
@@ -420,7 +479,8 @@ OIDC. Application promotion is a separate `workflow_dispatch` that:
 4. validates Cognito, membership, DynamoDB and Influx reads;
 5. switches Nginx and preserves the prior API digest;
 6. updates one-shot timer image references;
-7. publishes frontend assets and entrypoint;
+7. uploads and verifies the immutable frontend
+   `releases/<release_id>/` unit, then replaces root `index.html` last;
 8. publishes one synthetic sample and validates alert/read flow;
 9. records redacted evidence.
 
@@ -432,6 +492,12 @@ fixed at USD 0.
 - Cloudflare Free protects the most sensitive public endpoint available within
   the plan's rule limit.
 - Nginx applies general and auth/mutation IP zones.
+- Before evaluating those zones, Nginx trusts `CF-Connecting-IP` only when the
+  TCP peer is the exact loopback address or dedicated local container address
+  assigned to `cloudflared` (`set_real_ip_from` is not a broad private subnet),
+  using `real_ip_header CF-Connecting-IP` and `real_ip_recursive on`. The header
+  is ignored for every other source, and all rate-limit keys use the restored,
+  validated client address.
 - FastAPI enforces tenant membership, object ownership, idempotency and
   role-based mutation limits.
 - Telemetry read windows and row limits remain bounded.
@@ -465,15 +531,17 @@ synthetic tenant/read range without replacing the production volume.
 ## 20. Rollback
 
 - **API:** restore previous Nginx upstream and image digest.
-- **Frontend:** restore prior S3 entrypoint version and invalidate it.
+- **Frontend:** restore the prior root `index.html` version, which points only
+  to its retained immutable `releases/<release_id>/` unit, and invalidate that
+  entrypoint.
 - **Timers:** restore previous evaluator/publisher digest before the next run.
 - **InfluxDB:** never roll back or delete the volume during an application
   rollback; forward compatibility is required.
 - **DynamoDB:** schema changes are additive; no table restore is an automatic
   release action.
 - **OpenTofu:** a failed apply stops and requires a new reviewed plan.
-- **Provider features:** because they are absent, rollback cannot accidentally
-  send email, Telegram, Push or SMS.
+- **Notification/delivery features:** because they are absent, rollback cannot
+  accidentally send email, Telegram, Push or SMS.
 
 ## 21. Observability and SLOs
 
@@ -514,7 +582,7 @@ Controls:
 - one of the account's maximum three CloudFront Free-plan subscriptions, with
   eligibility and `ACTIVE` status checked before cutover;
 - DynamoDB on-demand maximum throughput and PITR;
-- only the base SQS/DLQ with no paid provider traffic;
+- only the base SQS/DLQ with no paid notification/delivery provider traffic;
 - no SES, Telegram infrastructure, SMS, Push, AWS IoT, Redis, NAT or load
   balancer;
 - bounded CloudWatch logs/alarms and no Container Insights;
@@ -528,16 +596,33 @@ Controls:
 
 - all existing Python/Go contracts and V4 M1 gates remain green;
 - production settings reject dev auth, endpoint overrides and fake senders;
-- Compose contains no emulator, local key or public database/MQTT binding;
+- `portfolio-demo` starts with Redis and Telegram absent, constructs neither
+  client, exposes neither route, and serves cache-disabled reads from DynamoDB;
+- an exact-origin browser preflight succeeds for the declared CORS contract,
+  while wildcard, cookie and unlisted-origin/header cases fail closed;
+- a staged Roles Anywhere renewal gracefully replaces the API before credential
+  expiry, and a newly invoked one-shot job uses only the renewed credential set;
+- Compose contains no emulator, local key or host database/MQTT binding;
+- Mosquitto rejects anonymous and cross-ACL access while the authenticated
+  publisher-to-Telegraf synthetic flow succeeds with distinct credentials;
 - cross-tenant membership and telemetry reads fail closed;
 - DynamoDB TTL/optimistic version/idempotency behavior;
 - SQS redrive/canary behavior without domain delivery mutation;
 - Influx retention, backup and isolated restore;
 - unknown MQTT device drop and trusted enrichment;
 - evaluator fencing, duplicate schedule and timeout behavior;
-- CDN private origin, SPA rollback and CSP;
+- CDN private origin, immutable release-prefix upload, last-write
+  `index.html` cutover, matching-unit SPA rollback and CSP; no service worker is
+  registered or served;
 - CloudFront Free eligibility plus exact `ACTIVE` distribution/WAF binding;
-- disabled provider resources are absent from the OpenTofu plan;
+- Cognito exact-domain availability, Authorization Code + PKCE login,
+  self-registration rejection and suppressed-message admin seeding;
+- disabled notification/delivery provider resources are absent from the
+  OpenTofu plan;
+- secret inventory contains the complete InfluxDB and per-principal MQTT paths,
+  with no disabled-feature secret containers;
+- Nginx derives distinct rate-limit keys from validated Cloudflare visitor IPs
+  and ignores spoofed `CF-Connecting-IP` from every untrusted peer;
 - aggregate cost policy remains below USD 15.
 
 ### 23.2 Production smoke
@@ -562,7 +647,8 @@ Controls:
 - No municipal infrastructure, Infisical or self-hosted GitHub runner is used.
 - No long-lived AWS or GHCR credential exists.
 - Only synthetic/controlled telemetry is present and visibly identified.
-- Disabled commercial/provider resources are absent, not merely idle.
+- Disabled commercial and notification/delivery provider resources are absent,
+  not merely idle.
 - Deploy, rollback, rate-limit, backup/restore and cost-freeze drills pass.
 - `limnopulse.com` and `api.limnopulse.com` meet the stated health and
   isolation contracts.
@@ -577,6 +663,10 @@ Controls:
   <https://docs.aws.amazon.com/AWSSimpleQueueService/latest/SQSDeveloperGuide/sqs-dead-letter-queues.html>
 - Amazon Cognito authorization-code flow:
   <https://docs.aws.amazon.com/cognito/latest/developerguide/authorization-endpoint.html>
+- Amazon Cognito admin-only user creation:
+  <https://docs.aws.amazon.com/cognito/latest/developerguide/user-pool-settings-admin-create-user-policy.html>
+- Boto3 credential provider behavior:
+  <https://docs.aws.amazon.com/boto3/latest/guide/credentials.html>
 - Amazon CloudFront Origin Access Control:
   <https://docs.aws.amazon.com/AmazonCloudFront/latest/DeveloperGuide/private-content-restricting-access-to-s3.html>
 - Amazon CloudFront flat-rate plan quotas:
@@ -585,3 +675,5 @@ Controls:
   <https://docs.aws.amazon.com/PricingPlanManager/latest/UserGuide/getting-started-pricingplanmanager-api.html>
 - InfluxDB backup and restore:
   <https://docs.influxdata.com/influxdb/v2/admin/backup-restore/>
+- Cloudflare original visitor IP restoration:
+  <https://developers.cloudflare.com/support/troubleshooting/restoring-visitor-ips/restoring-original-visitor-ips/>
