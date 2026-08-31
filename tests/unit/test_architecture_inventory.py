@@ -97,10 +97,49 @@ REQUIRED_ADR_GATE_PATTERNS = {
         r"\bno grace, restricted, or suspended path may report monitoring as active "
         r"after ingestion or monitoring coverage has stopped\b",
     ),
+    "ADR-012-commands-use-a-separate-safety-plane.md": (
+        r"\bPhase 8 dispatch must require idempotency validity AND a non-expired TTL "
+        r"in the same execution-gate conjunction;\s+invalid or replayed idempotency, "
+        r"an expired TTL, or a command outside its time-bounded window must not "
+        r"dispatch, and Phase 8 tests must verify both gates\b",
+    ),
     "ADR-016-eventbridge-is-selective-sqs-is-durable.md": (
         r"\bselected IAM role and target invocation,\s+"
         r"idempotent duplicate delivery,\s+retry behavior,\s+and "
         r"Scheduler DLQ operation where appropriate must be proven\b",
+        r"\bBecause Scheduler is at-least-once, every selected target must remain "
+        r"leased and fenced;\s+Scheduler verification must prove retry overlap with a "
+        r"slow invocation cannot let two workers act on the same work unit\b",
+    ),
+    "ADR-017-sns-is-provider-feedback-not-notification-service.md": (
+        r"\bPhase 7C must also prove least-privilege AWS End User Messaging publish "
+        r"permission, an SQS queue policy restricted by `aws:SourceArn` to the SNS "
+        r"topic, a subscription delivery-failure DLQ where appropriate, and "
+        r"fixture-tested selection of SNS envelope or raw delivery\b",
+    ),
+    "ADR-018-eum-push-and-sms-are-provider-adapters.md": (
+        r"\bOn both Android and iOS, registration must reject cross-user and "
+        r"cross-tenant claims for a token already owned by another user or tenant and "
+        r"must not overwrite the existing owner\b",
+    ),
+}
+FORBIDDEN_ADR_GATE_PATTERNS = {
+    "ADR-012-commands-use-a-separate-safety-plane.md": (
+        r"\bmay proceed with invalid idempotency\b",
+        r"\bmay proceed with an expired TTL or a time-unbounded command\b",
+    ),
+    "ADR-016-eventbridge-is-selective-sqs-is-durable.md": (
+        r"\bwithout leases\b",
+        r"\bwithout fencing\b",
+    ),
+    "ADR-017-sns-is-provider-feedback-not-notification-service.md": (
+        r"\bwithout least privilege\b",
+        r"\bmay omit the aws:SourceArn restriction\b",
+        r"\bmay omit (?:its|the) delivery-failure DLQ\b",
+        r"\bneed not be fixture-tested\b",
+    ),
+    "ADR-018-eum-push-and-sms-are-provider-adapters.md": (
+        r"\bmay accept cross-user and cross-tenant claims\b.*\boverwrite\b",
     ),
 }
 
@@ -224,6 +263,19 @@ def assert_adr_inventory(adr_root: Path) -> None:
                 f"normative implementation gate markers missing in {filename}: "
                 f"{missing_patterns}"
             )
+            forbidden_patterns = tuple(
+                pattern
+                for pattern in FORBIDDEN_ADR_GATE_PATTERNS.get(filename, ())
+                if re.search(
+                    pattern,
+                    gate_body,
+                    flags=re.IGNORECASE | re.DOTALL,
+                )
+            )
+            assert not forbidden_patterns, (
+                f"normative implementation gate inversions in {filename}: "
+                f"{forbidden_patterns}"
+            )
 
     assert entry_phases == EXPECTED_ADR_ENTRY_PHASES, (
         "docs/adr/README.md must retain the exact ADR entry phase mapping"
@@ -316,7 +368,10 @@ def test_adr_index_requires_exact_visible_label(tmp_path: Path) -> None:
     "filename",
     (
         "ADR-010-stripe-is-an-adapter-internal-entitlements-are-canonical.md",
+        "ADR-012-commands-use-a-separate-safety-plane.md",
         "ADR-016-eventbridge-is-selective-sqs-is-durable.md",
+        "ADR-017-sns-is-provider-feedback-not-notification-service.md",
+        "ADR-018-eum-push-and-sms-are-provider-adapters.md",
     ),
 )
 def test_normative_implementation_gate_cannot_be_removed(
@@ -422,6 +477,91 @@ def test_scheduler_gate_rejects_negative_reliability_behavior(
     inverted_gate = record.replace(required_clause, inverted_clause, 1)
     assert inverted_gate != record
     adr_path.write_text(inverted_gate, encoding="utf-8")
+
+    with pytest.raises(AssertionError, match="normative implementation gate"):
+        assert_adr_inventory(adr_root)
+
+
+@pytest.mark.parametrize(
+    ("filename", "inverted_clause"),
+    (
+        (
+            "ADR-016-eventbridge-is-selective-sqs-is-durable.md",
+            "At-least-once Scheduler targets may run without leases during retry overlap with a slow invocation.",
+        ),
+        (
+            "ADR-016-eventbridge-is-selective-sqs-is-durable.md",
+            "At-least-once Scheduler targets may run without fencing during retry overlap with a slow invocation.",
+        ),
+        (
+            "ADR-018-eum-push-and-sms-are-provider-adapters.md",
+            "Android and iOS may accept cross-user and cross-tenant claims for an already owned token and overwrite its owner.",
+        ),
+        (
+            "ADR-017-sns-is-provider-feedback-not-notification-service.md",
+            "AWS End User Messaging may publish to the SNS topic without least privilege.",
+        ),
+        (
+            "ADR-017-sns-is-provider-feedback-not-notification-service.md",
+            "The SQS queue policy may omit the aws:SourceArn restriction.",
+        ),
+        (
+            "ADR-017-sns-is-provider-feedback-not-notification-service.md",
+            "The subscription may omit its delivery-failure DLQ.",
+        ),
+        (
+            "ADR-017-sns-is-provider-feedback-not-notification-service.md",
+            "SNS envelope and raw delivery need not be fixture-tested.",
+        ),
+        (
+            "ADR-012-commands-use-a-separate-safety-plane.md",
+            "Phase 8 dispatch may proceed with invalid idempotency.",
+        ),
+        (
+            "ADR-012-commands-use-a-separate-safety-plane.md",
+            "Phase 8 dispatch may proceed with an expired TTL or a time-unbounded command.",
+        ),
+    ),
+)
+def test_adr_gate_rejects_round_four_semantic_inversion(
+    tmp_path: Path,
+    filename: str,
+    inverted_clause: str,
+) -> None:
+    adr_root = tmp_path / "adr"
+    shutil.copytree(ROOT / "docs/adr", adr_root)
+    adr_path = adr_root / filename
+    record = adr_path.read_text(encoding="utf-8")
+    inverted_gate = record.replace(
+        "\n## Non-goals",
+        f"\n{inverted_clause}\n\n## Non-goals",
+        1,
+    )
+    assert inverted_gate != record
+    adr_path.write_text(inverted_gate, encoding="utf-8")
+
+    with pytest.raises(AssertionError, match="normative implementation gate"):
+        assert_adr_inventory(adr_root)
+
+
+def test_scheduler_gate_requires_lease_and_fencing_clause(tmp_path: Path) -> None:
+    adr_root = tmp_path / "adr"
+    shutil.copytree(ROOT / "docs/adr", adr_root)
+    adr_path = adr_root / "ADR-016-eventbridge-is-selective-sqs-is-durable.md"
+    record = adr_path.read_text(encoding="utf-8")
+    required_clause = (
+        "Because Scheduler is at-least-once, every selected target must remain "
+        "leased and fenced; Scheduler verification must prove retry overlap with a "
+        "slow invocation cannot let two workers act on the same work unit."
+    )
+    record_with_clause = record.replace(
+        "\n## Non-goals",
+        f"\n{required_clause}\n\n## Non-goals",
+        1,
+    )
+    without_clause = record_with_clause.replace(required_clause, "")
+    assert without_clause != record_with_clause
+    adr_path.write_text(without_clause, encoding="utf-8")
 
     with pytest.raises(AssertionError, match="normative implementation gate"):
         assert_adr_inventory(adr_root)

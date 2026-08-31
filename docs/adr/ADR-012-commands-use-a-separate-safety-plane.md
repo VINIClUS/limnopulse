@@ -20,7 +20,7 @@ V4 §§12, 24 Phase 8, 27, and 31 separate the command safety plane and identify
 
 ## Implementation gate
 
-Phase 8 must reject plan-only authorization and unsafe preconditions, distinguish transport acceptance from physical success, test timeout/ambiguity, and provide global, provider, and tenant kill switches.
+Phase 8 must reject plan-only authorization and unsafe preconditions, distinguish transport acceptance from physical success, test timeout/ambiguity, and provide global, provider, and tenant kill switches. Phase 8 dispatch must require idempotency validity AND a non-expired TTL in the same execution-gate conjunction; invalid or replayed idempotency, an expired TTL, or a command outside its time-bounded window must not dispatch, and Phase 8 tests must verify both gates.
 
 ## Non-goals
 
