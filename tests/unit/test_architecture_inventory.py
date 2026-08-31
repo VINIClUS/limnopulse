@@ -603,6 +603,21 @@ def assert_adr_inventory(adr_root: Path) -> None:
                     raise AssertionError(
                         "exact launch SMS mapping must be valid JSON"
                     ) from error
+                non_integer_fields = (
+                    (("<root>", "<mapping>"),)
+                    if not isinstance(plan_sms_limits, dict)
+                    else tuple(
+                        (tier, field)
+                        for tier, expected_fields in EXPECTED_PLAN_SMS_LIMITS.items()
+                        for field in expected_fields
+                        if not isinstance(plan_sms_limits.get(tier), dict)
+                        or type(plan_sms_limits[tier].get(field)) is not int
+                    )
+                )
+                assert not non_integer_fields, (
+                    "exact launch SMS mapping integer fields must use JSON integers: "
+                    f"{non_integer_fields}"
+                )
                 assert plan_sms_limits == EXPECTED_PLAN_SMS_LIMITS, (
                     "exact launch SMS mapping must retain every tier and value"
                 )
@@ -1197,6 +1212,57 @@ def test_planversion_gate_rejects_wrong_exact_launch_sms_value(
     adr_path.write_text("\n".join(lines) + "\n", encoding="utf-8")
 
     with pytest.raises(AssertionError, match="exact launch SMS mapping"):
+        assert_adr_inventory(adr_root)
+
+
+@pytest.mark.parametrize(
+    ("tier", "field", "integer_token", "wrong_type_token"),
+    (
+        ("Trial", "provider_calls", "0", "false"),
+        ("Trial", "budget_usd_minor", "0", "false"),
+        ("Trial", "max_price_usd_minor", "0", "false"),
+        ("Starter", "provider_calls", "0", "false"),
+        ("Starter", "budget_usd_minor", "0", "false"),
+        ("Starter", "max_price_usd_minor", "0", "false"),
+        ("Farm", "provider_calls", "10", "10.0"),
+        ("Farm", "budget_usd_minor", "50", "50.0"),
+        ("Farm", "max_price_usd_minor", "5", "5.0"),
+        ("Pro", "provider_calls", "50", "50.0"),
+        ("Pro", "budget_usd_minor", "250", "250.0"),
+        ("Pro", "max_price_usd_minor", "5", "5.0"),
+        ("Business", "provider_calls", "250", "250.0"),
+        ("Business", "budget_usd_minor", "1250", "1250.0"),
+        ("Business", "max_price_usd_minor", "5", "5.0"),
+    ),
+)
+def test_planversion_gate_rejects_non_integer_exact_launch_sms_type(
+    tmp_path: Path,
+    tier: str,
+    field: str,
+    integer_token: str,
+    wrong_type_token: str,
+) -> None:
+    adr_root = tmp_path / "adr"
+    shutil.copytree(ROOT / "docs/adr", adr_root)
+    adr_path = (
+        adr_root
+        / "ADR-010-stripe-is-an-adapter-internal-entitlements-are-canonical.md"
+    )
+    record = adr_path.read_text(encoding="utf-8")
+    lines = record.splitlines()
+    row_index = next(
+        index for index, line in enumerate(lines) if line.startswith(f'  "{tier}":')
+    )
+    integer_fragment = f'"{field}": {integer_token}'
+    assert integer_fragment in lines[row_index]
+    lines[row_index] = lines[row_index].replace(
+        integer_fragment,
+        f'"{field}": {wrong_type_token}',
+        1,
+    )
+    adr_path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+
+    with pytest.raises(AssertionError, match="integer fields"):
         assert_adr_inventory(adr_root)
 
 
