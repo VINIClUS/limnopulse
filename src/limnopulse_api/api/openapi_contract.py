@@ -6,6 +6,7 @@ from copy import deepcopy
 from typing import Any
 
 from fastapi import FastAPI
+from fastapi.routing import APIRoute, iter_route_contexts
 
 _CANONICAL_422_DESCRIPTION = "Unprocessable Entity"
 _PYTHON_422_DESCRIPTIONS = frozenset(
@@ -49,10 +50,26 @@ def _reachable_components(components: dict[str, Any], roots: Iterable[Any]) -> d
     }
 
 
-def _normalize_422_descriptions(paths: dict[str, Any]) -> None:
-    for path_item in paths.values():
-        for operation in path_item.values():
-            if not isinstance(operation, dict):
+def _implicit_422_operations(app: FastAPI) -> set[tuple[str, str]]:
+    operations: set[tuple[str, str]] = set()
+    for context in iter_route_contexts(app.routes):
+        if not isinstance(context.original_route, APIRoute) or context.path_format is None:
+            continue
+        declared_response = context.responses.get(422, context.responses.get("422"))
+        if not isinstance(declared_response, dict) or "description" in declared_response:
+            continue
+        operations.update(
+            (context.path_format, method.lower()) for method in context.methods or ()
+        )
+    return operations
+
+
+def _normalize_422_descriptions(
+    paths: dict[str, Any], implicit_operations: set[tuple[str, str]]
+) -> None:
+    for path, path_item in paths.items():
+        for method, operation in path_item.items():
+            if (path, method) not in implicit_operations or not isinstance(operation, dict):
                 continue
             responses = operation.get("responses")
             if not isinstance(responses, dict):
@@ -79,7 +96,7 @@ def build_v1_openapi_contract(app: FastAPI) -> dict[str, Any]:
         for path in sorted(schema["paths"])
         if path.startswith("/v1/")
     }
-    _normalize_422_descriptions(paths)
+    _normalize_422_descriptions(paths, _implicit_422_operations(app))
     return {
         "openapi": schema["openapi"],
         "info": schema["info"],

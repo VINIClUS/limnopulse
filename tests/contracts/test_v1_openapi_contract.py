@@ -39,6 +39,18 @@ def test_v1_openapi_normalizes_only_framework_default_422_description() -> None:
         return {"ok": True}
 
     @app.put(
+        "/v1/collision",
+        responses={
+            422: {
+                "model": ErrorResponse,
+                "description": "Unprocessable Content",
+            }
+        },
+    )
+    async def collision_response() -> dict[str, bool]:
+        return {"ok": True}
+
+    @app.put(
         "/v1/other-schema",
         responses={
             422: {
@@ -60,6 +72,9 @@ def test_v1_openapi_normalizes_only_framework_default_422_description() -> None:
     )
     assert actual["paths"]["/v1/custom"]["put"]["responses"]["422"]["description"] == (
         "Verified email required"
+    )
+    assert actual["paths"]["/v1/collision"]["put"]["responses"]["422"]["description"] == (
+        "Unprocessable Content"
     )
     assert actual["paths"]["/v1/other-schema"]["put"]["responses"]["422"][
         "description"
