@@ -3,7 +3,12 @@ import re
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[2]
+DYNAMODB_IMPORT_PATH = "github.com/aws/aws-sdk-go-v2/service/dynamodb"
+DYNAMODB_IMPORT_MARKER = "__DYNAMODB_IMPORT__"
 GO_SCAN_METHOD_CALL = re.compile(r"\.\s*Scan\s*\(")
+GO_UNQUALIFIED_SCAN_PAGINATOR_CALL = re.compile(
+    r"(?<![.A-Za-z0-9_])NewScanPaginator\s*\("
+)
 GO_TOKEN = re.compile(
     r"(?P<line_comment>//[^\n]*)"
     r"|(?P<block_comment>/\*.*?\*/)"
@@ -14,13 +19,13 @@ GO_TOKEN = re.compile(
 )
 GO_IMPORT_BLOCK = re.compile(r"\bimport\s*\((?P<body>.*?)\)", re.DOTALL)
 GO_DYNAMODB_IMPORT_SPEC = re.compile(
-    r'^\s*(?:(?P<alias>[A-Za-z_][A-Za-z0-9_]*)\s+)?'
-    r'["`]github\.com/aws/aws-sdk-go-v2/service/dynamodb["`]\s*$',
+    rf"^\s*(?:(?P<alias>\.|[A-Za-z_][A-Za-z0-9_]*)\s+)?"
+    rf"{DYNAMODB_IMPORT_MARKER}\s*$",
     re.MULTILINE,
 )
 GO_DYNAMODB_SINGLE_IMPORT = re.compile(
-    r'^\s*import\s+(?:(?P<alias>[A-Za-z_][A-Za-z0-9_]*)\s+)?'
-    r'["`]github\.com/aws/aws-sdk-go-v2/service/dynamodb["`]\s*$',
+    rf"^\s*import\s+(?:(?P<alias>\.|[A-Za-z_][A-Za-z0-9_]*)\s+)?"
+    rf"{DYNAMODB_IMPORT_MARKER}\s*$",
     re.MULTILINE,
 )
 
@@ -43,12 +48,13 @@ def _blank_go_token(value: str) -> str:
     return "".join("\n" if char == "\n" else " " for char in value)
 
 
-def _without_go_comments(source: str) -> str:
+def _go_import_structure(source: str) -> str:
     return GO_TOKEN.sub(
         lambda match: (
-            _blank_go_token(match.group())
-            if match.lastgroup in {"line_comment", "block_comment"}
-            else match.group()
+            DYNAMODB_IMPORT_MARKER
+            if match.lastgroup in {"string", "raw_string"}
+            and match.group()[1:-1] == DYNAMODB_IMPORT_PATH
+            else _blank_go_token(match.group())
         ),
         source,
     )
@@ -71,12 +77,19 @@ def _dynamodb_import_aliases(source: str) -> set[str]:
 
 
 def _has_go_scan_call(source: str) -> bool:
-    source_without_comments = _without_go_comments(source)
-    aliases = _dynamodb_import_aliases(source_without_comments)
+    aliases = _dynamodb_import_aliases(_go_import_structure(source))
     code = GO_TOKEN.sub(lambda match: _blank_go_token(match.group()), source)
-    return bool(GO_SCAN_METHOD_CALL.search(code)) or any(
+    qualified_paginator_call = any(
         re.search(rf"\b{re.escape(alias)}\s*\.\s*NewScanPaginator\s*\(", code)
-        for alias in aliases
+        for alias in aliases - {"."}
+    )
+    return (
+        bool(GO_SCAN_METHOD_CALL.search(code))
+        or (
+            "." in aliases
+            and bool(GO_UNQUALIFIED_SCAN_PAGINATOR_CALL.search(code))
+        )
+        or qualified_paginator_call
     )
 
 
@@ -154,6 +167,40 @@ def test_go_offenders_detect_scan_paginator_import_alias_without_comments(
     (root / "store_test.go").write_text(source, encoding="utf-8")
 
     assert go_offenders(root) == ["internal/store.go"]
+
+
+def test_go_offenders_detect_scan_paginator_dot_import(tmp_path, monkeypatch) -> None:
+    monkeypatch.setitem(globals(), "ROOT", tmp_path)
+    root = tmp_path / "internal"
+    root.mkdir()
+    source = (
+        "package store\n"
+        'import . "github.com/aws/aws-sdk-go-v2/service/dynamodb"\n'
+        "func f(client *Client) { NewScanPaginator(client, nil) }\n"
+    )
+    (root / "store.go").write_text(source, encoding="utf-8")
+    (root / "store_test.go").write_text(source, encoding="utf-8")
+
+    assert go_offenders(root) == ["internal/store.go"]
+
+
+def test_go_offenders_ignore_dynamodb_import_fabricated_by_raw_string(
+    tmp_path, monkeypatch
+) -> None:
+    monkeypatch.setitem(globals(), "ROOT", tmp_path)
+    root = tmp_path / "internal"
+    root.mkdir()
+    source = (
+        "package store\n"
+        'import ddb "example.com/not-dynamodb"\n'
+        "var example = `\n"
+        'import ddb "github.com/aws/aws-sdk-go-v2/service/dynamodb"\n'
+        "`\n"
+        "func f() { ddb.NewScanPaginator(nil, nil) }\n"
+    )
+    (root / "allowed.go").write_text(source, encoding="utf-8")
+
+    assert go_offenders(root) == []
 
 
 def test_no_dynamodb_scan_in_application_code() -> None:
