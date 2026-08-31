@@ -708,13 +708,6 @@ FORBIDDEN_ADR_GATE_PATTERNS = {
         r"\ban unclaimed Push token may be registered without an authenticated tenant "
         r"member\b",
         r"\bPush registration may accept a missing, invalid, or mismatched principal\b",
-        r"(?=[^.\n]*\b(?:SMS|production) readiness(?: freshness)?\b)"
-        r"(?=[^.\n]*\bsubjective\b)(?=[^.\n]*\b(?:may|need not|without|omit|no)\b)"
-        r"(?=[^.\n]*objective (?:expiry|expiration))"
-        r"(?=[^.\n]*authoritative (?:evidence )?source)[^.\n]*\.",
-        r"(?=[^.\n]*\bPush registration(?: or refresh)?\b)"
-        r"(?=[^.\n]*\baccept\b)(?=[^.\n]*\binactive tenant membership\b)"
-        r"[^.\n]*\.",
     ),
     "ADR-010-stripe-is-an-adapter-internal-entitlements-are-canonical.md": (
         r"\bStripe webhook ingress may return 2xx before durable queue acceptance\b",
@@ -728,17 +721,79 @@ FORBIDDEN_ADR_GATE_PATTERNS = {
         r"\ban Enterprise PlanVersion may omit SMS count, budget, currency, max price, "
         r"or overage fields\b",
         r"\bmissing Enterprise SMS limits may inherit implicit or unlimited defaults\b",
-        r"(?=(?:[^.\n]|\.(?=[A-Za-z]))*\bEnterprise PlanVersion\b)"
-        r"(?=(?:[^.\n]|\.(?=[A-Za-z]))*\bomit(?:s|ted)?\b)"
-        r"(?=(?:[^.\n]|\.(?=[A-Za-z]))*notifications\.sms\.critical)"
-        r"(?=(?:[^.\n]|\.(?=[A-Za-z]))*\binherit(?:s|ed)?\b)"
-        r"(?:[^.\n]|\.(?=[A-Za-z]))*\.",
         r"\ban absent entitlement cache entry may be treated as active or default "
         r"entitlement\b",
         r"\bwhen durable entitlement lookup is unavailable, a cache miss may allow "
         r"paid SMS or command action instead of conservative denial\b",
     ),
 }
+
+
+def semantic_gate_inversions(filename: str, gate_body: str) -> tuple[str, ...]:
+    compact_gate = re.sub(r"\s+", " ", gate_body)
+    sentences = tuple(
+        sentence.strip()
+        for sentence in re.split(r"(?<=[.!?])\s+", compact_gate)
+        if sentence.strip()
+    )
+
+    def contains(sentence: str, pattern: str) -> bool:
+        return re.search(pattern, sentence, flags=re.IGNORECASE) is not None
+
+    def is_permissive(sentence: str) -> bool:
+        return contains(
+            sentence,
+            r"\b(?:may|can|need not|permit(?:s|ted)?|allow(?:s|ed)?)\b",
+        )
+
+    def is_normative_prohibition(sentence: str) -> bool:
+        return any(
+            contains(sentence, pattern)
+            for pattern in (
+                r"\b(?:must|shall)\b[^.!?]*\b(?:not|never|reject|deny|block|"
+                r"refuse|prohibit|forbid)\b",
+                r"\bno\b[^.!?]*\bmay\b",
+                r"\b(?:prohibited|forbidden)\b",
+            )
+        )
+
+    inversions: list[str] = []
+    for sentence in sentences:
+        if not is_permissive(sentence) or is_normative_prohibition(sentence):
+            continue
+        if filename.endswith("ADR-018-eum-push-and-sms-are-provider-adapters.md"):
+            if all(
+                contains(sentence, pattern)
+                for pattern in (
+                    r"\b(?:SMS|production) readiness(?: freshness)?\b",
+                    r"\bsubjective\b",
+                    r"\bobjective (?:expiry|expiration)\b",
+                    r"\bauthoritative (?:evidence )?source\b",
+                )
+            ):
+                inversions.append("permissive subjective SMS readiness")
+            if all(
+                contains(sentence, pattern)
+                for pattern in (
+                    r"\bPush registration(?: or refresh)?\b",
+                    r"\binactive tenant membership\b",
+                    r"\b(?:accept(?:s|ed)?|allow(?:s|ed)?)\b",
+                )
+            ):
+                inversions.append("permissive inactive Push membership")
+        if filename.endswith(
+            "ADR-010-stripe-is-an-adapter-internal-entitlements-are-canonical.md"
+        ) and all(
+            contains(sentence, pattern)
+            for pattern in (
+                r"\bEnterprise PlanVersion\b",
+                r"\bomit(?:s|ted)?\b",
+                r"notifications\.sms\.critical",
+                r"\binherit(?:s|ed)?\b",
+            )
+        ):
+            inversions.append("permissive inherited Enterprise SMS critical flag")
+    return tuple(inversions)
 
 
 def inventory_rows(
@@ -926,7 +981,7 @@ def assert_adr_inventory(adr_root: Path) -> None:
                     gate_body,
                     flags=re.IGNORECASE | re.DOTALL,
                 )
-            )
+            ) + semantic_gate_inversions(filename, gate_body)
             assert not forbidden_patterns, (
                 f"normative implementation gate inversions in {filename}: "
                 f"{forbidden_patterns}"
@@ -2193,6 +2248,14 @@ def test_adr_gate_rejects_round_fourteen_semantic_inversion(
             "ADR-018-eum-push-and-sms-are-provider-adapters.md",
             "Push registration or refresh may accept an authenticated principal with inactive tenant membership.",
         ),
+        (
+            "ADR-018-eum-push-and-sms-are-provider-adapters.md",
+            "Inactive tenant membership may be accepted during Push registration.",
+        ),
+        (
+            "ADR-018-eum-push-and-sms-are-provider-adapters.md",
+            "Push registration can allow inactive tenant membership.",
+        ),
     ),
 )
 def test_adr_gate_rejects_round_fourteen_b_semantic_inversion(
@@ -2214,6 +2277,55 @@ def test_adr_gate_rejects_round_fourteen_b_semantic_inversion(
 
     with pytest.raises(AssertionError, match="normative implementation gate"):
         assert_adr_inventory(adr_root)
+
+
+@pytest.mark.parametrize(
+    ("filename", "safe_clause"),
+    (
+        (
+            "ADR-018-eum-push-and-sms-are-provider-adapters.md",
+            "SMS readiness must reject subjective evidence without an authoritative evidence source or objective expiry.",
+        ),
+        (
+            "ADR-018-eum-push-and-sms-are-provider-adapters.md",
+            "Production readiness must not accept subjective evidence without an authoritative source or objective expiration.",
+        ),
+        (
+            "ADR-010-stripe-is-an-adapter-internal-entitlements-are-canonical.md",
+            "An Enterprise PlanVersion must not omit notifications.sms.critical or use inherited values.",
+        ),
+        (
+            "ADR-010-stripe-is-an-adapter-internal-entitlements-are-canonical.md",
+            "No Enterprise PlanVersion may omit notifications.sms.critical or inherit a default.",
+        ),
+        (
+            "ADR-018-eum-push-and-sms-are-provider-adapters.md",
+            "Push registration must not accept inactive tenant membership.",
+        ),
+        (
+            "ADR-018-eum-push-and-sms-are-provider-adapters.md",
+            "Push registration must never accept inactive tenant membership.",
+        ),
+    ),
+)
+def test_adr_gate_allows_round_fourteen_c_normative_prohibition(
+    tmp_path: Path,
+    filename: str,
+    safe_clause: str,
+) -> None:
+    adr_root = tmp_path / "adr"
+    shutil.copytree(ROOT / "docs/adr", adr_root)
+    adr_path = adr_root / filename
+    record = adr_path.read_text(encoding="utf-8")
+    safe_gate = record.replace(
+        "\n## Non-goals",
+        f"\n{safe_clause}\n\n## Non-goals",
+        1,
+    )
+    assert safe_gate != record
+    adr_path.write_text(safe_gate, encoding="utf-8")
+
+    assert_adr_inventory(adr_root)
 
 
 def test_scheduler_gate_requires_lease_and_fencing_clause(tmp_path: Path) -> None:
