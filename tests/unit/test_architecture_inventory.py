@@ -18,6 +18,53 @@ EXPECTED = {
     "Billing/AWS IoT/Push/SMS/commands": "planned",
     "Device permanently bound to a pond": "obsolete",
 }
+EXPECTED_INVENTORY_METADATA = {
+    "FastAPI control plane": (
+        "implemented",
+        "Preserve the existing API and composition boundary.",
+        "Phase 0 baseline",
+    ),
+    "Tenant membership authorization": (
+        "implemented",
+        "Preserve as a core invariant; authenticated identity is not tenant authority.",
+        "Phase 0 baseline",
+    ),
+    "Pond/Device v1 and Influx reads": (
+        "implemented",
+        "Preserve `/v1`; add the generalized model behind `/v2` and retain legacy reads during telemetry migration.",
+        "Phases 1–2",
+    ),
+    "Alert evaluator and durable notifications": (
+        "implemented",
+        "Preserve the evaluator and ledger; generalize metric, destination, policy, and provider boundaries additively.",
+        "Phases 6–7A",
+    ),
+    "MQTT/Telegraf/Starlark registry": (
+        "local",
+        "Keep for local lab and compatibility; production moves to a trusted queue and normalizer path.",
+        "Phase 3",
+    ),
+    "OpenTofu cloud foundation": (
+        "scaffold",
+        "Extend incrementally with phase-owned resources; scaffold is not deployed capability.",
+        "Phase 3 onward",
+    ),
+    "Site/Asset/Component/Deployment": (
+        "planned",
+        "Add behind `/v2` with additive storage and `/v1` compatibility projection.",
+        "Phase 1",
+    ),
+    "Billing/AWS IoT/Push/SMS/commands": (
+        "planned",
+        "Add through canonical internal contracts and replaceable provider or safety adapters.",
+        "Phases 4, 5, 7B, 7C, 8",
+    ),
+    "Device permanently bound to a pond": (
+        "obsolete",
+        "Replace canonical v2 `pond_id` with temporal Deployment while projecting legacy behavior.",
+        "Phase 1",
+    ),
+}
 EXPECTED_ADR_FILES = (
     "ADR-001-aws-iot-is-an-integration-adapter.md",
     "ADR-002-site-and-asset-preserve-v1-pond.md",
@@ -111,6 +158,10 @@ REQUIRED_ADR_GATE_PATTERNS = {
         r"\bsuspended stops new paid processing,\s+disables commands\b",
         r"\bno grace, restricted, or suspended path may report monitoring as active "
         r"after ingestion or monitoring coverage has stopped\b",
+        r"\bPhase 4 webhook ingress must return `2xx` only after durable queue "
+        r"acceptance and must return `5xx` on transient enqueue failure so Stripe "
+        r"retries;\s+signature-verified, idempotent processing must remain "
+        r"asynchronous\b",
     ),
     "ADR-011-limnopulse-owns-notification-semantics.md": (
         r"\bPhase 7A must restrict `asset_context` policy writes to owners and admins;\s+"
@@ -123,6 +174,10 @@ REQUIRED_ADR_GATE_PATTERNS = {
         r"in the same execution-gate conjunction;\s+invalid or replayed idempotency, "
         r"an expired TTL, or a command outside its time-bounded window must not "
         r"dispatch, and Phase 8 tests must verify both gates\b",
+        r"\bActor permission is a mandatory Phase 8 dispatch conjunct separate from "
+        r"entitlement, effective capability, and safety preconditions;\s+the safety "
+        r"matrix must prove a permitted actor still needs every other gate and a "
+        r"denied actor never dispatches even when those other gates pass\b",
     ),
     "ADR-015-automatic-cloud-control-is-deferred.md": (
         r"\bPhase 10 automatic execution requires dry-run history accumulated over "
@@ -146,6 +201,14 @@ REQUIRED_ADR_GATE_PATTERNS = {
         r"\bOn both Android and iOS, registration must reject cross-user and "
         r"cross-tenant claims for a token already owned by another user or tenant and "
         r"must not overwrite the existing owner\b",
+        r"\bA `SendTextMessage` timeout after potential provider acceptance must leave "
+        r"the Attempt unknown or awaiting provider feedback;\s+it must not be "
+        r"automatically retried or resent, preventing duplicate messages and duplicate "
+        r"cost\b",
+        r"\bBefore Phase 7B launch, every raw Push token must be encrypted and never "
+        r"returned after write\b",
+        r"\bAcross Push and SMS, raw token, phone number, and message body values must "
+        r"be absent from queue jobs, logs, metrics, and ordinary audit records\b",
     ),
 }
 FORBIDDEN_ADR_GATE_PATTERNS = {
@@ -171,6 +234,10 @@ FORBIDDEN_ADR_GATE_PATTERNS = {
     "ADR-012-commands-use-a-separate-safety-plane.md": (
         r"\bmay proceed with invalid idempotency\b",
         r"\bmay proceed with an expired TTL or a time-unbounded command\b",
+        r"\bactor permission may be inferred from entitlement, capability, or "
+        r"preconditions instead of checked at dispatch\b",
+        r"\bdenied actor may dispatch when entitlement, capability, and preconditions "
+        r"pass\b",
     ),
     "ADR-015-automatic-cloud-control-is-deferred.md": (
         r"\bPhase 10 may approve automatic execution from a one-off policy simulation "
@@ -188,14 +255,25 @@ FORBIDDEN_ADR_GATE_PATTERNS = {
     ),
     "ADR-018-eum-push-and-sms-are-provider-adapters.md": (
         r"\bmay accept cross-user and cross-tenant claims\b.*\boverwrite\b",
+        r"\btimeout after potential SendTextMessage acceptance may be automatically "
+        r"retried or resent\b",
+        r"\bambiguous SMS send may be resent even when that can duplicate the message "
+        r"and cost\b",
+        r"\braw Push tokens may be stored unencrypted or returned after write\b",
+        r"\bPush token, phone number, or message body may appear in queue jobs, logs, "
+        r"metrics, or ordinary audit\b",
+    ),
+    "ADR-010-stripe-is-an-adapter-internal-entitlements-are-canonical.md": (
+        r"\bStripe webhook ingress may return 2xx before durable queue acceptance\b",
+        r"\btransient Stripe enqueue failure may return 2xx instead of 5xx\b",
     ),
 }
 
 
 def inventory_rows(
     path: Path = ROOT / "docs/current-state.md",
-) -> dict[str, tuple[str, tuple[str, ...]]]:
-    rows: dict[str, tuple[str, tuple[str, ...]]] = {}
+) -> dict[str, tuple[str, tuple[str, ...], str, str]]:
+    rows: dict[str, tuple[str, tuple[str, ...], str, str]] = {}
     text = path.read_text(encoding="utf-8")
     for line in text.splitlines():
         cells = [cell.strip() for cell in line.strip().split("|")]
@@ -218,14 +296,60 @@ def inventory_rows(
                     else (ROOT / relative_path).exists()
                 )
                 assert resolves, f"evidence path does not resolve: {evidence}"
-            rows[surface] = (cells[2].strip("`"), evidence_paths)
+            rows[surface] = (
+                cells[2].strip("`"),
+                evidence_paths,
+                cells[4],
+                cells[5],
+            )
     return rows
 
 
 def test_inventory_uses_the_approved_statuses() -> None:
     assert {
-        surface: status for surface, (status, _) in inventory_rows().items()
+        surface: row[0] for surface, row in inventory_rows().items()
     } == EXPECTED
+
+
+def inventory_metadata(
+    path: Path = ROOT / "docs/current-state.md",
+) -> dict[str, tuple[str, ...]]:
+    return {
+        surface: (row[0], *row[2:])
+        for surface, row in inventory_rows(path).items()
+    }
+
+
+def assert_inventory_metadata(path: Path = ROOT / "docs/current-state.md") -> None:
+    assert inventory_metadata(path) == EXPECTED_INVENTORY_METADATA, (
+        "exact V4 treatment and owning phase mapping required"
+    )
+
+
+def test_inventory_uses_exact_v4_treatment_and_owning_phase() -> None:
+    assert_inventory_metadata()
+
+
+@pytest.mark.parametrize(
+    ("old", "new"),
+    (
+        ("Preserve the existing API and composition boundary.", ""),
+        ("Phase 0 baseline", "Phase 9"),
+    ),
+)
+def test_inventory_parser_retains_semantic_columns(
+    tmp_path: Path,
+    old: str,
+    new: str,
+) -> None:
+    inventory_path = tmp_path / "current-state.md"
+    inventory = (ROOT / "docs/current-state.md").read_text(encoding="utf-8")
+    mutated = inventory.replace(old, new, 1)
+    assert mutated != inventory
+    inventory_path.write_text(mutated, encoding="utf-8")
+
+    with pytest.raises(AssertionError, match="exact V4 treatment"):
+        assert_inventory_metadata(inventory_path)
 
 
 def test_inventory_rejects_duplicate_surface(tmp_path: Path) -> None:
@@ -643,6 +767,64 @@ def test_adr_gate_rejects_round_four_semantic_inversion(
     ),
 )
 def test_adr_gate_rejects_round_five_semantic_inversion(
+    tmp_path: Path,
+    filename: str,
+    inverted_clause: str,
+) -> None:
+    adr_root = tmp_path / "adr"
+    shutil.copytree(ROOT / "docs/adr", adr_root)
+    adr_path = adr_root / filename
+    record = adr_path.read_text(encoding="utf-8")
+    inverted_gate = record.replace(
+        "\n## Non-goals",
+        f"\n{inverted_clause}\n\n## Non-goals",
+        1,
+    )
+    assert inverted_gate != record
+    adr_path.write_text(inverted_gate, encoding="utf-8")
+
+    with pytest.raises(AssertionError, match="normative implementation gate"):
+        assert_adr_inventory(adr_root)
+
+
+@pytest.mark.parametrize(
+    ("filename", "inverted_clause"),
+    (
+        (
+            "ADR-018-eum-push-and-sms-are-provider-adapters.md",
+            "A timeout after potential SendTextMessage acceptance may be automatically retried or resent.",
+        ),
+        (
+            "ADR-018-eum-push-and-sms-are-provider-adapters.md",
+            "An ambiguous SMS send may be resent even when that can duplicate the message and cost.",
+        ),
+        (
+            "ADR-018-eum-push-and-sms-are-provider-adapters.md",
+            "Raw Push tokens may be stored unencrypted or returned after write.",
+        ),
+        (
+            "ADR-018-eum-push-and-sms-are-provider-adapters.md",
+            "A Push token, phone number, or message body may appear in queue jobs, logs, metrics, or ordinary audit.",
+        ),
+        (
+            "ADR-012-commands-use-a-separate-safety-plane.md",
+            "Actor permission may be inferred from entitlement, capability, or preconditions instead of checked at dispatch.",
+        ),
+        (
+            "ADR-012-commands-use-a-separate-safety-plane.md",
+            "A denied actor may dispatch when entitlement, capability, and preconditions pass.",
+        ),
+        (
+            "ADR-010-stripe-is-an-adapter-internal-entitlements-are-canonical.md",
+            "Stripe webhook ingress may return 2xx before durable queue acceptance.",
+        ),
+        (
+            "ADR-010-stripe-is-an-adapter-internal-entitlements-are-canonical.md",
+            "A transient Stripe enqueue failure may return 2xx instead of 5xx.",
+        ),
+    ),
+)
+def test_adr_gate_rejects_round_six_semantic_inversion(
     tmp_path: Path,
     filename: str,
     inverted_clause: str,

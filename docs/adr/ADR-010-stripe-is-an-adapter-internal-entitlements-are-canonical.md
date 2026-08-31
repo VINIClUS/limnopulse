@@ -20,7 +20,7 @@ V4 §§18, 24 Phase 4, and 27 define the adapter boundary, immutable plan catalo
 
 ## Implementation gate
 
-Phase 4 must prove verified and idempotent webhook convergence, test/live isolation, immutable PlanVersion values, downgrade preflight, explicit subscriber migration, and no synchronous Stripe dependency. It must also prove the published billing-degradation behavior: grace keeps ingestion and critical alerts enabled while limiting new resources and automatic policies; restricted preserves critical notifications and only bounded existing ingestion with read-only history; suspended stops new paid processing, disables commands, and emits explicit suspension warnings. No grace, restricted, or suspended path may report monitoring as active after ingestion or monitoring coverage has stopped.
+Phase 4 must prove verified and idempotent webhook convergence, test/live isolation, immutable PlanVersion values, downgrade preflight, explicit subscriber migration, and no synchronous Stripe dependency. Phase 4 webhook ingress must return `2xx` only after durable queue acceptance and must return `5xx` on transient enqueue failure so Stripe retries; signature-verified, idempotent processing must remain asynchronous. It must also prove the published billing-degradation behavior: grace keeps ingestion and critical alerts enabled while limiting new resources and automatic policies; restricted preserves critical notifications and only bounded existing ingestion with read-only history; suspended stops new paid processing, disables commands, and emits explicit suspension warnings. No grace, restricted, or suspended path may report monitoring as active after ingestion or monitoring coverage has stopped.
 
 ## Non-goals
 
