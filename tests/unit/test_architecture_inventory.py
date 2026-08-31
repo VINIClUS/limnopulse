@@ -172,6 +172,10 @@ REQUIRED_ADR_GATE_PATTERNS = {
         r"\bDuring Phase 5 enrollment, if LimnoPulse generates an AWS IoT private "
         r"key, it must return that key only at creation and must never persist it or "
         r"return it later;\s+only the certificate ID or fingerprint may be stored\b",
+        r"\bPhase 5 ingest must resolve tenant ownership exclusively from the "
+        r"authenticated source mapping;\s+any tenant asserted in the payload, "
+        r"including another tenant's ID, must be ignored or rejected and must never "
+        r"override that mapping\b",
     ),
     "ADR-003-device-component-and-temporal-deployment.md": (
         r"\bPhase 1 must reject overlapping Deployment intervals for the same "
@@ -180,6 +184,10 @@ REQUIRED_ADR_GATE_PATTERNS = {
         r"\bPhase 1 concurrent relocation must use optimistic version checks so one "
         r"racing writer receives a version conflict while non-overlap, the current "
         r"Deployment pointer, and immutable ended history remain preserved\b",
+        r"\bPhase 1 probe replacement must retire the old Component and ProbeProfile "
+        r"identities and create new identities;\s+it must preserve prior Deployment, "
+        r"telemetry, and calibration attribution and must never mutate or rewrite "
+        r"that history in place\b",
     ),
     "ADR-004-effective-capability-is-derived.md": (
         r"\bPhase 6 must prove identical, reordered, and replayed health evidence "
@@ -372,6 +380,25 @@ REQUIRED_ADR_GATE_PATTERNS = {
         r"\bAlongside route and carrier readiness, the Brazil gate must prove in-app "
         r"destination management and opt-out, disclose that the displayed origin is "
         r"unstable, and make no promise of replies or a fixed originating number\b",
+        r"\bDistinct logical SMS jobs racing for the same tenant's last count slot or "
+        r"USD budget must contend atomically on one conditional budget-period version "
+        r"without Redis;\s+at most one winner may reserve and contact the provider, "
+        r"and every loser must defer or fail before the call so the tenant cannot "
+        r"overspend\b",
+        r"\bIn the pre-dispatch transaction, a current-country price above the "
+        r"PlanVersion cap must prevent `SendTextMessage` and consume no call count;\s+"
+        r"provider `MaxPrice` remains defense in depth and must not replace this "
+        r"guard\b",
+        r"\bAndroid/FCM and iOS/APNs must have separate kill switches;\s+each switch "
+        r"must stop only its own platform while preserving durable state, the other "
+        r"platform, and every other channel\b",
+        r"\bSuccessful provider Push acceptance must never become user incident "
+        r"acknowledgement and must leave incident acknowledgement and escalation "
+        r"state unchanged\b",
+        r"\bThe public destination contract must accept only canonical `android` and "
+        r"`ios` and reject provider channel names `GCM` and `APNS`;\s+adapter fixtures "
+        r"must prove `android` maps to AWS `GCM` and `ios` maps to `APNS` or "
+        r"`APNS_SANDBOX`\.",
     ),
 }
 FORBIDDEN_ADR_GATE_PATTERNS = {
@@ -381,6 +408,10 @@ FORBIDDEN_ADR_GATE_PATTERNS = {
         r"\bLimnoPulse may persist an AWS IoT generated private key in an integration "
         r"record\b",
         r"\ban AWS IoT generated private key may be returned after creation\b",
+        r"\bAWS IoT ingest may resolve tenant ownership from a tenant asserted in "
+        r"the payload\b",
+        r"\ba payload tenant from another tenant may override the authenticated "
+        r"source mapping\b",
     ),
     "ADR-003-device-component-and-temporal-deployment.md": (
         r"\bPhase 1 may accept overlapping Deployment intervals for the same "
@@ -390,6 +421,10 @@ FORBIDDEN_ADR_GATE_PATTERNS = {
         r"conflict\b",
         r"\ba relocation race may violate non-overlap, current pointer, or immutable "
         r"history\b",
+        r"\bprobe replacement may mutate the old Component or ProbeProfile identity "
+        r"in place\b",
+        r"\bprobe replacement may rewrite prior Deployment, telemetry, or calibration "
+        r"attribution to the new probe\b",
     ),
     "ADR-004-effective-capability-is-derived.md": (
         r"\bidentical, reordered, or replayed health evidence may produce different "
@@ -560,6 +595,24 @@ FORBIDDEN_ADR_GATE_PATTERNS = {
         r"\bBrazil may launch without in-app destination management or opt-out\b",
         r"\bBrazil may omit disclosure that the displayed origin is unstable\b",
         r"\bBrazil may promise replies or a fixed originating number\b",
+        r"\bdistinct logical SMS jobs may reserve the last count slot and USD budget "
+        r"using separate budget-period versions\b",
+        r"\ba same-tenant SMS budget race may overspend or let more than one loser "
+        r"contact the provider\b",
+        r"\bcorrect SMS reservation concurrency may depend on Redis\b",
+        r"\ba current-country price above the PlanVersion cap may start "
+        r"SendTextMessage and consume the call count\b",
+        r"\bthe provider MaxPrice check may replace the pre-dispatch country-price "
+        r"guard\b",
+        r"\bthe Android/FCM kill switch may also stop iOS/APNs\b",
+        r"\bthe iOS/APNs kill switch may also stop Android/FCM or discard durable "
+        r"state\b",
+        r"\bsuccessful provider Push acceptance may acknowledge the user incident\b",
+        r"\bsuccessful provider Push acceptance may change or cancel escalation state\b",
+        r"\bthe public canonical Push platform may accept AWS GCM or APNS channel "
+        r"names\b",
+        r"\bthe adapter may map canonical android to APNS instead of AWS GCM\b",
+        r"\bthe adapter may map canonical ios to GCM instead of APNS or APNS_SANDBOX\b",
     ),
     "ADR-010-stripe-is-an-adapter-internal-entitlements-are-canonical.md": (
         r"\bStripe webhook ingress may return 2xx before durable queue acceptance\b",
@@ -1755,6 +1808,96 @@ def test_adr_gate_rejects_round_eleven_semantic_inversion(
     ),
 )
 def test_adr_gate_rejects_round_twelve_semantic_inversion(
+    tmp_path: Path,
+    filename: str,
+    inverted_clause: str,
+) -> None:
+    adr_root = tmp_path / "adr"
+    shutil.copytree(ROOT / "docs/adr", adr_root)
+    adr_path = adr_root / filename
+    record = adr_path.read_text(encoding="utf-8")
+    inverted_gate = record.replace(
+        "\n## Non-goals",
+        f"\n{inverted_clause}\n\n## Non-goals",
+        1,
+    )
+    assert inverted_gate != record
+    adr_path.write_text(inverted_gate, encoding="utf-8")
+
+    with pytest.raises(AssertionError, match="normative implementation gate"):
+        assert_adr_inventory(adr_root)
+
+
+@pytest.mark.parametrize(
+    ("filename", "inverted_clause"),
+    (
+        (
+            "ADR-018-eum-push-and-sms-are-provider-adapters.md",
+            "Distinct logical SMS jobs may reserve the last count slot and USD budget using separate budget-period versions.",
+        ),
+        (
+            "ADR-018-eum-push-and-sms-are-provider-adapters.md",
+            "A same-tenant SMS budget race may overspend or let more than one loser contact the provider.",
+        ),
+        (
+            "ADR-018-eum-push-and-sms-are-provider-adapters.md",
+            "Correct SMS reservation concurrency may depend on Redis.",
+        ),
+        (
+            "ADR-018-eum-push-and-sms-are-provider-adapters.md",
+            "A current-country price above the PlanVersion cap may start SendTextMessage and consume the call count.",
+        ),
+        (
+            "ADR-018-eum-push-and-sms-are-provider-adapters.md",
+            "The provider MaxPrice check may replace the pre-dispatch country-price guard.",
+        ),
+        (
+            "ADR-018-eum-push-and-sms-are-provider-adapters.md",
+            "The Android/FCM kill switch may also stop iOS/APNs.",
+        ),
+        (
+            "ADR-018-eum-push-and-sms-are-provider-adapters.md",
+            "The iOS/APNs kill switch may also stop Android/FCM or discard durable state.",
+        ),
+        (
+            "ADR-018-eum-push-and-sms-are-provider-adapters.md",
+            "Successful provider Push acceptance may acknowledge the user incident.",
+        ),
+        (
+            "ADR-018-eum-push-and-sms-are-provider-adapters.md",
+            "Successful provider Push acceptance may change or cancel escalation state.",
+        ),
+        (
+            "ADR-003-device-component-and-temporal-deployment.md",
+            "Probe replacement may mutate the old Component or ProbeProfile identity in place.",
+        ),
+        (
+            "ADR-003-device-component-and-temporal-deployment.md",
+            "Probe replacement may rewrite prior Deployment, telemetry, or calibration attribution to the new probe.",
+        ),
+        (
+            "ADR-001-aws-iot-is-an-integration-adapter.md",
+            "AWS IoT ingest may resolve tenant ownership from a tenant asserted in the payload.",
+        ),
+        (
+            "ADR-001-aws-iot-is-an-integration-adapter.md",
+            "A payload tenant from another tenant may override the authenticated source mapping.",
+        ),
+        (
+            "ADR-018-eum-push-and-sms-are-provider-adapters.md",
+            "The public canonical Push platform may accept AWS GCM or APNS channel names.",
+        ),
+        (
+            "ADR-018-eum-push-and-sms-are-provider-adapters.md",
+            "The adapter may map canonical android to APNS instead of AWS GCM.",
+        ),
+        (
+            "ADR-018-eum-push-and-sms-are-provider-adapters.md",
+            "The adapter may map canonical ios to GCM instead of APNS or APNS_SANDBOX.",
+        ),
+    ),
+)
+def test_adr_gate_rejects_round_thirteen_semantic_inversion(
     tmp_path: Path,
     filename: str,
     inverted_clause: str,
