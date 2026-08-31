@@ -156,6 +156,9 @@ REQUIRED_ADR_GATE_PATTERNS = {
         r"\bPhase 2 must detect negative or extreme clock skew and emit a quality "
         r"flag while preserving original event-time semantics for delayed, replayed, "
         r"and out-of-order observations\b",
+        r"\bWhen no valid Deployment covers event time, Phase 2 must preserve the "
+        r"source event in bounded quarantine/DLQ metadata, mark connector health, "
+        r"and must not fall back to the current Deployment or location\b",
     ),
     "ADR-010-stripe-is-an-adapter-internal-entitlements-are-canonical.md": (
         r"\bgrace keeps ingestion and critical alerts enabled\b",
@@ -184,6 +187,10 @@ REQUIRED_ADR_GATE_PATTERNS = {
         r"token, and other sensitive fields;\s+its data payload is limited to an "
         r"opaque incident/notification ID, authenticated deep link, version, and "
         r"minimal routing metadata\b",
+        r"\bAt `BeginAttempt`, Phase 7A must recheck final incident and "
+        r"acknowledgement state;\s+if a queued escalation was acknowledged before "
+        r"the provider call, dispatch must deterministically perform no send and "
+        r"incur no charge\b",
     ),
     "ADR-012-commands-use-a-separate-safety-plane.md": (
         r"\bPhase 8 dispatch must require idempotency validity AND a non-expired TTL "
@@ -211,6 +218,9 @@ REQUIRED_ADR_GATE_PATTERNS = {
         r"\bBecause Scheduler is at-least-once, every selected target must remain "
         r"leased and fenced;\s+Scheduler verification must prove retry overlap with a "
         r"slow invocation cannot let two workers act on the same work unit\b",
+        r"\bPhase 3 HTTPS ingress must return accepted only after a durable SQS "
+        r"write;\s+a failed write must not return accepted\.\s+Phase 3 must prove "
+        r"at-least-once replay is safe and test DLQ redrive\b",
     ),
     "ADR-017-sns-is-provider-feedback-not-notification-service.md": (
         r"\bPhase 7C must also prove least-privilege AWS End User Messaging publish "
@@ -241,6 +251,17 @@ REQUIRED_ADR_GATE_PATTERNS = {
         r"TTL, attempt and rate limits, its own anti-abuse controls, and a separate "
         r"platform budget;\s+Phase 7C tests must prove it cannot share or bypass the "
         r"critical-escalation Attempt or budget\b",
+        r"\bEvery verified E\.164 SMS destination must store its number using "
+        r"application-level envelope encryption at rest throughout its lifecycle;\s+"
+        r"plaintext phone numbers must remain excluded from ordinary reads, queue "
+        r"jobs, logs, metrics, and ordinary audit records\b",
+        r"\bDuplicate standard SQS Push or SMS jobs, including concurrent "
+        r"multiprocess delivery, must be idempotent:\s+the same logical job yields "
+        r"one durable Attempt, one provider attempt, and one cost commitment\b",
+        r"\bEach Push destination must be keyed by tenant, recipient, client app, "
+        r"and client app instance;\s+multiple devices for one user must coexist and "
+        r"fan out independently, and registration or rotation of one instance must "
+        r"not overwrite another\b",
     ),
 }
 FORBIDDEN_ADR_GATE_PATTERNS = {
@@ -261,6 +282,10 @@ FORBIDDEN_ADR_GATE_PATTERNS = {
         r"\bnegative or extreme clock skew may pass without a quality flag\b",
         r"\bdelayed, replayed, or out-of-order observations may lose their "
         r"event-time semantics\b",
+        r"\bwhen no event-time Deployment exists, telemetry may fall back to the "
+        r"current Deployment or location\b",
+        r"\bmissing event-time Deployment may be discarded without bounded "
+        r"quarantine or DLQ metadata and without a connector-health signal\b",
     ),
     "ADR-011-limnopulse-owns-notification-semantics.md": (
         r"\bmember or viewer may update the asset_context preview policy\b",
@@ -271,6 +296,8 @@ FORBIDDEN_ADR_GATE_PATTERNS = {
         r"telemetry, command, or sensitive fields\b",
         r"\bgeneric data payload may include operational detail beyond opaque "
         r"identifiers and minimal routing metadata\b",
+        r"\bBeginAttempt may send and charge after the queued escalation was "
+        r"acknowledged before the provider call\b",
     ),
     "ADR-012-commands-use-a-separate-safety-plane.md": (
         r"\bmay proceed with invalid idempotency\b",
@@ -293,6 +320,10 @@ FORBIDDEN_ADR_GATE_PATTERNS = {
     "ADR-016-eventbridge-is-selective-sqs-is-durable.md": (
         r"\bwithout leases\b",
         r"\bwithout fencing\b",
+        r"\bPhase 3 HTTPS ingress may return accepted before a durable SQS write or "
+        r"after the write fails\b",
+        r"\bPhase 3 at-least-once replay may be unsafe and its DLQ redrive need not "
+        r"be tested\b",
     ),
     "ADR-017-sns-is-provider-feedback-not-notification-service.md": (
         r"\bwithout least privilege\b",
@@ -319,6 +350,13 @@ FORBIDDEN_ADR_GATE_PATTERNS = {
         r"platform budget\b",
         r"\bSMS verification may omit its digest, TTL, attempt limits, rate limits, "
         r"or anti-abuse tests\b",
+        r"\ba verified E\.164 SMS number may be stored unencrypted at rest\b",
+        r"\bduplicate Push or SMS SQS jobs may create multiple durable Attempts, "
+        r"provider attempts, or cost commitments\b",
+        r"\bregistration for a second client app instance may overwrite the user's "
+        r"existing Push destination\b",
+        r"\bmultiple devices for one user may be collapsed into one Push destination "
+        r"instead of independent fanout\b",
     ),
     "ADR-010-stripe-is-an-adapter-internal-entitlements-are-canonical.md": (
         r"\bStripe webhook ingress may return 2xx before durable queue acceptance\b",
@@ -968,6 +1006,68 @@ def test_adr_gate_rejects_round_six_semantic_inversion(
     ),
 )
 def test_adr_gate_rejects_round_seven_semantic_inversion(
+    tmp_path: Path,
+    filename: str,
+    inverted_clause: str,
+) -> None:
+    adr_root = tmp_path / "adr"
+    shutil.copytree(ROOT / "docs/adr", adr_root)
+    adr_path = adr_root / filename
+    record = adr_path.read_text(encoding="utf-8")
+    inverted_gate = record.replace(
+        "\n## Non-goals",
+        f"\n{inverted_clause}\n\n## Non-goals",
+        1,
+    )
+    assert inverted_gate != record
+    adr_path.write_text(inverted_gate, encoding="utf-8")
+
+    with pytest.raises(AssertionError, match="normative implementation gate"):
+        assert_adr_inventory(adr_root)
+
+
+@pytest.mark.parametrize(
+    ("filename", "inverted_clause"),
+    (
+        (
+            "ADR-018-eum-push-and-sms-are-provider-adapters.md",
+            "A verified E.164 SMS number may be stored unencrypted at rest.",
+        ),
+        (
+            "ADR-018-eum-push-and-sms-are-provider-adapters.md",
+            "Duplicate Push or SMS SQS jobs may create multiple durable Attempts, provider attempts, or cost commitments.",
+        ),
+        (
+            "ADR-018-eum-push-and-sms-are-provider-adapters.md",
+            "Registration for a second client app instance may overwrite the user's existing Push destination.",
+        ),
+        (
+            "ADR-018-eum-push-and-sms-are-provider-adapters.md",
+            "Multiple devices for one user may be collapsed into one Push destination instead of independent fanout.",
+        ),
+        (
+            "ADR-011-limnopulse-owns-notification-semantics.md",
+            "BeginAttempt may send and charge after the queued escalation was acknowledged before the provider call.",
+        ),
+        (
+            "ADR-016-eventbridge-is-selective-sqs-is-durable.md",
+            "Phase 3 HTTPS ingress may return accepted before a durable SQS write or after the write fails.",
+        ),
+        (
+            "ADR-016-eventbridge-is-selective-sqs-is-durable.md",
+            "Phase 3 at-least-once replay may be unsafe and its DLQ redrive need not be tested.",
+        ),
+        (
+            "ADR-006-telemetry-has-three-timestamps.md",
+            "When no event-time Deployment exists, telemetry may fall back to the current Deployment or location.",
+        ),
+        (
+            "ADR-006-telemetry-has-three-timestamps.md",
+            "Missing event-time Deployment may be discarded without bounded quarantine or DLQ metadata and without a connector-health signal.",
+        ),
+    ),
+)
+def test_adr_gate_rejects_round_eight_semantic_inversion(
     tmp_path: Path,
     filename: str,
     inverted_clause: str,

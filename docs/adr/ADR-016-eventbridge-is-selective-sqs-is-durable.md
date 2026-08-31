@@ -20,7 +20,7 @@ V4 §§7, 17, 21, 24, 27, and the future EventBridge decision gate preserve SES 
 
 ## Implementation gate
 
-Current SES feedback remains intact. When EventBridge Scheduler is selected for evaluator, relay, reconciliation, or backfill work, the selected IAM role and target invocation, idempotent duplicate delivery, retry behavior, and Scheduler DLQ operation where appropriate must be proven. Because Scheduler is at-least-once, every selected target must remain leased and fenced; Scheduler verification must prove retry overlap with a slow invocation cannot let two workers act on the same work unit. Any future bus requires multiple justified consumers, versioned schemas, PII review, transactional publication fencing, durable target queues, failure/replay tests, IAM review, cost comparison, and reversible publication.
+Current SES feedback remains intact. Phase 3 HTTPS ingress must return accepted only after a durable SQS write; a failed write must not return accepted. Phase 3 must prove at-least-once replay is safe and test DLQ redrive. When EventBridge Scheduler is selected for evaluator, relay, reconciliation, or backfill work, the selected IAM role and target invocation, idempotent duplicate delivery, retry behavior, and Scheduler DLQ operation where appropriate must be proven. Because Scheduler is at-least-once, every selected target must remain leased and fenced; Scheduler verification must prove retry overlap with a slow invocation cannot let two workers act on the same work unit. Any future bus requires multiple justified consumers, versioned schemas, PII review, transactional publication fencing, durable target queues, failure/replay tests, IAM review, cost comparison, and reversible publication.
 
 ## Non-goals
 
