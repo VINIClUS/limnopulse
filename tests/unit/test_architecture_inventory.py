@@ -241,6 +241,10 @@ REQUIRED_ADR_GATE_PATTERNS = {
         r"\bPhase 7A must restrict `asset_context` policy writes to owners and admins;\s+"
         r"each write must be revisioned and audited, and member or viewer updates "
         r"must be rejected\b",
+        r"\bEach `asset_context` preview may add at most one approved site/asset "
+        r"label, must record explicit exposure acknowledgement, and must never "
+        r"include sensitive telemetry, location, personal data, or free-form "
+        r"operational content\b",
         r"\bDetailed incident fetch must require fresh membership authorization\b",
         r"\bGeneric preview must use the exact localized `pt-BR` and `en-US` "
         r"templates\.\s+Its visible-payload allowlist must exclude tenant, site/asset, "
@@ -303,6 +307,10 @@ REQUIRED_ADR_GATE_PATTERNS = {
         r"must release the monetary reservation while retaining the consumed call "
         r"count;\s+final provider cost must settle actual cost and release only proven "
         r"excess, while missing final feedback retains the conservative reservation\b",
+        r"\bMalformed or unrelated SNS feedback already accepted by SQS must have "
+        r"bounded consumer retry/redrive, a consumer poison-message DLQ, and queue-age/"
+        r"DLQ observability;\s+this consumer path is distinct from and cannot be "
+        r"replaced by the SNS subscription delivery-failure DLQ\b",
     ),
     "ADR-018-eum-push-and-sms-are-provider-adapters.md": (
         r"\bOn both Android and iOS, registration must reject cross-user and "
@@ -319,6 +327,10 @@ REQUIRED_ADR_GATE_PATTERNS = {
         r"\bA provider per-address permanent Push failure must conditionally "
         r"invalidate only the destination version observed by the Attempt;\s+a late "
         r"failure for version N must preserve rotated version N\+1\b",
+        r"\bA provider-returned updated FCM/GCM token must be conditionally persisted "
+        r"as a fenced rotation against the destination version observed by the "
+        r"Attempt;\s+it must not be ignored, and a late provider response must not "
+        r"overwrite a newer client rotation\b",
         r"\bAn independent Push kill switch must stop Push while preserving durable "
         r"state and leaving email, Telegram, and SMS intact\b",
         r"\bA Push transport timeout after potential provider acceptance must become "
@@ -357,6 +369,9 @@ REQUIRED_ADR_GATE_PATTERNS = {
         r"\bPhase 7C request fixtures must prove `SendTextMessage` uses "
         r"`MessageType=TRANSACTIONAL`, the approved origination reference, protection "
         r"configuration, SMS configuration set, bounded TTL, and provider `MaxPrice`",
+        r"\bAlongside route and carrier readiness, the Brazil gate must prove in-app "
+        r"destination management and opt-out, disclose that the displayed origin is "
+        r"unstable, and make no promise of replies or a fixed originating number\b",
     ),
 }
 FORBIDDEN_ADR_GATE_PATTERNS = {
@@ -429,6 +444,11 @@ FORBIDDEN_ADR_GATE_PATTERNS = {
         r"identifiers and minimal routing metadata\b",
         r"\bBeginAttempt may send and charge after the queued escalation was "
         r"acknowledged before the provider call\b",
+        r"\ban asset_context preview may include more than one site or asset label\b",
+        r"\ban asset_context label may be unapproved or exposed without "
+        r"acknowledgement\b",
+        r"\basset_context may include sensitive telemetry, location, personal data, "
+        r"or free-form operational content\b",
     ),
     "ADR-012-commands-use-a-separate-safety-plane.md": (
         r"\bmay proceed with invalid idempotency\b",
@@ -482,6 +502,12 @@ FORBIDDEN_ADR_GATE_PATTERNS = {
         r"excess\b",
         r"\bmissing final SMS feedback may release the conservative monetary "
         r"reservation\b",
+        r"\bmalformed or unrelated SNS feedback already in SQS may retry without "
+        r"bounds and bypass the consumer DLQ\b",
+        r"\bmalformed or unrelated SNS feedback may fail without consumer "
+        r"observability\b",
+        r"\bthe SNS subscription delivery-failure DLQ may substitute for consumer "
+        r"redrive and its poison-message DLQ\b",
     ),
     "ADR-018-eum-push-and-sms-are-provider-adapters.md": (
         r"\bmay accept cross-user and cross-tenant claims\b.*\boverwrite\b",
@@ -527,6 +553,13 @@ FORBIDDEN_ADR_GATE_PATTERNS = {
         r"\bSendTextMessage may omit transactional type, origination reference, "
         r"protection configuration, or SMS configuration set\b",
         r"\bSendTextMessage may omit a bounded TTL or provider MaxPrice\b",
+        r"\ba provider-returned updated FCM/GCM token may be ignored instead of "
+        r"conditionally persisted\b",
+        r"\ba late provider-returned updated token may overwrite a newer client "
+        r"rotation\b",
+        r"\bBrazil may launch without in-app destination management or opt-out\b",
+        r"\bBrazil may omit disclosure that the displayed origin is unstable\b",
+        r"\bBrazil may promise replies or a fixed originating number\b",
     ),
     "ADR-010-stripe-is-an-adapter-internal-entitlements-are-canonical.md": (
         r"\bStripe webhook ingress may return 2xx before durable queue acceptance\b",
@@ -685,7 +718,16 @@ def assert_adr_inventory(adr_root: Path) -> None:
             *EXPECTED_ADR_SECTION_HEADINGS,
         )
         assert headings == expected_headings, f"exact ADR headings required: {filename}"
-        assert "**Status:** Accepted" in record, filename
+        status_lines = tuple(
+            re.findall(
+                r"^\*\*Status:\*\* ([^\n]+)$",
+                record,
+                flags=re.MULTILINE,
+            )
+        )
+        assert status_lines == ("Accepted",), (
+            f"dedicated ADR status must be exactly Accepted: {filename}"
+        )
         implementation_gate = re.search(
             r"(?ms)^## Implementation gate\n\n(.*?)(?=^## Non-goals$)",
             record,
@@ -771,6 +813,28 @@ def assert_adr_inventory(adr_root: Path) -> None:
 
 def test_adr_index_is_complete_and_every_record_is_accepted() -> None:
     assert_adr_inventory(ROOT / "docs/adr")
+
+
+def test_adr_record_requires_dedicated_accepted_status(tmp_path: Path) -> None:
+    adr_root = tmp_path / "adr"
+    shutil.copytree(ROOT / "docs/adr", adr_root)
+    adr_path = adr_root / EXPECTED_ADR_FILES[0]
+    record = adr_path.read_text(encoding="utf-8")
+    proposed_with_history = record.replace(
+        "**Status:** Accepted",
+        "**Status:** Proposed",
+        1,
+    ).replace(
+        "\n## Non-goals",
+        "\nHistorical note: the earlier draft contained **Status:** Accepted.\n\n"
+        "## Non-goals",
+        1,
+    )
+    assert proposed_with_history != record
+    adr_path.write_text(proposed_with_history, encoding="utf-8")
+
+    with pytest.raises(AssertionError, match="dedicated ADR status"):
+        assert_adr_inventory(adr_root)
 
 
 def test_adr_inventory_rejects_unexpected_record(tmp_path: Path) -> None:
@@ -1621,6 +1685,76 @@ def test_adr_gate_rejects_round_ten_semantic_inversion(
     ),
 )
 def test_adr_gate_rejects_round_eleven_semantic_inversion(
+    tmp_path: Path,
+    filename: str,
+    inverted_clause: str,
+) -> None:
+    adr_root = tmp_path / "adr"
+    shutil.copytree(ROOT / "docs/adr", adr_root)
+    adr_path = adr_root / filename
+    record = adr_path.read_text(encoding="utf-8")
+    inverted_gate = record.replace(
+        "\n## Non-goals",
+        f"\n{inverted_clause}\n\n## Non-goals",
+        1,
+    )
+    assert inverted_gate != record
+    adr_path.write_text(inverted_gate, encoding="utf-8")
+
+    with pytest.raises(AssertionError, match="normative implementation gate"):
+        assert_adr_inventory(adr_root)
+
+
+@pytest.mark.parametrize(
+    ("filename", "inverted_clause"),
+    (
+        (
+            "ADR-011-limnopulse-owns-notification-semantics.md",
+            "An asset_context preview may include more than one site or asset label.",
+        ),
+        (
+            "ADR-011-limnopulse-owns-notification-semantics.md",
+            "An asset_context label may be unapproved or exposed without acknowledgement.",
+        ),
+        (
+            "ADR-011-limnopulse-owns-notification-semantics.md",
+            "Asset_context may include sensitive telemetry, location, personal data, or free-form operational content.",
+        ),
+        (
+            "ADR-018-eum-push-and-sms-are-provider-adapters.md",
+            "A provider-returned updated FCM/GCM token may be ignored instead of conditionally persisted.",
+        ),
+        (
+            "ADR-018-eum-push-and-sms-are-provider-adapters.md",
+            "A late provider-returned updated token may overwrite a newer client rotation.",
+        ),
+        (
+            "ADR-017-sns-is-provider-feedback-not-notification-service.md",
+            "Malformed or unrelated SNS feedback already in SQS may retry without bounds and bypass the consumer DLQ.",
+        ),
+        (
+            "ADR-017-sns-is-provider-feedback-not-notification-service.md",
+            "Malformed or unrelated SNS feedback may fail without consumer observability.",
+        ),
+        (
+            "ADR-017-sns-is-provider-feedback-not-notification-service.md",
+            "The SNS subscription delivery-failure DLQ may substitute for consumer redrive and its poison-message DLQ.",
+        ),
+        (
+            "ADR-018-eum-push-and-sms-are-provider-adapters.md",
+            "Brazil may launch without in-app destination management or opt-out.",
+        ),
+        (
+            "ADR-018-eum-push-and-sms-are-provider-adapters.md",
+            "Brazil may omit disclosure that the displayed origin is unstable.",
+        ),
+        (
+            "ADR-018-eum-push-and-sms-are-provider-adapters.md",
+            "Brazil may promise replies or a fixed originating number.",
+        ),
+    ),
+)
+def test_adr_gate_rejects_round_twelve_semantic_inversion(
     tmp_path: Path,
     filename: str,
     inverted_clause: str,
