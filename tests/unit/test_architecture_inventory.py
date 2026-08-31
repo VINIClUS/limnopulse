@@ -708,10 +708,13 @@ FORBIDDEN_ADR_GATE_PATTERNS = {
         r"\ban unclaimed Push token may be registered without an authenticated tenant "
         r"member\b",
         r"\bPush registration may accept a missing, invalid, or mismatched principal\b",
-        r"\bproduction readiness may use subjective freshness without an authoritative "
-        r"evidence source or objective expiry rule\b",
-        r"\bPush registration or refresh may accept an authenticated principal with "
-        r"inactive tenant membership\b",
+        r"(?=[^.\n]*\b(?:SMS|production) readiness(?: freshness)?\b)"
+        r"(?=[^.\n]*\bsubjective\b)(?=[^.\n]*\b(?:may|need not|without|omit|no)\b)"
+        r"(?=[^.\n]*objective (?:expiry|expiration))"
+        r"(?=[^.\n]*authoritative (?:evidence )?source)[^.\n]*\.",
+        r"(?=[^.\n]*\bPush registration(?: or refresh)?\b)"
+        r"(?=[^.\n]*\baccept\b)(?=[^.\n]*\binactive tenant membership\b)"
+        r"[^.\n]*\.",
     ),
     "ADR-010-stripe-is-an-adapter-internal-entitlements-are-canonical.md": (
         r"\bStripe webhook ingress may return 2xx before durable queue acceptance\b",
@@ -725,8 +728,11 @@ FORBIDDEN_ADR_GATE_PATTERNS = {
         r"\ban Enterprise PlanVersion may omit SMS count, budget, currency, max price, "
         r"or overage fields\b",
         r"\bmissing Enterprise SMS limits may inherit implicit or unlimited defaults\b",
-        r"\ban Enterprise PlanVersion may omit notifications\.sms\.critical and "
-        r"inherit its value\b",
+        r"(?=(?:[^.\n]|\.(?=[A-Za-z]))*\bEnterprise PlanVersion\b)"
+        r"(?=(?:[^.\n]|\.(?=[A-Za-z]))*\bomit(?:s|ted)?\b)"
+        r"(?=(?:[^.\n]|\.(?=[A-Za-z]))*notifications\.sms\.critical)"
+        r"(?=(?:[^.\n]|\.(?=[A-Za-z]))*\binherit(?:s|ed)?\b)"
+        r"(?:[^.\n]|\.(?=[A-Za-z]))*\.",
         r"\ban absent entitlement cache entry may be treated as active or default "
         r"entitlement\b",
         r"\bwhen durable entitlement lookup is unavailable, a cache miss may allow "
@@ -2165,11 +2171,23 @@ def test_adr_gate_rejects_round_fourteen_semantic_inversion(
     (
         (
             "ADR-018-eum-push-and-sms-are-provider-adapters.md",
+            "SMS readiness freshness may be subjective and need not define an objective expiry or authoritative evidence source.",
+        ),
+        (
+            "ADR-018-eum-push-and-sms-are-provider-adapters.md",
             "Production readiness may use subjective freshness without an authoritative evidence source or objective expiry rule.",
         ),
         (
             "ADR-010-stripe-is-an-adapter-internal-entitlements-are-canonical.md",
+            "An Enterprise PlanVersion may omit notifications.sms.critical and inherit its default.",
+        ),
+        (
+            "ADR-010-stripe-is-an-adapter-internal-entitlements-are-canonical.md",
             "An Enterprise PlanVersion may omit notifications.sms.critical and inherit its value.",
+        ),
+        (
+            "ADR-018-eum-push-and-sms-are-provider-adapters.md",
+            "A Push registration may accept an inactive tenant membership.",
         ),
         (
             "ADR-018-eum-push-and-sms-are-provider-adapters.md",
