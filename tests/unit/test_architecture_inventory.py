@@ -89,6 +89,22 @@ EXPECTED_ADR_SECTION_HEADINGS = (
     "## Implementation gate",
     "## Non-goals",
 )
+REQUIRED_ADR_GATE_PATTERNS = {
+    "ADR-010-stripe-is-an-adapter-internal-entitlements-are-canonical.md": (
+        r"\bgrace\b",
+        r"\brestricted\b",
+        r"\bsuspended\b",
+        r"\bno\s+(?:grace|restricted|suspended).*report monitoring\s+as\s+active",
+        r"ingestion.*coverage.*stopped",
+    ),
+    "ADR-016-eventbridge-is-selective-sqs-is-durable.md": (
+        r"\bScheduler\b",
+        r"selected.*\brole\b.*target invocation",
+        r"idempotent duplicate",
+        r"\bretry\b",
+        r"\bDLQ\b",
+    ),
+}
 
 
 def inventory_rows(
@@ -160,13 +176,14 @@ def assert_adr_inventory(adr_root: Path) -> None:
     assert index_path.is_file(), "missing docs/adr/README.md"
     index = index_path.read_text(encoding="utf-8")
     link_targets = set(re.findall(r"\[[^\]]+\]\(([^)]+)\)", index))
-    entry_phases = dict(
+    index_rows = tuple(
         re.findall(
-            r"^\| \[[^\]]+\]\(([^)]+)\) \| ([^|]+) \|$",
+            r"^\| \[([^\]]+)\]\(([^)]+)\) \| ([^|]+) \|$",
             index,
             flags=re.MULTILINE,
         )
     )
+    entry_phases = {target: phase for _, target, phase in index_rows}
 
     expected = set(EXPECTED_ADR_FILES)
     discovered = {path.name for path in adr_root.glob("ADR-*.md")}
@@ -189,9 +206,36 @@ def assert_adr_inventory(adr_root: Path) -> None:
         )
         assert headings == expected_headings, f"exact ADR headings required: {filename}"
         assert "**Status:** Accepted" in record, filename
+        required_gate_patterns = REQUIRED_ADR_GATE_PATTERNS.get(filename, ())
+        if required_gate_patterns:
+            implementation_gate = re.search(
+                r"(?ms)^## Implementation gate\n\n(.*?)(?=^## Non-goals$)",
+                record,
+            )
+            gate_body = implementation_gate.group(1) if implementation_gate else ""
+            missing_patterns = tuple(
+                pattern
+                for pattern in required_gate_patterns
+                if not re.search(
+                    pattern,
+                    gate_body,
+                    flags=re.IGNORECASE | re.DOTALL,
+                )
+            )
+            assert not missing_patterns, (
+                f"normative implementation gate markers missing in {filename}: "
+                f"{missing_patterns}"
+            )
 
     assert entry_phases == EXPECTED_ADR_ENTRY_PHASES, (
         "docs/adr/README.md must retain the exact ADR entry phase mapping"
+    )
+    expected_index_rows = tuple(
+        (filename[:7], filename, EXPECTED_ADR_ENTRY_PHASES[filename])
+        for filename in EXPECTED_ADR_FILES
+    )
+    assert index_rows == expected_index_rows, (
+        "docs/adr/README.md must retain the exact ADR index triples"
     )
 
 
@@ -253,4 +297,65 @@ def test_adr_index_requires_exact_entry_phase_mapping(tmp_path: Path) -> None:
     )
 
     with pytest.raises(AssertionError, match="exact ADR entry phase mapping"):
+        assert_adr_inventory(adr_root)
+
+
+def test_adr_index_requires_exact_visible_label(tmp_path: Path) -> None:
+    adr_root = tmp_path / "adr"
+    shutil.copytree(ROOT / "docs/adr", adr_root)
+    index_path = adr_root / "README.md"
+    index = index_path.read_text(encoding="utf-8")
+    index_path.write_text(
+        index.replace("[ADR-001](", "[ADR-999](", 1),
+        encoding="utf-8",
+    )
+
+    with pytest.raises(AssertionError, match="exact ADR index triples"):
+        assert_adr_inventory(adr_root)
+
+
+@pytest.mark.parametrize(
+    "filename",
+    (
+        "ADR-010-stripe-is-an-adapter-internal-entitlements-are-canonical.md",
+        "ADR-016-eventbridge-is-selective-sqs-is-durable.md",
+    ),
+)
+def test_normative_implementation_gate_cannot_be_removed(
+    tmp_path: Path,
+    filename: str,
+) -> None:
+    adr_root = tmp_path / "adr"
+    shutil.copytree(ROOT / "docs/adr", adr_root)
+    adr_path = adr_root / filename
+    record = adr_path.read_text(encoding="utf-8")
+    without_gate_body = re.sub(
+        r"(?ms)(^## Implementation gate\n\n).*?(?=^## Non-goals$)",
+        r"\1",
+        record,
+    )
+    assert without_gate_body != record
+    adr_path.write_text(without_gate_body, encoding="utf-8")
+
+    with pytest.raises(AssertionError, match="normative implementation gate"):
+        assert_adr_inventory(adr_root)
+
+
+def test_billing_gate_forbids_false_active_monitoring(tmp_path: Path) -> None:
+    adr_root = tmp_path / "adr"
+    shutil.copytree(ROOT / "docs/adr", adr_root)
+    adr_path = (
+        adr_root
+        / "ADR-010-stripe-is-an-adapter-internal-entitlements-are-canonical.md"
+    )
+    record = adr_path.read_text(encoding="utf-8")
+    weakened_gate = record.replace(
+        "No grace, restricted, or suspended path may report monitoring as active",
+        "A grace, restricted, or suspended path may report monitoring as active",
+        1,
+    )
+    assert weakened_gate != record
+    adr_path.write_text(weakened_gate, encoding="utf-8")
+
+    with pytest.raises(AssertionError, match="normative implementation gate"):
         assert_adr_inventory(adr_root)
