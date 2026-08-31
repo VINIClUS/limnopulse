@@ -176,6 +176,9 @@ REQUIRED_ADR_GATE_PATTERNS = {
         r"authenticated source mapping;\s+any tenant asserted in the payload, "
         r"including another tenant's ID, must be ignored or rejected and must never "
         r"override that mapping\b",
+        r"\bPhase 5 certificate rotation must verify the replacement AWS IoT identity "
+        r"can connect before disabling the old certificate;\s+a failed replacement "
+        r"must keep the old certificate enabled\b",
     ),
     "ADR-003-device-component-and-temporal-deployment.md": (
         r"\bPhase 1 must reject overlapping Deployment intervals for the same "
@@ -193,6 +196,12 @@ REQUIRED_ADR_GATE_PATTERNS = {
         r"\bPhase 6 must prove identical, reordered, and replayed health evidence "
         r"produces deterministic Device and Component health transitions, keeping "
         r"health-derived effective-capability inputs stable\b",
+    ),
+    "ADR-005-canonical-telemetry-is-metric-based.md": (
+        r"\bBefore any canonical write, Phase 2 must deterministically classify a "
+        r"schema-valid but physically implausible value against the metric/model "
+        r"plausible range as `out_of_range`, never `valid`, and persist the quality "
+        r"provenance\b",
     ),
     "ADR-006-telemetry-has-three-timestamps.md": (
         r"\bPhase 2 must detect negative or extreme clock skew and emit a quality "
@@ -244,6 +253,15 @@ REQUIRED_ADR_GATE_PATTERNS = {
         r"\bPhase 4 must prove a BRL Stripe subscription retains the USD-denominated "
         r"SMS budget and that neither entitlement evaluation nor notification "
         r"dispatch performs a synchronous FX call\b",
+        r"\bEvery Enterprise PlanVersion must explicitly set SMS provider-call count, "
+        r"budget amount, budget currency, maximum price, and overage behavior;\s+the "
+        r"contract values may vary, but no missing field may inherit an implicit or "
+        r"unlimited default\b",
+        r"\bOn an absent entitlement cache entry, Phase 4 must fetch the durable "
+        r"EntitlementSnapshot;\s+if the authoritative store is unavailable, paid SMS "
+        r"and command actions must be conservatively denied, never treated as active "
+        r"or default, so cache availability cannot change authorization, budget, or "
+        r"logical outcome\b",
     ),
     "ADR-011-limnopulse-owns-notification-semantics.md": (
         r"\bPhase 7A must restrict `asset_context` policy writes to owners and admins;\s+"
@@ -264,6 +282,14 @@ REQUIRED_ADR_GATE_PATTERNS = {
         r"acknowledgement state;\s+if a queued escalation was acknowledged before "
         r"the provider call, dispatch must deterministically perform no send and "
         r"incur no charge\b",
+        r"\bBefore queue dispatch, the same deterministic Delivery ID must create at "
+        r"most one logical Delivery even when outbox or fanout expansion retries\b",
+        r"\bAt `BeginAttempt`, Phase 7A must recheck recipient preference independently "
+        r"of destination and policy state;\s+if the channel was disabled after queueing, "
+        r"the Attempt must make no provider call and incur no charge\b",
+        r"\bThe destination snapshot selected at fanout must remain immutable after "
+        r"Delivery creation;\s+later token, phone, or provider-binding changes must not "
+        r"rewrite queued or historical Delivery evidence\b",
     ),
     "ADR-012-commands-use-a-separate-safety-plane.md": (
         r"\bPhase 8 dispatch must require idempotency validity AND a non-expired TTL "
@@ -286,6 +312,9 @@ REQUIRED_ADR_GATE_PATTERNS = {
         r"\bWhen transport succeeds but a required physical postcondition is unmet, "
         r"Phase 8 must record `physical_verification=not_confirmed`, a failed command "
         r"result, and an operational incident\b",
+        r"\bPhase 8 must append an immutable audit event for every command request, "
+        r"approval, dispatch, and result transition;\s+mutable command state must not "
+        r"substitute for any lifecycle audit event\b",
     ),
     "ADR-015-automatic-cloud-control-is-deferred.md": (
         r"\bPhase 10 automatic execution requires dry-run history accumulated over "
@@ -319,6 +348,11 @@ REQUIRED_ADR_GATE_PATTERNS = {
         r"bounded consumer retry/redrive, a consumer poison-message DLQ, and queue-age/"
         r"DLQ observability;\s+this consumer path is distinct from and cannot be "
         r"replaced by the SNS subscription delivery-failure DLQ\b",
+        r"\bPhase 7C feedback must correlate an Attempt and reservation exclusively by "
+        r"provider message ID, never by destination or phone number\b",
+        r"\bAn independent feedback-consumer kill switch must pause consumption while "
+        r"preserving queued events and evidence;\s+the SMS send-lane kill switch must "
+        r"not substitute for it\b",
     ),
     "ADR-018-eum-push-and-sms-are-provider-adapters.md": (
         r"\bOn both Android and iOS, registration must reject cross-user and "
@@ -399,6 +433,19 @@ REQUIRED_ADR_GATE_PATTERNS = {
         r"`ios` and reject provider channel names `GCM` and `APNS`;\s+adapter fixtures "
         r"must prove `android` maps to AWS `GCM` and `ios` maps to `APNS` or "
         r"`APNS_SANDBOX`\.",
+        r"\bThe Phase 7C pre-dispatch transaction must require present and fresh "
+        r"country configuration, route validation, origination reference, current "
+        r"price, and registration state;\s+any absent or stale readiness evidence must "
+        r"fail closed before the provider call\b",
+        r"\bThe provider `ProtectConfiguration` country policy itself must allow only "
+        r"BR and US and block every other country;\s+the application country allowlist "
+        r"is independent and must not substitute for this provider control\b",
+        r"\bFCM service-account JSON and APNs private-key payloads must never enter "
+        r"OpenTofu state;\s+when infrastructure provisioning cannot avoid state "
+        r"exposure, credentials must use secure post-provisioning or secret deployment\b",
+        r"\bEvery Push registration or refresh must authenticate the principal and "
+        r"verify tenant membership;\s+a missing, invalid, or mismatched principal must "
+        r"be rejected even when the token is unclaimed\b",
     ),
 }
 FORBIDDEN_ADR_GATE_PATTERNS = {
@@ -412,6 +459,10 @@ FORBIDDEN_ADR_GATE_PATTERNS = {
         r"the payload\b",
         r"\ba payload tenant from another tenant may override the authenticated "
         r"source mapping\b",
+        r"\bcertificate rotation may disable the old AWS IoT identity before "
+        r"verifying the replacement can connect\b",
+        r"\ba failed replacement AWS IoT identity may leave the old certificate "
+        r"disabled\b",
     ),
     "ADR-003-device-component-and-temporal-deployment.md": (
         r"\bPhase 1 may accept overlapping Deployment intervals for the same "
@@ -429,6 +480,12 @@ FORBIDDEN_ADR_GATE_PATTERNS = {
     "ADR-004-effective-capability-is-derived.md": (
         r"\bidentical, reordered, or replayed health evidence may produce different "
         r"Device or Component health transitions\b",
+    ),
+    "ADR-005-canonical-telemetry-is-metric-based.md": (
+        r"\ba schema-valid but implausible metric value may be classified valid "
+        r"instead of out_of_range\b",
+        r"\bplausible-range quality classification and provenance may occur after "
+        r"the canonical write\b",
     ),
     "ADR-006-telemetry-has-three-timestamps.md": (
         r"\bnegative or extreme clock skew may pass without a quality flag\b",
@@ -484,6 +541,15 @@ FORBIDDEN_ADR_GATE_PATTERNS = {
         r"acknowledgement\b",
         r"\basset_context may include sensitive telemetry, location, personal data, "
         r"or free-form operational content\b",
+        r"\bthe same delivery ID may create duplicate logical Deliveries before queue "
+        r"dispatch\b",
+        r"\bBeginAttempt may call the provider after the recipient disabled the "
+        r"channel preference while queued\b",
+        r"\bBeginAttempt may infer preferences from destination or policy state "
+        r"instead of rechecking them independently\b",
+        r"\btoken, phone, or provider-binding changes may rewrite a Delivery "
+        r"destination snapshot after fanout\b",
+        r"\ba Delivery destination snapshot may remain mutable after creation\b",
     ),
     "ADR-012-commands-use-a-separate-safety-plane.md": (
         r"\bmay proceed with invalid idempotency\b",
@@ -507,6 +573,10 @@ FORBIDDEN_ADR_GATE_PATTERNS = {
         r"\ban unmet physical postcondition may leave the command result successful\b",
         r"\ban unmet physical postcondition may omit physical_verification=not_confirmed "
         r"or the operational incident\b",
+        r"\bmutable command state may substitute for immutable command lifecycle "
+        r"audit events\b",
+        r"\bcommand request, approval, dispatch, or result may omit its immutable "
+        r"audit event\b",
     ),
     "ADR-015-automatic-cloud-control-is-deferred.md": (
         r"\bPhase 10 may approve automatic execution from a one-off policy simulation "
@@ -543,6 +613,12 @@ FORBIDDEN_ADR_GATE_PATTERNS = {
         r"observability\b",
         r"\bthe SNS subscription delivery-failure DLQ may substitute for consumer "
         r"redrive and its poison-message DLQ\b",
+        r"\bSMS feedback may correlate an Attempt by destination phone number instead "
+        r"of provider message ID\b",
+        r"\bprovider message ID need not be the exclusive SMS feedback correlation key\b",
+        r"\bthe feedback-consumer kill switch may discard queued events or evidence\b",
+        r"\bthe SMS send-lane kill switch may substitute for an independent "
+        r"feedback-consumer kill switch\b",
     ),
     "ADR-018-eum-push-and-sms-are-provider-adapters.md": (
         r"\bmay accept cross-user and cross-tenant claims\b.*\boverwrite\b",
@@ -613,6 +689,19 @@ FORBIDDEN_ADR_GATE_PATTERNS = {
         r"names\b",
         r"\bthe adapter may map canonical android to APNS instead of AWS GCM\b",
         r"\bthe adapter may map canonical ios to GCM instead of APNS or APNS_SANDBOX\b",
+        r"\bSMS pre-dispatch may proceed when country configuration, route validation, "
+        r"origination reference, current price, or registration state is absent\b",
+        r"\bSMS pre-dispatch may rely on stale country readiness evidence\b",
+        r"\bProtectConfiguration may allow countries beyond BR and US\b",
+        r"\bthe application country allowlist may substitute for a restrictive "
+        r"ProtectConfiguration policy\b",
+        r"\bFCM service-account JSON or an APNs private key may be stored in OpenTofu "
+        r"state\b",
+        r"\bOpenTofu may deploy raw Push credentials directly instead of secure "
+        r"post-provisioning or secret deployment\b",
+        r"\ban unclaimed Push token may be registered without an authenticated tenant "
+        r"member\b",
+        r"\bPush registration may accept a missing, invalid, or mismatched principal\b",
     ),
     "ADR-010-stripe-is-an-adapter-internal-entitlements-are-canonical.md": (
         r"\bStripe webhook ingress may return 2xx before durable queue acceptance\b",
@@ -623,6 +712,13 @@ FORBIDDEN_ADR_GATE_PATTERNS = {
         r"\ba BRL Stripe subscription may convert the SMS budget away from USD\b",
         r"\bentitlement evaluation or notification dispatch may perform synchronous "
         r"FX calls\b",
+        r"\ban Enterprise PlanVersion may omit SMS count, budget, currency, max price, "
+        r"or overage fields\b",
+        r"\bmissing Enterprise SMS limits may inherit implicit or unlimited defaults\b",
+        r"\ban absent entitlement cache entry may be treated as active or default "
+        r"entitlement\b",
+        r"\bwhen durable entitlement lookup is unavailable, a cache miss may allow "
+        r"paid SMS or command action instead of conservative denial\b",
     ),
 }
 
@@ -1898,6 +1994,140 @@ def test_adr_gate_rejects_round_twelve_semantic_inversion(
     ),
 )
 def test_adr_gate_rejects_round_thirteen_semantic_inversion(
+    tmp_path: Path,
+    filename: str,
+    inverted_clause: str,
+) -> None:
+    adr_root = tmp_path / "adr"
+    shutil.copytree(ROOT / "docs/adr", adr_root)
+    adr_path = adr_root / filename
+    record = adr_path.read_text(encoding="utf-8")
+    inverted_gate = record.replace(
+        "\n## Non-goals",
+        f"\n{inverted_clause}\n\n## Non-goals",
+        1,
+    )
+    assert inverted_gate != record
+    adr_path.write_text(inverted_gate, encoding="utf-8")
+
+    with pytest.raises(AssertionError, match="normative implementation gate"):
+        assert_adr_inventory(adr_root)
+
+
+@pytest.mark.parametrize(
+    ("filename", "inverted_clause"),
+    (
+        (
+            "ADR-018-eum-push-and-sms-are-provider-adapters.md",
+            "SMS pre-dispatch may proceed when country configuration, route validation, origination reference, current price, or registration state is absent.",
+        ),
+        (
+            "ADR-018-eum-push-and-sms-are-provider-adapters.md",
+            "SMS pre-dispatch may rely on stale country readiness evidence.",
+        ),
+        (
+            "ADR-018-eum-push-and-sms-are-provider-adapters.md",
+            "ProtectConfiguration may allow countries beyond BR and US.",
+        ),
+        (
+            "ADR-018-eum-push-and-sms-are-provider-adapters.md",
+            "The application country allowlist may substitute for a restrictive ProtectConfiguration policy.",
+        ),
+        (
+            "ADR-017-sns-is-provider-feedback-not-notification-service.md",
+            "SMS feedback may correlate an Attempt by destination phone number instead of provider message ID.",
+        ),
+        (
+            "ADR-017-sns-is-provider-feedback-not-notification-service.md",
+            "Provider message ID need not be the exclusive SMS feedback correlation key.",
+        ),
+        (
+            "ADR-017-sns-is-provider-feedback-not-notification-service.md",
+            "The feedback-consumer kill switch may discard queued events or evidence.",
+        ),
+        (
+            "ADR-017-sns-is-provider-feedback-not-notification-service.md",
+            "The SMS send-lane kill switch may substitute for an independent feedback-consumer kill switch.",
+        ),
+        (
+            "ADR-011-limnopulse-owns-notification-semantics.md",
+            "The same delivery ID may create duplicate logical Deliveries before queue dispatch.",
+        ),
+        (
+            "ADR-018-eum-push-and-sms-are-provider-adapters.md",
+            "FCM service-account JSON or an APNs private key may be stored in OpenTofu state.",
+        ),
+        (
+            "ADR-018-eum-push-and-sms-are-provider-adapters.md",
+            "OpenTofu may deploy raw Push credentials directly instead of secure post-provisioning or secret deployment.",
+        ),
+        (
+            "ADR-005-canonical-telemetry-is-metric-based.md",
+            "A schema-valid but implausible metric value may be classified valid instead of out_of_range.",
+        ),
+        (
+            "ADR-005-canonical-telemetry-is-metric-based.md",
+            "Plausible-range quality classification and provenance may occur after the canonical write.",
+        ),
+        (
+            "ADR-001-aws-iot-is-an-integration-adapter.md",
+            "Certificate rotation may disable the old AWS IoT identity before verifying the replacement can connect.",
+        ),
+        (
+            "ADR-001-aws-iot-is-an-integration-adapter.md",
+            "A failed replacement AWS IoT identity may leave the old certificate disabled.",
+        ),
+        (
+            "ADR-010-stripe-is-an-adapter-internal-entitlements-are-canonical.md",
+            "An Enterprise PlanVersion may omit SMS count, budget, currency, max price, or overage fields.",
+        ),
+        (
+            "ADR-010-stripe-is-an-adapter-internal-entitlements-are-canonical.md",
+            "Missing Enterprise SMS limits may inherit implicit or unlimited defaults.",
+        ),
+        (
+            "ADR-018-eum-push-and-sms-are-provider-adapters.md",
+            "An unclaimed Push token may be registered without an authenticated tenant member.",
+        ),
+        (
+            "ADR-018-eum-push-and-sms-are-provider-adapters.md",
+            "Push registration may accept a missing, invalid, or mismatched principal.",
+        ),
+        (
+            "ADR-011-limnopulse-owns-notification-semantics.md",
+            "BeginAttempt may call the provider after the recipient disabled the channel preference while queued.",
+        ),
+        (
+            "ADR-011-limnopulse-owns-notification-semantics.md",
+            "BeginAttempt may infer preferences from destination or policy state instead of rechecking them independently.",
+        ),
+        (
+            "ADR-011-limnopulse-owns-notification-semantics.md",
+            "Token, phone, or provider-binding changes may rewrite a Delivery destination snapshot after fanout.",
+        ),
+        (
+            "ADR-011-limnopulse-owns-notification-semantics.md",
+            "A Delivery destination snapshot may remain mutable after creation.",
+        ),
+        (
+            "ADR-010-stripe-is-an-adapter-internal-entitlements-are-canonical.md",
+            "An absent entitlement cache entry may be treated as active or default entitlement.",
+        ),
+        (
+            "ADR-010-stripe-is-an-adapter-internal-entitlements-are-canonical.md",
+            "When durable entitlement lookup is unavailable, a cache miss may allow paid SMS or command action instead of conservative denial.",
+        ),
+        (
+            "ADR-012-commands-use-a-separate-safety-plane.md",
+            "Mutable command state may substitute for immutable command lifecycle audit events.",
+        ),
+        (
+            "ADR-012-commands-use-a-separate-safety-plane.md",
+            "Command request, approval, dispatch, or result may omit its immutable audit event.",
+        ),
+    ),
+)
+def test_adr_gate_rejects_round_fourteen_semantic_inversion(
     tmp_path: Path,
     filename: str,
     inverted_clause: str,

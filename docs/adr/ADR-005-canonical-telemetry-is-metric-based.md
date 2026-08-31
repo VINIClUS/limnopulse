@@ -20,7 +20,7 @@ V4 §§3, 10, 24 Phase 2, and 27 define generic observations and transport-indep
 
 ## Implementation gate
 
-Phase 2 must prove unit conversion, two probes for one metric, trusted tenant mapping, v1 pivot equivalence, and bounded tag cardinality before v2 canonical writes are enabled.
+Phase 2 must prove unit conversion, two probes for one metric, trusted tenant mapping, v1 pivot equivalence, and bounded tag cardinality before v2 canonical writes are enabled. Before any canonical write, Phase 2 must deterministically classify a schema-valid but physically implausible value against the metric/model plausible range as `out_of_range`, never `valid`, and persist the quality provenance.
 
 ## Non-goals
 
