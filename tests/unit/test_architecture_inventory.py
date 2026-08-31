@@ -147,6 +147,11 @@ REQUIRED_ADR_GATE_PATTERNS = {
         r"Component while permitting adjacent half-open intervals where one ends "
         r"exactly when the next starts\b",
     ),
+    "ADR-004-effective-capability-is-derived.md": (
+        r"\bPhase 6 must prove identical, reordered, and replayed health evidence "
+        r"produces deterministic Device and Component health transitions, keeping "
+        r"health-derived effective-capability inputs stable\b",
+    ),
     "ADR-006-telemetry-has-three-timestamps.md": (
         r"\bPhase 2 must detect negative or extreme clock skew and emit a quality "
         r"flag while preserving original event-time semantics for delayed, replayed, "
@@ -162,12 +167,23 @@ REQUIRED_ADR_GATE_PATTERNS = {
         r"acceptance and must return `5xx` on transient enqueue failure so Stripe "
         r"retries;\s+signature-verified, idempotent processing must remain "
         r"asynchronous\b",
+        r"\bEntitlementSnapshot cache entries must be snapshot-versioned and "
+        r"short-lived;\s+a stale active cache entry must never override a newer "
+        r"durable restricted or suspended state\.\s+Phase 4 tests must prove "
+        r"stale-cache and mid-request suspension block both SMS spend and command "
+        r"dispatch\b",
     ),
     "ADR-011-limnopulse-owns-notification-semantics.md": (
         r"\bPhase 7A must restrict `asset_context` policy writes to owners and admins;\s+"
         r"each write must be revisioned and audited, and member or viewer updates "
         r"must be rejected\b",
         r"\bDetailed incident fetch must require fresh membership authorization\b",
+        r"\bGeneric preview must use the exact localized `pt-BR` and `en-US` "
+        r"templates\.\s+Its visible-payload allowlist must exclude tenant, site/asset, "
+        r"location, precise telemetry, personal/phone, command, actuator, credential, "
+        r"token, and other sensitive fields;\s+its data payload is limited to an "
+        r"opaque incident/notification ID, authenticated deep link, version, and "
+        r"minimal routing metadata\b",
     ),
     "ADR-012-commands-use-a-separate-safety-plane.md": (
         r"\bPhase 8 dispatch must require idempotency validity AND a non-expired TTL "
@@ -178,6 +194,11 @@ REQUIRED_ADR_GATE_PATTERNS = {
         r"entitlement, effective capability, and safety preconditions;\s+the safety "
         r"matrix must prove a permitted actor still needs every other gate and a "
         r"denied actor never dispatches even when those other gates pass\b",
+        r"\bPhase 8 must explicitly reject stopping the last running aerator while "
+        r"dissolved oxygen is low\b",
+        r"\bImmediately before dispatch, Phase 8 must recheck the current approval and "
+        r"governing policy revisions;\s+stale revisions, version conflicts, and "
+        r"approval races must fence dispatch\b",
     ),
     "ADR-015-automatic-cloud-control-is-deferred.md": (
         r"\bPhase 10 automatic execution requires dry-run history accumulated over "
@@ -209,6 +230,17 @@ REQUIRED_ADR_GATE_PATTERNS = {
         r"returned after write\b",
         r"\bAcross Push and SMS, raw token, phone number, and message body values must "
         r"be absent from queue jobs, logs, metrics, and ordinary audit records\b",
+        r"\bA provider per-address permanent Push failure must conditionally "
+        r"invalidate only the destination version observed by the Attempt;\s+a late "
+        r"failure for version N must preserve rotated version N\+1\b",
+        r"\bAn independent Push kill switch must stop Push while preserving durable "
+        r"state and leaving email, Telegram, and SMS intact\b",
+        r"\bA Push transport timeout after potential provider acceptance must become "
+        r"ambiguous or unknown and must not be automatically retried or resent\b",
+        r"\bEach SMS verification challenge must use a separate Attempt with digest, "
+        r"TTL, attempt and rate limits, its own anti-abuse controls, and a separate "
+        r"platform budget;\s+Phase 7C tests must prove it cannot share or bypass the "
+        r"critical-escalation Attempt or budget\b",
     ),
 }
 FORBIDDEN_ADR_GATE_PATTERNS = {
@@ -221,6 +253,10 @@ FORBIDDEN_ADR_GATE_PATTERNS = {
         r"Component\b",
         r"\bPhase 1 must reject adjacent half-open Deployment intervals\b",
     ),
+    "ADR-004-effective-capability-is-derived.md": (
+        r"\bidentical, reordered, or replayed health evidence may produce different "
+        r"Device or Component health transitions\b",
+    ),
     "ADR-006-telemetry-has-three-timestamps.md": (
         r"\bnegative or extreme clock skew may pass without a quality flag\b",
         r"\bdelayed, replayed, or out-of-order observations may lose their "
@@ -230,6 +266,11 @@ FORBIDDEN_ADR_GATE_PATTERNS = {
         r"\bmember or viewer may update the asset_context preview policy\b",
         r"\basset_context policy write may proceed without revision or audit\b",
         r"\bdetailed incident fetch may proceed without fresh membership authorization\b",
+        r"\bgeneric preview may use non-exact localized templates\b",
+        r"\bgeneric visible payload may include tenant, asset, location, precise "
+        r"telemetry, command, or sensitive fields\b",
+        r"\bgeneric data payload may include operational detail beyond opaque "
+        r"identifiers and minimal routing metadata\b",
     ),
     "ADR-012-commands-use-a-separate-safety-plane.md": (
         r"\bmay proceed with invalid idempotency\b",
@@ -238,6 +279,12 @@ FORBIDDEN_ADR_GATE_PATTERNS = {
         r"preconditions instead of checked at dispatch\b",
         r"\bdenied actor may dispatch when entitlement, capability, and preconditions "
         r"pass\b",
+        r"\bPhase 8 may dispatch a stop command for the last running aerator while "
+        r"dissolved oxygen is low\b",
+        r"\bdispatch may rely on queued approval and policy revisions without "
+        r"rechecking their current versions\b",
+        r"\bstale approval, version conflict, or approval race may proceed to "
+        r"dispatch\b",
     ),
     "ADR-015-automatic-cloud-control-is-deferred.md": (
         r"\bPhase 10 may approve automatic execution from a one-off policy simulation "
@@ -262,10 +309,23 @@ FORBIDDEN_ADR_GATE_PATTERNS = {
         r"\braw Push tokens may be stored unencrypted or returned after write\b",
         r"\bPush token, phone number, or message body may appear in queue jobs, logs, "
         r"metrics, or ordinary audit\b",
+        r"\blate permanent Push failure for destination version N may invalidate "
+        r"rotated version N\+1\b",
+        r"\bPush kill switch may discard durable state or disable email, Telegram, "
+        r"or SMS\b",
+        r"\bPush timeout after potential provider acceptance may be automatically "
+        r"retried or resent\b",
+        r"\bSMS verification challenge may share the critical-escalation Attempt and "
+        r"platform budget\b",
+        r"\bSMS verification may omit its digest, TTL, attempt limits, rate limits, "
+        r"or anti-abuse tests\b",
     ),
     "ADR-010-stripe-is-an-adapter-internal-entitlements-are-canonical.md": (
         r"\bStripe webhook ingress may return 2xx before durable queue acceptance\b",
         r"\btransient Stripe enqueue failure may return 2xx instead of 5xx\b",
+        r"\bstale active entitlement cache entry may override a newer durable "
+        r"restricted or suspended state\b",
+        r"\bmid-request suspension may still allow SMS spend or command dispatch\b",
     ),
 }
 
@@ -541,6 +601,7 @@ def test_adr_index_requires_exact_visible_label(tmp_path: Path) -> None:
     (
         "ADR-001-aws-iot-is-an-integration-adapter.md",
         "ADR-003-device-component-and-temporal-deployment.md",
+        "ADR-004-effective-capability-is-derived.md",
         "ADR-006-telemetry-has-three-timestamps.md",
         "ADR-010-stripe-is-an-adapter-internal-entitlements-are-canonical.md",
         "ADR-011-limnopulse-owns-notification-semantics.md",
@@ -825,6 +886,88 @@ def test_adr_gate_rejects_round_five_semantic_inversion(
     ),
 )
 def test_adr_gate_rejects_round_six_semantic_inversion(
+    tmp_path: Path,
+    filename: str,
+    inverted_clause: str,
+) -> None:
+    adr_root = tmp_path / "adr"
+    shutil.copytree(ROOT / "docs/adr", adr_root)
+    adr_path = adr_root / filename
+    record = adr_path.read_text(encoding="utf-8")
+    inverted_gate = record.replace(
+        "\n## Non-goals",
+        f"\n{inverted_clause}\n\n## Non-goals",
+        1,
+    )
+    assert inverted_gate != record
+    adr_path.write_text(inverted_gate, encoding="utf-8")
+
+    with pytest.raises(AssertionError, match="normative implementation gate"):
+        assert_adr_inventory(adr_root)
+
+
+@pytest.mark.parametrize(
+    ("filename", "inverted_clause"),
+    (
+        (
+            "ADR-012-commands-use-a-separate-safety-plane.md",
+            "Phase 8 may dispatch a stop command for the last running aerator while dissolved oxygen is low.",
+        ),
+        (
+            "ADR-012-commands-use-a-separate-safety-plane.md",
+            "Dispatch may rely on queued approval and policy revisions without rechecking their current versions.",
+        ),
+        (
+            "ADR-012-commands-use-a-separate-safety-plane.md",
+            "A stale approval, version conflict, or approval race may proceed to dispatch.",
+        ),
+        (
+            "ADR-018-eum-push-and-sms-are-provider-adapters.md",
+            "A late permanent Push failure for destination version N may invalidate rotated version N+1.",
+        ),
+        (
+            "ADR-018-eum-push-and-sms-are-provider-adapters.md",
+            "The Push kill switch may discard durable state or disable email, Telegram, or SMS.",
+        ),
+        (
+            "ADR-018-eum-push-and-sms-are-provider-adapters.md",
+            "A Push timeout after potential provider acceptance may be automatically retried or resent.",
+        ),
+        (
+            "ADR-018-eum-push-and-sms-are-provider-adapters.md",
+            "An SMS verification challenge may share the critical-escalation Attempt and platform budget.",
+        ),
+        (
+            "ADR-018-eum-push-and-sms-are-provider-adapters.md",
+            "SMS verification may omit its digest, TTL, attempt limits, rate limits, or anti-abuse tests.",
+        ),
+        (
+            "ADR-010-stripe-is-an-adapter-internal-entitlements-are-canonical.md",
+            "A stale active entitlement cache entry may override a newer durable restricted or suspended state.",
+        ),
+        (
+            "ADR-010-stripe-is-an-adapter-internal-entitlements-are-canonical.md",
+            "A mid-request suspension may still allow SMS spend or command dispatch.",
+        ),
+        (
+            "ADR-011-limnopulse-owns-notification-semantics.md",
+            "Generic preview may use non-exact localized templates.",
+        ),
+        (
+            "ADR-011-limnopulse-owns-notification-semantics.md",
+            "Generic visible payload may include tenant, asset, location, precise telemetry, command, or sensitive fields.",
+        ),
+        (
+            "ADR-011-limnopulse-owns-notification-semantics.md",
+            "Generic data payload may include operational detail beyond opaque identifiers and minimal routing metadata.",
+        ),
+        (
+            "ADR-004-effective-capability-is-derived.md",
+            "Identical, reordered, or replayed health evidence may produce different Device or Component health transitions.",
+        ),
+    ),
+)
+def test_adr_gate_rejects_round_seven_semantic_inversion(
     tmp_path: Path,
     filename: str,
     inverted_clause: str,

@@ -20,7 +20,7 @@ V4 §§9, 11, 24 Phases 1, 5, and 6, plus §27 preserve this layered capability 
 
 ## Implementation gate
 
-Phase 1 freezes declarations and provenance. Provider and health phases must prove derivation; Phase 8 treats effective capability as one input while enforcing entitlement, authorization, risk, preconditions, and physical verification separately.
+Phase 1 freezes declarations and provenance. Provider and health phases must prove derivation; Phase 8 treats effective capability as one input while enforcing entitlement, authorization, risk, preconditions, and physical verification separately. Phase 6 must prove identical, reordered, and replayed health evidence produces deterministic Device and Component health transitions, keeping health-derived effective-capability inputs stable.
 
 ## Non-goals
 
