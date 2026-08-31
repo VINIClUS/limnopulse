@@ -1,9 +1,15 @@
 # Limnopulse Architecture
 
-**Version:** 1.3
-**Updated:** 2026-08-13
+**Version:** 1.4
+**Updated:** 2026-08-25
 
 Limnopulse is the successor to the AquaFarm prototype. AquaFarm names in historical material describe the predecessor only; all active resources, topics, buckets, code, and new documentation use the Limnopulse name.
+
+## V4 architecture baseline
+
+- [Current-state inventory](current-state.md)
+- [Platform redesign technical specification V4](superpowers/specs/2026-08-16-limnopulse-platform-redesign-tech-spec-v4.md)
+- [V4 parallel execution design](superpowers/specs/2026-08-25-limnopulse-v4-parallel-execution-design.md)
 
 ## Delivery status
 
