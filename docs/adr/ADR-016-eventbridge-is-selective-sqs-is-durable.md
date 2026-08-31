@@ -20,7 +20,7 @@ V4 §§7, 17, 21, 24, 27, and the future EventBridge decision gate preserve SES 
 
 ## Implementation gate
 
-Current SES feedback remains intact. Any future bus requires multiple justified consumers, versioned schemas, PII review, transactional publication fencing, durable target queues, failure/replay tests, IAM review, cost comparison, and reversible publication.
+Current SES feedback remains intact. When EventBridge Scheduler is selected for evaluator, relay, reconciliation, or backfill work, the selected IAM role and target invocation, idempotent duplicate delivery, retry behavior, and Scheduler DLQ operation where appropriate must be proven. Any future bus requires multiple justified consumers, versioned schemas, PII review, transactional publication fencing, durable target queues, failure/replay tests, IAM review, cost comparison, and reversible publication.
 
 ## Non-goals
 
