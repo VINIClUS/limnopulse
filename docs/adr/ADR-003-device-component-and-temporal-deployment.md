@@ -20,7 +20,7 @@ V4 §§3, 9, 20, 24 Phase 1, 27, and 32 define the entity split and Component-sc
 
 ## Implementation gate
 
-Phase 1 accepts the model only when a gateway with multiple probes is representable, relocation does not rewrite history, adjacent intervals are valid, and v1 Device pond changes project compatible transitions. Phase 1 must reject overlapping Deployment intervals for the same Component while permitting adjacent half-open intervals where one ends exactly when the next starts.
+Phase 1 accepts the model only when a gateway with multiple probes is representable, relocation does not rewrite history, adjacent intervals are valid, and v1 Device pond changes project compatible transitions. Phase 1 must reject overlapping Deployment intervals for the same Component while permitting adjacent half-open intervals where one ends exactly when the next starts. Phase 1 concurrent relocation must use optimistic version checks so one racing writer receives a version conflict while non-overlap, the current Deployment pointer, and immutable ended history remain preserved.
 
 ## Non-goals
 

@@ -177,6 +177,9 @@ REQUIRED_ADR_GATE_PATTERNS = {
         r"\bPhase 1 must reject overlapping Deployment intervals for the same "
         r"Component while permitting adjacent half-open intervals where one ends "
         r"exactly when the next starts\b",
+        r"\bPhase 1 concurrent relocation must use optimistic version checks so one "
+        r"racing writer receives a version conflict while non-overlap, the current "
+        r"Deployment pointer, and immutable ended history remain preserved\b",
     ),
     "ADR-004-effective-capability-is-derived.md": (
         r"\bPhase 6 must prove identical, reordered, and replayed health evidence "
@@ -190,6 +193,10 @@ REQUIRED_ADR_GATE_PATTERNS = {
         r"\bWhen no valid Deployment covers event time, Phase 2 must preserve the "
         r"source event in bounded quarantine/DLQ metadata, mark connector health, "
         r"and must not fall back to the current Deployment or location\b",
+        r"\bCurrent-health views must use `received_at` or `ingested_at` so replaying "
+        r"an old `observed_at` cannot refresh current health or mark a device online\b",
+        r"\bEvent-time alert windows must apply a completeness delay for supported "
+        r"lateness and produce order-independent outcomes for the same observations\b",
     ),
     "ADR-007-influx-v2-dual-write-migration.md": (
         r"\bBefore dual write is enabled, Phase 2 must prove an Influx outage after "
@@ -260,6 +267,13 @@ REQUIRED_ADR_GATE_PATTERNS = {
         r"\bImmediately before dispatch, Phase 8 must recheck the current approval and "
         r"governing policy revisions;\s+stale revisions, version conflicts, and "
         r"approval races must fence dispatch\b",
+        r"\bPhase 8 must derive risk class from the command definition and current "
+        r"context:\s+R2 requires human approval, R3 is prohibited or requires a "
+        r"stricter role and site policy, and R4 is never exposed;\s+the command "
+        r"risk-class matrix must prove each outcome\b",
+        r"\bWhen transport succeeds but a required physical postcondition is unmet, "
+        r"Phase 8 must record `physical_verification=not_confirmed`, a failed command "
+        r"result, and an operational incident\b",
     ),
     "ADR-015-automatic-cloud-control-is-deferred.md": (
         r"\bPhase 10 automatic execution requires dry-run history accumulated over "
@@ -277,12 +291,18 @@ REQUIRED_ADR_GATE_PATTERNS = {
         r"at-least-once replay is safe and test DLQ redrive\b",
         r"\bPhase 3 must deny ingress credentials or mapping data when an "
         r"IntegrationAccount attempts to claim a tenant it does not own\b",
+        r"\bPhase 3 must authenticate the provider source before resolving ownership "
+        r"mapping and must reject missing, invalid, or mismatched credentials\b",
     ),
     "ADR-017-sns-is-provider-feedback-not-notification-service.md": (
         r"\bPhase 7C must also prove least-privilege AWS End User Messaging publish "
         r"permission, an SQS queue policy restricted by `aws:SourceArn` to the SNS "
         r"topic, a subscription delivery-failure DLQ where appropriate, and "
         r"fixture-tested selection of SNS envelope or raw delivery\b",
+        r"\bFor a definite no-acceptance/no-charge SMS result, feedback settlement "
+        r"must release the monetary reservation while retaining the consumed call "
+        r"count;\s+final provider cost must settle actual cost and release only proven "
+        r"excess, while missing final feedback retains the conservative reservation\b",
     ),
     "ADR-018-eum-push-and-sms-are-provider-adapters.md": (
         r"\bOn both Android and iOS, registration must reject cross-user and "
@@ -323,6 +343,20 @@ REQUIRED_ADR_GATE_PATTERNS = {
         r"\bPhase 7C BR and US tests must prove SMS origination references, pools, "
         r"and routes are environment-bound and cannot cross development, staging, "
         r"or production\b",
+        r"\bThe final pre-provider transaction must recheck active recipient "
+        r"membership and authorization;\s+a recipient revoked after queueing must not "
+        r"receive the SMS\b",
+        r"\bPhase 7C must use the exact approved critical SMS templates: `pt-BR` "
+        r"`LimnoPulse: incidente crítico\. Abra o app e confirme\.` and `en-US` "
+        r"`LimnoPulse: critical incident\. Open the app and acknowledge\.`;\s+content "
+        r"must exclude tenant, site/asset, location, precise telemetry, personal/phone, "
+        r"command, actuator, credential, token, and other sensitive fields\b",
+        r"\bA definite throttled or temporary Push per-address result, including 429 "
+        r"or 5xx, must retry with bounds rather than being dropped or retried without "
+        r"limit;\s+ambiguous and permanent outcomes retain their separate rules\b",
+        r"\bPhase 7C request fixtures must prove `SendTextMessage` uses "
+        r"`MessageType=TRANSACTIONAL`, the approved origination reference, protection "
+        r"configuration, SMS configuration set, bounded TTL, and provider `MaxPrice`",
     ),
 }
 FORBIDDEN_ADR_GATE_PATTERNS = {
@@ -337,6 +371,10 @@ FORBIDDEN_ADR_GATE_PATTERNS = {
         r"\bPhase 1 may accept overlapping Deployment intervals for the same "
         r"Component\b",
         r"\bPhase 1 must reject adjacent half-open Deployment intervals\b",
+        r"\bconcurrent relocations may both commit without an optimistic version "
+        r"conflict\b",
+        r"\ba relocation race may violate non-overlap, current pointer, or immutable "
+        r"history\b",
     ),
     "ADR-004-effective-capability-is-derived.md": (
         r"\bidentical, reordered, or replayed health evidence may produce different "
@@ -350,6 +388,12 @@ FORBIDDEN_ADR_GATE_PATTERNS = {
         r"current Deployment or location\b",
         r"\bmissing event-time Deployment may be discarded without bounded "
         r"quarantine or DLQ metadata and without a connector-health signal\b",
+        r"\breplayed old telemetry may refresh current health and mark a device online\b",
+        r"\bcurrent health may ignore receive and ingest time and use old observed_at "
+        r"as a fresh heartbeat\b",
+        r"\bevent-time alert windows may finalize without a completeness delay\b",
+        r"\bsamples within supported lateness may produce different alert outcomes by "
+        r"arrival order\b",
     ),
     "ADR-007-influx-v2-dual-write-migration.md": (
         r"\bafter durable queue acceptance, an Influx write failure may acknowledge "
@@ -399,6 +443,15 @@ FORBIDDEN_ADR_GATE_PATTERNS = {
         r"rechecking their current versions\b",
         r"\bstale approval, version conflict, or approval race may proceed to "
         r"dispatch\b",
+        r"\ban R2 command may dispatch without human approval\b",
+        r"\ban R3 command may use a lower-risk path instead of prohibition or "
+        r"stricter policy\b",
+        r"\ban R4 command may be exposed\b",
+        r"\bcommand risk class may ignore the current context and use only its "
+        r"definition\b",
+        r"\ban unmet physical postcondition may leave the command result successful\b",
+        r"\ban unmet physical postcondition may omit physical_verification=not_confirmed "
+        r"or the operational incident\b",
     ),
     "ADR-015-automatic-cloud-control-is-deferred.md": (
         r"\bPhase 10 may approve automatic execution from a one-off policy simulation "
@@ -414,12 +467,21 @@ FORBIDDEN_ADR_GATE_PATTERNS = {
         r"\bPhase 3 may allow an IntegrationAccount to claim a tenant it does not own\b",
         r"\bingress credentials or mapping data may override IntegrationAccount "
         r"tenant ownership\b",
+        r"\bPhase 3 may resolve ingress ownership before authenticating the provider "
+        r"source\b",
+        r"\bPhase 3 may accept missing, invalid, or mismatched provider credentials\b",
     ),
     "ADR-017-sns-is-provider-feedback-not-notification-service.md": (
         r"\bwithout least privilege\b",
         r"\bmay omit the aws:SourceArn restriction\b",
         r"\bmay omit (?:its|the) delivery-failure DLQ\b",
         r"\bneed not be fixture-tested\b",
+        r"\ba definite no-charge SMS result may release the consumed call count\b",
+        r"\ba definite no-charge SMS result may retain the monetary reservation\b",
+        r"\bfinal provider cost may skip actual-cost settlement or release of proven "
+        r"excess\b",
+        r"\bmissing final SMS feedback may release the conservative monetary "
+        r"reservation\b",
     ),
     "ADR-018-eum-push-and-sms-are-provider-adapters.md": (
         r"\bmay accept cross-user and cross-tenant claims\b.*\boverwrite\b",
@@ -453,6 +515,18 @@ FORBIDDEN_ADR_GATE_PATTERNS = {
         r"\bdevelopment or staging may use production SMS origination references, "
         r"pools, or routes\b",
         r"\bPhase 7C may omit BR and US SMS origination environment-isolation tests\b",
+        r"\bSMS dispatch may skip the final active membership and recipient-authorization "
+        r"recheck\b",
+        r"\ba recipient revoked after queueing may still receive the tenant SMS\b",
+        r"\bPhase 7C may use non-approved localized critical SMS templates\b",
+        r"\bcritical SMS may include tenant, asset, precise telemetry, phone, or "
+        r"command detail\b",
+        r"\ba definite throttled or temporary Push 429/5xx result may be dropped "
+        r"without retry\b",
+        r"\ba definite throttled or temporary Push result may retry without bounds\b",
+        r"\bSendTextMessage may omit transactional type, origination reference, "
+        r"protection configuration, or SMS configuration set\b",
+        r"\bSendTextMessage may omit a bounded TTL or provider MaxPrice\b",
     ),
     "ADR-010-stripe-is-an-adapter-internal-entitlements-are-canonical.md": (
         r"\bStripe webhook ingress may return 2xx before durable queue acceptance\b",
@@ -612,13 +686,16 @@ def assert_adr_inventory(adr_root: Path) -> None:
         )
         assert headings == expected_headings, f"exact ADR headings required: {filename}"
         assert "**Status:** Accepted" in record, filename
+        implementation_gate = re.search(
+            r"(?ms)^## Implementation gate\n\n(.*?)(?=^## Non-goals$)",
+            record,
+        )
+        gate_body = implementation_gate.group(1) if implementation_gate else ""
+        assert gate_body.strip(), (
+            f"normative implementation gate must be non-empty: {filename}"
+        )
         required_gate_patterns = REQUIRED_ADR_GATE_PATTERNS.get(filename, ())
         if required_gate_patterns:
-            implementation_gate = re.search(
-                r"(?ms)^## Implementation gate\n\n(.*?)(?=^## Non-goals$)",
-                record,
-            )
-            gate_body = implementation_gate.group(1) if implementation_gate else ""
             missing_patterns = tuple(
                 pattern
                 for pattern in required_gate_patterns
@@ -769,22 +846,7 @@ def test_adr_index_requires_exact_visible_label(tmp_path: Path) -> None:
 
 @pytest.mark.parametrize(
     "filename",
-    (
-        "ADR-001-aws-iot-is-an-integration-adapter.md",
-        "ADR-003-device-component-and-temporal-deployment.md",
-        "ADR-004-effective-capability-is-derived.md",
-        "ADR-006-telemetry-has-three-timestamps.md",
-        "ADR-007-influx-v2-dual-write-migration.md",
-        "ADR-008-hardware-accuracy-remains-customer-vendor-owned.md",
-        "ADR-009-edge-is-optional-and-customer-hosted.md",
-        "ADR-010-stripe-is-an-adapter-internal-entitlements-are-canonical.md",
-        "ADR-011-limnopulse-owns-notification-semantics.md",
-        "ADR-012-commands-use-a-separate-safety-plane.md",
-        "ADR-015-automatic-cloud-control-is-deferred.md",
-        "ADR-016-eventbridge-is-selective-sqs-is-durable.md",
-        "ADR-017-sns-is-provider-feedback-not-notification-service.md",
-        "ADR-018-eum-push-and-sms-are-provider-adapters.md",
-    ),
+    EXPECTED_ADR_FILES,
 )
 def test_normative_implementation_gate_cannot_be_removed(
     tmp_path: Path,
@@ -1429,6 +1491,136 @@ def test_vendor_connector_gate_rejects_round_nine_semantic_inversion(
     ),
 )
 def test_adr_gate_rejects_round_ten_semantic_inversion(
+    tmp_path: Path,
+    filename: str,
+    inverted_clause: str,
+) -> None:
+    adr_root = tmp_path / "adr"
+    shutil.copytree(ROOT / "docs/adr", adr_root)
+    adr_path = adr_root / filename
+    record = adr_path.read_text(encoding="utf-8")
+    inverted_gate = record.replace(
+        "\n## Non-goals",
+        f"\n{inverted_clause}\n\n## Non-goals",
+        1,
+    )
+    assert inverted_gate != record
+    adr_path.write_text(inverted_gate, encoding="utf-8")
+
+    with pytest.raises(AssertionError, match="normative implementation gate"):
+        assert_adr_inventory(adr_root)
+
+
+@pytest.mark.parametrize(
+    ("filename", "inverted_clause"),
+    (
+        (
+            "ADR-006-telemetry-has-three-timestamps.md",
+            "Replayed old telemetry may refresh current health and mark a device online.",
+        ),
+        (
+            "ADR-006-telemetry-has-three-timestamps.md",
+            "Current health may ignore receive and ingest time and use old observed_at as a fresh heartbeat.",
+        ),
+        (
+            "ADR-018-eum-push-and-sms-are-provider-adapters.md",
+            "SMS dispatch may skip the final active membership and recipient-authorization recheck.",
+        ),
+        (
+            "ADR-018-eum-push-and-sms-are-provider-adapters.md",
+            "A recipient revoked after queueing may still receive the tenant SMS.",
+        ),
+        (
+            "ADR-018-eum-push-and-sms-are-provider-adapters.md",
+            "Phase 7C may use non-approved localized critical SMS templates.",
+        ),
+        (
+            "ADR-018-eum-push-and-sms-are-provider-adapters.md",
+            "Critical SMS may include tenant, asset, precise telemetry, phone, or command detail.",
+        ),
+        (
+            "ADR-017-sns-is-provider-feedback-not-notification-service.md",
+            "A definite no-charge SMS result may release the consumed call count.",
+        ),
+        (
+            "ADR-017-sns-is-provider-feedback-not-notification-service.md",
+            "A definite no-charge SMS result may retain the monetary reservation.",
+        ),
+        (
+            "ADR-017-sns-is-provider-feedback-not-notification-service.md",
+            "Final provider cost may skip actual-cost settlement or release of proven excess.",
+        ),
+        (
+            "ADR-017-sns-is-provider-feedback-not-notification-service.md",
+            "Missing final SMS feedback may release the conservative monetary reservation.",
+        ),
+        (
+            "ADR-006-telemetry-has-three-timestamps.md",
+            "Event-time alert windows may finalize without a completeness delay.",
+        ),
+        (
+            "ADR-006-telemetry-has-three-timestamps.md",
+            "Samples within supported lateness may produce different alert outcomes by arrival order.",
+        ),
+        (
+            "ADR-018-eum-push-and-sms-are-provider-adapters.md",
+            "A definite throttled or temporary Push 429/5xx result may be dropped without retry.",
+        ),
+        (
+            "ADR-018-eum-push-and-sms-are-provider-adapters.md",
+            "A definite throttled or temporary Push result may retry without bounds.",
+        ),
+        (
+            "ADR-018-eum-push-and-sms-are-provider-adapters.md",
+            "SendTextMessage may omit transactional type, origination reference, protection configuration, or SMS configuration set.",
+        ),
+        (
+            "ADR-018-eum-push-and-sms-are-provider-adapters.md",
+            "SendTextMessage may omit a bounded TTL or provider MaxPrice.",
+        ),
+        (
+            "ADR-012-commands-use-a-separate-safety-plane.md",
+            "An R2 command may dispatch without human approval.",
+        ),
+        (
+            "ADR-012-commands-use-a-separate-safety-plane.md",
+            "An R3 command may use a lower-risk path instead of prohibition or stricter policy.",
+        ),
+        (
+            "ADR-012-commands-use-a-separate-safety-plane.md",
+            "An R4 command may be exposed.",
+        ),
+        (
+            "ADR-012-commands-use-a-separate-safety-plane.md",
+            "Command risk class may ignore the current context and use only its definition.",
+        ),
+        (
+            "ADR-016-eventbridge-is-selective-sqs-is-durable.md",
+            "Phase 3 may resolve ingress ownership before authenticating the provider source.",
+        ),
+        (
+            "ADR-016-eventbridge-is-selective-sqs-is-durable.md",
+            "Phase 3 may accept missing, invalid, or mismatched provider credentials.",
+        ),
+        (
+            "ADR-012-commands-use-a-separate-safety-plane.md",
+            "An unmet physical postcondition may leave the command result successful.",
+        ),
+        (
+            "ADR-012-commands-use-a-separate-safety-plane.md",
+            "An unmet physical postcondition may omit physical_verification=not_confirmed or the operational incident.",
+        ),
+        (
+            "ADR-003-device-component-and-temporal-deployment.md",
+            "Concurrent relocations may both commit without an optimistic version conflict.",
+        ),
+        (
+            "ADR-003-device-component-and-temporal-deployment.md",
+            "A relocation race may violate non-overlap, current pointer, or immutable history.",
+        ),
+    ),
+)
+def test_adr_gate_rejects_round_eleven_semantic_inversion(
     tmp_path: Path,
     filename: str,
     inverted_clause: str,

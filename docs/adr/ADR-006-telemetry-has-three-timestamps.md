@@ -20,7 +20,7 @@ V4 §§10, 24 Phase 2, and 27 retain the three-time observation model.
 
 ## Implementation gate
 
-Phase 2 must test delayed, duplicated, replayed, and out-of-order observations, resolve Deployment at event time, and prevent receive or ingest time from silently replacing event semantics. Phase 2 must detect negative or extreme clock skew and emit a quality flag while preserving original event-time semantics for delayed, replayed, and out-of-order observations. When no valid Deployment covers event time, Phase 2 must preserve the source event in bounded quarantine/DLQ metadata, mark connector health, and must not fall back to the current Deployment or location.
+Phase 2 must test delayed, duplicated, replayed, and out-of-order observations, resolve Deployment at event time, and prevent receive or ingest time from silently replacing event semantics. Phase 2 must detect negative or extreme clock skew and emit a quality flag while preserving original event-time semantics for delayed, replayed, and out-of-order observations. When no valid Deployment covers event time, Phase 2 must preserve the source event in bounded quarantine/DLQ metadata, mark connector health, and must not fall back to the current Deployment or location. Current-health views must use `received_at` or `ingested_at` so replaying an old `observed_at` cannot refresh current health or mark a device online. Event-time alert windows must apply a completeness delay for supported lateness and produce order-independent outcomes for the same observations.
 
 ## Non-goals
 
