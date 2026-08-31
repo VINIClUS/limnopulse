@@ -169,6 +169,9 @@ REQUIRED_ADR_GATE_PATTERNS = {
         r"\bBefore any queued consumer acts, it must recheck the DeviceIntegration "
         r"lifecycle state;\s+after decommission, both queued command dispatch and "
         r"queued ingest must be fenced\b",
+        r"\bDuring Phase 5 enrollment, if LimnoPulse generates an AWS IoT private "
+        r"key, it must return that key only at creation and must never persist it or "
+        r"return it later;\s+only the certificate ID or fingerprint may be stored\b",
     ),
     "ADR-003-device-component-and-temporal-deployment.md": (
         r"\bPhase 1 must reject overlapping Deployment intervals for the same "
@@ -188,11 +191,25 @@ REQUIRED_ADR_GATE_PATTERNS = {
         r"source event in bounded quarantine/DLQ metadata, mark connector health, "
         r"and must not fall back to the current Deployment or location\b",
     ),
+    "ADR-007-influx-v2-dual-write-migration.md": (
+        r"\bBefore dual write is enabled, Phase 2 must prove an Influx outage after "
+        r"durable queue acceptance leaves telemetry retryable or moves it to a "
+        r"recoverable DLQ, never acknowledges or loses it after a failed write, and "
+        r"recovers it without data loss\b",
+    ),
+    "ADR-008-hardware-accuracy-remains-customer-vendor-owned.md": (
+        r"\bFor water-condition rules, Phase 6 no-data, stale, and query-error "
+        r"outcomes must neither open nor resolve an incident;\s+an active incident "
+        r"must remain active unless the rule is explicitly a stale/offline rule\b",
+    ),
     "ADR-009-edge-is-optional-and-customer-hosted.md": (
         r"\bSeparately from edge acceptance, Phase 9 may ship the first vendor "
         r"connector only after tests prove connector upgrades preserve stable "
         r"canonical metric identity, rate-limit/retry/cursor recovery, and clearly "
         r"expose the compatibility level\b",
+        r"\bIf the selected Phase 9 vendor connector has a webhook path, it must "
+        r"verify signatures and deduplicate events so provider retries remain "
+        r"idempotent\b",
     ),
     "ADR-010-stripe-is-an-adapter-internal-entitlements-are-canonical.md": (
         r"\bgrace keeps ingestion and critical alerts enabled\b",
@@ -209,6 +226,9 @@ REQUIRED_ADR_GATE_PATTERNS = {
         r"durable restricted or suspended state\.\s+Phase 4 tests must prove "
         r"stale-cache and mid-request suspension block both SMS spend and command "
         r"dispatch\b",
+        r"\bPhase 4 must prove a BRL Stripe subscription retains the USD-denominated "
+        r"SMS budget and that neither entitlement evaluation nor notification "
+        r"dispatch performs a synchronous FX call\b",
     ),
     "ADR-011-limnopulse-owns-notification-semantics.md": (
         r"\bPhase 7A must restrict `asset_context` policy writes to owners and admins;\s+"
@@ -255,6 +275,8 @@ REQUIRED_ADR_GATE_PATTERNS = {
         r"\bPhase 3 HTTPS ingress must return accepted only after a durable SQS "
         r"write;\s+a failed write must not return accepted\.\s+Phase 3 must prove "
         r"at-least-once replay is safe and test DLQ redrive\b",
+        r"\bPhase 3 must deny ingress credentials or mapping data when an "
+        r"IntegrationAccount attempts to claim a tenant it does not own\b",
     ),
     "ADR-017-sns-is-provider-feedback-not-notification-service.md": (
         r"\bPhase 7C must also prove least-privilege AWS End User Messaging publish "
@@ -296,12 +318,20 @@ REQUIRED_ADR_GATE_PATTERNS = {
         r"and client app instance;\s+multiple devices for one user must coexist and "
         r"fan out independently, and registration or rotation of one instance must "
         r"not overwrite another\b",
+        r"\bEvery validation or other failure before `SendTextMessage` starts must "
+        r"release both the reserved count slot and the reserved USD amount\b",
+        r"\bPhase 7C BR and US tests must prove SMS origination references, pools, "
+        r"and routes are environment-bound and cannot cross development, staging, "
+        r"or production\b",
     ),
 }
 FORBIDDEN_ADR_GATE_PATTERNS = {
     "ADR-001-aws-iot-is-an-integration-adapter.md": (
         r"\bqueued consumer may act without rechecking integration lifecycle state\b",
         r"\bdecommission may leave queued commands or ingest unfenced\b",
+        r"\bLimnoPulse may persist an AWS IoT generated private key in an integration "
+        r"record\b",
+        r"\ban AWS IoT generated private key may be returned after creation\b",
     ),
     "ADR-003-device-component-and-temporal-deployment.md": (
         r"\bPhase 1 may accept overlapping Deployment intervals for the same "
@@ -321,12 +351,28 @@ FORBIDDEN_ADR_GATE_PATTERNS = {
         r"\bmissing event-time Deployment may be discarded without bounded "
         r"quarantine or DLQ metadata and without a connector-health signal\b",
     ),
+    "ADR-007-influx-v2-dual-write-migration.md": (
+        r"\bafter durable queue acceptance, an Influx write failure may acknowledge "
+        r"and lose telemetry\b",
+        r"\btelemetry from a failed Influx write may be neither retryable nor "
+        r"recoverable from DLQ\b",
+        r"\bdual write may begin before recovery from an Influx outage is proven\b",
+    ),
+    "ADR-008-hardware-accuracy-remains-customer-vendor-owned.md": (
+        r"\bno-data, stale, or query-error evaluation may open a water-condition "
+        r"incident without an explicit stale/offline rule\b",
+        r"\bno-data, stale, or query-error evaluation may resolve an active "
+        r"water-condition incident without an explicit stale/offline rule\b",
+    ),
     "ADR-009-edge-is-optional-and-customer-hosted.md": (
         r"\ba Phase 9 connector upgrade may change canonical metric identity\b",
         r"\bthe first vendor connector may ship without rate-limit, retry, or cursor "
         r"recovery tests\b",
         r"\bthe first vendor connector may hide its compatibility level\b",
         r"\bpassing edge acceptance may substitute for vendor-connector acceptance\b",
+        r"\ba selected vendor webhook path may accept events without signature "
+        r"verification\b",
+        r"\bvendor webhook retries may bypass event dedupe or idempotence\b",
     ),
     "ADR-011-limnopulse-owns-notification-semantics.md": (
         r"\bmember or viewer may update the asset_context preview policy\b",
@@ -365,6 +411,9 @@ FORBIDDEN_ADR_GATE_PATTERNS = {
         r"after the write fails\b",
         r"\bPhase 3 at-least-once replay may be unsafe and its DLQ redrive need not "
         r"be tested\b",
+        r"\bPhase 3 may allow an IntegrationAccount to claim a tenant it does not own\b",
+        r"\bingress credentials or mapping data may override IntegrationAccount "
+        r"tenant ownership\b",
     ),
     "ADR-017-sns-is-provider-feedback-not-notification-service.md": (
         r"\bwithout least privilege\b",
@@ -398,6 +447,12 @@ FORBIDDEN_ADR_GATE_PATTERNS = {
         r"existing Push destination\b",
         r"\bmultiple devices for one user may be collapsed into one Push destination "
         r"instead of independent fanout\b",
+        r"\ba validation failure before SendTextMessage may retain the reserved "
+        r"count slot\b",
+        r"\ba failure before SendTextMessage may retain the reserved USD amount\b",
+        r"\bdevelopment or staging may use production SMS origination references, "
+        r"pools, or routes\b",
+        r"\bPhase 7C may omit BR and US SMS origination environment-isolation tests\b",
     ),
     "ADR-010-stripe-is-an-adapter-internal-entitlements-are-canonical.md": (
         r"\bStripe webhook ingress may return 2xx before durable queue acceptance\b",
@@ -405,6 +460,9 @@ FORBIDDEN_ADR_GATE_PATTERNS = {
         r"\bstale active entitlement cache entry may override a newer durable "
         r"restricted or suspended state\b",
         r"\bmid-request suspension may still allow SMS spend or command dispatch\b",
+        r"\ba BRL Stripe subscription may convert the SMS budget away from USD\b",
+        r"\bentitlement evaluation or notification dispatch may perform synchronous "
+        r"FX calls\b",
     ),
 }
 
@@ -716,6 +774,8 @@ def test_adr_index_requires_exact_visible_label(tmp_path: Path) -> None:
         "ADR-003-device-component-and-temporal-deployment.md",
         "ADR-004-effective-capability-is-derived.md",
         "ADR-006-telemetry-has-three-timestamps.md",
+        "ADR-007-influx-v2-dual-write-migration.md",
+        "ADR-008-hardware-accuracy-remains-customer-vendor-owned.md",
         "ADR-009-edge-is-optional-and-customer-hosted.md",
         "ADR-010-stripe-is-an-adapter-internal-entitlements-are-canonical.md",
         "ADR-011-limnopulse-owns-notification-semantics.md",
@@ -1282,6 +1342,100 @@ def test_vendor_connector_gate_rejects_round_nine_semantic_inversion(
     adr_root = tmp_path / "adr"
     shutil.copytree(ROOT / "docs/adr", adr_root)
     adr_path = adr_root / "ADR-009-edge-is-optional-and-customer-hosted.md"
+    record = adr_path.read_text(encoding="utf-8")
+    inverted_gate = record.replace(
+        "\n## Non-goals",
+        f"\n{inverted_clause}\n\n## Non-goals",
+        1,
+    )
+    assert inverted_gate != record
+    adr_path.write_text(inverted_gate, encoding="utf-8")
+
+    with pytest.raises(AssertionError, match="normative implementation gate"):
+        assert_adr_inventory(adr_root)
+
+
+@pytest.mark.parametrize(
+    ("filename", "inverted_clause"),
+    (
+        (
+            "ADR-016-eventbridge-is-selective-sqs-is-durable.md",
+            "Phase 3 may allow an IntegrationAccount to claim a tenant it does not own.",
+        ),
+        (
+            "ADR-016-eventbridge-is-selective-sqs-is-durable.md",
+            "Ingress credentials or mapping data may override IntegrationAccount tenant ownership.",
+        ),
+        (
+            "ADR-018-eum-push-and-sms-are-provider-adapters.md",
+            "A validation failure before SendTextMessage may retain the reserved count slot.",
+        ),
+        (
+            "ADR-018-eum-push-and-sms-are-provider-adapters.md",
+            "A failure before SendTextMessage may retain the reserved USD amount.",
+        ),
+        (
+            "ADR-008-hardware-accuracy-remains-customer-vendor-owned.md",
+            "No-data, stale, or query-error evaluation may open a water-condition incident without an explicit stale/offline rule.",
+        ),
+        (
+            "ADR-008-hardware-accuracy-remains-customer-vendor-owned.md",
+            "No-data, stale, or query-error evaluation may resolve an active water-condition incident without an explicit stale/offline rule.",
+        ),
+        (
+            "ADR-018-eum-push-and-sms-are-provider-adapters.md",
+            "Development or staging may use production SMS origination references, pools, or routes.",
+        ),
+        (
+            "ADR-018-eum-push-and-sms-are-provider-adapters.md",
+            "Phase 7C may omit BR and US SMS origination environment-isolation tests.",
+        ),
+        (
+            "ADR-010-stripe-is-an-adapter-internal-entitlements-are-canonical.md",
+            "A BRL Stripe subscription may convert the SMS budget away from USD.",
+        ),
+        (
+            "ADR-010-stripe-is-an-adapter-internal-entitlements-are-canonical.md",
+            "Entitlement evaluation or notification dispatch may perform synchronous FX calls.",
+        ),
+        (
+            "ADR-007-influx-v2-dual-write-migration.md",
+            "After durable queue acceptance, an Influx write failure may acknowledge and lose telemetry.",
+        ),
+        (
+            "ADR-007-influx-v2-dual-write-migration.md",
+            "Telemetry from a failed Influx write may be neither retryable nor recoverable from DLQ.",
+        ),
+        (
+            "ADR-007-influx-v2-dual-write-migration.md",
+            "Dual write may begin before recovery from an Influx outage is proven.",
+        ),
+        (
+            "ADR-001-aws-iot-is-an-integration-adapter.md",
+            "LimnoPulse may persist an AWS IoT generated private key in an integration record.",
+        ),
+        (
+            "ADR-001-aws-iot-is-an-integration-adapter.md",
+            "An AWS IoT generated private key may be returned after creation.",
+        ),
+        (
+            "ADR-009-edge-is-optional-and-customer-hosted.md",
+            "A selected vendor webhook path may accept events without signature verification.",
+        ),
+        (
+            "ADR-009-edge-is-optional-and-customer-hosted.md",
+            "Vendor webhook retries may bypass event dedupe or idempotence.",
+        ),
+    ),
+)
+def test_adr_gate_rejects_round_ten_semantic_inversion(
+    tmp_path: Path,
+    filename: str,
+    inverted_clause: str,
+) -> None:
+    adr_root = tmp_path / "adr"
+    shutil.copytree(ROOT / "docs/adr", adr_root)
+    adr_path = adr_root / filename
     record = adr_path.read_text(encoding="utf-8")
     inverted_gate = record.replace(
         "\n## Non-goals",

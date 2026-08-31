@@ -20,7 +20,7 @@ V4 §§4, 7, 13, 15, 24 Phase 9, and 27 define the optional customer-hosted edge
 
 ## Implementation gate
 
-Phase 9 may ship an edge contract only after authentication, local buffer/replay, upgrade, and compatibility acceptance tests pass and direct integrations remain operational. Separately from edge acceptance, Phase 9 may ship the first vendor connector only after tests prove connector upgrades preserve stable canonical metric identity, rate-limit/retry/cursor recovery, and clearly expose the compatibility level.
+Phase 9 may ship an edge contract only after authentication, local buffer/replay, upgrade, and compatibility acceptance tests pass and direct integrations remain operational. Separately from edge acceptance, Phase 9 may ship the first vendor connector only after tests prove connector upgrades preserve stable canonical metric identity, rate-limit/retry/cursor recovery, and clearly expose the compatibility level. If the selected Phase 9 vendor connector has a webhook path, it must verify signatures and deduplicate events so provider retries remain idempotent.
 
 ## Non-goals
 

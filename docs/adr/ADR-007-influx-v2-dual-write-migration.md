@@ -20,7 +20,7 @@ V4 §§3, 10, 24 Phase 2, and 27 prescribe InfluxDB continuity, generic observat
 
 ## Implementation gate
 
-Phase 2 enables v2 reads only after duplicate, ordering, conversion, cardinality, evaluator parity, and byte/semantic v1 visibility tests pass. Either write path can be disabled without deleting legacy data.
+Phase 2 enables v2 reads only after duplicate, ordering, conversion, cardinality, evaluator parity, and byte/semantic v1 visibility tests pass. Before dual write is enabled, Phase 2 must prove an Influx outage after durable queue acceptance leaves telemetry retryable or moves it to a recoverable DLQ, never acknowledges or loses it after a failed write, and recovers it without data loss. Either write path can be disabled without deleting legacy data.
 
 ## Non-goals
 

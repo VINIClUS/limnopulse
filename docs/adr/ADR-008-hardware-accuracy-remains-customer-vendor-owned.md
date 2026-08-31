@@ -20,7 +20,7 @@ V4 §§4, 11, 24 Phase 6, 27, and 31 preserve this responsibility boundary and f
 
 ## Implementation gate
 
-Phase 6 must distinguish unknown from overdue calibration, expose provenance, and prevent missing data from appearing healthy. Phase 9 connector contracts must retain vendor responsibility.
+Phase 6 must distinguish unknown from overdue calibration, expose provenance, and prevent missing data from appearing healthy. For water-condition rules, Phase 6 no-data, stale, and query-error outcomes must neither open nor resolve an incident; an active incident must remain active unless the rule is explicitly a stale/offline rule. Phase 9 connector contracts must retain vendor responsibility.
 
 ## Non-goals
 
