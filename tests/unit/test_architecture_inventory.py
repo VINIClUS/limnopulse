@@ -740,27 +740,20 @@ def semantic_gate_inversions(filename: str, gate_body: str) -> tuple[str, ...]:
     def contains(sentence: str, pattern: str) -> bool:
         return re.search(pattern, sentence, flags=re.IGNORECASE) is not None
 
-    def is_permissive(sentence: str) -> bool:
-        return contains(
-            sentence,
-            r"\b(?:may|can|need not|permit(?:s|ted)?|allow(?:s|ed)?)\b",
+    def modal_permits(sentence: str, predicate: str) -> bool:
+        permission = (
+            rf"\b(?:may|can)\s+(?!not\b|never\b)(?:\w+\s+){{0,3}}{predicate}\b"
         )
-
-    def is_normative_prohibition(sentence: str) -> bool:
-        return any(
-            contains(sentence, pattern)
-            for pattern in (
-                r"\b(?:must|shall)\b[^.!?]*\b(?:not|never|reject|deny|block|"
-                r"refuse|prohibit|forbid)\b",
-                r"\bno\b[^.!?]*\bmay\b",
-                r"\b(?:prohibited|forbidden)\b",
-            )
+        scoped_no = rf"\bno\b[^;.!?]{{0,120}}{permission}"
+        explicitly_allowed = (
+            rf"{predicate}\b[^;.!?]{{0,80}}\b(?:is|are)\s+(?:allowed|permitted)\b"
         )
+        return (
+            contains(sentence, permission) and not contains(sentence, scoped_no)
+        ) or contains(sentence, explicitly_allowed)
 
     inversions: list[str] = []
     for sentence in sentences:
-        if not is_permissive(sentence) or is_normative_prohibition(sentence):
-            continue
         if filename.endswith("ADR-018-eum-push-and-sms-are-provider-adapters.md"):
             if all(
                 contains(sentence, pattern)
@@ -770,6 +763,16 @@ def semantic_gate_inversions(filename: str, gate_body: str) -> tuple[str, ...]:
                     r"\bobjective (?:expiry|expiration)\b",
                     r"\bauthoritative (?:evidence )?source\b",
                 )
+            ) and (
+                modal_permits(
+                    sentence,
+                    r"(?:be\s+subjective|use\s+subjective|accept(?:s|ed|ing)?|"
+                    r"allow(?:s|ed|ing)?|rely(?:s|ied|ing)?)",
+                )
+                or contains(
+                    sentence,
+                    r"\bneed not\b[^;.!?]{0,80}\b(?:define|require|include)\b",
+                )
             ):
                 inversions.append("permissive subjective SMS readiness")
             if all(
@@ -777,7 +780,18 @@ def semantic_gate_inversions(filename: str, gate_body: str) -> tuple[str, ...]:
                 for pattern in (
                     r"\bPush registration(?: or refresh)?\b",
                     r"\binactive tenant membership\b",
-                    r"\b(?:accept(?:s|ed)?|allow(?:s|ed)?)\b",
+                    r"\b(?:accept(?:s|ed|ing)?|allow(?:s|ed|ing)?|"
+                    r"permit(?:s|ted|ting)?)\b",
+                )
+            ) and (
+                modal_permits(
+                    sentence,
+                    r"(?:accept(?:s|ed|ing)?|allow(?:s|ed|ing)?|"
+                    r"permit(?:s|ted|ting)?)",
+                )
+                or contains(
+                    sentence,
+                    r"\bneed not\b[^;.!?]{0,80}\b(?:reject|deny|block|refuse)\b",
                 )
             ):
                 inversions.append("permissive inactive Push membership")
@@ -791,6 +805,9 @@ def semantic_gate_inversions(filename: str, gate_body: str) -> tuple[str, ...]:
                 r"notifications\.sms\.critical",
                 r"\binherit(?:s|ed)?\b",
             )
+        ) and modal_permits(
+            sentence,
+            r"(?:omit(?:s|ted|ting)?|inherit(?:s|ed|ing)?|use(?:s|d|ing)?)",
         ):
             inversions.append("permissive inherited Enterprise SMS critical flag")
     return tuple(inversions)
@@ -2309,6 +2326,85 @@ def test_adr_gate_rejects_round_fourteen_b_semantic_inversion(
     ),
 )
 def test_adr_gate_allows_round_fourteen_c_normative_prohibition(
+    tmp_path: Path,
+    filename: str,
+    safe_clause: str,
+) -> None:
+    adr_root = tmp_path / "adr"
+    shutil.copytree(ROOT / "docs/adr", adr_root)
+    adr_path = adr_root / filename
+    record = adr_path.read_text(encoding="utf-8")
+    safe_gate = record.replace(
+        "\n## Non-goals",
+        f"\n{safe_clause}\n\n## Non-goals",
+        1,
+    )
+    assert safe_gate != record
+    adr_path.write_text(safe_gate, encoding="utf-8")
+
+    assert_adr_inventory(adr_root)
+
+
+@pytest.mark.parametrize(
+    ("filename", "inverted_clause"),
+    (
+        (
+            "ADR-018-eum-push-and-sms-are-provider-adapters.md",
+            "SMS readiness may use subjective evidence without an authoritative evidence source or objective expiry; logs must not expose tokens.",
+        ),
+        (
+            "ADR-010-stripe-is-an-adapter-internal-entitlements-are-canonical.md",
+            "An Enterprise PlanVersion may omit notifications.sms.critical and inherit its default; operators must not bypass audit.",
+        ),
+        (
+            "ADR-018-eum-push-and-sms-are-provider-adapters.md",
+            "Push registration may accept inactive tenant membership; logs must not expose tokens.",
+        ),
+        (
+            "ADR-018-eum-push-and-sms-are-provider-adapters.md",
+            "Push registration may permit inactive tenant membership.",
+        ),
+    ),
+)
+def test_adr_gate_rejects_round_fourteen_e_predicate_local_permission(
+    tmp_path: Path,
+    filename: str,
+    inverted_clause: str,
+) -> None:
+    adr_root = tmp_path / "adr"
+    shutil.copytree(ROOT / "docs/adr", adr_root)
+    adr_path = adr_root / filename
+    record = adr_path.read_text(encoding="utf-8")
+    inverted_gate = record.replace(
+        "\n## Non-goals",
+        f"\n{inverted_clause}\n\n## Non-goals",
+        1,
+    )
+    assert inverted_gate != record
+    adr_path.write_text(inverted_gate, encoding="utf-8")
+
+    with pytest.raises(AssertionError, match="normative implementation gate"):
+        assert_adr_inventory(adr_root)
+
+
+@pytest.mark.parametrize(
+    ("filename", "safe_clause"),
+    (
+        (
+            "ADR-018-eum-push-and-sms-are-provider-adapters.md",
+            "SMS readiness may not accept subjective evidence without an authoritative evidence source or objective expiry.",
+        ),
+        (
+            "ADR-010-stripe-is-an-adapter-internal-entitlements-are-canonical.md",
+            "An Enterprise PlanVersion may never omit notifications.sms.critical or inherit default values.",
+        ),
+        (
+            "ADR-018-eum-push-and-sms-are-provider-adapters.md",
+            "Push registration may not accept inactive tenant membership.",
+        ),
+    ),
+)
+def test_adr_gate_allows_round_fourteen_e_predicate_local_prohibition(
     tmp_path: Path,
     filename: str,
     safe_clause: str,
