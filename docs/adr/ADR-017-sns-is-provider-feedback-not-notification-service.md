@@ -16,7 +16,7 @@ Delayed, duplicate, and out-of-order provider events can be reconciled idempoten
 
 ## V4 traceability
 
-V4 §§18–21, 24 Phase 7C, and 27 define configuration set to SNS to SQS feedback and reject SNS as notification authority.
+V4 §§17, 21, 24 Phase 7C, and 27 define configuration set to SNS to SQS feedback and reject SNS as notification authority.
 
 ## Implementation gate
 

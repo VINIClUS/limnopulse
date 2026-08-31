@@ -16,4 +16,4 @@
 | Billing/AWS IoT/Push/SMS/commands | `planned` | `docs/superpowers/specs/2026-08-16-limnopulse-platform-redesign-tech-spec-v4.md` | Add through canonical internal contracts and replaceable provider or safety adapters. | Phases 4, 5, 7B, 7C, 8 |
 | Device permanently bound to a pond | `obsolete` | `src/limnopulse_api/domain/entities.py` | Replace canonical v2 `pond_id` with temporal Deployment while projecting legacy behavior. | Phase 1 |
 
-The execution baseline is the approved V4 planning point. The task branch starts from newer `main@e95d3eee9c813e3946d43f297071a80b62dd123b`; changes between those revisions are documentation-only, so the runtime baseline remains unchanged.
+The execution baseline above is the frozen approved V4 planning point. Issue #28 originally branched from `main@e95d3eee9c813e3946d43f297071a80b62dd123b`; after Issue #27 merged, the branch was rebased onto current `main@bd6e579a20017f769c6f041bdfde35cb67b30c93`. Changes after the runtime baseline are planning or verification artifacts, so runtime behavior remains unchanged.

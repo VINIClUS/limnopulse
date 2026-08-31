@@ -16,7 +16,7 @@ Customers can use non-AWS paths without synthetic AWS resources, and provider re
 
 ## V4 traceability
 
-V4 §§3, 7, 24 Phase 5, and 27 preserve AWS IoT as an optional supported integration rather than domain identity.
+V4 §§3, 9, 13–14, 24 Phase 5, and 27 preserve AWS IoT as an optional supported integration rather than domain identity.
 
 ## Implementation gate
 

@@ -16,7 +16,7 @@ Hot paths remain available during Stripe outages and historical limits remain ex
 
 ## V4 traceability
 
-V4 §§17, 24 Phase 4, and 27 define the adapter boundary, immutable plan catalog, internal trial, quotas, and audit-only rollback.
+V4 §§18, 24 Phase 4, and 27 define the adapter boundary, immutable plan catalog, internal trial, quotas, and audit-only rollback.
 
 ## Implementation gate
 

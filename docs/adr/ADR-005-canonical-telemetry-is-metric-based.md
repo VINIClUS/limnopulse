@@ -16,7 +16,7 @@ New metrics and integrations can enter through normalization without altering th
 
 ## V4 traceability
 
-V4 §§3, 12, 13, 24 Phase 2, and 27 define generic observations and transport-independent normalization.
+V4 §§3, 10, 24 Phase 2, and 27 define generic observations and transport-independent normalization.
 
 ## Implementation gate
 

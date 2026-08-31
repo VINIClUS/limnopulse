@@ -16,7 +16,7 @@ The platform can expose uncertainty honestly and remain hardware-independent. Pr
 
 ## V4 traceability
 
-V4 §§4, 14, 24 Phase 6, 27, and 31 preserve this responsibility boundary and flag overstated confidence as a risk.
+V4 §§4, 11, 24 Phase 6, 27, and 31 preserve this responsibility boundary and flag overstated confidence as a risk.
 
 ## Implementation gate
 

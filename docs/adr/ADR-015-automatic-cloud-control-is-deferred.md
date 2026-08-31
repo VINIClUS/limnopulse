@@ -16,7 +16,7 @@ The first commercial release favors observation, incidents, recommendations, and
 
 ## V4 traceability
 
-V4 §§4, 16, 24 Phase 10, 27, and 31 explicitly defer automatic policies and retain local critical interlocks.
+V4 §§4, 12, 24 Phase 10, 27, and 31 explicitly defer automatic policies and retain local critical interlocks.
 
 ## Implementation gate
 

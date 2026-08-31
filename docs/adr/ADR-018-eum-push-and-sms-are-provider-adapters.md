@@ -16,7 +16,7 @@ One durable model supports platform rollout and provider replacement while isola
 
 ## V4 traceability
 
-V4 §§4, 18–20, 24 Phases 7B/7C, 27, and 31 require Android/FCM first, iOS/APNs second, and both before broad Brazil+United States launch. Production SMS is BR/US-only: Brazil requires shared/international-route and carrier readiness with no initial short code; the US requires registered toll-free readiness. Direct FCM/APNs adapters, Web Push, and alternative providers remain deferred.
+V4 §§4, 17, 24 Phases 7B/7C, 27, and 31 require Android/FCM first, iOS/APNs second, and both before broad Brazil+United States launch. Production SMS is BR/US-only: Brazil requires shared/international-route and carrier readiness with no initial short code; the US requires registered toll-free readiness. Direct FCM/APNs adapters, Web Push, and alternative providers remain deferred.
 
 ## Implementation gate
 

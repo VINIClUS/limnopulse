@@ -16,7 +16,7 @@ Customers choose topology and retain local infrastructure responsibility. The ed
 
 ## V4 traceability
 
-V4 §§4, 7, 15, 24 Phase 9, and 27 define the optional customer-hosted edge boundary.
+V4 §§4, 7, 13, 15, 24 Phase 9, and 27 define the optional customer-hosted edge boundary.
 
 ## Implementation gate
 

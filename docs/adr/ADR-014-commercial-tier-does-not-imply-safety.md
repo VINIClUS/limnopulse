@@ -16,7 +16,7 @@ Billing changes cannot silently authorize unsafe commands or certify hardware. P
 
 ## V4 traceability
 
-V4 §§11, 16, 17, 24 Phases 4 and 8, 27, and 31 preserve the separation between tier, compatibility, and safety.
+V4 §§9, 12, 18, 24 Phases 4 and 8, 27, and 31 preserve the separation between tier, compatibility, and safety.
 
 ## Implementation gate
 

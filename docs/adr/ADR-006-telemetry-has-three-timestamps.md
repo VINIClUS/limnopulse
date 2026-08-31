@@ -16,7 +16,7 @@ Historical deployment resolution and latency diagnosis become accurate, while re
 
 ## V4 traceability
 
-V4 §§12, 13, 24 Phase 2, and 27 retain the three-time observation model.
+V4 §§10, 24 Phase 2, and 27 retain the three-time observation model.
 
 ## Implementation gate
 

@@ -4,23 +4,23 @@
 
 ## Context
 
-Hardware family claims, integration support, per-instance configuration, runtime availability, and safety verification can disagree. A single mutable boolean would overstate what a device can currently do.
+Provider implementation, model profiles, discovered evidence, per-instance overrides, and current health can disagree. A single mutable boolean would overstate what a device can currently do.
 
 ## Decision
 
-Effective capability is derived from declared provider/model support, instance configuration, runtime evidence, entitlement, risk classification, and required verification rather than stored as one authoritative flag.
+Effective capability is derived from connector/provider implementation, model profile, discovered evidence, instance override, and current runtime health rather than stored as one authoritative flag.
 
 ## Consequences
 
-APIs can explain support versus availability and avoid stale promises. Consumers must retain provenance and evaluate all required inputs before telemetry or commands rely on a capability.
+APIs can explain support versus availability and avoid stale promises. Consumers retain provenance; entitlement, authorization, risk, operational preconditions, and physical verification remain independent execution gates.
 
 ## V4 traceability
 
-V4 §§8, 11, 16, 24 Phases 1, 5, 6, and 8, plus §27 preserve this layered capability rule.
+V4 §§9, 11, 24 Phases 1, 5, and 6, plus §27 preserve this layered capability rule.
 
 ## Implementation gate
 
-Phase 1 freezes declarations and provenance. Provider, health, and command phases must prove derivation and reject unavailable or unsafe execution even when a commercial plan permits the feature.
+Phase 1 freezes declarations and provenance. Provider and health phases must prove derivation; Phase 8 treats effective capability as one input while enforcing entitlement, authorization, risk, preconditions, and physical verification separately.
 
 ## Non-goals
 

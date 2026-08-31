@@ -16,7 +16,7 @@ New domains can model non-pond assets while current integrations continue to wor
 
 ## V4 traceability
 
-V4 §§3, 8, 24 Phase 1, 27, and 32 define Site/Asset introduction and the retained Pond compatibility boundary.
+V4 §§3, 9, 19, 24 Phase 1, 27, and 32 define Site/Asset introduction and the retained Pond compatibility boundary.
 
 ## Implementation gate
 

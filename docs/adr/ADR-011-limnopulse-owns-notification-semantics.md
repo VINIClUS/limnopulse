@@ -16,7 +16,7 @@ Email, Telegram, Push, and SMS share durable semantics while retaining isolated 
 
 ## V4 traceability
 
-V4 §§18–20, 24 Phase 7A, 27, and 31 require versioned `pt-BR`/`en-US` content; generic lock-screen previews by default; bounded, revisioned, audited owner/admin asset-context opt-in; one canonical Android/iOS destination and Delivery model; and SMS country/readiness plus immutable PlanVersion controls.
+V4 §§17, 24 Phase 7A, 27, and 31 require versioned `pt-BR`/`en-US` content; generic lock-screen previews by default; bounded, revisioned, audited owner/admin asset-context opt-in; one canonical Android/iOS destination and Delivery model; and SMS country/readiness plus immutable PlanVersion controls.
 
 ## Implementation gate
 

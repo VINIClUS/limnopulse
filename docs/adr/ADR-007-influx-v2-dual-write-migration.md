@@ -16,7 +16,7 @@ Migration is rollbackable per write and read path, but temporarily costs extra s
 
 ## V4 traceability
 
-V4 §§3, 13, 24 Phase 2, and 27 prescribe InfluxDB continuity, generic observations, dual write, and legacy pivot equivalence.
+V4 §§3, 10, 24 Phase 2, and 27 prescribe InfluxDB continuity, generic observations, dual write, and legacy pivot equivalence.
 
 ## Implementation gate
 

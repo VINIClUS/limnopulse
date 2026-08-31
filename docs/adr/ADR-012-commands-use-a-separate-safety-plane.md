@@ -16,7 +16,7 @@ Manual and assisted actions are explainable and kill-switchable, and ambiguous o
 
 ## V4 traceability
 
-V4 §§16, 24 Phase 8, 27, and 31 separate the command safety plane and identify physical verification as a highest-risk decision.
+V4 §§12, 24 Phase 8, 27, and 31 separate the command safety plane and identify physical verification as a highest-risk decision.
 
 ## Implementation gate
 

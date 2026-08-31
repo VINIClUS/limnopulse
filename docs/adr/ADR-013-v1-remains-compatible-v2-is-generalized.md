@@ -16,7 +16,7 @@ Migration can proceed additively and roll back by disabling v2 paths. The applic
 
 ## V4 traceability
 
-V4 §§3, 8, 23, 24 Phase 1, 27, and 32 make v1 compatibility the boundary for the first implementation milestone.
+V4 §§3, 9, 19, 24 Phase 1, 27, and 32 make v1 compatibility the boundary for the first implementation milestone.
 
 ## Implementation gate
 

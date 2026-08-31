@@ -16,7 +16,7 @@ Workers retain retry isolation and bounded backlog behavior. Producers need fenc
 
 ## V4 traceability
 
-V4 §§19, 21, 24, 27, and the future EventBridge decision gate preserve SES feedback and Scheduler while deferring a custom domain bus.
+V4 §§7, 17, 21, 24, 27, and the future EventBridge decision gate preserve SES feedback and Scheduler while deferring a custom domain bus.
 
 ## Implementation gate
 

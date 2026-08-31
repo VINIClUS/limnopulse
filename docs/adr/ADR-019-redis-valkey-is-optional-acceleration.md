@@ -16,7 +16,7 @@ The platform can operate correctly without a mandatory cache deployment. No-cach
 
 ## V4 traceability
 
-V4 §§3, 20, 21.1, 24 Phase 7A, 27, and 31 identify current Redis coupling and require DynamoDB/SQS plus bounded workers to preserve correctness.
+V4 §§3, 21.1, 24 Phase 7A, 27, and 31 identify current Redis coupling and require DynamoDB/SQS plus bounded workers to preserve correctness.
 
 ## Implementation gate
 

@@ -16,7 +16,7 @@ A gateway can host multiple probes, and placement at event time remains reconstr
 
 ## V4 traceability
 
-V4 §§3, 8, 10, 24 Phase 1, 27, and 32 define the entity split and Component-scoped deployment history.
+V4 §§3, 9, 20, 24 Phase 1, 27, and 32 define the entity split and Component-scoped deployment history.
 
 ## Implementation gate
 
