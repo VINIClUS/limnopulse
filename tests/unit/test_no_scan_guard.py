@@ -6,8 +6,9 @@ ROOT = Path(__file__).resolve().parents[2]
 DYNAMODB_IMPORT_PATH = "github.com/aws/aws-sdk-go-v2/service/dynamodb"
 DYNAMODB_IMPORT_MARKER = "__DYNAMODB_IMPORT__"
 GO_SCAN_METHOD_CALL = re.compile(r"\.\s*Scan\s*\(")
-GO_UNQUALIFIED_SCAN_PAGINATOR_CALL = re.compile(
-    r"(?<![.A-Za-z0-9_])NewScanPaginator\s*\("
+GO_SCAN_PAGINATOR_CALL = re.compile(r"\bNewScanPaginator\s*\(")
+GO_PAGINATOR_DECLARATION_PREFIX = re.compile(
+    r"\bfunc(?:\s*\([^)]*\))?\s*$"
 )
 GO_TOKEN = re.compile(
     r"(?P<line_comment>//[^\n]*)"
@@ -76,6 +77,17 @@ def _dynamodb_import_aliases(source: str) -> set[str]:
     return aliases
 
 
+def _has_unqualified_scan_paginator_call(code: str) -> bool:
+    for match in GO_SCAN_PAGINATOR_CALL.finditer(code):
+        prefix = code[: match.start()]
+        if re.search(r"\.\s*$", prefix):
+            continue
+        if GO_PAGINATOR_DECLARATION_PREFIX.search(prefix):
+            continue
+        return True
+    return False
+
+
 def _has_go_scan_call(source: str) -> bool:
     aliases = _dynamodb_import_aliases(_go_import_structure(source))
     code = GO_TOKEN.sub(lambda match: _blank_go_token(match.group()), source)
@@ -87,7 +99,7 @@ def _has_go_scan_call(source: str) -> bool:
         bool(GO_SCAN_METHOD_CALL.search(code))
         or (
             "." in aliases
-            and bool(GO_UNQUALIFIED_SCAN_PAGINATOR_CALL.search(code))
+            and _has_unqualified_scan_paginator_call(code)
         )
         or qualified_paginator_call
     )
@@ -182,6 +194,47 @@ def test_go_offenders_detect_scan_paginator_dot_import(tmp_path, monkeypatch) ->
     (root / "store_test.go").write_text(source, encoding="utf-8")
 
     assert go_offenders(root) == ["internal/store.go"]
+
+
+def test_go_offenders_ignore_local_paginator_method_with_dot_import(
+    tmp_path, monkeypatch
+) -> None:
+    monkeypatch.setitem(globals(), "ROOT", tmp_path)
+    root = tmp_path / "internal"
+    root.mkdir()
+    source = (
+        "package store\n"
+        'import . "github.com/aws/aws-sdk-go-v2/service/dynamodb"\n'
+        "var _ Client\n"
+        "type local struct{}\n"
+        "func (local) NewScanPaginator() {}\n"
+    )
+    (root / "allowed.go").write_text(source, encoding="utf-8")
+
+    assert go_offenders(root) == []
+
+
+def test_go_offenders_ignore_other_package_paginator_selectors_with_dot_import(
+    tmp_path, monkeypatch
+) -> None:
+    monkeypatch.setitem(globals(), "ROOT", tmp_path)
+    root = tmp_path / "internal"
+    root.mkdir()
+    source = (
+        "package store\n"
+        "import (\n"
+        '    . "github.com/aws/aws-sdk-go-v2/service/dynamodb"\n'
+        '    other "example.com/other"\n'
+        ")\n"
+        "var _ Client\n"
+        "func f() {\n"
+        "    other . NewScanPaginator(nil, nil)\n"
+        "    other./* qualifier */NewScanPaginator(nil, nil)\n"
+        "}\n"
+    )
+    (root / "allowed.go").write_text(source, encoding="utf-8")
+
+    assert go_offenders(root) == []
 
 
 def test_go_offenders_ignore_dynamodb_import_fabricated_by_raw_string(
