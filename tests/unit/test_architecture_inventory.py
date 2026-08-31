@@ -1,3 +1,4 @@
+import re
 import shutil
 from pathlib import Path
 
@@ -39,13 +40,15 @@ EXPECTED_ADR_FILES = (
 )
 
 
-def inventory_rows() -> dict[str, str]:
+def inventory_rows(path: Path = ROOT / "docs/current-state.md") -> dict[str, str]:
     rows: dict[str, str] = {}
-    text = (ROOT / "docs/current-state.md").read_text(encoding="utf-8")
+    text = path.read_text(encoding="utf-8")
     for line in text.splitlines():
         cells = [cell.strip() for cell in line.strip().split("|")]
         if len(cells) == 7 and cells[1] not in {"", "Surface", "---"}:
-            rows[cells[1]] = cells[2].strip("`")
+            surface = cells[1]
+            assert surface not in rows, f"duplicate inventory surface: {surface}"
+            rows[surface] = cells[2].strip("`")
     return rows
 
 
@@ -53,10 +56,23 @@ def test_inventory_uses_the_approved_statuses() -> None:
     assert inventory_rows() == EXPECTED
 
 
+def test_inventory_rejects_duplicate_surface(tmp_path: Path) -> None:
+    inventory_path = tmp_path / "current-state.md"
+    inventory_path.write_text(
+        (ROOT / "docs/current-state.md").read_text(encoding="utf-8")
+        + "\n| FastAPI control plane | `implemented` | `duplicate.py` | Preserve. | Phase 0 |\n",
+        encoding="utf-8",
+    )
+
+    with pytest.raises(AssertionError, match="duplicate inventory surface"):
+        inventory_rows(inventory_path)
+
+
 def assert_adr_inventory(adr_root: Path) -> None:
     index_path = adr_root / "README.md"
     assert index_path.is_file(), "missing docs/adr/README.md"
     index = index_path.read_text(encoding="utf-8")
+    link_targets = set(re.findall(r"\[[^\]]+\]\(([^)]+)\)", index))
 
     expected = set(EXPECTED_ADR_FILES)
     discovered = {path.name for path in adr_root.glob("ADR-*.md")}
@@ -68,7 +84,9 @@ def assert_adr_inventory(adr_root: Path) -> None:
     for filename in EXPECTED_ADR_FILES:
         path = adr_root / filename
         assert path.is_file(), f"missing docs/adr/{filename}"
-        assert filename in index, f"docs/adr/README.md does not link {filename}"
+        assert filename in link_targets, (
+            f"docs/adr/README.md does not link exact Markdown target {filename}"
+        )
         assert "**Status:** Accepted" in path.read_text(encoding="utf-8"), filename
 
 
@@ -85,4 +103,20 @@ def test_adr_inventory_rejects_unexpected_record(tmp_path: Path) -> None:
     )
 
     with pytest.raises(AssertionError, match="unexpected ADR files"):
+        assert_adr_inventory(adr_root)
+
+
+def test_adr_index_requires_exact_markdown_link_target(tmp_path: Path) -> None:
+    adr_root = tmp_path / "adr"
+    shutil.copytree(ROOT / "docs/adr", adr_root)
+    filename = EXPECTED_ADR_FILES[0]
+    index_path = adr_root / "README.md"
+    index = index_path.read_text(encoding="utf-8")
+    index_path.write_text(
+        index.replace(f"]({filename})", "](ADR-999-wrong-target.md)", 1)
+        + f"\nPlain-text stale filename: {filename}\n",
+        encoding="utf-8",
+    )
+
+    with pytest.raises(AssertionError, match="exact Markdown target"):
         assert_adr_inventory(adr_root)

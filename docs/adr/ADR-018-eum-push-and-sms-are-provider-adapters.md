@@ -20,7 +20,7 @@ V4 §§4, 17, 24 Phases 7B/7C, 27, and 31 require Android/FCM first, iOS/APNs se
 
 ## Implementation gate
 
-Phase 7B independently proves Android then iOS registration, rotation, invalidation, environment separation, secure previews, and dual-platform launch readiness. Phase 7C blocks every non-BR/US country, Brazil until shared-route tests pass, and the US until toll-free approval, STOP/HELP, consent, budget, encoding, and feedback gates pass.
+Phase 7B independently proves Android then iOS registration, rotation, invalidation, environment separation, secure previews, and dual-platform launch readiness. Phase 7C applies the common SMS gates to both Brazil and the United States: verified and consented destinations, critical-only acknowledgement-aware escalation, exact `PlanVersion` count and USD budget/max-price enforcement, single-part GSM-7/UCS-2 preflight with multipart rejection, durable reservation and provider-call semantics, idempotent delayed/duplicate/out-of-order delivery-receipt reconciliation, spend/price/storm controls, and an independent SMS kill switch. Country readiness remains separate: every non-BR/US country is blocked, Brazil remains blocked until shared/international-route validation and carrier tests pass, and the United States remains blocked until registered toll-free approval plus STOP/HELP and opt-in/privacy/terms controls pass.
 
 ## Non-goals
 
