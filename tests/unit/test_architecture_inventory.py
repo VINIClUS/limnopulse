@@ -1,4 +1,5 @@
 import glob
+import json
 import re
 import shutil
 from pathlib import Path
@@ -136,6 +137,33 @@ EXPECTED_ADR_SECTION_HEADINGS = (
     "## Implementation gate",
     "## Non-goals",
 )
+EXPECTED_PLAN_SMS_LIMITS = {
+    "Trial": {
+        "provider_calls": 0,
+        "budget_usd_minor": 0,
+        "max_price_usd_minor": 0,
+    },
+    "Starter": {
+        "provider_calls": 0,
+        "budget_usd_minor": 0,
+        "max_price_usd_minor": 0,
+    },
+    "Farm": {
+        "provider_calls": 10,
+        "budget_usd_minor": 50,
+        "max_price_usd_minor": 5,
+    },
+    "Pro": {
+        "provider_calls": 50,
+        "budget_usd_minor": 250,
+        "max_price_usd_minor": 5,
+    },
+    "Business": {
+        "provider_calls": 250,
+        "budget_usd_minor": 1250,
+        "max_price_usd_minor": 5,
+    },
+}
 REQUIRED_ADR_GATE_PATTERNS = {
     "ADR-001-aws-iot-is-an-integration-adapter.md": (
         r"\bBefore any queued consumer acts, it must recheck the DeviceIntegration "
@@ -159,6 +187,12 @@ REQUIRED_ADR_GATE_PATTERNS = {
         r"\bWhen no valid Deployment covers event time, Phase 2 must preserve the "
         r"source event in bounded quarantine/DLQ metadata, mark connector health, "
         r"and must not fall back to the current Deployment or location\b",
+    ),
+    "ADR-009-edge-is-optional-and-customer-hosted.md": (
+        r"\bSeparately from edge acceptance, Phase 9 may ship the first vendor "
+        r"connector only after tests prove connector upgrades preserve stable "
+        r"canonical metric identity, rate-limit/retry/cursor recovery, and clearly "
+        r"expose the compatibility level\b",
     ),
     "ADR-010-stripe-is-an-adapter-internal-entitlements-are-canonical.md": (
         r"\bgrace keeps ingestion and critical alerts enabled\b",
@@ -286,6 +320,13 @@ FORBIDDEN_ADR_GATE_PATTERNS = {
         r"current Deployment or location\b",
         r"\bmissing event-time Deployment may be discarded without bounded "
         r"quarantine or DLQ metadata and without a connector-health signal\b",
+    ),
+    "ADR-009-edge-is-optional-and-customer-hosted.md": (
+        r"\ba Phase 9 connector upgrade may change canonical metric identity\b",
+        r"\bthe first vendor connector may ship without rate-limit, retry, or cursor "
+        r"recovery tests\b",
+        r"\bthe first vendor connector may hide its compatibility level\b",
+        r"\bpassing edge acceptance may substitute for vendor-connector acceptance\b",
     ),
     "ADR-011-limnopulse-owns-notification-semantics.md": (
         r"\bmember or viewer may update the asset_context preview policy\b",
@@ -546,6 +587,25 @@ def assert_adr_inventory(adr_root: Path) -> None:
                 f"normative implementation gate inversions in {filename}: "
                 f"{forbidden_patterns}"
             )
+            if filename == (
+                "ADR-010-stripe-is-an-adapter-internal-entitlements-are-canonical.md"
+            ):
+                serialized_mapping = re.search(
+                    r"(?ms)Phase 4 must freeze and test this exact serialized launch "
+                    r"SMS mapping; USD fields use integer minor units:\n\n"
+                    r"```json\n(.*?)\n```",
+                    gate_body,
+                )
+                assert serialized_mapping, "exact launch SMS mapping is missing"
+                try:
+                    plan_sms_limits = json.loads(serialized_mapping.group(1))
+                except json.JSONDecodeError as error:
+                    raise AssertionError(
+                        "exact launch SMS mapping must be valid JSON"
+                    ) from error
+                assert plan_sms_limits == EXPECTED_PLAN_SMS_LIMITS, (
+                    "exact launch SMS mapping must retain every tier and value"
+                )
 
     assert entry_phases == EXPECTED_ADR_ENTRY_PHASES, (
         "docs/adr/README.md must retain the exact ADR entry phase mapping"
@@ -641,6 +701,7 @@ def test_adr_index_requires_exact_visible_label(tmp_path: Path) -> None:
         "ADR-003-device-component-and-temporal-deployment.md",
         "ADR-004-effective-capability-is-derived.md",
         "ADR-006-telemetry-has-three-timestamps.md",
+        "ADR-009-edge-is-optional-and-customer-hosted.md",
         "ADR-010-stripe-is-an-adapter-internal-entitlements-are-canonical.md",
         "ADR-011-limnopulse-owns-notification-semantics.md",
         "ADR-012-commands-use-a-separate-safety-plane.md",
@@ -1075,6 +1136,86 @@ def test_adr_gate_rejects_round_eight_semantic_inversion(
     adr_root = tmp_path / "adr"
     shutil.copytree(ROOT / "docs/adr", adr_root)
     adr_path = adr_root / filename
+    record = adr_path.read_text(encoding="utf-8")
+    inverted_gate = record.replace(
+        "\n## Non-goals",
+        f"\n{inverted_clause}\n\n## Non-goals",
+        1,
+    )
+    assert inverted_gate != record
+    adr_path.write_text(inverted_gate, encoding="utf-8")
+
+    with pytest.raises(AssertionError, match="normative implementation gate"):
+        assert_adr_inventory(adr_root)
+
+
+@pytest.mark.parametrize(
+    ("tier", "field", "expected_value", "wrong_value"),
+    (
+        ("Trial", "provider_calls", 0, 1),
+        ("Trial", "budget_usd_minor", 0, 1),
+        ("Trial", "max_price_usd_minor", 0, 1),
+        ("Starter", "provider_calls", 0, 1),
+        ("Starter", "budget_usd_minor", 0, 1),
+        ("Starter", "max_price_usd_minor", 0, 1),
+        ("Farm", "provider_calls", 10, 11),
+        ("Farm", "budget_usd_minor", 50, 51),
+        ("Farm", "max_price_usd_minor", 5, 6),
+        ("Pro", "provider_calls", 50, 51),
+        ("Pro", "budget_usd_minor", 250, 251),
+        ("Pro", "max_price_usd_minor", 5, 6),
+        ("Business", "provider_calls", 250, 251),
+        ("Business", "budget_usd_minor", 1250, 1251),
+        ("Business", "max_price_usd_minor", 5, 6),
+    ),
+)
+def test_planversion_gate_rejects_wrong_exact_launch_sms_value(
+    tmp_path: Path,
+    tier: str,
+    field: str,
+    expected_value: int,
+    wrong_value: int,
+) -> None:
+    adr_root = tmp_path / "adr"
+    shutil.copytree(ROOT / "docs/adr", adr_root)
+    adr_path = (
+        adr_root
+        / "ADR-010-stripe-is-an-adapter-internal-entitlements-are-canonical.md"
+    )
+    record = adr_path.read_text(encoding="utf-8")
+    lines = record.splitlines()
+    row_index = next(
+        index for index, line in enumerate(lines) if line.startswith(f'  "{tier}":')
+    )
+    expected_fragment = f'"{field}": {expected_value}'
+    assert expected_fragment in lines[row_index]
+    lines[row_index] = lines[row_index].replace(
+        expected_fragment,
+        f'"{field}": {wrong_value}',
+        1,
+    )
+    adr_path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+
+    with pytest.raises(AssertionError, match="exact launch SMS mapping"):
+        assert_adr_inventory(adr_root)
+
+
+@pytest.mark.parametrize(
+    "inverted_clause",
+    (
+        "A Phase 9 connector upgrade may change canonical metric identity.",
+        "The first vendor connector may ship without rate-limit, retry, or cursor recovery tests.",
+        "The first vendor connector may hide its compatibility level.",
+        "Passing edge acceptance may substitute for vendor-connector acceptance.",
+    ),
+)
+def test_vendor_connector_gate_rejects_round_nine_semantic_inversion(
+    tmp_path: Path,
+    inverted_clause: str,
+) -> None:
+    adr_root = tmp_path / "adr"
+    shutil.copytree(ROOT / "docs/adr", adr_root)
+    adr_path = adr_root / "ADR-009-edge-is-optional-and-customer-hosted.md"
     record = adr_path.read_text(encoding="utf-8")
     inverted_gate = record.replace(
         "\n## Non-goals",
