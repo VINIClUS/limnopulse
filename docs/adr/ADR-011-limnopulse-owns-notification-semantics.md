@@ -20,7 +20,7 @@ V4 §§17, 24 Phase 7A, 27, and 31 require versioned `pt-BR`/`en-US` content; ge
 
 ## Implementation gate
 
-Phase 7A must keep SES/Telegram suites green, fence destination and policy revisions at attempt start, require fresh authorization for detail, keep PII out of jobs, default unknown preview policy to generic, and remain correct without Redis. Phases 7B/7C consume this contract only after those gates pass.
+Phase 7A must keep SES/Telegram suites green, fence destination and policy revisions at attempt start, keep PII out of jobs, default unknown preview policy to generic, and remain correct without Redis. Phase 7A must restrict `asset_context` policy writes to owners and admins; each write must be revisioned and audited, and member or viewer updates must be rejected. Detailed incident fetch must require fresh membership authorization. Phases 7B/7C consume this contract only after those gates pass.
 
 ## Non-goals
 

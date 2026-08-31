@@ -20,7 +20,7 @@ V4 §§10, 24 Phase 2, and 27 retain the three-time observation model.
 
 ## Implementation gate
 
-Phase 2 must test delayed, duplicated, replayed, and out-of-order observations, resolve Deployment at event time, and prevent receive or ingest time from silently replacing event semantics.
+Phase 2 must test delayed, duplicated, replayed, and out-of-order observations, resolve Deployment at event time, and prevent receive or ingest time from silently replacing event semantics. Phase 2 must detect negative or extreme clock skew and emit a quality flag while preserving original event-time semantics for delayed, replayed, and out-of-order observations.
 
 ## Non-goals
 

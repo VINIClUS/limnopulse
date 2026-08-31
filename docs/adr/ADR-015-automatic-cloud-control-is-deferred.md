@@ -20,7 +20,7 @@ V4 §§4, 12, 24 Phase 10, 27, and 31 explicitly defer automatic policies and re
 
 ## Implementation gate
 
-Phase 10 cannot begin automatic execution without tenant risk acceptance, policy simulation, change management, model monitoring, kill switches, rollback, and an approved safety review.
+Phase 10 cannot begin automatic execution without tenant risk acceptance, policy simulation, change management, model monitoring, kill switches, rollback, and an approved safety review. Phase 10 automatic execution requires dry-run history accumulated over time and may not rely on a one-off policy simulation.
 
 ## Non-goals
 

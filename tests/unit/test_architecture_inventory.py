@@ -90,6 +90,21 @@ EXPECTED_ADR_SECTION_HEADINGS = (
     "## Non-goals",
 )
 REQUIRED_ADR_GATE_PATTERNS = {
+    "ADR-001-aws-iot-is-an-integration-adapter.md": (
+        r"\bBefore any queued consumer acts, it must recheck the DeviceIntegration "
+        r"lifecycle state;\s+after decommission, both queued command dispatch and "
+        r"queued ingest must be fenced\b",
+    ),
+    "ADR-003-device-component-and-temporal-deployment.md": (
+        r"\bPhase 1 must reject overlapping Deployment intervals for the same "
+        r"Component while permitting adjacent half-open intervals where one ends "
+        r"exactly when the next starts\b",
+    ),
+    "ADR-006-telemetry-has-three-timestamps.md": (
+        r"\bPhase 2 must detect negative or extreme clock skew and emit a quality "
+        r"flag while preserving original event-time semantics for delayed, replayed, "
+        r"and out-of-order observations\b",
+    ),
     "ADR-010-stripe-is-an-adapter-internal-entitlements-are-canonical.md": (
         r"\bgrace keeps ingestion and critical alerts enabled\b",
         r"\brestricted preserves critical notifications and only bounded existing ingestion\b",
@@ -97,11 +112,21 @@ REQUIRED_ADR_GATE_PATTERNS = {
         r"\bno grace, restricted, or suspended path may report monitoring as active "
         r"after ingestion or monitoring coverage has stopped\b",
     ),
+    "ADR-011-limnopulse-owns-notification-semantics.md": (
+        r"\bPhase 7A must restrict `asset_context` policy writes to owners and admins;\s+"
+        r"each write must be revisioned and audited, and member or viewer updates "
+        r"must be rejected\b",
+        r"\bDetailed incident fetch must require fresh membership authorization\b",
+    ),
     "ADR-012-commands-use-a-separate-safety-plane.md": (
         r"\bPhase 8 dispatch must require idempotency validity AND a non-expired TTL "
         r"in the same execution-gate conjunction;\s+invalid or replayed idempotency, "
         r"an expired TTL, or a command outside its time-bounded window must not "
         r"dispatch, and Phase 8 tests must verify both gates\b",
+    ),
+    "ADR-015-automatic-cloud-control-is-deferred.md": (
+        r"\bPhase 10 automatic execution requires dry-run history accumulated over "
+        r"time and may not rely on a one-off policy simulation\b",
     ),
     "ADR-016-eventbridge-is-selective-sqs-is-durable.md": (
         r"\bselected IAM role and target invocation,\s+"
@@ -124,9 +149,32 @@ REQUIRED_ADR_GATE_PATTERNS = {
     ),
 }
 FORBIDDEN_ADR_GATE_PATTERNS = {
+    "ADR-001-aws-iot-is-an-integration-adapter.md": (
+        r"\bqueued consumer may act without rechecking integration lifecycle state\b",
+        r"\bdecommission may leave queued commands or ingest unfenced\b",
+    ),
+    "ADR-003-device-component-and-temporal-deployment.md": (
+        r"\bPhase 1 may accept overlapping Deployment intervals for the same "
+        r"Component\b",
+        r"\bPhase 1 must reject adjacent half-open Deployment intervals\b",
+    ),
+    "ADR-006-telemetry-has-three-timestamps.md": (
+        r"\bnegative or extreme clock skew may pass without a quality flag\b",
+        r"\bdelayed, replayed, or out-of-order observations may lose their "
+        r"event-time semantics\b",
+    ),
+    "ADR-011-limnopulse-owns-notification-semantics.md": (
+        r"\bmember or viewer may update the asset_context preview policy\b",
+        r"\basset_context policy write may proceed without revision or audit\b",
+        r"\bdetailed incident fetch may proceed without fresh membership authorization\b",
+    ),
     "ADR-012-commands-use-a-separate-safety-plane.md": (
         r"\bmay proceed with invalid idempotency\b",
         r"\bmay proceed with an expired TTL or a time-unbounded command\b",
+    ),
+    "ADR-015-automatic-cloud-control-is-deferred.md": (
+        r"\bPhase 10 may approve automatic execution from a one-off policy simulation "
+        r"without dry-run history over time\b",
     ),
     "ADR-016-eventbridge-is-selective-sqs-is-durable.md": (
         r"\bwithout leases\b",
@@ -367,8 +415,13 @@ def test_adr_index_requires_exact_visible_label(tmp_path: Path) -> None:
 @pytest.mark.parametrize(
     "filename",
     (
+        "ADR-001-aws-iot-is-an-integration-adapter.md",
+        "ADR-003-device-component-and-temporal-deployment.md",
+        "ADR-006-telemetry-has-three-timestamps.md",
         "ADR-010-stripe-is-an-adapter-internal-entitlements-are-canonical.md",
+        "ADR-011-limnopulse-owns-notification-semantics.md",
         "ADR-012-commands-use-a-separate-safety-plane.md",
+        "ADR-015-automatic-cloud-control-is-deferred.md",
         "ADR-016-eventbridge-is-selective-sqs-is-durable.md",
         "ADR-017-sns-is-provider-feedback-not-notification-service.md",
         "ADR-018-eum-push-and-sms-are-provider-adapters.md",
@@ -524,6 +577,72 @@ def test_scheduler_gate_rejects_negative_reliability_behavior(
     ),
 )
 def test_adr_gate_rejects_round_four_semantic_inversion(
+    tmp_path: Path,
+    filename: str,
+    inverted_clause: str,
+) -> None:
+    adr_root = tmp_path / "adr"
+    shutil.copytree(ROOT / "docs/adr", adr_root)
+    adr_path = adr_root / filename
+    record = adr_path.read_text(encoding="utf-8")
+    inverted_gate = record.replace(
+        "\n## Non-goals",
+        f"\n{inverted_clause}\n\n## Non-goals",
+        1,
+    )
+    assert inverted_gate != record
+    adr_path.write_text(inverted_gate, encoding="utf-8")
+
+    with pytest.raises(AssertionError, match="normative implementation gate"):
+        assert_adr_inventory(adr_root)
+
+
+@pytest.mark.parametrize(
+    ("filename", "inverted_clause"),
+    (
+        (
+            "ADR-003-device-component-and-temporal-deployment.md",
+            "Phase 1 may accept overlapping Deployment intervals for the same Component.",
+        ),
+        (
+            "ADR-003-device-component-and-temporal-deployment.md",
+            "Phase 1 must reject adjacent half-open Deployment intervals.",
+        ),
+        (
+            "ADR-015-automatic-cloud-control-is-deferred.md",
+            "Phase 10 may approve automatic execution from a one-off policy simulation without dry-run history over time.",
+        ),
+        (
+            "ADR-001-aws-iot-is-an-integration-adapter.md",
+            "A queued consumer may act without rechecking integration lifecycle state.",
+        ),
+        (
+            "ADR-001-aws-iot-is-an-integration-adapter.md",
+            "Decommission may leave queued commands or ingest unfenced.",
+        ),
+        (
+            "ADR-011-limnopulse-owns-notification-semantics.md",
+            "A member or viewer may update the asset_context preview policy.",
+        ),
+        (
+            "ADR-011-limnopulse-owns-notification-semantics.md",
+            "An asset_context policy write may proceed without revision or audit.",
+        ),
+        (
+            "ADR-011-limnopulse-owns-notification-semantics.md",
+            "Detailed incident fetch may proceed without fresh membership authorization.",
+        ),
+        (
+            "ADR-006-telemetry-has-three-timestamps.md",
+            "Negative or extreme clock skew may pass without a quality flag.",
+        ),
+        (
+            "ADR-006-telemetry-has-three-timestamps.md",
+            "Delayed, replayed, or out-of-order observations may lose their event-time semantics.",
+        ),
+    ),
+)
+def test_adr_gate_rejects_round_five_semantic_inversion(
     tmp_path: Path,
     filename: str,
     inverted_clause: str,
