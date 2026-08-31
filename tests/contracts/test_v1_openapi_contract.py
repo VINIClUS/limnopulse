@@ -1,8 +1,13 @@
+import importlib
 import json
 from pathlib import Path
+from typing import Annotated
 
-from fastapi import FastAPI
+import fastapi.routing as fastapi_routing
+from fastapi import FastAPI, Security
+from fastapi.security import APIKeyHeader, HTTPAuthorizationCredentials, HTTPBearer
 
+from limnopulse_api.api import openapi_contract
 from limnopulse_api.api.openapi_contract import build_v1_openapi_contract
 from limnopulse_api.api.v1.schemas.common import ErrorResponse
 from limnopulse_api.core.config import Settings
@@ -80,3 +85,49 @@ def test_v1_openapi_normalizes_only_framework_default_422_description() -> None:
         "description"
     ] == "Unprocessable Content"
     assert source_schema == source_snapshot
+
+
+def test_effective_api_routes_fall_back_without_route_context_helper(
+    monkeypatch,
+) -> None:
+    app = FastAPI()
+
+    @app.get("/v1/items/{item_id}")
+    async def get_item(item_id: str) -> dict[str, str]:
+        return {"item_id": item_id}
+
+    with monkeypatch.context() as patch:
+        patch.delattr(fastapi_routing, "iter_route_contexts", raising=False)
+        compatibility_module = importlib.reload(openapi_contract)
+        routes = list(compatibility_module.iter_effective_api_routes(app))
+
+    assert [(route.path_format, route.methods) for route in routes] == [
+        ("/v1/items/{item_id}", {"GET"})
+    ]
+
+
+def test_v1_openapi_keeps_only_security_schemes_used_by_v1_operations() -> None:
+    app = FastAPI()
+    used_bearer = HTTPBearer(scheme_name="UsedBearer")
+    unused_key = APIKeyHeader(name="X-Unused-Key", scheme_name="UnusedKey")
+
+    @app.get("/v1/secure")
+    async def secure(
+        credentials: Annotated[HTTPAuthorizationCredentials, Security(used_bearer)],
+    ) -> dict[str, str]:
+        return {"scheme": credentials.scheme}
+
+    @app.get("/internal/secure")
+    async def internal_secure(
+        key: Annotated[str, Security(unused_key)],
+    ) -> dict[str, str]:
+        return {"key": key}
+
+    actual = build_v1_openapi_contract(app)
+
+    assert actual["paths"]["/v1/secure"]["get"]["security"] == [
+        {"UsedBearer": []}
+    ]
+    assert actual["components"]["securitySchemes"] == {
+        "UsedBearer": {"scheme": "bearer", "type": "http"}
+    }

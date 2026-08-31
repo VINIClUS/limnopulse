@@ -5,14 +5,29 @@ from collections.abc import Iterable
 from copy import deepcopy
 from typing import Any
 
+import fastapi.routing as fastapi_routing
 from fastapi import FastAPI
-from fastapi.routing import APIRoute, iter_route_contexts
+from fastapi.routing import APIRoute
 
 _CANONICAL_422_DESCRIPTION = "Unprocessable Entity"
 _PYTHON_422_DESCRIPTIONS = frozenset(
     {_CANONICAL_422_DESCRIPTION, "Unprocessable Content"}
 )
 _ERROR_RESPONSE_SCHEMA = {"$ref": "#/components/schemas/ErrorResponse"}
+_OPENAPI_METHODS = frozenset(
+    {"delete", "get", "head", "options", "patch", "post", "put", "trace"}
+)
+
+
+def iter_effective_api_routes(app: FastAPI) -> Iterable[Any]:
+    iter_route_contexts = getattr(fastapi_routing, "iter_route_contexts", None)
+    if iter_route_contexts is None:
+        yield from (route for route in app.routes if isinstance(route, APIRoute))
+        return
+
+    for context in iter_route_contexts(app.routes):
+        if isinstance(context.original_route, APIRoute) and context.path_format is not None:
+            yield context
 
 
 def _component_refs(value: Any) -> set[tuple[str, str]]:
@@ -34,8 +49,32 @@ def _component_refs(value: Any) -> set[tuple[str, str]]:
     return refs
 
 
+def _operation_security_refs(paths: Iterable[Any]) -> set[tuple[str, str]]:
+    refs: set[tuple[str, str]] = set()
+    for path_item in paths:
+        if not isinstance(path_item, dict):
+            continue
+        for method, operation in path_item.items():
+            if method not in _OPENAPI_METHODS or not isinstance(operation, dict):
+                continue
+            security = operation.get("security")
+            if not isinstance(security, list):
+                continue
+            for requirement in security:
+                if isinstance(requirement, dict):
+                    refs.update(
+                        ("securitySchemes", name)
+                        for name in requirement
+                        if isinstance(name, str)
+                    )
+    return refs
+
+
 def _reachable_components(components: dict[str, Any], roots: Iterable[Any]) -> dict[str, Any]:
-    pending = list(_component_refs(list(roots)))
+    root_values = list(roots)
+    pending = list(
+        _component_refs(root_values) | _operation_security_refs(root_values)
+    )
     selected: dict[str, dict[str, Any]] = {}
     while pending:
         section, name = pending.pop()
@@ -52,14 +91,12 @@ def _reachable_components(components: dict[str, Any], roots: Iterable[Any]) -> d
 
 def _implicit_422_operations(app: FastAPI) -> set[tuple[str, str]]:
     operations: set[tuple[str, str]] = set()
-    for context in iter_route_contexts(app.routes):
-        if not isinstance(context.original_route, APIRoute) or context.path_format is None:
-            continue
-        declared_response = context.responses.get(422, context.responses.get("422"))
+    for route in iter_effective_api_routes(app):
+        declared_response = route.responses.get(422, route.responses.get("422"))
         if not isinstance(declared_response, dict) or "description" in declared_response:
             continue
         operations.update(
-            (context.path_format, method.lower()) for method in context.methods or ()
+            (route.path_format, method.lower()) for method in route.methods or ()
         )
     return operations
 

@@ -3,7 +3,9 @@ import re
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[2]
-GO_SCAN_CALL = re.compile(r"\.\s*Scan\s*\(")
+GO_SCAN_CALL = re.compile(
+    r"(?:\.\s*Scan\s*\(|\bdynamodb\s*\.\s*NewScanPaginator\s*\()"
+)
 
 
 def python_offenders(root: Path) -> list[str]:
@@ -44,6 +46,22 @@ def test_go_offenders_detect_scan_calls_but_exclude_test_files(tmp_path, monkeyp
     root = tmp_path / "internal"
     root.mkdir()
     source = "package store\nfunc f(client Client) { client . Scan (nil) }\n"
+    (root / "store.go").write_text(source, encoding="utf-8")
+    (root / "store_test.go").write_text(source, encoding="utf-8")
+
+    assert go_offenders(root) == ["internal/store.go"]
+
+
+def test_go_offenders_detect_scan_paginator_but_exclude_test_files(
+    tmp_path, monkeypatch
+) -> None:
+    monkeypatch.setitem(globals(), "ROOT", tmp_path)
+    root = tmp_path / "internal"
+    root.mkdir()
+    source = (
+        "package store\n"
+        "func f(client *dynamodb.Client) { dynamodb.NewScanPaginator(client, nil) }\n"
+    )
     (root / "store.go").write_text(source, encoding="utf-8")
     (root / "store_test.go").write_text(source, encoding="utf-8")
 
