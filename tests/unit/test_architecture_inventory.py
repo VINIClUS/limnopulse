@@ -91,18 +91,16 @@ EXPECTED_ADR_SECTION_HEADINGS = (
 )
 REQUIRED_ADR_GATE_PATTERNS = {
     "ADR-010-stripe-is-an-adapter-internal-entitlements-are-canonical.md": (
-        r"\bgrace\b",
-        r"\brestricted\b",
-        r"\bsuspended\b",
-        r"\bno\s+(?:grace|restricted|suspended).*report monitoring\s+as\s+active",
-        r"ingestion.*coverage.*stopped",
+        r"\bgrace keeps ingestion and critical alerts enabled\b",
+        r"\brestricted preserves critical notifications and only bounded existing ingestion\b",
+        r"\bsuspended stops new paid processing,\s+disables commands\b",
+        r"\bno grace, restricted, or suspended path may report monitoring as active "
+        r"after ingestion or monitoring coverage has stopped\b",
     ),
     "ADR-016-eventbridge-is-selective-sqs-is-durable.md": (
-        r"\bScheduler\b",
-        r"selected.*\brole\b.*target invocation",
-        r"idempotent duplicate",
-        r"\bretry\b",
-        r"\bDLQ\b",
+        r"\bselected IAM role and target invocation,\s+"
+        r"idempotent duplicate delivery,\s+retry behavior,\s+and "
+        r"Scheduler DLQ operation where appropriate must be proven\b",
     ),
 }
 
@@ -356,6 +354,74 @@ def test_billing_gate_forbids_false_active_monitoring(tmp_path: Path) -> None:
     )
     assert weakened_gate != record
     adr_path.write_text(weakened_gate, encoding="utf-8")
+
+    with pytest.raises(AssertionError, match="normative implementation gate"):
+        assert_adr_inventory(adr_root)
+
+
+@pytest.mark.parametrize(
+    ("required_clause", "inverted_clause"),
+    (
+        (
+            "grace keeps ingestion and critical alerts enabled",
+            "grace stops ingestion and disables critical alerts",
+        ),
+        (
+            "restricted preserves critical notifications and only bounded existing ingestion",
+            "restricted disables critical notifications and permits unlimited existing ingestion",
+        ),
+        (
+            "suspended stops new paid processing, disables commands",
+            "suspended continues new paid processing, enables commands",
+        ),
+    ),
+)
+def test_billing_gate_rejects_inverted_state_behavior(
+    tmp_path: Path,
+    required_clause: str,
+    inverted_clause: str,
+) -> None:
+    adr_root = tmp_path / "adr"
+    shutil.copytree(ROOT / "docs/adr", adr_root)
+    adr_path = (
+        adr_root
+        / "ADR-010-stripe-is-an-adapter-internal-entitlements-are-canonical.md"
+    )
+    record = adr_path.read_text(encoding="utf-8")
+    inverted_gate = record.replace(required_clause, inverted_clause, 1)
+    assert inverted_gate != record
+    adr_path.write_text(inverted_gate, encoding="utf-8")
+
+    with pytest.raises(AssertionError, match="normative implementation gate"):
+        assert_adr_inventory(adr_root)
+
+
+@pytest.mark.parametrize(
+    ("required_clause", "inverted_clause"),
+    (
+        (
+            "idempotent duplicate delivery",
+            "non-idempotent duplicate delivery",
+        ),
+        ("retry behavior", "no retry behavior"),
+        (
+            "Scheduler DLQ operation",
+            "no Scheduler DLQ operation",
+        ),
+    ),
+)
+def test_scheduler_gate_rejects_negative_reliability_behavior(
+    tmp_path: Path,
+    required_clause: str,
+    inverted_clause: str,
+) -> None:
+    adr_root = tmp_path / "adr"
+    shutil.copytree(ROOT / "docs/adr", adr_root)
+    adr_path = adr_root / "ADR-016-eventbridge-is-selective-sqs-is-durable.md"
+    record = adr_path.read_text(encoding="utf-8")
+    inverted_gate = record.replace(required_clause, inverted_clause, 1)
+    assert inverted_gate != record
+    adr_path.write_text(inverted_gate, encoding="utf-8")
 
     with pytest.raises(AssertionError, match="normative implementation gate"):
         assert_adr_inventory(adr_root)
