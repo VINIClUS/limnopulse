@@ -253,8 +253,9 @@ REQUIRED_ADR_GATE_PATTERNS = {
         r"\bPhase 4 must prove a BRL Stripe subscription retains the USD-denominated "
         r"SMS budget and that neither entitlement evaluation nor notification "
         r"dispatch performs a synchronous FX call\b",
-        r"\bEvery Enterprise PlanVersion must explicitly set SMS provider-call count, "
-        r"budget amount, budget currency, maximum price, and overage behavior;\s+the "
+        r"\bEvery Enterprise PlanVersion must explicitly set the "
+        r"`notifications\.sms\.critical` boolean, SMS provider-call count, budget "
+        r"amount, budget currency, maximum price, and overage behavior;\s+the "
         r"contract values may vary, but no missing field may inherit an implicit or "
         r"unlimited default\b",
         r"\bOn an absent entitlement cache entry, Phase 4 must fetch the durable "
@@ -437,15 +438,20 @@ REQUIRED_ADR_GATE_PATTERNS = {
         r"country configuration, route validation, origination reference, current "
         r"price, and registration state;\s+any absent or stale readiness evidence must "
         r"fail closed before the provider call\b",
+        r"\bBefore production, every readiness evidence category must define its "
+        r"authoritative source and an objective expiration rule using `expires_at` or "
+        r"maximum age;\s+subjective freshness or evidence with no expiry must fail "
+        r"closed\b",
         r"\bThe provider `ProtectConfiguration` country policy itself must allow only "
         r"BR and US and block every other country;\s+the application country allowlist "
         r"is independent and must not substitute for this provider control\b",
         r"\bFCM service-account JSON and APNs private-key payloads must never enter "
         r"OpenTofu state;\s+when infrastructure provisioning cannot avoid state "
         r"exposure, credentials must use secure post-provisioning or secret deployment\b",
-        r"\bEvery Push registration or refresh must authenticate the principal and "
-        r"verify tenant membership;\s+a missing, invalid, or mismatched principal must "
-        r"be rejected even when the token is unclaimed\b",
+        r"\bEvery Push registration or refresh must authenticate the current principal "
+        r"and verify current ACTIVE tenant membership;\s+a missing, invalid, or "
+        r"mismatched principal must be rejected even when the token is unclaimed, and "
+        r"inactive membership must be rejected independently\b",
     ),
 }
 FORBIDDEN_ADR_GATE_PATTERNS = {
@@ -702,6 +708,10 @@ FORBIDDEN_ADR_GATE_PATTERNS = {
         r"\ban unclaimed Push token may be registered without an authenticated tenant "
         r"member\b",
         r"\bPush registration may accept a missing, invalid, or mismatched principal\b",
+        r"\bproduction readiness may use subjective freshness without an authoritative "
+        r"evidence source or objective expiry rule\b",
+        r"\bPush registration or refresh may accept an authenticated principal with "
+        r"inactive tenant membership\b",
     ),
     "ADR-010-stripe-is-an-adapter-internal-entitlements-are-canonical.md": (
         r"\bStripe webhook ingress may return 2xx before durable queue acceptance\b",
@@ -715,6 +725,8 @@ FORBIDDEN_ADR_GATE_PATTERNS = {
         r"\ban Enterprise PlanVersion may omit SMS count, budget, currency, max price, "
         r"or overage fields\b",
         r"\bmissing Enterprise SMS limits may inherit implicit or unlimited defaults\b",
+        r"\ban Enterprise PlanVersion may omit notifications\.sms\.critical and "
+        r"inherit its value\b",
         r"\ban absent entitlement cache entry may be treated as active or default "
         r"entitlement\b",
         r"\bwhen durable entitlement lookup is unavailable, a cache miss may allow "
@@ -2128,6 +2140,44 @@ def test_adr_gate_rejects_round_thirteen_semantic_inversion(
     ),
 )
 def test_adr_gate_rejects_round_fourteen_semantic_inversion(
+    tmp_path: Path,
+    filename: str,
+    inverted_clause: str,
+) -> None:
+    adr_root = tmp_path / "adr"
+    shutil.copytree(ROOT / "docs/adr", adr_root)
+    adr_path = adr_root / filename
+    record = adr_path.read_text(encoding="utf-8")
+    inverted_gate = record.replace(
+        "\n## Non-goals",
+        f"\n{inverted_clause}\n\n## Non-goals",
+        1,
+    )
+    assert inverted_gate != record
+    adr_path.write_text(inverted_gate, encoding="utf-8")
+
+    with pytest.raises(AssertionError, match="normative implementation gate"):
+        assert_adr_inventory(adr_root)
+
+
+@pytest.mark.parametrize(
+    ("filename", "inverted_clause"),
+    (
+        (
+            "ADR-018-eum-push-and-sms-are-provider-adapters.md",
+            "Production readiness may use subjective freshness without an authoritative evidence source or objective expiry rule.",
+        ),
+        (
+            "ADR-010-stripe-is-an-adapter-internal-entitlements-are-canonical.md",
+            "An Enterprise PlanVersion may omit notifications.sms.critical and inherit its value.",
+        ),
+        (
+            "ADR-018-eum-push-and-sms-are-provider-adapters.md",
+            "Push registration or refresh may accept an authenticated principal with inactive tenant membership.",
+        ),
+    ),
+)
+def test_adr_gate_rejects_round_fourteen_b_semantic_inversion(
     tmp_path: Path,
     filename: str,
     inverted_clause: str,
