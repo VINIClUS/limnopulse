@@ -1,0 +1,3 @@
+# CVE/misconfig exceptions for Trivy gates in .github/workflows/trivy.yml.
+# Format: <CVE-ID or AVD-ID>  # reason + review date (YYYY-MM-DD)
+# Do not silence findings without a documented reason — this file is reviewed in PRs.
