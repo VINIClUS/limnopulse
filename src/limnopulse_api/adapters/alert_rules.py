@@ -373,7 +373,8 @@ class DynamoAlertRuleRepository:
                     "UpdateExpression": (
                         "SET #status = :resolved, #resolved_at = :resolved_at, "
                         "#resolved_by = :resolved_by, #resolution_reason = :reason, "
-                        "#updated_at = :resolved_at, #version = #version + :one"
+                        "#updated_at = :resolved_at, #version = #version + :one "
+                        "REMOVE #gsi3pk, #gsi3sk"
                     ),
                     "ConditionExpression": (
                         "#status IN (:open, :acknowledged, :suppressed) "
@@ -387,6 +388,8 @@ class DynamoAlertRuleRepository:
                         "#updated_at": "updated_at",
                         "#version": "version",
                         "#evaluation_revision": "evaluation_revision",
+                        "#gsi3pk": "GSI3PK",
+                        "#gsi3sk": "GSI3SK",
                     },
                     "ExpressionAttributeValues": event_values,
                 }
