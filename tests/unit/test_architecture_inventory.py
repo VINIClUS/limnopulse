@@ -1376,6 +1376,97 @@ CODEX_REVIEW_GATE_CASES = (
             r"signature verification\b"
         ),
     },
+    {
+        "name": "Stripe secret state exclusion and rollback",
+        "filename": "ADR-010-stripe-is-an-adapter-internal-entitlements-are-canonical.md",
+        "required_pattern": (
+            r"\bPhase 4 must ensure OpenTofu never writes Stripe secret or webhook secret "
+            r"values/versions into state; configure them only through secure post-"
+            r"provisioning or environment secret deployment, and prove independent Stripe "
+            r"credential rotation and rollback\b"
+        ),
+        "required_clause": (
+            "Phase 4 must ensure OpenTofu never writes Stripe secret or webhook secret "
+            "values/versions into state; configure them only through secure post-"
+            "provisioning or environment secret deployment, and prove independent Stripe "
+            "credential rotation and rollback."
+        ),
+        "inverted_clause": (
+            "Phase 4 may write Stripe secret or webhook secret values into OpenTofu state."
+        ),
+        "forbidden_pattern": (
+            r"\bPhase 4 may write Stripe secret or webhook secret values into OpenTofu "
+            r"state\b"
+        ),
+    },
+    {
+        "name": "Checkout request idempotency",
+        "filename": "ADR-010-stripe-is-an-adapter-internal-entitlements-are-canonical.md",
+        "required_pattern": (
+            r"\bPhase 4 Checkout must derive a request idempotency key from tenant and "
+            r"request identity and prove lost-response retries resolve to one Checkout "
+            r"Session/operation rather than creating a duplicate\b"
+        ),
+        "required_clause": (
+            "Phase 4 Checkout must derive a request idempotency key from tenant and "
+            "request identity and prove lost-response retries resolve to one Checkout "
+            "Session/operation rather than creating a duplicate."
+        ),
+        "inverted_clause": (
+            "Phase 4 Checkout may create duplicate sessions when a response is lost and "
+            "the owner retries the request."
+        ),
+        "forbidden_pattern": (
+            r"\bPhase 4 Checkout may create duplicate sessions when a response is lost "
+            r"and the owner retries the request\b"
+        ),
+    },
+    {
+        "name": "destination lifecycle audit trail",
+        "filename": "ADR-018-eum-push-and-sms-are-provider-adapters.md",
+        "required_pattern": (
+            r"\bEvery Push and SMS destination lifecycle mutation—create, verify, rotate, "
+            r"invalidate, revoke, delete, and opt-out—and every cross-user token-claim "
+            r"rejection must emit an immutable audit event\b"
+        ),
+        "required_clause": (
+            "Every Push and SMS destination lifecycle mutation—create, verify, rotate, "
+            "invalidate, revoke, delete, and opt-out—and every cross-user token-claim "
+            "rejection must emit an immutable audit event."
+        ),
+        "inverted_clause": (
+            "Destination lifecycle mutations may omit immutable audit events and cross-user "
+            "token-claim rejection audit records."
+        ),
+        "forbidden_pattern": (
+            r"\bDestination lifecycle mutations may omit immutable audit events and "
+            r"cross-user token-claim rejection audit records\b"
+        ),
+    },
+    {
+        "name": "destination PII erasure",
+        "filename": "ADR-018-eum-push-and-sms-are-provider-adapters.md",
+        "required_pattern": (
+            r"\bAfter account lifecycle deletion, raw Push tokens and phone numbers must "
+            r"be erased; only non-reversible hashes and delivery evidence may remain when "
+            r"policy/legal retention permits, and erasure tests must prove tombstoned "
+            r"destinations retain no decryptable PII\b"
+        ),
+        "required_clause": (
+            "After account lifecycle deletion, raw Push tokens and phone numbers must be "
+            "erased; only non-reversible hashes and delivery evidence may remain when "
+            "policy/legal retention permits, and erasure tests must prove tombstoned "
+            "destinations retain no decryptable PII."
+        ),
+        "inverted_clause": (
+            "Account deletion may retain decryptable raw Push tokens or phone numbers "
+            "indefinitely."
+        ),
+        "forbidden_pattern": (
+            r"\bAccount deletion may retain decryptable raw Push tokens or phone numbers "
+            r"indefinitely\b"
+        ),
+    },
 )
 for _case in CODEX_REVIEW_GATE_CASES:
     _filename = _case["filename"]

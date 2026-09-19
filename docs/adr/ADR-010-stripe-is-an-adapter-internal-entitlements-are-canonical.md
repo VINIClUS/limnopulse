@@ -45,6 +45,8 @@ The contract values may vary, but no missing field may inherit an implicit or un
 
 Phase 4 Checkout must accept plan, interval, and currency plus allowlisted success_path and cancel_path; the server must resolve an environment-specific Stripe Price ID from the approved immutable PlanVersion catalog and reject client-supplied Price IDs. Phase 4 must periodically reconcile current Stripe subscription state against internal BillingAccount and EntitlementSnapshot; permanently missed webhook/retry/DLQ events must be detected and stale entitlements corrected. Phase 4 Stripe webhook ingress must enforce a strict raw-body size bound before signature verification and enqueue; oversized bodies must be rejected without unbounded buffering.
 
+Phase 4 must ensure OpenTofu never writes Stripe secret or webhook secret values/versions into state; configure them only through secure post-provisioning or environment secret deployment, and prove independent Stripe credential rotation and rollback. Phase 4 Checkout must derive a request idempotency key from tenant and request identity and prove lost-response retries resolve to one Checkout Session/operation rather than creating a duplicate.
+
 Phase 4 must require a tenant owner/admin role for Checkout, Customer Portal, plan-change, and every billing mutation or session endpoint; ordinary members must be rejected and each decision audited.
 
 ## Non-goals
