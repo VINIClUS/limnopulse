@@ -23,3 +23,9 @@ ses_eventbridge_rule_name     = "limnopulse-ses-events"
 
 redis_url    = ""
 influxdb_url = ""
+
+# Feature boundaries (see variables.tf and design spec §16). Leave both
+# false for the initial VPS-only apply; flip telegram_delivery to true
+# once the Fase 2 Proxmox worker is being provisioned.
+email_delivery    = false
+telegram_delivery = false

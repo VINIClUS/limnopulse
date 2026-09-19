@@ -118,6 +118,31 @@ variable "influxdb_url" {
   default     = ""
 }
 
+# Feature boundaries from docs/superpowers/specs/2026-08-29-limnopulse-production-deployment-design.md
+# §16: "The current unconditional SES, EventBridge and Telegram resources
+# must be made conditional before a real production plan." DynamoDB, Cognito
+# and the core notification-jobs queue are load-bearing for every profile and
+# stay unconditional; only the two delivery channels below are gated.
+variable "email_delivery" {
+  description = "Provision SES, its EventBridge feedback routing, and the ses_events SQS queues. False until the email channel is actually wired up (ops/vps and Fase 2 do not use it yet)."
+  type        = bool
+  default     = false
+}
+
+variable "telegram_delivery" {
+  description = <<-EOT
+    Provision the Telegram bot token secret, the outbound telegram-jobs SQS
+    queue, and the Telegram worker's IAM policy — the Fase 2 async delivery
+    path. Does NOT gate the webhook secret or its reader policy (see
+    telegram.tf): those are required unconditionally because the API's
+    inbound POST /webhooks/telegram route exists regardless of this flag,
+    and src/limnopulse_api/core/config.py refuses to boot with
+    APP_ENV=prod unless TELEGRAM_WEBHOOK_SECRET_ARN is set.
+  EOT
+  type        = bool
+  default     = false
+}
+
 locals {
   common_tags = {
     Project     = var.project_name

@@ -452,9 +452,25 @@ aws_iot             = false
 redis               = false
 ```
 
-Disabled modules produce no resources or secret containers. The current
-unconditional SES, EventBridge and Telegram resources must be made conditional
-before a real production plan.
+Disabled modules produce no resources or secret containers.
+
+> **Update (2026-09-19):** `email_delivery` and `telegram_delivery` now exist
+> as real `bool` variables in `infra/opentofu/variables.tf` (default
+> `false`), gating the SES/EventBridge resources in `ses.tf` and the
+> Telegram bot-token secret, outbound jobs queue and worker IAM policy in
+> `telegram.tf`/`queues.tf` behind `count`. The Telegram **webhook** secret
+> and its reader policy stay unconditional — the API's inbound
+> `POST /webhooks/telegram` route and its `APP_ENV=prod` startup validator
+> both require it regardless of outbound delivery. Verified with `tofu plan`
+> against a throwaway local state: defaults create 9 resources (Cognito,
+> DynamoDB ×2, the core notification-jobs queue, the webhook secret); both
+> flags `true` reproduces the original unconditional plan exactly (28
+> resources, matching pre-gating `tofu plan` output). `core_dynamodb`,
+> `core_cognito`, `core_sqs` were not made toggleable — every profile needs
+> them, so they stay unconditional rather than adding always-`true` flags
+> with no real branch. `push_delivery`, `sms_delivery`, `stripe_billing`,
+> `aws_iot` and `redis` have no corresponding resources in this file yet;
+> nothing to gate.
 
 Additional application-owned modules cover:
 
