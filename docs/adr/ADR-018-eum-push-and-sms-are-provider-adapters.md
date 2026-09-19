@@ -24,6 +24,8 @@ Phase 7B independently proves Android then iOS registration, rotation, invalidat
 
 Every SMS destination create, verify, and delete request must authenticate the current principal and verify current ACTIVE tenant membership; missing, invalid, mismatched, inactive, cross-user, or cross-tenant requests must be rejected, even when the destination is pending or unclaimed. Phase 7B must version, rotate, and roll back FCM service-account and APNs credentials; invalid or expired replacements must fail closed without leaving a compromised credential active, and the credential rotation/rollback runbooks and tests must be proven before launch. Phase 7C launch readiness must enable and exercise AWS account/enforced provider spend limits and billing alarms as an outer boundary in addition to tenant budgets, per-message caps, and storm controls.
 
+Every Push destination revoke and delete request must authenticate the current principal and verify current ACTIVE tenant membership; missing, invalid, mismatched, inactive, cross-user, or cross-tenant requests must be rejected. Phase 7B adapter fixtures must prove that an overall provider `200` containing a per-address permanent failure is parsed as a permanent failure for that address and conditionally invalidates only the observed destination version.
+
 ## Non-goals
 
 This record does not make AWS EUM canonical, equate acceptance with receipt or acknowledgement, provision a Brazilian short code, add 10DLC, support marketing traffic, or implement direct FCM/APNs or Web Push now.

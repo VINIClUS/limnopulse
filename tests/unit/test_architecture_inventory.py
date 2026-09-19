@@ -475,6 +475,7 @@ REQUIRED_ADR_GATE_PATTERNS = {
         r"mismatched principal must be rejected even when the token is unclaimed, and "
         r"inactive membership must be rejected independently\b",
     ),
+    "ADR-019-redis-valkey-is-optional-acceleration.md": (),
 }
 FORBIDDEN_ADR_GATE_PATTERNS = {
     "ADR-001-aws-iot-is-an-integration-adapter.md": (
@@ -731,6 +732,7 @@ FORBIDDEN_ADR_GATE_PATTERNS = {
         r"member\b",
         r"\bPush registration may accept a missing, invalid, or mismatched principal\b",
     ),
+    "ADR-019-redis-valkey-is-optional-acceleration.md": (),
     "ADR-010-stripe-is-an-adapter-internal-entitlements-are-canonical.md": (
         r"\bStripe webhook ingress may return 2xx before durable queue acceptance\b",
         r"\btransient Stripe enqueue failure may return 2xx instead of 5xx\b",
@@ -917,6 +919,160 @@ CODEX_REVIEW_GATE_CASES = (
         "forbidden_pattern": (
             r"\bPhase 7B may replace Push provider credentials without versioned rollback "
             r"or invalid-credential tests\b"
+        ),
+    },
+    {
+        "name": "Push destination lifecycle authorization",
+        "filename": "ADR-018-eum-push-and-sms-are-provider-adapters.md",
+        "required_pattern": (
+            r"\bEvery Push destination revoke and delete request must authenticate "
+            r"the current principal and verify current ACTIVE tenant membership;\s+"
+            r"missing, invalid, mismatched, inactive, cross-user, or cross-tenant "
+            r"requests must be rejected\b"
+        ),
+        "required_clause": (
+            "Every Push destination revoke and delete request must authenticate "
+            "the current principal and verify current ACTIVE tenant membership; "
+            "missing, invalid, mismatched, inactive, cross-user, or cross-tenant "
+            "requests must be rejected."
+        ),
+        "inverted_clause": (
+            "Push destination revoke and delete requests may skip current principal "
+            "authentication or active tenant membership."
+        ),
+        "forbidden_pattern": (
+            r"\bPush destination revoke and delete requests may skip current principal "
+            r"authentication or active tenant membership\b"
+        ),
+    },
+    {
+        "name": "durable command intent before dispatch",
+        "filename": "ADR-012-commands-use-a-separate-safety-plane.md",
+        "required_pattern": (
+            r"\bPhase 8 must durably persist and claim command intent before provider "
+            r"dispatch;\s+no provider call may begin until that durable claim succeeds\b"
+        ),
+        "required_clause": (
+            "Phase 8 must durably persist and claim command intent before provider "
+            "dispatch; no provider call may begin until that durable claim succeeds."
+        ),
+        "inverted_clause": (
+            "Phase 8 may call the provider before persisting or durably claiming command "
+            "intent."
+        ),
+        "forbidden_pattern": (
+            r"\bPhase 8 may call the provider before persisting or durably claiming "
+            r"command intent\b"
+        ),
+    },
+    {
+        "name": "unsupported notification locale handling",
+        "filename": "ADR-011-limnopulse-owns-notification-semantics.md",
+        "required_pattern": (
+            r"\bUnsupported destination locales must be rejected or use only an explicit "
+            r"versioned template fallback;\s+no implicit locale fallback is allowed\b"
+        ),
+        "required_clause": (
+            "Unsupported destination locales must be rejected or use only an explicit "
+            "versioned template fallback; no implicit locale fallback is allowed."
+        ),
+        "inverted_clause": (
+            "Unsupported destination locales may use an implicit locale fallback."
+        ),
+        "forbidden_pattern": (
+            r"\bUnsupported destination locales may use an implicit locale fallback\b"
+        ),
+    },
+    {
+        "name": "nested Push response failure parsing",
+        "filename": "ADR-018-eum-push-and-sms-are-provider-adapters.md",
+        "required_pattern": (
+            r"\bPhase 7B adapter fixtures must prove that an overall provider `200` "
+            r"containing a per-address permanent failure is parsed as a permanent "
+            r"failure for that address and conditionally invalidates only the observed "
+            r"destination version\b"
+        ),
+        "required_clause": (
+            "Phase 7B adapter fixtures must prove that an overall provider `200` "
+            "containing a per-address permanent failure is parsed as a permanent "
+            "failure for that address and conditionally invalidates only the observed "
+            "destination version."
+        ),
+        "inverted_clause": (
+            "Phase 7B adapter fixtures may treat an overall provider `200` with a "
+            "per-address permanent failure as success without invalidating the "
+            "destination."
+        ),
+        "forbidden_pattern": (
+            r"\bPhase 7B adapter fixtures may treat an overall provider `200` with a "
+            r"per-address permanent failure as success without invalidating the "
+            r"destination\b"
+        ),
+    },
+    {
+        "name": "Redis destination privacy",
+        "filename": "ADR-019-redis-valkey-is-optional-acceleration.md",
+        "required_pattern": (
+            r"\bPhase 7A must prove that raw Push tokens, phone numbers, Telegram chat "
+            r"IDs, and secrets are never used as Redis/Valkey keys or metric labels;\s+"
+            r"cache-enabled and no-cache tests must preserve this privacy boundary\b"
+        ),
+        "required_clause": (
+            "Phase 7A must prove that raw Push tokens, phone numbers, Telegram chat "
+            "IDs, and secrets are never used as Redis/Valkey keys or metric labels; "
+            "cache-enabled and no-cache tests must preserve this privacy boundary."
+        ),
+        "inverted_clause": (
+            "Redis/Valkey cache keys may contain raw Push tokens, phone numbers, "
+            "Telegram chat IDs, or secrets."
+        ),
+        "forbidden_pattern": (
+            r"\bRedis/Valkey cache keys may contain raw Push tokens, phone numbers, "
+            r"Telegram chat IDs, or secrets\b"
+        ),
+    },
+    {
+        "name": "billing owner/admin authorization",
+        "filename": "ADR-010-stripe-is-an-adapter-internal-entitlements-are-canonical.md",
+        "required_pattern": (
+            r"\bPhase 4 must require a tenant owner/admin role for Checkout, Customer "
+            r"Portal, plan-change, and every billing mutation or session endpoint;\s+"
+            r"ordinary members must be rejected and each decision audited\b"
+        ),
+        "required_clause": (
+            "Phase 4 must require a tenant owner/admin role for Checkout, Customer "
+            "Portal, plan-change, and every billing mutation or session endpoint; "
+            "ordinary members must be rejected and each decision audited."
+        ),
+        "inverted_clause": (
+            "Phase 4 may allow ordinary tenant members to call Checkout, Customer "
+            "Portal, plan-change, or billing mutation/session endpoints."
+        ),
+        "forbidden_pattern": (
+            r"\bPhase 4 may allow ordinary tenant members to call Checkout, Customer "
+            r"Portal, plan-change, or billing mutation/session endpoints\b"
+        ),
+    },
+    {
+        "name": "tenant and event-family anti-storm isolation",
+        "filename": "ADR-019-redis-valkey-is-optional-acceleration.md",
+        "required_pattern": (
+            r"\bAnti-storm windows must be enforced independently per tenant and event "
+            r"family;\s+one tenant or event family's burst must not consume or suppress "
+            r"another's allowance, and Redis/no-Redis tests must prove isolation\b"
+        ),
+        "required_clause": (
+            "Anti-storm windows must be enforced independently per tenant and event "
+            "family; one tenant or event family's burst must not consume or suppress "
+            "another's allowance, and Redis/no-Redis tests must prove isolation."
+        ),
+        "inverted_clause": (
+            "Anti-storm windows may use one global allowance shared across tenants and "
+            "event families."
+        ),
+        "forbidden_pattern": (
+            r"\bAnti-storm windows may use one global allowance shared across tenants "
+            r"and event families\b"
         ),
     },
 )
