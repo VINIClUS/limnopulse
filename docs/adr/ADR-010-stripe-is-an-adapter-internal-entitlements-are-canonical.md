@@ -24,21 +24,21 @@ Phase 4 must prove verified and idempotent webhook convergence, test/live isolat
 
 ```json
 {
-  "Trial": {"critical": false, "provider_calls": 0, "budget_usd_minor": 0, "max_price_usd_minor": 0, "overage": false},
-  "Starter": {"critical": false, "provider_calls": 0, "budget_usd_minor": 0, "max_price_usd_minor": 0, "overage": false},
-  "Farm": {"critical": true, "provider_calls": 10, "budget_usd_minor": 50, "max_price_usd_minor": 5, "overage": false},
-  "Pro": {"critical": true, "provider_calls": 50, "budget_usd_minor": 250, "max_price_usd_minor": 5, "overage": false},
-  "Business": {"critical": true, "provider_calls": 250, "budget_usd_minor": 1250, "max_price_usd_minor": 5, "overage": false}
+  "Trial": {"critical": false, "monthly_messages_max": 0, "monthly_budget_minor": 0, "monthly_budget_currency": "USD", "max_price_per_message_minor": 0, "overage": false},
+  "Starter": {"critical": false, "monthly_messages_max": 0, "monthly_budget_minor": 0, "monthly_budget_currency": "USD", "max_price_per_message_minor": 0, "overage": false},
+  "Farm": {"critical": true, "monthly_messages_max": 10, "monthly_budget_minor": 50, "monthly_budget_currency": "USD", "max_price_per_message_minor": 5, "overage": false},
+  "Pro": {"critical": true, "monthly_messages_max": 50, "monthly_budget_minor": 250, "monthly_budget_currency": "USD", "max_price_per_message_minor": 5, "overage": false},
+  "Business": {"critical": true, "monthly_messages_max": 250, "monthly_budget_minor": 1250, "monthly_budget_currency": "USD", "max_price_per_message_minor": 5, "overage": false}
 }
 ```
 
 Every Enterprise PlanVersion must explicitly set each of the following fields:
 
 - `notifications.sms.critical`: boolean flag.
-- `notifications.sms.provider_calls`: SMS provider-call count.
-- `notifications.sms.budget.amount`: budget amount.
-- `notifications.sms.budget.currency`: budget currency.
-- `notifications.sms.max_price`: maximum price.
+- `notifications.sms.monthly_messages_max`: monthly SMS provider-call count.
+- `notifications.sms.monthly_budget_minor`: monthly budget amount in integer minor units.
+- `notifications.sms.monthly_budget_currency`: monthly budget currency.
+- `notifications.sms.max_price_per_message_minor`: maximum price per message in integer minor units.
 - `notifications.sms.overage`: overage behavior.
 
 The contract values may vary, but no missing field may inherit an implicit or unlimited default. Phase 4 must enforce sites, devices, components, integrations, active rules, and Push destinations with transactionally maintained counters; reserve and create must be atomic where possible, archive/delete decrements idempotent, and boundary plus concurrent-create tests must prove no quota oversubscription. Phase 4 must prove a BRL Stripe subscription retains the USD-denominated SMS budget and that neither entitlement evaluation nor notification dispatch performs a synchronous FX call. Phase 4 webhook ingress must return `2xx` only after durable queue acceptance and must return `5xx` on transient enqueue failure so Stripe retries; signature-verified, idempotent processing must remain asynchronous. EntitlementSnapshot cache entries must be snapshot-versioned and short-lived; a stale active cache entry must never override a newer durable restricted or suspended state. Phase 4 tests must prove stale-cache and mid-request suspension block both SMS spend and command dispatch. On an absent entitlement cache entry, Phase 4 must fetch the durable EntitlementSnapshot; if the authoritative store is unavailable, paid SMS and command actions must be conservatively denied, never treated as active or default, so cache availability cannot change authorization, budget, or logical outcome. It must also prove the published billing-degradation behavior: grace keeps ingestion and critical alerts enabled while limiting new resources and automatic policies; restricted preserves critical notifications and only bounded existing ingestion with read-only history; suspended stops new paid processing, disables commands, and emits explicit suspension warnings. No grace, restricted, or suspended path may report monitoring as active after ingestion or monitoring coverage has stopped.
@@ -48,6 +48,8 @@ Phase 4 Checkout must accept plan, interval, and currency plus allowlisted succe
 Phase 4 must ensure OpenTofu never writes Stripe secret or webhook secret values/versions into state; configure them only through secure post-provisioning or environment secret deployment, and prove independent Stripe credential rotation and rollback. Phase 4 Checkout must derive a request idempotency key from tenant and request identity and prove lost-response retries resolve to one Checkout Session/operation rather than creating a duplicate.
 
 Phase 4 must require a tenant owner/admin role for Checkout, Customer Portal, plan-change, and every billing mutation or session endpoint; ordinary members must be rejected and each decision audited.
+
+Phase 4 Customer Portal must permit only payment methods, invoice viewing/download, cancel at period end, and resume where supported; direct plan upgrades/downgrades must be disabled until versioned transition controls are enabled through LimnoPulse APIs and tested.
 
 ## Non-goals
 

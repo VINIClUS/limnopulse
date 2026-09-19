@@ -30,6 +30,8 @@ Before Phase 7B launch, every raw Push token must use application-level envelope
 
 Every Push and SMS destination lifecycle mutation—create, verify, rotate, invalidate, revoke, delete, and opt-out—and every cross-user token-claim rejection must emit an immutable audit event. After account lifecycle deletion, raw Push tokens and phone numbers must be erased; only non-reversible hashes and delivery evidence may remain when policy/legal retention permits, and erasure tests must prove tombstoned destinations retain no decryptable PII.
 
+Phase 7C must enforce durable SMS storm/rate windows independently per recipient, tenant, and event family before provider dispatch; recipient-scoped limits must prevent one recipient from receiving every family allowance.
+
 ## Non-goals
 
 This record does not make AWS EUM canonical, equate acceptance with receipt or acknowledgement, provision a Brazilian short code, add 10DLC, support marketing traffic, or implement direct FCM/APNs or Web Push now.

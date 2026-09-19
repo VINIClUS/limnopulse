@@ -157,45 +157,51 @@ REQUIRED_ADR_DECISION_PATTERNS = {
 EXPECTED_PLAN_SMS_LIMITS = {
     "Trial": {
         "critical": False,
-        "provider_calls": 0,
-        "budget_usd_minor": 0,
-        "max_price_usd_minor": 0,
+        "monthly_messages_max": 0,
+        "monthly_budget_minor": 0,
+        "monthly_budget_currency": "USD",
+        "max_price_per_message_minor": 0,
         "overage": False,
     },
     "Starter": {
         "critical": False,
-        "provider_calls": 0,
-        "budget_usd_minor": 0,
-        "max_price_usd_minor": 0,
+        "monthly_messages_max": 0,
+        "monthly_budget_minor": 0,
+        "monthly_budget_currency": "USD",
+        "max_price_per_message_minor": 0,
         "overage": False,
     },
     "Farm": {
         "critical": True,
-        "provider_calls": 10,
-        "budget_usd_minor": 50,
-        "max_price_usd_minor": 5,
+        "monthly_messages_max": 10,
+        "monthly_budget_minor": 50,
+        "monthly_budget_currency": "USD",
+        "max_price_per_message_minor": 5,
         "overage": False,
     },
     "Pro": {
         "critical": True,
-        "provider_calls": 50,
-        "budget_usd_minor": 250,
-        "max_price_usd_minor": 5,
+        "monthly_messages_max": 50,
+        "monthly_budget_minor": 250,
+        "monthly_budget_currency": "USD",
+        "max_price_per_message_minor": 5,
         "overage": False,
     },
     "Business": {
         "critical": True,
-        "provider_calls": 250,
-        "budget_usd_minor": 1250,
-        "max_price_usd_minor": 5,
+        "monthly_messages_max": 250,
+        "monthly_budget_minor": 1250,
+        "monthly_budget_currency": "USD",
+        "max_price_per_message_minor": 5,
         "overage": False,
     },
 }
 PLAN_SMS_INTEGER_FIELDS = (
-    "provider_calls",
-    "budget_usd_minor",
-    "max_price_usd_minor",
+    "monthly_messages_max",
+    "monthly_budget_minor",
+    "max_price_per_message_minor",
 )
+PLAN_SMS_CURRENCY_FIELDS = ("monthly_budget_currency",)
 PLAN_SMS_BOOLEAN_FIELDS = ("critical", "overage")
 
 
@@ -1467,6 +1473,52 @@ CODEX_REVIEW_GATE_CASES = (
             r"indefinitely\b"
         ),
     },
+    {
+        "name": "restricted Customer Portal plan changes",
+        "filename": "ADR-010-stripe-is-an-adapter-internal-entitlements-are-canonical.md",
+        "required_pattern": (
+            r"\bPhase 4 Customer Portal must permit only payment methods, invoice "
+            r"viewing/download, cancel at period end, and resume where supported; "
+            r"direct plan upgrades/downgrades must be disabled until versioned transition "
+            r"controls are enabled through LimnoPulse APIs and tested\b"
+        ),
+        "required_clause": (
+            "Phase 4 Customer Portal must permit only payment methods, invoice "
+            "viewing/download, cancel at period end, and resume where supported; "
+            "direct plan upgrades/downgrades must be disabled until versioned transition "
+            "controls are enabled through LimnoPulse APIs and tested."
+        ),
+        "inverted_clause": (
+            "Phase 4 Customer Portal may permit direct unrestricted plan upgrades or "
+            "downgrades without LimnoPulse PlanVersion validation and downgrade preflight."
+        ),
+        "forbidden_pattern": (
+            r"\bPhase 4 Customer Portal may permit direct unrestricted plan upgrades or "
+            r"downgrades without LimnoPulse PlanVersion validation and downgrade preflight\b"
+        ),
+    },
+    {
+        "name": "per-recipient SMS storm window",
+        "filename": "ADR-018-eum-push-and-sms-are-provider-adapters.md",
+        "required_pattern": (
+            r"\bPhase 7C must enforce durable SMS storm/rate windows independently per "
+            r"recipient, tenant, and event family before provider dispatch; recipient-"
+            r"scoped limits must prevent one recipient from receiving every family allowance\b"
+        ),
+        "required_clause": (
+            "Phase 7C must enforce durable SMS storm/rate windows independently per "
+            "recipient, tenant, and event family before provider dispatch; recipient-"
+            "scoped limits must prevent one recipient from receiving every family allowance."
+        ),
+        "inverted_clause": (
+            "Phase 7C may use only tenant and event-family storm windows and allow one "
+            "recipient to receive every family allowance."
+        ),
+        "forbidden_pattern": (
+            r"\bPhase 7C may use only tenant and event-family storm windows and allow one "
+            r"recipient to receive every family allowance\b"
+        ),
+    },
 )
 for _case in CODEX_REVIEW_GATE_CASES:
     _filename = _case["filename"]
@@ -1583,23 +1635,24 @@ ENTERPRISE_PLAN_VERSION_REQUIREMENTS: tuple[tuple[str, str], ...] = (
         r"(?m)^\s*-\s+`notifications\.sms\.critical`:\s+boolean flag\b",
     ),
     (
-        "provider-call count",
-        r"(?m)^\s*-\s+`notifications\.sms\.provider_calls`:\s+"
-        r"SMS provider-call count\b",
+        "monthly message count",
+        r"(?m)^\s*-\s+`notifications\.sms\.monthly_messages_max`:\s+"
+        r"monthly SMS provider-call count\b",
     ),
     (
-        "budget amount",
-        r"(?m)^\s*-\s+`notifications\.sms\.budget\.amount`:\s+"
-        r"budget amount\b",
+        "monthly budget amount",
+        r"(?m)^\s*-\s+`notifications\.sms\.monthly_budget_minor`:\s+"
+        r"monthly budget amount in integer minor units\b",
     ),
     (
-        "budget currency",
-        r"(?m)^\s*-\s+`notifications\.sms\.budget\.currency`:\s+"
-        r"budget currency\b",
+        "monthly budget currency",
+        r"(?m)^\s*-\s+`notifications\.sms\.monthly_budget_currency`:\s+"
+        r"monthly budget currency\b",
     ),
     (
-        "maximum price",
-        r"(?m)^\s*-\s+`notifications\.sms\.max_price`:\s+maximum price\b",
+        "maximum price per message",
+        r"(?m)^\s*-\s+`notifications\.sms\.max_price_per_message_minor`:\s+"
+        r"maximum price per message in integer minor units\b",
     ),
     (
         "overage behavior",
@@ -2038,6 +2091,17 @@ def assert_adr_inventory(adr_root: Path) -> None:
                     "exact launch SMS mapping boolean fields must use JSON booleans: "
                     f"{non_boolean_fields}"
                 )
+                non_string_fields = tuple(
+                    (tier, field)
+                    for tier, expected_fields in EXPECTED_PLAN_SMS_LIMITS.items()
+                    for field in PLAN_SMS_CURRENCY_FIELDS
+                    if not isinstance(plan_sms_limits.get(tier), dict)
+                    or type(plan_sms_limits[tier].get(field)) is not str
+                )
+                assert not non_string_fields, (
+                    "exact launch SMS mapping currency fields must use JSON strings: "
+                    f"{non_string_fields}"
+                )
                 assert plan_sms_limits == EXPECTED_PLAN_SMS_LIMITS, (
                     "exact launch SMS mapping must retain every tier and value"
                 )
@@ -2237,10 +2301,13 @@ def test_billing_gate_rejects_inverted_state_behavior(
     ("requirement", "marker"),
     (
         ("critical flag", "`notifications.sms.critical`"),
-        ("provider-call count", "SMS provider-call count"),
-        ("budget amount", "budget amount"),
-        ("budget currency", "budget currency"),
-        ("maximum price", "maximum price"),
+        ("monthly message count", "`notifications.sms.monthly_messages_max`"),
+        ("monthly budget amount", "`notifications.sms.monthly_budget_minor`"),
+        ("monthly budget currency", "`notifications.sms.monthly_budget_currency`"),
+        (
+            "maximum price per message",
+            "`notifications.sms.max_price_per_message_minor`",
+        ),
         ("overage behavior", "overage behavior"),
         (
             "no implicit or unlimited default",
@@ -2575,21 +2642,21 @@ def test_adr_gate_rejects_round_eight_semantic_inversion(
 @pytest.mark.parametrize(
     ("tier", "field", "expected_value", "wrong_value"),
     (
-        ("Trial", "provider_calls", 0, 1),
-        ("Trial", "budget_usd_minor", 0, 1),
-        ("Trial", "max_price_usd_minor", 0, 1),
-        ("Starter", "provider_calls", 0, 1),
-        ("Starter", "budget_usd_minor", 0, 1),
-        ("Starter", "max_price_usd_minor", 0, 1),
-        ("Farm", "provider_calls", 10, 11),
-        ("Farm", "budget_usd_minor", 50, 51),
-        ("Farm", "max_price_usd_minor", 5, 6),
-        ("Pro", "provider_calls", 50, 51),
-        ("Pro", "budget_usd_minor", 250, 251),
-        ("Pro", "max_price_usd_minor", 5, 6),
-        ("Business", "provider_calls", 250, 251),
-        ("Business", "budget_usd_minor", 1250, 1251),
-        ("Business", "max_price_usd_minor", 5, 6),
+        ("Trial", "monthly_messages_max", 0, 1),
+        ("Trial", "monthly_budget_minor", 0, 1),
+        ("Trial", "max_price_per_message_minor", 0, 1),
+        ("Starter", "monthly_messages_max", 0, 1),
+        ("Starter", "monthly_budget_minor", 0, 1),
+        ("Starter", "max_price_per_message_minor", 0, 1),
+        ("Farm", "monthly_messages_max", 10, 11),
+        ("Farm", "monthly_budget_minor", 50, 51),
+        ("Farm", "max_price_per_message_minor", 5, 6),
+        ("Pro", "monthly_messages_max", 50, 51),
+        ("Pro", "monthly_budget_minor", 250, 251),
+        ("Pro", "max_price_per_message_minor", 5, 6),
+        ("Business", "monthly_messages_max", 250, 251),
+        ("Business", "monthly_budget_minor", 1250, 1251),
+        ("Business", "max_price_per_message_minor", 5, 6),
     ),
 )
 def test_planversion_gate_rejects_wrong_exact_launch_sms_value(
@@ -2615,21 +2682,21 @@ def test_planversion_gate_rejects_wrong_exact_launch_sms_value(
 @pytest.mark.parametrize(
     ("tier", "field", "integer_token", "wrong_type_token"),
     (
-        ("Trial", "provider_calls", "0", "false"),
-        ("Trial", "budget_usd_minor", "0", "false"),
-        ("Trial", "max_price_usd_minor", "0", "false"),
-        ("Starter", "provider_calls", "0", "false"),
-        ("Starter", "budget_usd_minor", "0", "false"),
-        ("Starter", "max_price_usd_minor", "0", "false"),
-        ("Farm", "provider_calls", "10", "10.0"),
-        ("Farm", "budget_usd_minor", "50", "50.0"),
-        ("Farm", "max_price_usd_minor", "5", "5.0"),
-        ("Pro", "provider_calls", "50", "50.0"),
-        ("Pro", "budget_usd_minor", "250", "250.0"),
-        ("Pro", "max_price_usd_minor", "5", "5.0"),
-        ("Business", "provider_calls", "250", "250.0"),
-        ("Business", "budget_usd_minor", "1250", "1250.0"),
-        ("Business", "max_price_usd_minor", "5", "5.0"),
+        ("Trial", "monthly_messages_max", "0", "false"),
+        ("Trial", "monthly_budget_minor", "0", "false"),
+        ("Trial", "max_price_per_message_minor", "0", "false"),
+        ("Starter", "monthly_messages_max", "0", "false"),
+        ("Starter", "monthly_budget_minor", "0", "false"),
+        ("Starter", "max_price_per_message_minor", "0", "false"),
+        ("Farm", "monthly_messages_max", "10", "10.0"),
+        ("Farm", "monthly_budget_minor", "50", "50.0"),
+        ("Farm", "max_price_per_message_minor", "5", "5.0"),
+        ("Pro", "monthly_messages_max", "50", "50.0"),
+        ("Pro", "monthly_budget_minor", "250", "250.0"),
+        ("Pro", "max_price_per_message_minor", "5", "5.0"),
+        ("Business", "monthly_messages_max", "250", "250.0"),
+        ("Business", "monthly_budget_minor", "1250", "1250.0"),
+        ("Business", "max_price_per_message_minor", "5", "5.0"),
     ),
 )
 def test_planversion_gate_rejects_non_integer_exact_launch_sms_type(
