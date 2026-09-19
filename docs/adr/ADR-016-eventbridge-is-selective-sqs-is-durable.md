@@ -24,6 +24,8 @@ Current SES feedback remains intact. Phase 3 HTTPS ingress must return accepted 
 
 Phase 3 HTTP batch ingress must require an `Idempotency-Key` or stable `source_event_id`; if the durable SQS write succeeds but the HTTP response is lost, retrying with that identity must not create a second canonical observation.
 
+Phase 3 HTTPS ingress must enforce bounded request payload size, per-IntegrationAccount rate limits, and entitlement limits before durable enqueue; oversized or over-rate requests must be rejected without unbounded buffering or queue admission.
+
 ## Non-goals
 
 This record does not make EventBridge a ledger, queue, ordering guarantee, or mandatory transport between all internal components.

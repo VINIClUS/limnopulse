@@ -156,30 +156,35 @@ REQUIRED_ADR_DECISION_PATTERNS = {
 }
 EXPECTED_PLAN_SMS_LIMITS = {
     "Trial": {
+        "critical": False,
         "provider_calls": 0,
         "budget_usd_minor": 0,
         "max_price_usd_minor": 0,
         "overage": False,
     },
     "Starter": {
+        "critical": False,
         "provider_calls": 0,
         "budget_usd_minor": 0,
         "max_price_usd_minor": 0,
         "overage": False,
     },
     "Farm": {
+        "critical": True,
         "provider_calls": 10,
         "budget_usd_minor": 50,
         "max_price_usd_minor": 5,
         "overage": False,
     },
     "Pro": {
+        "critical": True,
         "provider_calls": 50,
         "budget_usd_minor": 250,
         "max_price_usd_minor": 5,
         "overage": False,
     },
     "Business": {
+        "critical": True,
         "provider_calls": 250,
         "budget_usd_minor": 1250,
         "max_price_usd_minor": 5,
@@ -191,6 +196,7 @@ PLAN_SMS_INTEGER_FIELDS = (
     "budget_usd_minor",
     "max_price_usd_minor",
 )
+PLAN_SMS_BOOLEAN_FIELDS = ("critical", "overage")
 REQUIRED_ADR_GATE_PATTERNS = {
     "ADR-001-aws-iot-is-an-integration-adapter.md": (
         r"\bBefore any queued consumer acts, it must recheck the DeviceIntegration "
@@ -1075,6 +1081,283 @@ CODEX_REVIEW_GATE_CASES = (
             r"and event families\b"
         ),
     },
+    {
+        "name": "trusted telemetry ownership chain",
+        "filename": "ADR-001-aws-iot-is-an-integration-adapter.md",
+        "required_pattern": (
+            r"\bPhase 5 ingest must resolve the complete source-to-tenant-to-site-to-"
+            r"asset-to-deployment-to-component ownership chain from trusted authenticated "
+            r"mapping;\s+every payload-supplied site, asset, deployment, or component ID "
+            r"must be ignored or rejected and must never override that chain\b"
+        ),
+        "required_clause": (
+            "Phase 5 ingest must resolve the complete source-to-tenant-to-site-to-asset-"
+            "to-deployment-to-component ownership chain from trusted authenticated "
+            "mapping; every payload-supplied site, asset, deployment, or component ID "
+            "must be ignored or rejected and must never override that chain."
+        ),
+        "inverted_clause": (
+            "Phase 5 ingest may accept payload-supplied site, asset, deployment, or "
+            "component IDs instead of the trusted ownership chain."
+        ),
+        "forbidden_pattern": (
+            r"\bPhase 5 ingest may accept payload-supplied site, asset, deployment, or "
+            r"component IDs instead of the trusted ownership chain\b"
+        ),
+    },
+    {
+        "name": "Push token envelope encryption",
+        "filename": "ADR-018-eum-push-and-sms-are-provider-adapters.md",
+        "required_pattern": (
+            r"\bBefore Phase 7B launch, every raw Push token must use application-level "
+            r"envelope encryption through KMS or the Database Encryption SDK and must "
+            r"never be returned after write;\s+server-side table encryption alone is "
+            r"insufficient\b"
+        ),
+        "required_clause": (
+            "Before Phase 7B launch, every raw Push token must use application-level "
+            "envelope encryption through KMS or the Database Encryption SDK and must "
+            "never be returned after write; server-side table encryption alone is "
+            "insufficient."
+        ),
+        "inverted_clause": (
+            "Push tokens may rely only on DynamoDB or other server-side table encryption "
+            "after write."
+        ),
+        "forbidden_pattern": (
+            r"\bPush tokens may rely only on DynamoDB or other server-side table "
+            r"encryption after write\b"
+        ),
+    },
+    {
+        "name": "bounded HTTP ingress protections",
+        "filename": "ADR-016-eventbridge-is-selective-sqs-is-durable.md",
+        "required_pattern": (
+            r"\bPhase 3 HTTPS ingress must enforce bounded request payload size, "
+            r"per-IntegrationAccount rate limits, and entitlement limits before durable "
+            r"enqueue;\s+oversized or over-rate requests must be rejected without "
+            r"unbounded buffering or queue admission\b"
+        ),
+        "required_clause": (
+            "Phase 3 HTTPS ingress must enforce bounded request payload size, "
+            "per-IntegrationAccount rate limits, and entitlement limits before durable "
+            "enqueue; oversized or over-rate requests must be rejected without "
+            "unbounded buffering or queue admission."
+        ),
+        "inverted_clause": (
+            "Phase 3 HTTPS ingress may accept oversized or over-rate requests into the "
+            "durable queue without payload or entitlement bounds."
+        ),
+        "forbidden_pattern": (
+            r"\bPhase 3 HTTPS ingress may accept oversized or over-rate requests into "
+            r"the durable queue without payload or entitlement bounds\b"
+        ),
+    },
+    {
+        "name": "PlanVersion Stripe price resolution",
+        "filename": "ADR-010-stripe-is-an-adapter-internal-entitlements-are-canonical.md",
+        "required_pattern": (
+            r"\bPhase 4 Checkout must accept only plan, interval, and currency;\s+the "
+            r"server must resolve an environment-specific Stripe Price ID from the "
+            r"approved immutable PlanVersion catalog and reject client-supplied Price IDs\b"
+        ),
+        "required_clause": (
+            "Phase 4 Checkout must accept only plan, interval, and currency; the server "
+            "must resolve an environment-specific Stripe Price ID from the approved "
+            "immutable PlanVersion catalog and reject client-supplied Price IDs."
+        ),
+        "inverted_clause": (
+            "Phase 4 Checkout may accept a client-supplied Stripe Price ID instead of "
+            "resolving it from PlanVersion."
+        ),
+        "forbidden_pattern": (
+            r"\bPhase 4 Checkout may accept a client-supplied Stripe Price ID instead "
+            r"of resolving it from PlanVersion\b"
+        ),
+    },
+    {
+        "name": "APNs environment mismatch rejection",
+        "filename": "ADR-018-eum-push-and-sms-are-provider-adapters.md",
+        "required_pattern": (
+            r"\bPhase 7B must fail closed when an iOS destination, token, credential, "
+            r"or channel reference is tagged for the wrong APNs sandbox/production "
+            r"environment;\s+APNS and APNS_SANDBOX references are non-interchangeable "
+            r"and mismatch tests are required\b"
+        ),
+        "required_clause": (
+            "Phase 7B must fail closed when an iOS destination, token, credential, or "
+            "channel reference is tagged for the wrong APNs sandbox/production "
+            "environment; APNS and APNS_SANDBOX references are non-interchangeable and "
+            "mismatch tests are required."
+        ),
+        "inverted_clause": (
+            "Phase 7B may send an iOS destination through APNS or APNS_SANDBOX despite "
+            "a sandbox/production environment mismatch."
+        ),
+        "forbidden_pattern": (
+            r"\bPhase 7B may send an iOS destination through APNS or APNS_SANDBOX "
+            r"despite a sandbox/production environment mismatch\b"
+        ),
+    },
+    {
+        "name": "versioned destination lifecycle mutations",
+        "filename": "ADR-018-eum-push-and-sms-are-provider-adapters.md",
+        "required_pattern": (
+            r"\bEvery Push and SMS destination lifecycle mutation—registration, refresh, "
+            r"revoke, delete, invalidation, and opt-out—must use optimistic versioning/"
+            r"conditional writes;\s+stale races must not resurrect or overwrite newer "
+            r"state\b"
+        ),
+        "required_clause": (
+            "Every Push and SMS destination lifecycle mutation—registration, refresh, "
+            "revoke, delete, invalidation, and opt-out—must use optimistic versioning/"
+            "conditional writes; stale races must not resurrect or overwrite newer "
+            "state."
+        ),
+        "inverted_clause": (
+            "Destination lifecycle mutations may overwrite state without optimistic "
+            "version checks or conditional writes."
+        ),
+        "forbidden_pattern": (
+            r"\bDestination lifecycle mutations may overwrite state without optimistic "
+            r"version checks or conditional writes\b"
+        ),
+    },
+    {
+        "name": "SMS verification entitlement",
+        "filename": "ADR-018-eum-push-and-sms-are-provider-adapters.md",
+        "required_pattern": (
+            r"\bBefore any SMS verification challenge sends, Phase 7C must verify "
+            r"tenant SMS eligibility and entitlement, including Trial/Starter/suspended "
+            r"denial;\s+only an explicitly audited administrative import may bypass "
+            r"that check\b"
+        ),
+        "required_clause": (
+            "Before any SMS verification challenge sends, Phase 7C must verify tenant "
+            "SMS eligibility and entitlement, including Trial/Starter/suspended denial; "
+            "only an explicitly audited administrative import may bypass that check."
+        ),
+        "inverted_clause": (
+            "SMS verification challenges may send for Trial, Starter, or suspended tenants "
+            "without an entitlement check."
+        ),
+        "forbidden_pattern": (
+            r"\bSMS verification challenges may send for Trial, Starter, or suspended "
+            r"tenants without an entitlement check\b"
+        ),
+    },
+    {
+        "name": "exact GSM-7 extension counting",
+        "filename": "ADR-018-eum-push-and-sms-are-provider-adapters.md",
+        "required_pattern": (
+            r"\bPhase 7C message preflight must count GSM-7 extension escapes and "
+            r"concatenation thresholds exactly, enforce one-part GSM-7/UCS-2 limits, "
+            r"reject multipart messages, and regression-test template changes\b"
+        ),
+        "required_clause": (
+            "Phase 7C message preflight must count GSM-7 extension escapes and "
+            "concatenation thresholds exactly, enforce one-part GSM-7/UCS-2 limits, "
+            "reject multipart messages, and regression-test template changes."
+        ),
+        "inverted_clause": (
+            "Phase 7C message preflight may count GSM-7 extension escapes as ordinary "
+            "characters and allow multipart messages."
+        ),
+        "forbidden_pattern": (
+            r"\bPhase 7C message preflight may count GSM-7 extension escapes as ordinary "
+            r"characters and allow multipart messages\b"
+        ),
+    },
+    {
+        "name": "Stripe missed-webhook reconciliation",
+        "filename": "ADR-010-stripe-is-an-adapter-internal-entitlements-are-canonical.md",
+        "required_pattern": (
+            r"\bPhase 4 must periodically reconcile current Stripe subscription state "
+            r"against internal BillingAccount and EntitlementSnapshot;\s+permanently "
+            r"missed webhook/retry/DLQ events must be detected and stale entitlements "
+            r"corrected\b"
+        ),
+        "required_clause": (
+            "Phase 4 must periodically reconcile current Stripe subscription state "
+            "against internal BillingAccount and EntitlementSnapshot; permanently "
+            "missed webhook/retry/DLQ events must be detected and stale entitlements "
+            "corrected."
+        ),
+        "inverted_clause": (
+            "Phase 4 may rely on webhook retries and DLQs without periodic Stripe "
+            "reconciliation."
+        ),
+        "forbidden_pattern": (
+            r"\bPhase 4 may rely on webhook retries and DLQs without periodic Stripe "
+            r"reconciliation\b"
+        ),
+    },
+    {
+        "name": "ambiguous Push no cross-channel fallback",
+        "filename": "ADR-018-eum-push-and-sms-are-provider-adapters.md",
+        "required_pattern": (
+            r"\bAfter possible Push provider acceptance becomes ambiguous or unknown, "
+            r"the orchestrator must not automatically fall back to SMS or another "
+            r"channel unless a versioned policy explicitly accepts duplicate risk\b"
+        ),
+        "required_clause": (
+            "After possible Push provider acceptance becomes ambiguous or unknown, the "
+            "orchestrator must not automatically fall back to SMS or another channel "
+            "unless a versioned policy explicitly accepts duplicate risk."
+        ),
+        "inverted_clause": (
+            "After ambiguous Push acceptance, the orchestrator may automatically fall "
+            "back to SMS without a versioned duplicate-risk policy."
+        ),
+        "forbidden_pattern": (
+            r"\bAfter ambiguous Push acceptance, the orchestrator may automatically fall "
+            r"back to SMS without a versioned duplicate-risk policy\b"
+        ),
+    },
+    {
+        "name": "Push and SMS dispatch queue DLQs",
+        "filename": "ADR-018-eum-push-and-sms-are-provider-adapters.md",
+        "required_pattern": (
+            r"\bPhase 7B/7C launch readiness must provision separate Push and SMS "
+            r"dispatch queues and DLQs with bounded poison-message redrive, queue-age/"
+            r"DLQ alarms, and recovery tests;\s+feedback-consumer DLQs do not substitute\b"
+        ),
+        "required_clause": (
+            "Phase 7B/7C launch readiness must provision separate Push and SMS dispatch "
+            "queues and DLQs with bounded poison-message redrive, queue-age/DLQ alarms, "
+            "and recovery tests; feedback-consumer DLQs do not substitute."
+        ),
+        "inverted_clause": (
+            "Push and SMS dispatch queues may retry poison messages indefinitely without "
+            "separate DLQs or recovery alarms."
+        ),
+        "forbidden_pattern": (
+            r"\bPush and SMS dispatch queues may retry poison messages indefinitely "
+            r"without separate DLQs or recovery alarms\b"
+        ),
+    },
+    {
+        "name": "bounded Stripe webhook body",
+        "filename": "ADR-010-stripe-is-an-adapter-internal-entitlements-are-canonical.md",
+        "required_pattern": (
+            r"\bPhase 4 Stripe webhook ingress must enforce a strict raw-body size "
+            r"bound before signature verification and enqueue;\s+oversized bodies must "
+            r"be rejected without unbounded buffering\b"
+        ),
+        "required_clause": (
+            "Phase 4 Stripe webhook ingress must enforce a strict raw-body size bound "
+            "before signature verification and enqueue; oversized bodies must be "
+            "rejected without unbounded buffering."
+        ),
+        "inverted_clause": (
+            "Phase 4 Stripe webhook ingress may buffer an unbounded raw body before "
+            "signature verification."
+        ),
+        "forbidden_pattern": (
+            r"\bPhase 4 Stripe webhook ingress may buffer an unbounded raw body before "
+            r"signature verification\b"
+        ),
+    },
 )
 for _case in CODEX_REVIEW_GATE_CASES:
     _filename = _case["filename"]
@@ -1273,6 +1556,25 @@ def replace_adr_fragment(
         filename,
         lambda record: record.replace(old, new, 1),
     )
+
+
+def mutate_planversion_row(
+    adr_root: Path,
+    tier: str,
+    old_fragment: str,
+    new_fragment: str,
+) -> None:
+    adr_path = (
+        adr_root
+        / "ADR-010-stripe-is-an-adapter-internal-entitlements-are-canonical.md"
+    )
+    lines = adr_path.read_text(encoding="utf-8").splitlines()
+    row_index = next(
+        index for index, line in enumerate(lines) if line.startswith(f'  "{tier}":')
+    )
+    assert old_fragment in lines[row_index]
+    lines[row_index] = lines[row_index].replace(old_fragment, new_fragment, 1)
+    adr_path.write_text("\n".join(lines) + "\n", encoding="utf-8")
 
 
 def assert_adr_rejected(
@@ -1601,15 +1903,16 @@ def assert_adr_inventory(adr_root: Path) -> None:
                     "exact launch SMS mapping integer fields must use JSON integers: "
                     f"{non_integer_fields}"
                 )
-                non_boolean_overage = tuple(
-                    tier
-                    for tier in EXPECTED_PLAN_SMS_LIMITS
+                non_boolean_fields = tuple(
+                    (tier, field)
+                    for tier, expected_fields in EXPECTED_PLAN_SMS_LIMITS.items()
+                    for field in PLAN_SMS_BOOLEAN_FIELDS
                     if not isinstance(plan_sms_limits.get(tier), dict)
-                    or type(plan_sms_limits[tier].get("overage")) is not bool
+                    or type(plan_sms_limits[tier].get(field)) is not bool
                 )
-                assert not non_boolean_overage, (
-                    "exact launch SMS mapping overage fields must use JSON booleans: "
-                    f"{non_boolean_overage}"
+                assert not non_boolean_fields, (
+                    "exact launch SMS mapping boolean fields must use JSON booleans: "
+                    f"{non_boolean_fields}"
                 )
                 assert plan_sms_limits == EXPECTED_PLAN_SMS_LIMITS, (
                     "exact launch SMS mapping must retain every tier and value"
@@ -2173,23 +2476,13 @@ def test_planversion_gate_rejects_wrong_exact_launch_sms_value(
     wrong_value: int,
 ) -> None:
     adr_root = copy_adr_fixture(tmp_path)
-    adr_path = (
-        adr_root
-        / "ADR-010-stripe-is-an-adapter-internal-entitlements-are-canonical.md"
-    )
-    record = adr_path.read_text(encoding="utf-8")
-    lines = record.splitlines()
-    row_index = next(
-        index for index, line in enumerate(lines) if line.startswith(f'  "{tier}":')
-    )
     expected_fragment = f'"{field}": {expected_value}'
-    assert expected_fragment in lines[row_index]
-    lines[row_index] = lines[row_index].replace(
+    mutate_planversion_row(
+        adr_root,
+        tier,
         expected_fragment,
         f'"{field}": {wrong_value}',
-        1,
     )
-    adr_path.write_text("\n".join(lines) + "\n", encoding="utf-8")
 
     with pytest.raises(AssertionError, match="exact launch SMS mapping"):
         assert_adr_inventory(adr_root)
@@ -2223,23 +2516,13 @@ def test_planversion_gate_rejects_non_integer_exact_launch_sms_type(
     wrong_type_token: str,
 ) -> None:
     adr_root = copy_adr_fixture(tmp_path)
-    adr_path = (
-        adr_root
-        / "ADR-010-stripe-is-an-adapter-internal-entitlements-are-canonical.md"
-    )
-    record = adr_path.read_text(encoding="utf-8")
-    lines = record.splitlines()
-    row_index = next(
-        index for index, line in enumerate(lines) if line.startswith(f'  "{tier}":')
-    )
     integer_fragment = f'"{field}": {integer_token}'
-    assert integer_fragment in lines[row_index]
-    lines[row_index] = lines[row_index].replace(
+    mutate_planversion_row(
+        adr_root,
+        tier,
         integer_fragment,
         f'"{field}": {wrong_type_token}',
-        1,
     )
-    adr_path.write_text("\n".join(lines) + "\n", encoding="utf-8")
 
     with pytest.raises(AssertionError, match="integer fields"):
         assert_adr_inventory(adr_root)
@@ -3008,20 +3291,66 @@ def test_planversion_gate_rejects_missing_or_enabled_sms_overage(
     new: str,
 ) -> None:
     adr_root = copy_adr_fixture(tmp_path)
-    adr_path = (
-        adr_root
-        / "ADR-010-stripe-is-an-adapter-internal-entitlements-are-canonical.md"
-    )
-    record = adr_path.read_text(encoding="utf-8")
-    lines = record.splitlines()
-    row_index = next(
-        index for index, line in enumerate(lines) if line.startswith(f'  "{tier}":')
-    )
-    assert old in lines[row_index]
-    lines[row_index] = lines[row_index].replace(old, new, 1)
-    adr_path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+    mutate_planversion_row(adr_root, tier, old, new)
 
     assert_adr_rejected(adr_root, match="exact launch SMS mapping")
+
+
+@pytest.mark.parametrize(
+    ("tier", "expected_value", "wrong_value"),
+    (
+        ("Trial", False, True),
+        ("Starter", False, True),
+        ("Farm", True, False),
+        ("Pro", True, False),
+        ("Business", True, False),
+    ),
+)
+def test_planversion_gate_rejects_wrong_exact_launch_sms_critical_value(
+    tmp_path: Path,
+    tier: str,
+    expected_value: bool,
+    wrong_value: bool,
+) -> None:
+    adr_root = copy_adr_fixture(tmp_path)
+    expected_fragment = f'"critical": {str(expected_value).lower()}'
+    wrong_fragment = f'"critical": {str(wrong_value).lower()}'
+    mutate_planversion_row(adr_root, tier, expected_fragment, wrong_fragment)
+
+    with pytest.raises(AssertionError, match="exact launch SMS mapping"):
+        assert_adr_inventory(adr_root)
+
+
+@pytest.mark.parametrize(
+    ("tier", "expected_token", "wrong_token"),
+    tuple(
+        (tier, str(expected).lower(), "0")
+        for tier, expected in (
+            ("Trial", False),
+            ("Starter", False),
+            ("Farm", True),
+            ("Pro", True),
+            ("Business", True),
+        )
+    ),
+)
+def test_planversion_gate_rejects_non_boolean_exact_launch_sms_critical_type(
+    tmp_path: Path,
+    tier: str,
+    expected_token: str,
+    wrong_token: str,
+) -> None:
+    adr_root = copy_adr_fixture(tmp_path)
+    expected_fragment = f'"critical": {expected_token}'
+    mutate_planversion_row(
+        adr_root,
+        tier,
+        expected_fragment,
+        f'"critical": {wrong_token}',
+    )
+
+    with pytest.raises(AssertionError, match="boolean fields"):
+        assert_adr_inventory(adr_root)
 
 
 def test_scheduler_gate_requires_lease_and_fencing_clause(tmp_path: Path) -> None:
