@@ -66,6 +66,24 @@ describe("Cognito session", () => {
     await logout();
     expect(sdk.signOut).toHaveBeenCalled();
   });
+  it("preserves persistent tokens when sign-in fails", async () => {
+    localStorage.setItem(
+      "CognitoIdentityServiceProvider.existing.accessToken",
+      "existing-token",
+    );
+    const error = Object.assign(new Error("invalid credentials"), {
+      name: "NotAuthorizedException",
+    });
+    sdk.signIn.mockRejectedValue(error);
+
+    await expect(login("a@example.com", "wrong", true)).rejects.toBe(error);
+
+    expect(
+      localStorage.getItem(
+        "CognitoIdentityServiceProvider.existing.accessToken",
+      ),
+    ).toBe("existing-token");
+  });
   it("delegates recovery and confirmation to Cognito", async () => {
     await recover("a@example.com");
     await finishRecovery("a@example.com", "123456", "new-password");

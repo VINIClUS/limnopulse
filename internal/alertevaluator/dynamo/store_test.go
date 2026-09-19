@@ -163,6 +163,35 @@ func TestBackfillActiveAlertIndexDryRunSkipsCompleteProjection(t *testing.T) {
 	}
 }
 
+func TestBackfillActiveAlertIndexLimitSkipsAlreadyIndexedEvents(t *testing.T) {
+	indexed, _ := attributevalue.MarshalMap(map[string]any{
+		"PK": "TENANT#tnt_1", "SK": "ALERT_EVENT#event_1", "tenant_id": "tnt_1",
+		"event_id": "event_1", "status": "open", "opened_at": "2026-07-15T12:00:00.000000000Z",
+		"GSI3PK": "TENANT#tnt_1#ACTIVE_ALERT_EVENTS", "GSI3SK": "2026-07-15T12:00:00.000000000Z#EVENT#event_1",
+	})
+	pending, _ := attributevalue.MarshalMap(map[string]any{
+		"PK": "TENANT#tnt_1", "SK": "ALERT_EVENT#event_2", "tenant_id": "tnt_1",
+		"event_id": "event_2", "status": "acknowledged", "opened_at": "2026-07-15T12:01:00.000000000Z",
+	})
+	client := &fakeClient{
+		queryOutput:  &dynamodb.QueryOutput{Items: []map[string]types.AttributeValue{indexed, pending}},
+		updateOutput: &dynamodb.UpdateItemOutput{},
+	}
+
+	summary, err := (Store{Table: "domain", Client: client}).BackfillActiveAlertIndex(
+		context.Background(), BackfillOptions{Tenants: []string{"tnt_1"}, PageSize: 10, Limit: 1, Apply: true},
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if summary.AlertEventsQueried != 2 || summary.AlertEventsEligible != 1 || summary.AlertEventsUpdated != 1 || len(client.updateInputs) != 1 {
+		t.Fatalf("summary = %#v, updates = %d", summary, len(client.updateInputs))
+	}
+	if got := client.updateInputs[0].Key["SK"].(*types.AttributeValueMemberS).Value; got != "ALERT_EVENT#event_2" {
+		t.Fatalf("updated event = %s", got)
+	}
+}
+
 func TestBackfillActiveAlertIndexCompletesPartialProjection(t *testing.T) {
 	partial, _ := attributevalue.MarshalMap(map[string]any{
 		"PK": "TENANT#tnt_1", "SK": "ALERT_EVENT#event_1", "tenant_id": "tnt_1",

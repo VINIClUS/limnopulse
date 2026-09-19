@@ -55,7 +55,7 @@ A validação desta entrega cobre o adaptador e os fluxos de formulário com o S
 
 O onboarding persiste os IDs retornados em rascunho por usuário no `sessionStorage`. Voltar e avançar atualiza as entidades existentes; cada viveiro concluído é salvo antes do próximo. Não é uma transação única: uma queda de rede depois da gravação mas antes da resposta pode exigir conferir os cadastros existentes. A conclusão remove o rascunho.
 
-O dashboard tem caches separados por usuário/propriedade/viveiro/período, atualização a cada minuto e gráficos sem dados demonstrativos. `active` significa cadastro ativo, não conexão online. A última leitura é indicada como antiga após 15 minutos. Ausência de alerta não equivale a certificação da qualidade da água. Os detalhes de dispositivos e alertas ficam na mesma tela; não foram criadas páginas extras de relatórios ou administração.
+O dashboard tem caches separados por usuário/propriedade/viveiro/período, atualiza leituras e alertas a cada minuto e o resumo de 30 dias a cada cinco minutos, com gráficos sem dados demonstrativos. `active` significa cadastro ativo, não conexão online. A última leitura é indicada como antiga após 15 minutos. Ausência de alerta não equivale a certificação da qualidade da água. Os detalhes de dispositivos e alertas ficam na mesma tela; não foram criadas páginas extras de relatórios ou administração.
 
 ## API adicionada
 
@@ -129,7 +129,14 @@ Gere `frontend/dist` com os IDs públicos corretos. Sirva os arquivos estáticos
 Aplique `X-Robots-Tag: noindex, nofollow` também no servidor para `/planos` e `/checkout`, reforçando o meta robots controlado pela aplicação para crawlers sem JavaScript. Não inclua essas URLs no sitemap. Exemplo de localização Nginx (adapte o root/upstream existente):
 
 ```nginx
-location /v1/ { proxy_pass http://127.0.0.1:8000; }
+# When Uvicorn runs on this host, start it with:
+# uvicorn limnopulse_api.main:app --proxy-headers --forwarded-allow-ips=127.0.0.1
+location /v1/ {
+    proxy_pass http://127.0.0.1:8000;
+    proxy_set_header X-Real-IP $remote_addr;
+    proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+    proxy_set_header X-Forwarded-Proto $scheme;
+}
 location ~ ^/(planos|checkout)/?$ {
     add_header X-Robots-Tag "noindex, nofollow" always;
     try_files $uri /index.html;

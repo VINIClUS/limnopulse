@@ -204,6 +204,7 @@ function TenantOverview({
       refetchInterval: 60000,
     })),
   });
+  const summaryRefetchInterval = period === "30d" ? 5 * 60000 : 60000;
   const summary = useQuery({
     queryKey: ["summary", tenant.tenant_id, pond?.pond_id, period],
     queryFn: ({ signal }) =>
@@ -212,7 +213,7 @@ function TenantOverview({
         { signal },
       ),
     enabled: Boolean(pond),
-    refetchInterval: 60000,
+    refetchInterval: summaryRefetchInterval,
   });
   const current = latest[rows.findIndex((p) => p.pond_id === pond?.pond_id)];
   const stats = summary.data?.statistics[metric];
@@ -575,7 +576,8 @@ function TenantOverview({
                 ? alertsTruncated
                   ? `${activeAlerts.length}+`
                   : activeAlerts.length
-                : "—"})
+                : "—"}
+              )
             </summary>
             {alertsTruncated && (
               <p role="status">

@@ -1,6 +1,7 @@
 from datetime import UTC, datetime
 from io import StringIO
 from pathlib import Path
+import stat
 import sys
 
 import pytest
@@ -89,6 +90,7 @@ def test_main_creates_exclusive_csv_in_current_directory(monkeypatch, tmp_path: 
     export_leads.main()
 
     assert (tmp_path / "leads.csv").read_text(encoding="utf-8-sig").count("lead_1") == 1
+    assert stat.S_IMODE((tmp_path / "leads.csv").stat().st_mode) == 0o600
     with pytest.raises(FileExistsError):
         export_leads.main()
 

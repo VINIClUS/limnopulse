@@ -2,6 +2,7 @@
 
 import argparse
 import csv
+import os
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
@@ -68,7 +69,8 @@ def main():
         boto3.client("dynamodb", region_name=args.region, endpoint_url=args.endpoint_url),
     )
     # Exclusive creation avoids overwriting an existing contact export.
-    with open(output_name, "x", newline="", encoding="utf-8-sig") as output:
+    fd = os.open(output_name, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+    with os.fdopen(fd, "w", newline="", encoding="utf-8-sig") as output:
         export_csv(repo, args.start, args.end + timedelta(days=1), output)
 
 

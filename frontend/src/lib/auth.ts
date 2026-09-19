@@ -94,7 +94,6 @@ export async function login(
   password: string,
   remember: boolean,
 ) {
-  await authStorage.clear();
   localStorage.removeItem(devKey);
   sessionStorage.removeItem(devKey);
   sessionStorage.setItem(rememberKey, String(remember));

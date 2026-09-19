@@ -80,10 +80,6 @@ func (store Store) BackfillActiveAlertIndex(ctx context.Context, options Backfil
 				if event.EventID == "" || event.SK != "ALERT_EVENT#"+event.EventID {
 					continue
 				}
-				if options.Limit > 0 && processed >= options.Limit {
-					return summary, nil
-				}
-				processed++
 				summary.AlertEventsQueried++
 				if event.Status != string(alertevaluator.StatusOpen) && event.Status != string(alertevaluator.StatusAcknowledged) {
 					continue
@@ -92,8 +88,15 @@ func (store Store) BackfillActiveAlertIndex(ctx context.Context, options Backfil
 					summary.AlertEventsSkipped++
 					continue
 				}
+				if options.Limit > 0 && processed >= options.Limit {
+					return summary, nil
+				}
+				processed++
 				summary.AlertEventsEligible++
 				if !options.Apply {
+					if options.Limit > 0 && processed >= options.Limit {
+						return summary, nil
+					}
 					continue
 				}
 				updated, err := store.updateActiveAlertIndex(ctx, event.TenantID, event.EventID, event.OpenedAt)
@@ -104,6 +107,9 @@ func (store Store) BackfillActiveAlertIndex(ctx context.Context, options Backfil
 					summary.AlertEventsUpdated++
 				} else {
 					summary.AlertEventsSkipped++
+				}
+				if options.Limit > 0 && processed >= options.Limit {
+					return summary, nil
 				}
 			}
 			lastKey = output.LastEvaluatedKey

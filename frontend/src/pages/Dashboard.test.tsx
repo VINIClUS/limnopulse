@@ -1,4 +1,4 @@
-import { render, screen, waitFor } from "@testing-library/react";
+import { fireEvent, render, screen, waitFor } from "@testing-library/react";
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { MemoryRouter } from "react-router";
 import { beforeEach, expect, it, vi } from "vitest";
@@ -117,4 +117,34 @@ it("polls the bounded active-alert view and marks truncated counts", async () =>
   expect(
     api.mock.calls.some(([path]) => path === "/tenants/tnt_1/alert-events"),
   ).toBe(false);
+});
+
+it("refreshes the 30-day summary every five minutes", async () => {
+  const queryClient = new QueryClient({
+    defaultOptions: { queries: { retry: false } },
+  });
+  render(
+    <QueryClientProvider client={queryClient}>
+      <MemoryRouter>
+        <Dashboard onContact={() => {}} />
+      </MemoryRouter>
+    </QueryClientProvider>,
+  );
+
+  const period = await screen.findByRole("combobox", { name: "Período" });
+  fireEvent.change(period, { target: { value: "30d" } });
+  await waitFor(() =>
+    expect(
+      api.mock.calls.some(
+        ([path]) =>
+          path === "/tenants/tnt_1/ponds/pond_1/metrics/summary?period=30d",
+      ),
+    ).toBe(true),
+  );
+
+  const query = queryClient.getQueryCache().find({
+    queryKey: ["summary", "tnt_1", "pond_1", "30d"],
+  });
+  const options = query?.options as { refetchInterval?: number } | undefined;
+  expect(options?.refetchInterval).toBe(5 * 60 * 1000);
 });
