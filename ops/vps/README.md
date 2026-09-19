@@ -38,7 +38,19 @@ generated InfluxDB admin token/password, the `limnopulse-api` IAM user's
 access key). **Never generate this file from CI; create it by hand and
 never commit it.**
 
-## 2. Deploy user
+## 2. GitHub Environment protection
+
+Do this **before** step 3 registers any secret — secrets should be scoped to
+this environment, not to the repo, and creating the environment first is
+what makes that possible.
+
+In repo Settings > Environments, create `production` with at least one
+required reviewer. `deploy.yml` references `environment: production` but the
+protection rule itself is not expressible in the workflow file — this is the
+control that keeps promotion human-gated (design §17.3: "Merge to `main`
+never automatically deploys production").
+
+## 3. Deploy user
 
 ```bash
 useradd --system --create-home --shell /usr/sbin/nologin limnopulse-deploy
@@ -67,17 +79,10 @@ chown -R limnopulse-deploy:limnopulse-deploy /home/limnopulse-deploy/.ssh
 chmod 600 /home/limnopulse-deploy/.ssh/authorized_keys
 ```
 
-Register the **private** half as the `VPS_SSH_KEY` GitHub Actions secret, and
-`ssh-keyscan 103.199.184.166` output as `VPS_KNOWN_HOSTS`. Both live only in
-`deploy.yml`'s `production` environment, never in `build.yml`'s scope.
-
-## 3. GitHub Environment protection
-
-In repo Settings > Environments, create `production` with at least one
-required reviewer. `deploy.yml` references `environment: production` but the
-protection rule itself is not expressible in the workflow file — this is the
-control that keeps promotion human-gated (design §17.3: "Merge to `main`
-never automatically deploys production").
+Register the **private** half as the `VPS_SSH_KEY` secret, and
+`ssh-keyscan 103.199.184.166` output as `VPS_KNOWN_HOSTS`, both scoped to the
+`production` environment created in step 2 — never to the repo, never to
+`build.yml`'s scope.
 
 ## 4. GHCR package visibility
 
@@ -115,9 +120,22 @@ certificate can't be issued yet.
 
 ## 6. First deploy
 
-Trigger `deploy.yml` (`workflow_dispatch`) with the `main-<sha>` tag that
-`build.yml` produced, approve the environment gate, and watch
-`/var/log/limnopulse-deploy.log` on the VPS. Then run the verification
-checklist in the plan document.
+**Do not promote the first `main-<sha>` tag that `build.yml` ever produces.**
+`build.yml`'s frontend build-args (`VITE_COGNITO_USER_POOL_ID`,
+`VITE_COGNITO_CLIENT_ID`) come from repository Variables that don't exist
+until Fase 0's `tofu apply` has run and someone sets them — before that, the
+frontend image bakes in blank auth config, and `deploy.yml` promotes the
+*exact* built artifact, never rebuilding. Promoting that tag ships a live
+site with a login that can never succeed. Order:
+
+1. Finish Fase 0 (`tofu apply`) and get real Cognito IDs.
+2. Set `vars.VITE_COGNITO_USER_POOL_ID` / `vars.VITE_COGNITO_CLIENT_ID` in
+   repo Settings > Secrets and variables > Actions > Variables.
+3. Push anything to `main` (even empty) so `build.yml` produces the first
+   tag with real auth config baked in.
+4. Only then trigger `deploy.yml` (`workflow_dispatch`) with that tag,
+   approve the environment gate, and watch
+   `/var/log/limnopulse-deploy.log` on the VPS. Then run the verification
+   checklist in the plan document.
 
 Finally, clean up the staging copies: `rm -f /tmp/limnopulse-deploy.sh /tmp/Caddyfile.limnopulse`.
