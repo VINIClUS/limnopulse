@@ -50,6 +50,14 @@ describe("Cognito session", () => {
       options: { authFlowType: "USER_SRP_AUTH" },
     });
   });
+  it("keeps the storage backend local to the tab when another tab changes remember", async () => {
+    sdk.signIn.mockResolvedValue({ isSignedIn: true });
+    await login("a@example.com", "secret", false);
+    localStorage.setItem("limnopulse:remember", "true");
+    await authStorage.setItem("token", "temporary");
+    expect(sessionStorage.getItem("token")).toBe("temporary");
+    expect(localStorage.getItem("token")).toBeNull();
+  });
   it("persists only when requested and clears tokens on logout", async () => {
     sdk.signIn.mockResolvedValue({ isSignedIn: true });
     await login("a@example.com", "secret", true);

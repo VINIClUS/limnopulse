@@ -65,21 +65,31 @@ func (store Store) BackfillActiveAlertIndex(ctx context.Context, options Backfil
 				return summary, fmt.Errorf("query alert events for tenant %s: %w", tenantID, err)
 			}
 			for _, item := range output.Items {
+				var event struct {
+					SK       string `dynamodbav:"SK"`
+					EventID  string `dynamodbav:"event_id"`
+					TenantID string `dynamodbav:"tenant_id"`
+					Status   string `dynamodbav:"status"`
+					OpenedAt string `dynamodbav:"opened_at"`
+					GSI3PK   string `dynamodbav:"GSI3PK"`
+					GSI3SK   string `dynamodbav:"GSI3SK"`
+				}
+				if err := attributevalue.UnmarshalMap(item, &event); err != nil {
+					return summary, fmt.Errorf("decode alert event during backfill: %w", err)
+				}
+				if event.EventID == "" || event.SK != "ALERT_EVENT#"+event.EventID {
+					continue
+				}
 				if options.Limit > 0 && processed >= options.Limit {
 					return summary, nil
 				}
 				processed++
 				summary.AlertEventsQueried++
-				var event struct {
-					EventID  string `dynamodbav:"event_id"`
-					TenantID string `dynamodbav:"tenant_id"`
-					Status   string `dynamodbav:"status"`
-					OpenedAt string `dynamodbav:"opened_at"`
-				}
-				if err := attributevalue.UnmarshalMap(item, &event); err != nil {
-					return summary, fmt.Errorf("decode alert event during backfill: %w", err)
-				}
 				if event.Status != string(alertevaluator.StatusOpen) && event.Status != string(alertevaluator.StatusAcknowledged) {
+					continue
+				}
+				if event.GSI3PK != "" && event.GSI3SK != "" {
+					summary.AlertEventsSkipped++
 					continue
 				}
 				summary.AlertEventsEligible++
@@ -120,7 +130,7 @@ func (store Store) updateActiveAlertIndex(ctx context.Context, tenantID, eventID
 	_, err = store.Client.UpdateItem(ctx, &dynamodb.UpdateItemInput{
 		TableName: aws.String(store.Table), Key: key,
 		UpdateExpression:          aws.String("SET #gsi_pk = :gsi_pk, #gsi_sk = :gsi_sk"),
-		ConditionExpression:       aws.String("#status IN (:open, :acknowledged) AND attribute_not_exists(#gsi_pk)"),
+		ConditionExpression:       aws.String("#status IN (:open, :acknowledged) AND (attribute_not_exists(#gsi_pk) OR attribute_not_exists(#gsi_sk))"),
 		ExpressionAttributeNames:  map[string]string{"#gsi_pk": "GSI3PK", "#gsi_sk": "GSI3SK", "#status": "status"},
 		ExpressionAttributeValues: values,
 	})

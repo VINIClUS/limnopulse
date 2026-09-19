@@ -17,3 +17,13 @@ func TestActiveAlertIndexBackfillRejectsInvalidFlag(t *testing.T) {
 		t.Fatal("expected invalid limit to fail")
 	}
 }
+
+func TestActiveAlertIndexBackfillAcceptsTenantIDAlias(t *testing.T) {
+	config, err := parseActiveAlertIndexBackfillArgs([]string{"--tenant-id", "tnt_123"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(config.tenants) != 1 || config.tenants[0] != "tnt_123" {
+		t.Fatalf("tenants = %#v", config.tenants)
+	}
+}

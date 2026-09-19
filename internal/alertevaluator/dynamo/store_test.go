@@ -17,6 +17,8 @@ import (
 type fakeClient struct {
 	queryInput    *dynamodb.QueryInput
 	queryOutput   *dynamodb.QueryOutput
+	queryOutputs  []*dynamodb.QueryOutput
+	queryCalls    int
 	updateInput   *dynamodb.UpdateItemInput
 	updateOutput  *dynamodb.UpdateItemOutput
 	getOutput     *dynamodb.GetItemOutput
@@ -26,6 +28,15 @@ type fakeClient struct {
 
 func (client *fakeClient) Query(_ context.Context, input *dynamodb.QueryInput, _ ...func(*dynamodb.Options)) (*dynamodb.QueryOutput, error) {
 	client.queryInput = input
+	if len(client.queryOutputs) > 0 {
+		index := client.queryCalls
+		if index >= len(client.queryOutputs) {
+			index = len(client.queryOutputs) - 1
+		}
+		client.queryCalls++
+		return client.queryOutputs[index], nil
+	}
+	client.queryCalls++
 	return client.queryOutput, nil
 }
 
@@ -99,6 +110,80 @@ func TestBackfillActiveAlertIndexIsDryRunByDefaultAndIdempotentShape(t *testing.
 	update := client.updateInputs[0]
 	if !strings.Contains(*update.ConditionExpression, "attribute_not_exists") || update.ExpressionAttributeNames["#gsi_pk"] != "GSI3PK" {
 		t.Fatalf("active index update = %#v", update)
+	}
+}
+
+func TestBackfillActiveAlertIndexDoesNotCountTransitionRowsTowardLimit(t *testing.T) {
+	transition, _ := attributevalue.MarshalMap(map[string]any{
+		"PK": "TENANT#tnt_1", "SK": "ALERT_EVENT#event_1#TRANSITION#2026-07-15T12:00:00.000000000Z#opened",
+		"tenant_id": "tnt_1", "event_id": "event_1", "transition": "opened",
+	})
+	active, _ := attributevalue.MarshalMap(map[string]any{
+		"PK": "TENANT#tnt_1", "SK": "ALERT_EVENT#event_2", "tenant_id": "tnt_1",
+		"event_id": "event_2", "status": "open", "opened_at": "2026-07-15T12:00:00.000000000Z",
+	})
+	lastKey := map[string]types.AttributeValue{
+		"PK": &types.AttributeValueMemberS{Value: "TENANT#tnt_1"},
+		"SK": &types.AttributeValueMemberS{Value: "ALERT_EVENT#event_1#TRANSITION#2026-07-15T12:00:00.000000000Z#opened"},
+	}
+	client := &fakeClient{
+		queryOutputs: []*dynamodb.QueryOutput{
+			{Items: []map[string]types.AttributeValue{transition}, LastEvaluatedKey: lastKey},
+			{Items: []map[string]types.AttributeValue{active}},
+		},
+		updateOutput: &dynamodb.UpdateItemOutput{},
+	}
+
+	summary, err := (Store{Table: "domain", Client: client}).BackfillActiveAlertIndex(
+		context.Background(), BackfillOptions{Tenants: []string{"tnt_1"}, PageSize: 1, Limit: 1, Apply: true},
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if client.queryCalls != 2 || summary.AlertEventsQueried != 1 || summary.AlertEventsUpdated != 1 || len(client.updateInputs) != 1 {
+		t.Fatalf("summary = %#v, query calls = %d, updates = %d", summary, client.queryCalls, len(client.updateInputs))
+	}
+}
+
+func TestBackfillActiveAlertIndexDryRunSkipsCompleteProjection(t *testing.T) {
+	indexed, _ := attributevalue.MarshalMap(map[string]any{
+		"PK": "TENANT#tnt_1", "SK": "ALERT_EVENT#event_1", "tenant_id": "tnt_1",
+		"event_id": "event_1", "status": "acknowledged", "opened_at": "2026-07-15T12:00:00.000000000Z",
+		"GSI3PK": "TENANT#tnt_1#ACTIVE_ALERT_EVENTS", "GSI3SK": "2026-07-15T12:00:00.000000000Z#EVENT#event_1",
+	})
+	client := &fakeClient{queryOutput: &dynamodb.QueryOutput{Items: []map[string]types.AttributeValue{indexed}}}
+	summary, err := (Store{Table: "domain", Client: client}).BackfillActiveAlertIndex(
+		context.Background(), BackfillOptions{Tenants: []string{"tnt_1"}, PageSize: 10},
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if summary.AlertEventsQueried != 1 || summary.AlertEventsEligible != 0 || summary.AlertEventsSkipped != 1 || len(client.updateInputs) != 0 {
+		t.Fatalf("summary = %#v, updates = %d", summary, len(client.updateInputs))
+	}
+}
+
+func TestBackfillActiveAlertIndexCompletesPartialProjection(t *testing.T) {
+	partial, _ := attributevalue.MarshalMap(map[string]any{
+		"PK": "TENANT#tnt_1", "SK": "ALERT_EVENT#event_1", "tenant_id": "tnt_1",
+		"event_id": "event_1", "status": "open", "opened_at": "2026-07-15T12:00:00.000000000Z",
+		"GSI3PK": "TENANT#tnt_1#ACTIVE_ALERT_EVENTS",
+	})
+	client := &fakeClient{
+		queryOutput:  &dynamodb.QueryOutput{Items: []map[string]types.AttributeValue{partial}},
+		updateOutput: &dynamodb.UpdateItemOutput{},
+	}
+	summary, err := (Store{Table: "domain", Client: client}).BackfillActiveAlertIndex(
+		context.Background(), BackfillOptions{Tenants: []string{"tnt_1"}, PageSize: 10, Apply: true},
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if summary.AlertEventsEligible != 1 || summary.AlertEventsUpdated != 1 || len(client.updateInputs) != 1 {
+		t.Fatalf("summary = %#v, updates = %d", summary, len(client.updateInputs))
+	}
+	if !strings.Contains(*client.updateInputs[0].ConditionExpression, "attribute_not_exists(#gsi_pk) OR attribute_not_exists(#gsi_sk)") {
+		t.Fatalf("partial projection condition = %s", *client.updateInputs[0].ConditionExpression)
 	}
 }
 

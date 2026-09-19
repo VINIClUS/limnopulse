@@ -11,12 +11,19 @@ import {
 } from "aws-amplify/auth";
 const rememberKey = "limnopulse:remember";
 const devKey = "limnopulse:dev-user";
+const cognitoKeyPrefix = "CognitoIdentityServiceProvider.";
 export const devAuthEnabled = () =>
   (import.meta.env.DEV || import.meta.env.MODE === "test") &&
   import.meta.env.VITE_DEV_AUTH === "true" &&
   ["localhost", "127.0.0.1", "[::1]"].includes(location.hostname);
-const storage = () =>
-  localStorage.getItem(rememberKey) === "true" ? localStorage : sessionStorage;
+const hasPersistentTokens = () =>
+  Object.keys(localStorage).some((key) => key.startsWith(cognitoKeyPrefix));
+const storage = () => {
+  const preference = sessionStorage.getItem(rememberKey);
+  if (preference === "true") return localStorage;
+  if (preference === "false") return sessionStorage;
+  return hasPersistentTokens() ? localStorage : sessionStorage;
+};
 export const authStorage = {
   async setItem(key: string, value: string) {
     storage().setItem(key, value);
@@ -31,7 +38,7 @@ export const authStorage = {
   async clear() {
     for (const s of [localStorage, sessionStorage])
       for (const k of Object.keys(s))
-        if (k.startsWith("CognitoIdentityServiceProvider.")) s.removeItem(k);
+        if (k.startsWith(cognitoKeyPrefix)) s.removeItem(k);
   },
 };
 const pool = import.meta.env.VITE_COGNITO_USER_POOL_ID,
@@ -44,6 +51,15 @@ if (authConfigured) {
   cognitoUserPoolsTokenProvider.setKeyValueStorage(authStorage);
 }
 export type SessionUser = { id: string; email: string };
+const definitiveAuthErrorNames = new Set([
+  "UserUnAuthenticatedException",
+  "NotAuthorizedException",
+]);
+const isDefinitiveAuthError = (error: unknown) => {
+  if (!error || typeof error !== "object" || !("name" in error)) return false;
+  const name = error.name;
+  return typeof name === "string" && definitiveAuthErrorNames.has(name);
+};
 export async function currentUser(): Promise<SessionUser | null> {
   if (devAuthEnabled()) {
     const email = storage().getItem(devKey);
@@ -60,8 +76,9 @@ export async function currentUser(): Promise<SessionUser | null> {
       id: user.userId,
       email: user.signInDetails?.loginId || user.username,
     };
-  } catch {
-    return null;
+  } catch (error) {
+    if (isDefinitiveAuthError(error)) return null;
+    throw error;
   }
 }
 export async function accessToken(forceRefresh = false) {
@@ -80,7 +97,7 @@ export async function login(
   await authStorage.clear();
   localStorage.removeItem(devKey);
   sessionStorage.removeItem(devKey);
-  localStorage.setItem(rememberKey, String(remember));
+  sessionStorage.setItem(rememberKey, String(remember));
   if (devAuthEnabled()) {
     storage().setItem(devKey, email);
     return { isSignedIn: true, nextStep: { signInStep: "DONE" } };
@@ -100,6 +117,7 @@ export async function logout() {
     await authStorage.clear();
     localStorage.removeItem(devKey);
     sessionStorage.removeItem(devKey);
+    sessionStorage.removeItem(rememberKey);
     localStorage.removeItem(rememberKey);
     for (const k of Object.keys(sessionStorage))
       if (k.startsWith("limnopulse:onboarding:")) sessionStorage.removeItem(k);

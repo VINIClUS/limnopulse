@@ -29,7 +29,13 @@ export function SessionProvider({ children }: { children: ReactNode }) {
     identity = useRef<SessionUser | null>(null);
   const refresh = useCallback(async () => {
     const ticket = ++generation.current;
-    const next = await currentUser();
+    let next: SessionUser | null;
+    try {
+      next = await currentUser();
+    } catch {
+      if (ticket === generation.current) setLoading(false);
+      return;
+    }
     if (ticket !== generation.current) return;
     if (identity.current?.id !== next?.id) {
       await cache.cancelQueries();
@@ -62,15 +68,12 @@ export function SessionProvider({ children }: { children: ReactNode }) {
     const changed = (event: StorageEvent) => {
       if (
         event.key === null ||
-        event.key === "limnopulse:remember" ||
         event.key === "limnopulse:dev-user" ||
         event.key.startsWith("CognitoIdentityServiceProvider.")
       ) {
-        // Hide/cancel private UI immediately, then reconcile the completed SDK write batch.
+        // Reconcile the completed SDK write batch before deciding whether the identity changed.
         ++generation.current;
         setLoading(true);
-        void cache.cancelQueries();
-        cache.clear();
         clearTimeout(timer);
         timer = setTimeout(() => void refresh(), 75);
       }
