@@ -9,6 +9,12 @@ import pytest
 
 
 ROOT = Path(__file__).resolve().parents[2]
+EXPECTED_EXECUTION_BASELINE = (
+    "141e108a479c983ed3a5efcbe729a30a43ab0ecb"
+)
+EXPECTED_RUNTIME_BASELINE = (
+    "4953601fbbc2f95c79e34439cce855307b7db2c8"
+)
 EXPECTED = {
     "FastAPI control plane": "implemented",
     "Tenant membership authorization": "implemented",
@@ -125,7 +131,9 @@ EXPECTED_ADR_ENTRY_PHASES = {
     "ADR-013-v1-remains-compatible-v2-is-generalized.md": "Phase 1",
     "ADR-014-commercial-tier-does-not-imply-safety.md": "Phase 4 contract; Phase 8 safety gate",
     "ADR-015-automatic-cloud-control-is-deferred.md": "Phase 10 decision gate",
-    "ADR-016-eventbridge-is-selective-sqs-is-durable.md": "Existing feedback; future bus gate",
+    "ADR-016-eventbridge-is-selective-sqs-is-durable.md": (
+        "Phase 3; existing feedback; future EventBridge decision gate"
+    ),
     "ADR-017-sns-is-provider-feedback-not-notification-service.md": "Phase 7C",
     "ADR-018-eum-push-and-sms-are-provider-adapters.md": "Phases 7B–7C",
     "ADR-019-redis-valkey-is-optional-acceleration.md": "Phase 7A",
@@ -138,33 +146,51 @@ EXPECTED_ADR_SECTION_HEADINGS = (
     "## Implementation gate",
     "## Non-goals",
 )
+REQUIRED_ADR_DECISION_PATTERNS = {
+    "ADR-001-aws-iot-is-an-integration-adapter.md": (
+        r"\bThe core Device and Integration models are provider-neutral\.\s+"
+        r"AWS IoT implements provisioning, authentication, trusted mapping, and "
+        r"ingress behind an adapter;\s+its identifiers and credentials stay in "
+        r"integration records\b"
+    ),
+}
 EXPECTED_PLAN_SMS_LIMITS = {
     "Trial": {
         "provider_calls": 0,
         "budget_usd_minor": 0,
         "max_price_usd_minor": 0,
+        "overage": False,
     },
     "Starter": {
         "provider_calls": 0,
         "budget_usd_minor": 0,
         "max_price_usd_minor": 0,
+        "overage": False,
     },
     "Farm": {
         "provider_calls": 10,
         "budget_usd_minor": 50,
         "max_price_usd_minor": 5,
+        "overage": False,
     },
     "Pro": {
         "provider_calls": 50,
         "budget_usd_minor": 250,
         "max_price_usd_minor": 5,
+        "overage": False,
     },
     "Business": {
         "provider_calls": 250,
         "budget_usd_minor": 1250,
         "max_price_usd_minor": 5,
+        "overage": False,
     },
 }
+PLAN_SMS_INTEGER_FIELDS = (
+    "provider_calls",
+    "budget_usd_minor",
+    "max_price_usd_minor",
+)
 REQUIRED_ADR_GATE_PATTERNS = {
     "ADR-001-aws-iot-is-an-integration-adapter.md": (
         r"\bBefore any queued consumer acts, it must recheck the DeviceIntegration "
@@ -724,6 +750,181 @@ FORBIDDEN_ADR_GATE_PATTERNS = {
     ),
 }
 
+CODEX_REVIEW_GATE_CASES = (
+    {
+        "name": "BeginAttempt membership fence",
+        "filename": "ADR-011-limnopulse-owns-notification-semantics.md",
+        "required_pattern": (
+            r"\bAt `BeginAttempt`, Phase 7A must recheck current active tenant "
+            r"membership for every channel;\s+if a queued recipient lost membership "
+            r"before the provider call, dispatch must deterministically perform no "
+            r"send and incur no charge\b"
+        ),
+        "required_clause": (
+            "At `BeginAttempt`, Phase 7A must recheck current active tenant "
+            "membership for every channel; if a queued recipient lost membership "
+            "before the provider call, dispatch must deterministically perform no "
+            "send and incur no charge."
+        ),
+        "inverted_clause": (
+            "At `BeginAttempt`, Phase 7A may skip current active tenant membership "
+            "for a queued recipient."
+        ),
+        "forbidden_pattern": (
+            r"\bAt `BeginAttempt`, Phase 7A may skip current active tenant membership "
+            r"for a queued recipient\b"
+        ),
+    },
+    {
+        "name": "immutable content snapshot",
+        "filename": "ADR-011-limnopulse-owns-notification-semantics.md",
+        "required_pattern": (
+            r"\bThe content snapshot selected at fanout must remain immutable "
+            r"alongside the destination snapshot after Delivery creation;\s+later "
+            r"template or content-revision changes must not rewrite queued or "
+            r"historical Delivery evidence\b"
+        ),
+        "required_clause": (
+            "The content snapshot selected at fanout must remain immutable alongside "
+            "the destination snapshot after Delivery creation; later template or "
+            "content-revision changes must not rewrite queued or historical Delivery "
+            "evidence."
+        ),
+        "inverted_clause": (
+            "The content snapshot may be resolved or overwritten at attempt time "
+            "after fanout."
+        ),
+        "forbidden_pattern": (
+            r"\bthe content snapshot may be resolved or overwritten at attempt time "
+            r"after fanout\b"
+        ),
+    },
+    {
+        "name": "SMS destination lifecycle authorization",
+        "filename": "ADR-018-eum-push-and-sms-are-provider-adapters.md",
+        "required_pattern": (
+            r"\bEvery SMS destination create, verify, and delete request must "
+            r"authenticate the current principal and verify current ACTIVE tenant "
+            r"membership;\s+missing, invalid, mismatched, inactive, cross-user, or "
+            r"cross-tenant requests must be rejected, even when the destination is "
+            r"pending or unclaimed\b"
+        ),
+        "required_clause": (
+            "Every SMS destination create, verify, and delete request must authenticate "
+            "the current principal and verify current ACTIVE tenant membership; missing, "
+            "invalid, mismatched, inactive, cross-user, or cross-tenant requests must "
+            "be rejected, even when the destination is pending or unclaimed."
+        ),
+        "inverted_clause": (
+            "SMS destination create, verify, and delete requests may skip current "
+            "principal authentication or active tenant membership."
+        ),
+        "forbidden_pattern": (
+            r"\bSMS destination create, verify, and delete requests may skip current "
+            r"principal authentication or active tenant membership\b"
+        ),
+    },
+    {
+        "name": "transactional non-SMS quota counters",
+        "filename": "ADR-010-stripe-is-an-adapter-internal-entitlements-are-canonical.md",
+        "required_pattern": (
+            r"\bPhase 4 must enforce sites, devices, components, integrations, active "
+            r"rules, and Push destinations with transactionally maintained counters;\s+"
+            r"reserve and create must be atomic where possible, archive/delete decrements "
+            r"idempotent, and boundary plus concurrent-create tests must prove no quota "
+            r"oversubscription\b"
+        ),
+        "required_clause": (
+            "Phase 4 must enforce sites, devices, components, integrations, active rules, "
+            "and Push destinations with transactionally maintained counters; reserve and "
+            "create must be atomic where possible, archive/delete decrements idempotent, "
+            "and boundary plus concurrent-create tests must prove no quota oversubscription."
+        ),
+        "inverted_clause": (
+            "Phase 4 may enforce non-SMS resource quotas with non-transactional "
+            "check-then-create logic that permits concurrent oversubscription."
+        ),
+        "forbidden_pattern": (
+            r"\bPhase 4 may enforce non-SMS resource quotas with non-transactional "
+            r"check-then-create logic that permits concurrent oversubscription\b"
+        ),
+    },
+    {
+        "name": "provider SMS spend boundary",
+        "filename": "ADR-018-eum-push-and-sms-are-provider-adapters.md",
+        "required_pattern": (
+            r"\bPhase 7C launch readiness must enable and exercise AWS account/enforced "
+            r"provider spend limits and billing alarms as an outer boundary in addition "
+            r"to tenant budgets, per-message caps, and storm controls\b"
+        ),
+        "required_clause": (
+            "Phase 7C launch readiness must enable and exercise AWS account/enforced "
+            "provider spend limits and billing alarms as an outer boundary in addition "
+            "to tenant budgets, per-message caps, and storm controls."
+        ),
+        "inverted_clause": (
+            "Phase 7C launch readiness may omit AWS account spend limits and billing "
+            "alarms when tenant budgets pass."
+        ),
+        "forbidden_pattern": (
+            r"\bPhase 7C launch readiness may omit AWS account spend limits and billing "
+            r"alarms when tenant budgets pass\b"
+        ),
+    },
+    {
+        "name": "stable HTTP batch identity",
+        "filename": "ADR-016-eventbridge-is-selective-sqs-is-durable.md",
+        "required_pattern": (
+            r"\bPhase 3 HTTP batch ingress must require an `Idempotency-Key` or stable "
+            r"`source_event_id`;\s+if the durable SQS write succeeds but the HTTP "
+            r"response is lost, retrying with that identity must not create a second "
+            r"canonical observation\b"
+        ),
+        "required_clause": (
+            "Phase 3 HTTP batch ingress must require an `Idempotency-Key` or stable "
+            "`source_event_id`; if the durable SQS write succeeds but the HTTP response "
+            "is lost, retrying with that identity must not create a second canonical "
+            "observation."
+        ),
+        "inverted_clause": (
+            "Phase 3 HTTP batch ingress may assign a new identity when a durable SQS "
+            "write succeeds but the response is lost."
+        ),
+        "forbidden_pattern": (
+            r"\bPhase 3 HTTP batch ingress may assign a new identity when a durable "
+            r"SQS write succeeds but the response is lost\b"
+        ),
+    },
+    {
+        "name": "provider credential rotation rollback",
+        "filename": "ADR-018-eum-push-and-sms-are-provider-adapters.md",
+        "required_pattern": (
+            r"\bPhase 7B must version, rotate, and roll back FCM service-account and "
+            r"APNs credentials;\s+invalid or expired replacements must fail closed "
+            r"without leaving a compromised credential active, and the credential "
+            r"rotation/rollback runbooks and tests must be proven before launch\b"
+        ),
+        "required_clause": (
+            "Phase 7B must version, rotate, and roll back FCM service-account and APNs "
+            "credentials; invalid or expired replacements must fail closed without leaving "
+            "a compromised credential active, and the credential rotation/rollback runbooks "
+            "and tests must be proven before launch."
+        ),
+        "inverted_clause": (
+            "Phase 7B may replace Push provider credentials without versioned rollback "
+            "or invalid-credential tests."
+        ),
+        "forbidden_pattern": (
+            r"\bPhase 7B may replace Push provider credentials without versioned rollback "
+            r"or invalid-credential tests\b"
+        ),
+    },
+)
+for _case in CODEX_REVIEW_GATE_CASES:
+    _filename = _case["filename"]
+    REQUIRED_ADR_GATE_PATTERNS[_filename] += (_case["required_pattern"],)
+    FORBIDDEN_ADR_GATE_PATTERNS[_filename] += (_case["forbidden_pattern"],)
+
 
 def semantic_gate_inversions(filename: str, gate_body: str) -> tuple[str, ...]:
     compact_gate = re.sub(r"\s+", " ", gate_body)
@@ -986,6 +1187,75 @@ def test_inventory_uses_exact_v4_treatment_and_owning_phase() -> None:
     assert_inventory_metadata()
 
 
+def assert_architecture_baseline_metadata(
+    current_state_path: Path = ROOT / "docs/current-state.md",
+    architecture_path: Path = ROOT / "docs/architecture.md",
+) -> None:
+    current_state = current_state_path.read_text(encoding="utf-8")
+    assert f"**Execution baseline:** `main@{EXPECTED_EXECUTION_BASELINE}`" in (
+        current_state
+    )
+    assert f"**Runtime baseline:** `{EXPECTED_RUNTIME_BASELINE}`" in current_state
+    assert "`4953601` hardens the alert-evaluator container runtime and updates Go dependencies" in current_state
+    assert "documentation and tests after that baseline do not change runtime behavior" in current_state
+
+    architecture = architecture_path.read_text(encoding="utf-8")
+    assert "**Version:** 1.4" in architecture
+    assert "**Updated:** 2026-08-25" in architecture
+    for link in (
+        "[Current-state inventory](current-state.md)",
+        "[Platform redesign technical specification V4](superpowers/specs/"
+        "2026-08-16-limnopulse-platform-redesign-tech-spec-v4.md)",
+        "[V4 parallel execution design](superpowers/specs/"
+        "2026-08-25-limnopulse-v4-parallel-execution-design.md)",
+    ):
+        assert link in architecture
+
+
+def test_architecture_baseline_metadata_is_pinned() -> None:
+    assert_architecture_baseline_metadata()
+
+
+@pytest.mark.parametrize(
+    ("relative_path", "old", "new"),
+    (
+        (
+            "docs/current-state.md",
+            f"**Runtime baseline:** `{EXPECTED_RUNTIME_BASELINE}`",
+            "**Runtime baseline:** `ce46b47fd646de762098a632b12e02d482c66485`",
+        ),
+        ("docs/architecture.md", "**Version:** 1.4", "**Version:** 1.3"),
+        (
+            "docs/architecture.md",
+            "[Current-state inventory](current-state.md)",
+            "Current-state inventory",
+        ),
+    ),
+)
+def test_architecture_baseline_metadata_rejects_mutation(
+    tmp_path: Path,
+    relative_path: str,
+    old: str,
+    new: str,
+) -> None:
+    current_state_path = tmp_path / "current-state.md"
+    architecture_path = tmp_path / "architecture.md"
+    shutil.copy(ROOT / "docs/current-state.md", current_state_path)
+    shutil.copy(ROOT / "docs/architecture.md", architecture_path)
+    target_path = (
+        current_state_path
+        if relative_path.endswith("current-state.md")
+        else architecture_path
+    )
+    record = target_path.read_text(encoding="utf-8")
+    mutated = record.replace(old, new, 1)
+    assert mutated != record
+    target_path.write_text(mutated, encoding="utf-8")
+
+    with pytest.raises(AssertionError):
+        assert_architecture_baseline_metadata(current_state_path, architecture_path)
+
+
 @pytest.mark.parametrize(
     ("old", "new"),
     (
@@ -1080,6 +1350,18 @@ def assert_adr_inventory(adr_root: Path) -> None:
         assert status_lines == ("Accepted",), (
             f"dedicated ADR status must be exactly Accepted: {filename}"
         )
+        decision = re.search(
+            r"(?ms)^## Decision\n\n(.*?)(?=^## Consequences$)",
+            record,
+        )
+        decision_body = decision.group(1) if decision else ""
+        required_decision_pattern = REQUIRED_ADR_DECISION_PATTERNS.get(filename)
+        if required_decision_pattern:
+            assert re.search(
+                required_decision_pattern,
+                decision_body,
+                flags=re.IGNORECASE | re.DOTALL,
+            ), f"ADR decision semantics missing in {filename}"
         implementation_gate = re.search(
             r"(?ms)^## Implementation gate\n\n(.*?)(?=^## Non-goals$)",
             record,
@@ -1154,7 +1436,7 @@ def assert_adr_inventory(adr_root: Path) -> None:
                     else tuple(
                         (tier, field)
                         for tier, expected_fields in EXPECTED_PLAN_SMS_LIMITS.items()
-                        for field in expected_fields
+                        for field in PLAN_SMS_INTEGER_FIELDS
                         if not isinstance(plan_sms_limits.get(tier), dict)
                         or type(plan_sms_limits[tier].get(field)) is not int
                     )
@@ -1162,6 +1444,16 @@ def assert_adr_inventory(adr_root: Path) -> None:
                 assert not non_integer_fields, (
                     "exact launch SMS mapping integer fields must use JSON integers: "
                     f"{non_integer_fields}"
+                )
+                non_boolean_overage = tuple(
+                    tier
+                    for tier in EXPECTED_PLAN_SMS_LIMITS
+                    if not isinstance(plan_sms_limits.get(tier), dict)
+                    or type(plan_sms_limits[tier].get("overage")) is not bool
+                )
+                assert not non_boolean_overage, (
+                    "exact launch SMS mapping overage fields must use JSON booleans: "
+                    f"{non_boolean_overage}"
                 )
                 assert plan_sms_limits == EXPECTED_PLAN_SMS_LIMITS, (
                     "exact launch SMS mapping must retain every tier and value"
@@ -1181,6 +1473,21 @@ def assert_adr_inventory(adr_root: Path) -> None:
 
 def test_adr_index_is_complete_and_every_record_is_accepted() -> None:
     assert_adr_inventory(ROOT / "docs/adr")
+
+
+def test_adr_decision_rejects_provider_identity_inversion(tmp_path: Path) -> None:
+    adr_root = copy_adr_fixture(tmp_path)
+    replace_adr_fragment(
+        adr_root,
+        "ADR-001-aws-iot-is-an-integration-adapter.md",
+        "The core Device and Integration models are provider-neutral. AWS IoT "
+        "implements provisioning, authentication, trusted mapping, and ingress "
+        "behind an adapter; its identifiers and credentials stay in integration "
+        "records.",
+        "AWS IoT Thing identity is the canonical Device domain identity.",
+    )
+
+    assert_adr_rejected(adr_root, match="ADR decision semantics")
 
 
 def test_adr_record_requires_dedicated_accepted_status(tmp_path: Path) -> None:
@@ -2495,6 +2802,70 @@ def test_adr_gate_allows_round_fourteen_f_emphatic_local_prohibition(
     mutate_adr_gate(adr_root, filename, safe_clause)
 
     assert_adr_inventory(adr_root)
+
+
+@pytest.mark.parametrize(
+    "case",
+    CODEX_REVIEW_GATE_CASES,
+    ids=lambda case: case["name"],
+)
+def test_codex_review_gate_rejects_missing_requirement(
+    tmp_path: Path,
+    case: dict[str, str],
+) -> None:
+    adr_root = copy_adr_fixture(tmp_path)
+    remove_adr_fragment(adr_root, case["filename"], case["required_clause"])
+
+    assert_adr_rejected(adr_root)
+
+
+@pytest.mark.parametrize(
+    "case",
+    CODEX_REVIEW_GATE_CASES,
+    ids=lambda case: case["name"],
+)
+def test_codex_review_gate_rejects_inverted_requirement(
+    tmp_path: Path,
+    case: dict[str, str],
+) -> None:
+    adr_root = copy_adr_fixture(tmp_path)
+    mutate_adr_gate(adr_root, case["filename"], case["inverted_clause"])
+
+    assert_adr_rejected(adr_root)
+
+
+@pytest.mark.parametrize(
+    ("tier", "old", "new"),
+    tuple(
+        (tier, '"overage": false', '"overage": true')
+        for tier in EXPECTED_PLAN_SMS_LIMITS
+    )
+    + tuple(
+        (tier, ', "overage": false', "")
+        for tier in EXPECTED_PLAN_SMS_LIMITS
+    ),
+)
+def test_planversion_gate_rejects_missing_or_enabled_sms_overage(
+    tmp_path: Path,
+    tier: str,
+    old: str,
+    new: str,
+) -> None:
+    adr_root = copy_adr_fixture(tmp_path)
+    adr_path = (
+        adr_root
+        / "ADR-010-stripe-is-an-adapter-internal-entitlements-are-canonical.md"
+    )
+    record = adr_path.read_text(encoding="utf-8")
+    lines = record.splitlines()
+    row_index = next(
+        index for index, line in enumerate(lines) if line.startswith(f'  "{tier}":')
+    )
+    assert old in lines[row_index]
+    lines[row_index] = lines[row_index].replace(old, new, 1)
+    adr_path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+
+    assert_adr_rejected(adr_root, match="exact launch SMS mapping")
 
 
 def test_scheduler_gate_requires_lease_and_fencing_clause(tmp_path: Path) -> None:

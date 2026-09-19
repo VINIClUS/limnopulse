@@ -19,7 +19,7 @@ These accepted records map the V4 architecture to explicit implementation gates.
 | [ADR-013](ADR-013-v1-remains-compatible-v2-is-generalized.md) | Phase 1 |
 | [ADR-014](ADR-014-commercial-tier-does-not-imply-safety.md) | Phase 4 contract; Phase 8 safety gate |
 | [ADR-015](ADR-015-automatic-cloud-control-is-deferred.md) | Phase 10 decision gate |
-| [ADR-016](ADR-016-eventbridge-is-selective-sqs-is-durable.md) | Existing feedback; future bus gate |
+| [ADR-016](ADR-016-eventbridge-is-selective-sqs-is-durable.md) | Phase 3; existing feedback; future EventBridge decision gate |
 | [ADR-017](ADR-017-sns-is-provider-feedback-not-notification-service.md) | Phase 7C |
 | [ADR-018](ADR-018-eum-push-and-sms-are-provider-adapters.md) | Phases 7B–7C |
 | [ADR-019](ADR-019-redis-valkey-is-optional-acceleration.md) | Phase 7A |
