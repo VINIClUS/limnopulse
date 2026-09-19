@@ -105,12 +105,16 @@ export type Summary = {
 };
 export type AlertEvent = {
   event_id: string;
+  tenant_id?: string;
+  rule_id?: string;
+  rule_name?: string;
   pond_id: string;
   status: string;
   state?: string;
   metric?: string;
   severity?: string;
   opened_at?: string;
+  [key: string]: unknown;
 };
 export const post = <T>(path: string, body: unknown, isPublic = false) =>
   api<T>(path, { method: "POST", body: JSON.stringify(body) }, isPublic);

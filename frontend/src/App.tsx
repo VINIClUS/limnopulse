@@ -11,6 +11,7 @@ import {
 import { Login } from "./pages/Login";
 import { Onboarding } from "./pages/Onboarding";
 import { Dashboard } from "./pages/Dashboard";
+import { AlertEventDetail } from "./pages/AlertEventDetail";
 import { Protected } from "./lib/session";
 import { ContactModal } from "./components/LeadForm";
 export function App() {
@@ -18,13 +19,10 @@ export function App() {
     [contact, setContact] = useState(false);
   const openContact = () => setContact(true);
   useEffect(() => {
-    const hidden = [
-      "/planos",
-      "/checkout",
-      "/entrar",
-      "/onboarding",
-      "/app",
-    ].includes(location.pathname);
+    const hidden =
+      ["/planos", "/checkout", "/entrar", "/onboarding", "/app"].includes(
+        location.pathname,
+      ) || location.pathname.startsWith("/tenants/");
     let meta = document.querySelector<HTMLMetaElement>('meta[name="robots"]');
     if (!meta) {
       meta = document.createElement("meta");
@@ -46,9 +44,15 @@ export function App() {
     document.title = `${titles[location.pathname] || "Página não encontrada"} | LimnoPulse`;
     setContact(false);
     if (location.hash) {
-      requestAnimationFrame(() =>
-        document.querySelector(location.hash)?.scrollIntoView(),
-      );
+      requestAnimationFrame(() => {
+        let id: string;
+        try {
+          id = decodeURIComponent(location.hash.slice(1));
+        } catch {
+          return;
+        }
+        document.getElementById(id)?.scrollIntoView();
+      });
     } else window.scrollTo(0, 0);
   }, [location.pathname, location.hash]);
   return (
@@ -89,6 +93,14 @@ export function App() {
           element={
             <Protected>
               <Dashboard onContact={openContact} />
+            </Protected>
+          }
+        />
+        <Route
+          path="/tenants/:tenantId/alert-events/:eventId"
+          element={
+            <Protected>
+              <AlertEventDetail />
             </Protected>
           }
         />

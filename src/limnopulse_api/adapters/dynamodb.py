@@ -131,6 +131,7 @@ class DynamoDomainRepository:
         response = self.client.get_item(
             TableName=self.table_name,
             Key=self._serialize_item(self.keys.tenant(tenant_id)),
+            ConsistentRead=True,
         )
         item = self._response_item(response)
         if item is None:

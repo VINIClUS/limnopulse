@@ -132,17 +132,23 @@ def test_new_domain_table_includes_alert_evaluation_and_event_indexes(
         "GSI1SK",
         "GSI2PK",
         "GSI2SK",
+        "GSI3PK",
+        "GSI3SK",
         "relay_gsi_pk",
         "relay_gsi_sk",
     }
     assert [index["IndexName"] for index in create["GlobalSecondaryIndexes"]] == [
         "AlertEvaluationByDue",
         "AlertEventsByTenantTime",
+        "ActiveAlertEventsByTenantTime",
         "NotificationRelayByAvailableAt",
     ]
     assert create["GlobalSecondaryIndexes"][0]["Projection"] == {"ProjectionType": "KEYS_ONLY"}
     assert create["GlobalSecondaryIndexes"][1]["Projection"] == {"ProjectionType": "ALL"}
     assert create["GlobalSecondaryIndexes"][2]["Projection"] == {
+        "ProjectionType": "ALL",
+    }
+    assert create["GlobalSecondaryIndexes"][3]["Projection"] == {
         "ProjectionType": "INCLUDE",
         "NonKeyAttributes": ["relay_work_kind"],
     }
@@ -172,11 +178,13 @@ def test_existing_table_waits_for_each_index_before_creating_next(
     assert created == [
         "AlertEvaluationByDue",
         "AlertEventsByTenantTime",
+        "ActiveAlertEventsByTenantTime",
         "NotificationRelayByAvailableAt",
     ]
     assert client.indexes == {
         "AlertEvaluationByDue": "ACTIVE",
         "AlertEventsByTenantTime": "ACTIVE",
+        "ActiveAlertEventsByTenantTime": "ACTIVE",
         "NotificationRelayByAvailableAt": "ACTIVE",
     }
 
@@ -193,6 +201,7 @@ def test_new_table_waits_for_all_indexes_before_returning(
     assert client.indexes == {
         "AlertEvaluationByDue": "ACTIVE",
         "AlertEventsByTenantTime": "ACTIVE",
+        "ActiveAlertEventsByTenantTime": "ACTIVE",
         "NotificationRelayByAvailableAt": "ACTIVE",
     }
     assert client.index_describe_calls >= 3
@@ -214,7 +223,7 @@ def test_existing_creating_index_is_awaited(
     assert [
         call["GlobalSecondaryIndexUpdates"][0]["Create"]["IndexName"]
         for call in client.update_table_calls
-    ] == ["NotificationRelayByAvailableAt"]
+    ] == ["ActiveAlertEventsByTenantTime", "NotificationRelayByAvailableAt"]
     assert client.indexes["AlertEvaluationByDue"] == "ACTIVE"
     assert client.indexes["NotificationRelayByAvailableAt"] == "ACTIVE"
     assert client.index_describe_calls >= 2

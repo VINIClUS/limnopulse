@@ -58,7 +58,7 @@ export async function visualApi(page: Page) {
           status: "active",
         })),
       };
-    else if (path.endsWith("/alert-events"))
+    else if (path.includes("/alert-events/active"))
       data = {
         items: [
           {
@@ -76,6 +76,7 @@ export async function visualApi(page: Page) {
             metric: "ph",
           },
         ],
+        has_more: false,
       };
     else if (path.endsWith("/metrics/latest")) {
       const i = Number(path.match(/pond_(\d)/)?.[1] || 1) - 1;

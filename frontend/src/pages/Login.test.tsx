@@ -15,12 +15,16 @@ vi.mock("../lib/auth", () => auth);
 vi.mock("../lib/session", () => ({ useSession: () => ({ refresh }) }));
 import { Login } from "./Login";
 beforeEach(() => vi.clearAllMocks());
-function setup() {
+function setup(initialEntries = ["/entrar"]) {
   render(
-    <MemoryRouter initialEntries={["/entrar"]}>
+    <MemoryRouter initialEntries={initialEntries}>
       <Routes>
         <Route path="/entrar" element={<Login onContact={() => {}} />} />
         <Route path="/app" element={<h1>Operação autenticada</h1>} />
+        <Route
+          path="/tenants/:tenantId/alert-events/:eventId"
+          element={<h1>Detalhe autenticado</h1>}
+        />
       </Routes>
     </MemoryRouter>,
   );
@@ -34,6 +38,19 @@ it("signs in through the custom form and opens the operation", async () => {
   await user.click(screen.getByRole("button", { name: "Entrar" }));
   expect(await screen.findByText("Operação autenticada")).toBeInTheDocument();
   expect(refresh).toHaveBeenCalledOnce();
+});
+it("returns to a protected deep link with query and fragment after sign-in", async () => {
+  auth.login.mockResolvedValue({ isSignedIn: true });
+  const user = setup([
+    {
+      pathname: "/entrar",
+      state: { from: "/tenants/tnt_1/alert-events/a1?tab=history#details" },
+    },
+  ] as never);
+  await user.type(screen.getByLabelText("E-mail"), "maria@example.com");
+  await user.type(screen.getByLabelText("Senha"), "password");
+  await user.click(screen.getByRole("button", { name: "Entrar" }));
+  expect(await screen.findByText("Detalhe autenticado")).toBeInTheDocument();
 });
 it("recovers the password and confirms a new password without creating an account", async () => {
   auth.recover.mockResolvedValue({

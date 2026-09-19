@@ -30,7 +30,10 @@ export function Login({ onContact }: { onContact: () => void }) {
   async function done() {
     await session.refresh();
     const target = location.state?.from;
-    navigate(target === "/onboarding" ? target : "/app", { replace: true });
+    navigate(
+      typeof target === "string" && target.startsWith("/") ? target : "/app",
+      { replace: true },
+    );
   }
   async function submit(e: FormEvent) {
     e.preventDefault();

@@ -103,6 +103,10 @@ export function Protected({ children }: { children: ReactNode }) {
   return user ? (
     children
   ) : (
-    <Navigate to="/entrar" replace state={{ from: location.pathname }} />
+    <Navigate
+      to="/entrar"
+      replace
+      state={{ from: `${location.pathname}${location.search}${location.hash}` }}
+    />
   );
 }

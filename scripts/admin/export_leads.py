@@ -3,12 +3,25 @@
 import argparse
 import csv
 from datetime import UTC, datetime, timedelta
+from pathlib import Path
 
 import boto3
 
 from limnopulse_api.adapters.leads import DynamoLeadRepository
 
 FIELDS = ["lead_id", "created_at", "name", "email", "phone", "property_name", "source", "consent"]
+
+
+def validate_output_name(value: str) -> str:
+    if (
+        not value
+        or Path(value).name != value
+        or value in {".", ".."}
+        or "/" in value
+        or "\\" in value
+    ):
+        raise ValueError("--output must be a simple filename in the current directory")
+    return value
 
 
 def export_csv(repository, start, end, output):
@@ -44,6 +57,10 @@ def main():
     parser.add_argument("--endpoint-url")
     parser.add_argument("--output", required=True)
     args = parser.parse_args()
+    try:
+        output_name = validate_output_name(args.output)
+    except ValueError as exc:
+        parser.error(str(exc))
     if args.end < args.start:
         parser.error("--end must be on or after --start")
     repo = DynamoLeadRepository(
@@ -51,7 +68,7 @@ def main():
         boto3.client("dynamodb", region_name=args.region, endpoint_url=args.endpoint_url),
     )
     # Exclusive creation avoids overwriting an existing contact export.
-    with open(args.output, "x", newline="", encoding="utf-8-sig") as output:
+    with open(output_name, "x", newline="", encoding="utf-8-sig") as output:
         export_csv(repo, args.start, args.end + timedelta(days=1), output)
 
 

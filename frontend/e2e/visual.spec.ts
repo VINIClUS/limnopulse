@@ -175,7 +175,7 @@ test("contact failure is visible and can be retried", async ({ page }) => {
 test("unavailable alerts never imply healthy water", async ({ page }) => {
   await visualApi(page);
   await visualSession(page);
-  await page.route("**/alert-events", (r) =>
+  await page.route("**/alert-events/active**", (r) =>
     r.fulfill({ status: 503, json: { detail: "unavailable" } }),
   );
   await page.goto("/app");

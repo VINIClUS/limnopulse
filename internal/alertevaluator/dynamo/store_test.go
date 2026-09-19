@@ -77,6 +77,31 @@ func TestBackfillQueriesExplicitTenantAndOnlyUpdatesEnabledActiveRules(t *testin
 	}
 }
 
+func TestBackfillActiveAlertIndexIsDryRunByDefaultAndIdempotentShape(t *testing.T) {
+	active, _ := attributevalue.MarshalMap(map[string]any{
+		"PK": "TENANT#tnt_1", "SK": "ALERT_EVENT#event_1", "tenant_id": "tnt_1",
+		"event_id": "event_1", "status": "open", "opened_at": "2026-07-15T12:00:00.000000000Z",
+	})
+	resolved, _ := attributevalue.MarshalMap(map[string]any{
+		"PK": "TENANT#tnt_1", "SK": "ALERT_EVENT#event_2", "tenant_id": "tnt_1",
+		"event_id": "event_2", "status": "resolved", "opened_at": "2026-07-15T12:00:00.000000000Z",
+	})
+	client := &fakeClient{queryOutput: &dynamodb.QueryOutput{Items: []map[string]types.AttributeValue{active, resolved}}}
+	store := Store{Table: "domain", Client: client}
+	summary, err := store.BackfillActiveAlertIndex(context.Background(), BackfillOptions{Tenants: []string{"tnt_1"}, PageSize: 10})
+	if err != nil || !summary.DryRun || summary.AlertEventsQueried != 2 || summary.AlertEventsEligible != 1 || len(client.updateInputs) != 0 {
+		t.Fatalf("dry-run summary = %#v, updates = %d, err = %v", summary, len(client.updateInputs), err)
+	}
+	_, err = store.BackfillActiveAlertIndex(context.Background(), BackfillOptions{Tenants: []string{"tnt_1"}, PageSize: 10, Apply: true})
+	if err != nil || len(client.updateInputs) != 1 {
+		t.Fatalf("apply err = %v, updates = %d", err, len(client.updateInputs))
+	}
+	update := client.updateInputs[0]
+	if !strings.Contains(*update.ConditionExpression, "attribute_not_exists") || update.ExpressionAttributeNames["#gsi_pk"] != "GSI3PK" {
+		t.Fatalf("active index update = %#v", update)
+	}
+}
+
 func (client *fakeClient) GetItem(_ context.Context, _ *dynamodb.GetItemInput, _ ...func(*dynamodb.Options)) (*dynamodb.GetItemOutput, error) {
 	return client.getOutput, nil
 }

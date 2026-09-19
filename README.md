@@ -103,6 +103,8 @@ docker compose --profile manual run --rm alert-evaluator run
 The process exits after the owned work is complete. Scheduling remains external.
 See [Phase 3B evaluator operations](docs/alert-evaluator-phase-3b.md) for replay,
 sharding, schedule backfill, scheduler examples, exit codes and metrics.
+Before switching consumers to the active-alert index, follow the tenant-by-tenant
+rollout in [active-alert index operations](docs/alert-active-index-rollout.md).
 
 ## Email Notifications
 

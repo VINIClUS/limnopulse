@@ -34,6 +34,7 @@ def test_verify_workflow_is_read_only_and_credential_free() -> None:
     assert all(re.fullmatch(r"[^@\s]+@[0-9a-f]{40}", ref) for ref in action_refs)
     assert {ref.partition("@")[0] for ref in action_refs} == {
         "actions/checkout",
+        "actions/setup-node",
         "actions/setup-go",
         "actions/setup-python",
         "astral-sh/setup-uv",
@@ -46,6 +47,7 @@ def test_verify_workflow_is_read_only_and_credential_free() -> None:
         "go",
         "opentofu",
         "compose",
+        "frontend",
     }
     expected_jobs = {
         "python": (
@@ -62,6 +64,14 @@ def test_verify_workflow_is_read_only_and_credential_free() -> None:
         runs = [step["run"] for step in steps if "run" in step]
         assert actions == expected_actions
         assert runs == [f"make {target}"]
+
+    frontend_steps = workflow["jobs"]["frontend"]["steps"]
+    frontend_actions = [
+        step["uses"].partition("@")[0] for step in frontend_steps if "uses" in step
+    ]
+    frontend_runs = [step["run"] for step in frontend_steps if "run" in step]
+    assert frontend_actions == ["actions/checkout", "actions/setup-node"]
+    assert frontend_runs == ["npm ci", "npm test", "npm run typecheck", "npm run build"]
 
 
 def test_makefile_exposes_safe_reproducible_targets() -> None:

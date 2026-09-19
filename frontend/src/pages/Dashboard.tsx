@@ -187,7 +187,10 @@ function TenantOverview({
   const alerts = useQuery({
     queryKey: ["alerts", tenant.tenant_id],
     queryFn: ({ signal }) =>
-      api<{ items: AlertEvent[] }>(`${base}/alert-events`, { signal }),
+      api<{ items: AlertEvent[]; has_more: boolean }>(
+        `${base}/alert-events/active?limit=100`,
+        { signal },
+      ),
     refetchInterval: 60000,
   });
   const pond =
@@ -217,6 +220,7 @@ function TenantOverview({
     alerts.data?.items.filter((a) =>
       ["open", "acknowledged"].includes(a.status),
     ) || [];
+  const alertsTruncated = alerts.data?.has_more === true;
   const pondAlerts = activeAlerts.filter((a) => a.pond_id === pond?.pond_id);
   const value = current?.data?.[metric];
   const dataError = ponds.error || devices.error || alerts.error;
@@ -286,7 +290,11 @@ function TenantOverview({
             <div>
               <h3>Alertas</h3>
               <strong className={activeAlerts.length ? "red-text" : ""}>
-                {alerts.isSuccess ? activeAlerts.length : "—"}
+                {alerts.isSuccess
+                  ? alertsTruncated
+                    ? `${activeAlerts.length}+`
+                    : activeAlerts.length
+                  : "—"}
               </strong>
               <p>{alerts.data ? "em aberto ou reconhecidos" : "Carregando…"}</p>
             </div>
@@ -563,8 +571,18 @@ function TenantOverview({
           <details className="card" id="alerts">
             <summary>
               Alertas da operação (
-              {alerts.isSuccess ? activeAlerts.length : "—"})
+              {alerts.isSuccess
+                ? alertsTruncated
+                  ? `${activeAlerts.length}+`
+                  : activeAlerts.length
+                : "—"})
             </summary>
+            {alertsTruncated && (
+              <p role="status">
+                Exibindo os 100 alertas mais recentes; as contagens podem estar
+                incompletas.
+              </p>
+            )}
             {alerts.isError ? (
               <ErrorNotice error={alerts.error} />
             ) : alerts.isPending ? (

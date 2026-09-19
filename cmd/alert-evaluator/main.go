@@ -37,9 +37,52 @@ func runMain(args []string) int {
 		return runEvaluator(ctx, args[1:])
 	case "backfill-schedule":
 		return runBackfill(ctx, args[1:])
+	case "backfill-active-alert-index":
+		return runActiveAlertIndexBackfill(ctx, args[1:])
 	default:
 		return writeFailure("usage", fmt.Sprintf("unknown command %q", args[0]))
 	}
+}
+
+func runActiveAlertIndexBackfill(ctx context.Context, args []string) int {
+	fs := flag.NewFlagSet("alert-evaluator backfill-active-alert-index", flag.ContinueOnError)
+	fs.SetOutput(os.Stderr)
+	var tenants stringList
+	var apply bool
+	var pageSize, limit int
+	fs.Var(&tenants, "tenant", "explicit tenant id; repeat for multiple tenants")
+	fs.BoolVar(&apply, "apply", false, "write the active-alert projection; default is dry-run")
+	fs.IntVar(&pageSize, "page-size", 25, "DynamoDB query page size")
+	fs.IntVar(&limit, "limit", 0, "maximum number of alert events to inspect; zero means unlimited")
+	if err := fs.Parse(args); err != nil {
+		return writeFailure("configuration", err.Error())
+	}
+	region := envOr("AWS_REGION", "us-east-1")
+	endpoint := envOr("DYNAMODB_ENDPOINT_URL", "")
+	awsConfig, err := loadAWSConfig(ctx, region, endpoint)
+	if err != nil {
+		return writeFailure("aws_configuration", err.Error())
+	}
+	client := dynamodb.NewFromConfig(awsConfig, func(options *dynamodb.Options) {
+		if endpoint != "" {
+			options.BaseEndpoint = aws.String(endpoint)
+		}
+	})
+	store := dynamoadapter.Store{Table: envOr("DYNAMODB_DOMAIN_TABLE", "LimnopulseDomain"), Client: client}
+	summary, err := store.BackfillActiveAlertIndex(ctx, dynamoadapter.BackfillOptions{Tenants: tenants, Apply: apply, PageSize: pageSize, Limit: limit})
+	if err != nil {
+		writeJSON(struct {
+			Result  string                        `json:"result"`
+			Error   string                        `json:"error"`
+			Summary dynamoadapter.BackfillSummary `json:"summary"`
+		}{"fatal_failure", err.Error(), summary})
+		return alertevaluator.ExitFatal
+	}
+	writeJSON(struct {
+		Result string                        `json:"result"`
+		Data   dynamoadapter.BackfillSummary `json:"summary"`
+	}{"success", summary})
+	return alertevaluator.ExitSuccess
 }
 
 func runEvaluator(ctx context.Context, args []string) int {
