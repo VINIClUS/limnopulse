@@ -30,6 +30,10 @@ Before Phase 7B launch, every raw Push token must use application-level envelope
 
 Every Push and SMS destination lifecycle mutation—create, verify, rotate, invalidate, revoke, delete, and opt-out—and every cross-user token-claim rejection must emit an immutable audit event. After account lifecycle deletion, raw Push tokens and phone numbers must be erased; only non-reversible hashes and delivery evidence may remain when policy/legal retention permits, and erasure tests must prove tombstoned destinations retain no decryptable PII.
 
+Phase 7C US readiness must require the toll-free origination number/pool registration use case to be exactly Notifications; any use-case mismatch must fail closed before dispatch.
+
+Phase 7C current SMS charge guard must include both provider country price and carrier fees when comparing total per-message cost to PlanVersion maximum; a carrier surcharge above the cap must fail closed before provider dispatch.
+
 Phase 7C must enforce durable SMS storm/rate windows independently per recipient, tenant, and event family before provider dispatch; recipient-scoped limits must prevent one recipient from receiving every family allowance.
 
 ## Non-goals

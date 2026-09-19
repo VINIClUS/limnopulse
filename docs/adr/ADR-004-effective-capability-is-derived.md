@@ -22,6 +22,8 @@ V4 §§9, 11, 24 Phases 1, 5, and 6, plus §27 preserve this layered capability 
 
 Phase 1 freezes declarations and provenance. Provider and health phases must prove derivation; Phase 8 treats effective capability as one input while enforcing entitlement, authorization, risk, preconditions, and physical verification separately. Phase 6 must prove identical, reordered, and replayed health evidence produces deterministic Device and Component health transitions, keeping health-derived effective-capability inputs stable.
 
+Phase 6 health transitions must apply evidence-based hysteresis around thresholds; threshold-flapping measurements must not repeatedly toggle Device or Component health or effective capability.
+
 ## Non-goals
 
 This record does not infer physical safety from billing tier, firmware strings, provider acceptance, or a device's self-assertion alone.

@@ -24,6 +24,8 @@ Phase 7A must keep SES/Telegram suites green, fence destination and policy revis
 
 Unsupported destination locales must be rejected or use only an explicit versioned template fallback; no implicit locale fallback is allowed.
 
+At BeginAttempt, acknowledgement and escalation dispatch must contend in one conditional DynamoDB transaction so exactly one outcome wins; a concurrent acknowledgement must prevent the provider call and charge.
+
 ## Non-goals
 
 This record does not make provider acceptance human acknowledgement, expose precise telemetry on a lock screen, authorize asset context for members/viewers, or create a marketing notification platform.

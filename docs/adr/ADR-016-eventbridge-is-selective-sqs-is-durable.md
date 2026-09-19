@@ -26,6 +26,10 @@ Phase 3 HTTP batch ingress must require an `Idempotency-Key` or stable `source_e
 
 Phase 3 HTTPS ingress must enforce bounded request payload size, per-IntegrationAccount rate limits, and entitlement limits before durable enqueue; oversized or over-rate requests must be rejected without unbounded buffering or queue admission.
 
+Phase 3 HTTPS normalization must resolve site, asset, deployment, and component ownership exclusively from the authenticated IntegrationAccount mapping; payload-supplied ownership identifiers must be ignored or rejected and must never override that mapping.
+
+Any future EventBridge consumer must prove duplicate- and order-independent idempotent handling before adoption; no consumer may assume exactly-once delivery or ordering.
+
 ## Non-goals
 
 This record does not make EventBridge a ledger, queue, ordering guarantee, or mandatory transport between all internal components.

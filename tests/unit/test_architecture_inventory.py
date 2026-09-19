@@ -1520,6 +1520,115 @@ CODEX_REVIEW_GATE_CASES = (
         ),
     },
 )
+
+
+def build_codex_review_gate_case(
+    name: str,
+    filename: str,
+    required_clause: str,
+    inverted_clause: str,
+) -> dict[str, str]:
+    return {
+        "name": name,
+        "filename": filename,
+        "required_pattern": rf"\b{re.escape(required_clause.removesuffix('.'))}\b",
+        "required_clause": required_clause,
+        "inverted_clause": inverted_clause,
+        "forbidden_pattern": rf"\b{re.escape(inverted_clause.removesuffix('.'))}\b",
+    }
+
+
+CODEX_REVIEW_GATE_CASES += tuple(
+    build_codex_review_gate_case(*case)
+    for case in (
+        (
+            "HTTPS trusted ownership mapping",
+            "ADR-016-eventbridge-is-selective-sqs-is-durable.md",
+            "Phase 3 HTTPS normalization must resolve site, asset, deployment, and component ownership exclusively from the authenticated IntegrationAccount mapping; payload-supplied ownership identifiers must be ignored or rejected and must never override that mapping.",
+            "Phase 3 HTTPS normalization may trust site, asset, deployment, or component identifiers supplied in the payload instead of the authenticated IntegrationAccount mapping.",
+        ),
+        (
+            "Stripe webhook log privacy",
+            "ADR-010-stripe-is-an-adapter-internal-entitlements-are-canonical.md",
+            "Phase 4 Stripe webhook ingress and workers must never log raw signed webhook bodies or customer/payment payloads; fixtures must prove billing PII is redacted or excluded from application logs.",
+            "Phase 4 Stripe webhook ingress and workers may log raw signed webhook bodies or customer/payment payloads.",
+        ),
+        (
+            "Enterprise automatic overage prohibition",
+            "ADR-010-stripe-is-an-adapter-internal-entitlements-are-canonical.md",
+            "For launch, every Enterprise PlanVersion must set `notifications.sms.overage` explicitly to false; automatic SMS overage remains disabled until a separately approved versioned billing decision.",
+            "For launch, an Enterprise PlanVersion may set `notifications.sms.overage` to true and automatically exceed its contracted SMS limits.",
+        ),
+        (
+            "grandfathered pre-billing PlanVersion",
+            "ADR-010-stripe-is-an-adapter-internal-entitlements-are-canonical.md",
+            "Phase 4 migration must assign every pre-billing tenant without a PlanVersion or EntitlementSnapshot a temporary grandfathered PlanVersion with explicit limits; migration must preserve all resources and must not delete resources solely because of the temporary assignment.",
+            "Phase 4 migration may leave pre-billing tenants without a PlanVersion or EntitlementSnapshot and delete their resources to enforce the new billing model.",
+        ),
+        (
+            "billing audit-only rollback",
+            "ADR-010-stripe-is-an-adapter-internal-entitlements-are-canonical.md",
+            "Phase 4 must provide a billing-enforcement feature flag that can safely revert enforcement to audit-only mode while retaining BillingAccount, EntitlementSnapshot, UsageCounter, and provider-event records; rollback tests must prove no records are deleted.",
+            "Phase 4 billing enforcement may have no audit-only rollback and may delete billing or provider-event records during recovery.",
+        ),
+        (
+            "metric and unit mapping provenance",
+            "ADR-005-canonical-telemetry-is-metric-based.md",
+            "Phase 2 normalization must persist the metric-catalog and unit-mapping versions used for every canonical observation; replaying a source event after a catalog revision must preserve the original mapping version and canonical identity.",
+            "Phase 2 normalization may omit metric-catalog and unit-mapping versions and assign a new mapping or canonical identity when a source event is replayed.",
+        ),
+        (
+            "resource quota counter reconciliation",
+            "ADR-010-stripe-is-an-adapter-internal-entitlements-are-canonical.md",
+            "Phase 4 must periodically recompute ordinary resource UsageCounter values with partition-scoped Query operations, never Scan, audit each repair, and preserve existing tenant resources.",
+            "Phase 4 may reconcile ordinary resource UsageCounter values with Scan operations or delete existing tenant resources during repair.",
+        ),
+        (
+            "US Notifications toll-free use case",
+            "ADR-018-eum-push-and-sms-are-provider-adapters.md",
+            "Phase 7C US readiness must require the toll-free origination number/pool registration use case to be exactly Notifications; any use-case mismatch must fail closed before dispatch.",
+            "Phase 7C US readiness may enable a toll-free origination number/pool for dispatch when its registration use case is not Notifications.",
+        ),
+        (
+            "acknowledgement escalation race transaction",
+            "ADR-011-limnopulse-owns-notification-semantics.md",
+            "At BeginAttempt, acknowledgement and escalation dispatch must contend in one conditional DynamoDB transaction so exactly one outcome wins; a concurrent acknowledgement must prevent the provider call and charge.",
+            "At BeginAttempt, acknowledgement and escalation dispatch may commit independently so a concurrent acknowledgement can race with the provider call and charge.",
+        ),
+        (
+            "SMS carrier fee price cap",
+            "ADR-018-eum-push-and-sms-are-provider-adapters.md",
+            "Phase 7C current SMS charge guard must include both provider country price and carrier fees when comparing total per-message cost to PlanVersion maximum; a carrier surcharge above the cap must fail closed before provider dispatch.",
+            "Phase 7C may compare only the base provider country price to the PlanVersion maximum and allow a carrier surcharge above the cap.",
+        ),
+        (
+            "vendor polling replay identity",
+            "ADR-009-edge-is-optional-and-customer-hosted.md",
+            "Phase 9 vendor polling cursor recovery must derive the same canonical event identity from the IntegrationAccount plus stable vendor event or observation fields; replay after a write-before-cursor-advance crash must target the same canonical point.",
+            "Phase 9 vendor polling cursor recovery may assign a fresh canonical identity when replaying an event after a write-before-cursor-advance crash.",
+        ),
+        (
+            "health transition hysteresis",
+            "ADR-004-effective-capability-is-derived.md",
+            "Phase 6 health transitions must apply evidence-based hysteresis around thresholds; threshold-flapping measurements must not repeatedly toggle Device or Component health or effective capability.",
+            "Phase 6 health transitions may toggle Device or Component health or effective capability on every threshold-flapping measurement.",
+        ),
+        (
+            "EventBridge consumer replay safety",
+            "ADR-016-eventbridge-is-selective-sqs-is-durable.md",
+            "Any future EventBridge consumer must prove duplicate- and order-independent idempotent handling before adoption; no consumer may assume exactly-once delivery or ordering.",
+            "A future EventBridge consumer may assume exactly-once delivery or ordering and skip duplicate or reordering tests.",
+        ),
+        (
+            "Stripe webhook event allowlist",
+            "ADR-010-stripe-is-an-adapter-internal-entitlements-are-canonical.md",
+            "Phase 4 Stripe webhook ingress must allowlist supported event types and reject or safely discard signed but unsupported types before durable enqueue.",
+            "Phase 4 Stripe webhook ingress may enqueue any signed event type before checking whether the event is supported.",
+        ),
+    )
+)
+
+
 for _case in CODEX_REVIEW_GATE_CASES:
     _filename = _case["filename"]
     REQUIRED_ADR_GATE_PATTERNS[_filename] += (_case["required_pattern"],)
@@ -3432,6 +3541,22 @@ def test_adr_gate_allows_round_fourteen_f_emphatic_local_prohibition(
     mutate_adr_gate(adr_root, filename, safe_clause)
 
     assert_adr_inventory(adr_root)
+
+
+@pytest.mark.parametrize(
+    "case",
+    CODEX_REVIEW_GATE_CASES,
+    ids=lambda case: case["name"],
+)
+def test_codex_review_gate_cases_are_present(case: dict[str, str]) -> None:
+    adr_path = ROOT / "docs" / "adr" / case["filename"]
+    record = adr_path.read_text(encoding="utf-8")
+    gate_match = re.search(
+        r"(?ms)^## Implementation gate\n\n(.*?)(?=^## Non-goals$)",
+        record,
+    )
+    assert gate_match
+    assert case["required_clause"] in gate_match.group(1), case["name"]
 
 
 @pytest.mark.parametrize(

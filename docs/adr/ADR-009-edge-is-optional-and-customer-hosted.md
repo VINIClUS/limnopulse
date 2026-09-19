@@ -22,6 +22,8 @@ V4 §§4, 7, 13, 15, 24 Phase 9, and 27 define the optional customer-hosted edge
 
 Phase 9 may ship an edge contract only after authentication, local buffer/replay, upgrade, and compatibility acceptance tests pass and direct integrations remain operational. Separately from edge acceptance, Phase 9 may ship the first vendor connector only after tests prove connector upgrades preserve stable canonical metric identity, rate-limit/retry/cursor recovery, and clearly expose the compatibility level. If the selected Phase 9 vendor connector has a webhook path, it must verify signatures and deduplicate events so provider retries remain idempotent.
 
+Phase 9 vendor polling cursor recovery must derive the same canonical event identity from the IntegrationAccount plus stable vendor event or observation fields; replay after a write-before-cursor-advance crash must target the same canonical point.
+
 ## Non-goals
 
 This record does not require LimnoPulse appliances, arbitrary customer code in SaaS, a custom broker, or cloud-dependent critical interlocks.

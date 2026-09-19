@@ -51,6 +51,18 @@ Phase 4 must require a tenant owner/admin role for Checkout, Customer Portal, pl
 
 Phase 4 Customer Portal must permit only payment methods, invoice viewing/download, cancel at period end, and resume where supported; direct plan upgrades/downgrades must be disabled until versioned transition controls are enabled through LimnoPulse APIs and tested.
 
+For launch, every Enterprise PlanVersion must set `notifications.sms.overage` explicitly to false; automatic SMS overage remains disabled until a separately approved versioned billing decision.
+
+Phase 4 migration must assign every pre-billing tenant without a PlanVersion or EntitlementSnapshot a temporary grandfathered PlanVersion with explicit limits; migration must preserve all resources and must not delete resources solely because of the temporary assignment.
+
+Phase 4 must provide a billing-enforcement feature flag that can safely revert enforcement to audit-only mode while retaining BillingAccount, EntitlementSnapshot, UsageCounter, and provider-event records; rollback tests must prove no records are deleted.
+
+Phase 4 Stripe webhook ingress must allowlist supported event types and reject or safely discard signed but unsupported types before durable enqueue.
+
+Phase 4 Stripe webhook ingress and workers must never log raw signed webhook bodies or customer/payment payloads; fixtures must prove billing PII is redacted or excluded from application logs.
+
+Phase 4 must periodically recompute ordinary resource UsageCounter values with partition-scoped Query operations, never Scan, audit each repair, and preserve existing tenant resources.
+
 ## Non-goals
 
 This record does not make Stripe authoritative for tenant identity, command safety, monitoring truth, or direct deletion of over-limit resources.
