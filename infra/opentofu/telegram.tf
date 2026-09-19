@@ -1,26 +1,34 @@
-# Unconditional: the API's inbound webhook route and its APP_ENV=prod
-# startup validator both require this secret regardless of whether outbound
-# Telegram delivery (var.telegram_delivery) is turned on. See variables.tf.
+# Gated by var.telegram_webhook (see variables.tf). recovery_window_in_days
+# = 0 so toggling this off then back on doesn't hit Secrets Manager's
+# pending-deletion name conflict within the normal 7-day recovery window;
+# the value is populated out of band regardless, so there's nothing to
+# recover.
 resource "aws_secretsmanager_secret" "telegram_webhook_secret" {
+  count = var.telegram_webhook ? 1 : 0
+
   name                    = var.telegram_webhook_secret_name
-  recovery_window_in_days = 7
+  recovery_window_in_days = 0
 
   tags = local.common_tags
 }
 
 data "aws_iam_policy_document" "telegram_webhook_secret_reader" {
+  count = var.telegram_webhook ? 1 : 0
+
   statement {
     sid       = "TelegramWebhookSecret"
     effect    = "Allow"
     actions   = ["secretsmanager:GetSecretValue"]
-    resources = [aws_secretsmanager_secret.telegram_webhook_secret.arn]
+    resources = [aws_secretsmanager_secret.telegram_webhook_secret[0].arn]
   }
 }
 
 resource "aws_iam_policy" "telegram_webhook_secret_reader" {
+  count = var.telegram_webhook ? 1 : 0
+
   name        = "${var.project_name}-${var.environment}-telegram-webhook-secret-reader"
   description = "Read-only access to the Telegram webhook authentication secret."
-  policy      = data.aws_iam_policy_document.telegram_webhook_secret_reader.json
+  policy      = data.aws_iam_policy_document.telegram_webhook_secret_reader[0].json
 
   tags = local.common_tags
 }
@@ -31,7 +39,7 @@ resource "aws_secretsmanager_secret" "telegram_bot_token" {
   count = var.telegram_delivery ? 1 : 0
 
   name                    = var.telegram_bot_token_secret_name
-  recovery_window_in_days = 7
+  recovery_window_in_days = 0
 
   tags = local.common_tags
 }

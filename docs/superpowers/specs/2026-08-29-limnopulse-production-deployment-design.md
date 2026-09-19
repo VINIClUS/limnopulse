@@ -458,19 +458,30 @@ Disabled modules produce no resources or secret containers.
 > as real `bool` variables in `infra/opentofu/variables.tf` (default
 > `false`), gating the SES/EventBridge resources in `ses.tf` and the
 > Telegram bot-token secret, outbound jobs queue and worker IAM policy in
-> `telegram.tf`/`queues.tf` behind `count`. The Telegram **webhook** secret
-> and its reader policy stay unconditional — the API's inbound
-> `POST /webhooks/telegram` route and its `APP_ENV=prod` startup validator
-> both require it regardless of outbound delivery. Verified with `tofu plan`
-> against a throwaway local state: defaults create 9 resources (Cognito,
-> DynamoDB ×2, the core notification-jobs queue, the webhook secret); both
-> flags `true` reproduces the original unconditional plan exactly (28
-> resources, matching pre-gating `tofu plan` output). `core_dynamodb`,
-> `core_cognito`, `core_sqs` were not made toggleable — every profile needs
-> them, so they stay unconditional rather than adding always-`true` flags
-> with no real branch. `push_delivery`, `sms_delivery`, `stripe_billing`,
-> `aws_iot` and `redis` have no corresponding resources in this file yet;
-> nothing to gate.
+> `telegram.tf`/`queues.tf` behind `count`. A third flag, `telegram_webhook`
+> (default `false`), independently gates the Telegram webhook secret and its
+> reader policy — an automated PR review (Codex, on PR #47) correctly
+> flagged an earlier draft that kept the webhook secret unconditional as
+> violating this section's own "disabled produces no resource or secret
+> container" acceptance criteria; splitting it into its own flag resolves
+> that without touching `src/limnopulse_api/core/config.py`, whose
+> `APP_ENV=prod` validator still hard-requires
+> `TELEGRAM_WEBHOOK_SECRET_ARN` (`env/cloud.tfvars.example` sets
+> `telegram_webhook = true` for exactly that reason — the API's inbound
+> `POST /webhooks/telegram` route is mounted unconditionally, independent of
+> outbound delivery). Fully relaxing that validator so the API can boot with
+> zero Telegram resources at all (the portfolio-demo gate in §3) is an
+> application-side change, out of scope here. Verified with `tofu plan`
+> against a throwaway local state: all three flags `false` creates 7
+> resources (Cognito, DynamoDB ×2, the core notification-jobs queue);
+> `env/cloud.tfvars.example` defaults (`telegram_webhook = true` only)
+> create 9; all delivery/webhook flags `true` reproduces the original
+> unconditional plan exactly (28 resources, matching pre-gating `tofu plan`
+> output). `core_dynamodb`, `core_cognito`, `core_sqs` were not made
+> toggleable — every profile needs them, so they stay unconditional rather
+> than adding always-`true` flags with no real branch. `push_delivery`,
+> `sms_delivery`, `stripe_billing`, `aws_iot` and `redis` have no
+> corresponding resources in this file yet; nothing to gate.
 
 Additional application-owned modules cover:
 

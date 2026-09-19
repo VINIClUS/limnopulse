@@ -69,15 +69,16 @@ output "telegram_worker_policy_arn" {
   value       = try(aws_iam_policy.telegram_worker[0].arn, null)
 }
 
-# Unconditional (see telegram.tf): the API needs this regardless of delivery.
+# Null when var.telegram_webhook = false (see variables.tf and telegram.tf).
+# Required for any APP_ENV=prod apply of this repo's API.
 output "telegram_webhook_secret_arn" {
   description = "TELEGRAM_WEBHOOK_SECRET_ARN"
-  value       = aws_secretsmanager_secret.telegram_webhook_secret.arn
+  value       = try(aws_secretsmanager_secret.telegram_webhook_secret[0].arn, null)
 }
 
 output "telegram_webhook_secret_reader_policy_arn" {
   description = "IAM policy ARN to attach to the FastAPI runtime role."
-  value       = aws_iam_policy.telegram_webhook_secret_reader.arn
+  value       = try(aws_iam_policy.telegram_webhook_secret_reader[0].arn, null)
 }
 
 # Null when var.email_delivery = false (see variables.tf and ses.tf).

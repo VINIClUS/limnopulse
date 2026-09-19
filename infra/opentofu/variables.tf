@@ -133,11 +133,23 @@ variable "telegram_delivery" {
   description = <<-EOT
     Provision the Telegram bot token secret, the outbound telegram-jobs SQS
     queue, and the Telegram worker's IAM policy — the Fase 2 async delivery
-    path. Does NOT gate the webhook secret or its reader policy (see
-    telegram.tf): those are required unconditionally because the API's
-    inbound POST /webhooks/telegram route exists regardless of this flag,
-    and src/limnopulse_api/core/config.py refuses to boot with
-    APP_ENV=prod unless TELEGRAM_WEBHOOK_SECRET_ARN is set.
+    path. Independent of var.telegram_webhook (see telegram.tf); a profile
+    can run the inbound webhook without the outbound worker, or vice versa.
+  EOT
+  type        = bool
+  default     = false
+}
+
+variable "telegram_webhook" {
+  description = <<-EOT
+    Provision the Telegram webhook secret and its reader IAM policy
+    (telegram.tf). Both false (the default, matching var.telegram_delivery)
+    gives the true zero-Telegram-resources profile from §16/§3 of the design
+    spec. Set to true for any APP_ENV=prod apply of this repo's API: its
+    inbound POST /webhooks/telegram route is mounted unconditionally, and
+    src/limnopulse_api/core/config.py refuses to boot with APP_ENV=prod
+    unless TELEGRAM_WEBHOOK_SECRET_ARN is set — see cloud.tfvars.example
+    and ops/vps/README.md, where this flag is turned on.
   EOT
   type        = bool
   default     = false
