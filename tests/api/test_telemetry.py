@@ -44,6 +44,7 @@ class FakeTelemetryRepository:
     def __init__(self) -> None:
         self.reading_calls: list[dict[str, object]] = []
         self.latest_calls: list[dict[str, str]] = []
+        self.latest_tenant_calls: list[dict[str, str]] = []
 
     async def query_readings(
         self,
@@ -83,6 +84,25 @@ class FakeTelemetryRepository:
             temp_c=25.1,
             ph=7.2,
         )
+
+    async def query_latest_metrics_for_tenant(self, *, tenant_id: str) -> list[LatestMetrics]:
+        self.latest_tenant_calls.append({"tenant_id": tenant_id})
+        return [
+            LatestMetrics(
+                measured_at=datetime(2026, 1, 1, 12, 5, tzinfo=UTC),
+                tenant_id=tenant_id,
+                pond_id="pond_1",
+                temp_c=25.1,
+                ph=7.2,
+            ),
+            LatestMetrics(
+                measured_at=datetime(2026, 1, 1, 12, 4, tzinfo=UTC),
+                tenant_id=tenant_id,
+                pond_id="pond_2",
+                temp_c=24.9,
+                ph=7.1,
+            ),
+        ]
 
 
 def make_membership(role: TenantRole = TenantRole.VIEWER) -> Membership:
@@ -242,6 +262,25 @@ def test_latest_metrics_delegates_with_server_side_tenant_and_pond_filters() -> 
     assert response.json()["tenant_id"] == "tnt_1"
     assert response.json()["pond_id"] == "pond_1"
     assert telemetry_repository.latest_calls == [{"tenant_id": "tnt_1", "pond_id": "pond_1"}]
+
+
+def test_latest_metrics_for_tenant_uses_one_batched_query() -> None:
+    telemetry_repository = FakeTelemetryRepository()
+    app = make_app(
+        membership=make_membership(TenantRole.OWNER),
+        pond=make_pond(),
+        telemetry_repository=telemetry_repository,
+    )
+
+    with TestClient(app) as client:
+        response = client.get(
+            "/v1/tenants/tnt_1/metrics/latest",
+            headers={"X-Dev-User-Sub": "sub_1"},
+        )
+
+    assert response.status_code == 200
+    assert [item["pond_id"] for item in response.json()["items"]] == ["pond_1", "pond_2"]
+    assert telemetry_repository.latest_tenant_calls == [{"tenant_id": "tnt_1"}]
 
 
 @pytest.mark.parametrize(

@@ -1,6 +1,6 @@
 import { useState } from "react";
 import { Link } from "react-router";
-import { useQuery, useQueries } from "@tanstack/react-query";
+import { useQuery } from "@tanstack/react-query";
 import {
   House,
   Fish,
@@ -196,13 +196,11 @@ function TenantOverview({
   const pond =
     ponds.data?.items.find((p) => p.pond_id === pondId) || ponds.data?.items[0];
   const rows = ponds.data?.items || [];
-  const latest = useQueries({
-    queries: rows.map((p) => ({
-      queryKey: ["latest", tenant.tenant_id, p.pond_id],
-      queryFn: ({ signal }: { signal: AbortSignal }) =>
-        api<Latest>(`${base}/ponds/${p.pond_id}/metrics/latest`, { signal }),
-      refetchInterval: 60000,
-    })),
+  const latest = useQuery({
+    queryKey: ["latest", tenant.tenant_id],
+    queryFn: ({ signal }) =>
+      api<{ items: Latest[] }>(`${base}/metrics/latest`, { signal }),
+    refetchInterval: 60000,
   });
   const summaryRefetchInterval = period === "30d" ? 5 * 60000 : 60000;
   const summary = useQuery({
@@ -215,7 +213,11 @@ function TenantOverview({
     enabled: Boolean(pond),
     refetchInterval: summaryRefetchInterval,
   });
-  const current = latest[rows.findIndex((p) => p.pond_id === pond?.pond_id)];
+  const currentData = latest.data?.items.find(
+    (item) => item.pond_id === pond?.pond_id,
+  );
+  const latestForPond = (pondId: string) =>
+    latest.data?.items.find((item) => item.pond_id === pondId);
   const stats = summary.data?.statistics[metric];
   const activeAlerts =
     alerts.data?.items.filter((a) =>
@@ -223,10 +225,10 @@ function TenantOverview({
     ) || [];
   const alertsTruncated = alerts.data?.has_more === true;
   const pondAlerts = activeAlerts.filter((a) => a.pond_id === pond?.pond_id);
-  const value = current?.data?.[metric];
+  const value = currentData?.[metric];
   const dataError = ponds.error || devices.error || alerts.error;
-  const stale = current?.data?.measured_at
-    ? Date.now() - new Date(current.data.measured_at).getTime() > 15 * 60000
+  const stale = currentData?.measured_at
+    ? Date.now() - new Date(currentData.measured_at).getTime() > 15 * 60000
     : true;
   return (
     <>
@@ -320,7 +322,7 @@ function TenantOverview({
                   aria-label="Atualizar métricas"
                   onClick={() => {
                     void summary.refetch();
-                    void current?.refetch();
+                    void latest.refetch();
                   }}
                 >
                   <RefreshCw size={17} />
@@ -342,8 +344,8 @@ function TenantOverview({
                   </select>
                 </label>
                 <small>
-                  {current?.data?.measured_at
-                    ? `Última leitura: ${new Date(current.data.measured_at).toLocaleString("pt-BR")}`
+                  {currentData?.measured_at
+                    ? `Última leitura: ${new Date(currentData.measured_at).toLocaleString("pt-BR")}`
                     : "Sem leitura disponível"}
                 </small>
               </div>
@@ -378,17 +380,17 @@ function TenantOverview({
                   );
                 })}
               </div>
-              {current?.isError && (
+              {latest.isError && (
                 <ErrorNotice
-                  error={current.error}
-                  retry={() => void current.refetch()}
+                  error={latest.error}
+                  retry={() => void latest.refetch()}
                 />
               )}
               <div className="metric-summary">
                 <div>
                   <small>Último valor</small>
                   <strong>
-                    {current?.isPending ? "…" : formatNumber(value)}{" "}
+                    {latest.isPending ? "…" : formatNumber(value)}{" "}
                     <em>{metrics[metric].unit}</em>
                   </strong>
                   <span className={`badge ${stale ? "warning" : ""}`}>
@@ -499,7 +501,7 @@ function TenantOverview({
                       </tr>
                     </thead>
                     <tbody>
-                      {rows.map((p, i) => (
+                      {rows.map((p) => (
                         <tr
                           key={p.pond_id}
                           className={
@@ -511,9 +513,13 @@ function TenantOverview({
                               {p.name}
                             </button>
                           </th>
-                          <td>{formatNumber(latest[i]?.data?.do_mg_l)}</td>
-                          <td>{formatNumber(latest[i]?.data?.ph)}</td>
-                          <td>{formatNumber(latest[i]?.data?.temp_c)}</td>
+                          <td>
+                            {formatNumber(latestForPond(p.pond_id)?.do_mg_l)}
+                          </td>
+                          <td>{formatNumber(latestForPond(p.pond_id)?.ph)}</td>
+                          <td>
+                            {formatNumber(latestForPond(p.pond_id)?.temp_c)}
+                          </td>
                           <td>
                             <span
                               className={`badge ${activeAlerts.some((a) => a.pond_id === p.pond_id) ? "warning" : ""}`}
@@ -524,7 +530,7 @@ function TenantOverview({
                                     (a) => a.pond_id === p.pond_id,
                                   ).length || "Nenhum"}
                             </span>
-                            {latest[i]?.isError && (
+                            {latest.isError && (
                               <span title="Falha ao carregar leitura"> ⚠</span>
                             )}
                           </td>

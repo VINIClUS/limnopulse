@@ -39,6 +39,13 @@ class PondTelemetryService:
             pond_id=pond_id,
         )
 
+    async def query_latest_metrics_for_tenant(
+        self, *, tenant_id: str
+    ) -> list[LatestMetrics]:
+        return await self.telemetry_repository.query_latest_metrics_for_tenant(
+            tenant_id=tenant_id
+        )
+
     async def query_summary(self, *, tenant_id: str, pond_id: str, period: str) -> MetricsSummary:
         await self._require_pond(tenant_id=tenant_id, pond_id=pond_id)
         return await self.telemetry_repository.query_summary(

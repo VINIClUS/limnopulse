@@ -12,17 +12,30 @@ import {
 const rememberKey = "limnopulse:remember";
 const devKey = "limnopulse:dev-user";
 const cognitoKeyPrefix = "CognitoIdentityServiceProvider.";
+let pendingLogin: { target: Storage; remember: boolean } | null = null;
 export const devAuthEnabled = () =>
   (import.meta.env.DEV || import.meta.env.MODE === "test") &&
   import.meta.env.VITE_DEV_AUTH === "true" &&
   ["localhost", "127.0.0.1", "[::1]"].includes(location.hostname);
 const hasPersistentTokens = () =>
   Object.keys(localStorage).some((key) => key.startsWith(cognitoKeyPrefix));
-const storage = () => {
+const preferredStorage = () => {
   const preference = sessionStorage.getItem(rememberKey);
   if (preference === "true") return localStorage;
   if (preference === "false") return sessionStorage;
   return hasPersistentTokens() ? localStorage : sessionStorage;
+};
+const storage = () => pendingLogin?.target || preferredStorage();
+const clearCognitoTokens = (target: Storage) => {
+  for (const key of Object.keys(target))
+    if (key.startsWith(cognitoKeyPrefix)) target.removeItem(key);
+};
+const finishLogin = () => {
+  if (!pendingLogin) return;
+  const { remember } = pendingLogin;
+  sessionStorage.setItem(rememberKey, String(remember));
+  clearCognitoTokens(remember ? sessionStorage : localStorage);
+  pendingLogin = null;
 };
 export const authStorage = {
   async setItem(key: string, value: string) {
@@ -36,9 +49,8 @@ export const authStorage = {
     sessionStorage.removeItem(key);
   },
   async clear() {
-    for (const s of [localStorage, sessionStorage])
-      for (const k of Object.keys(s))
-        if (k.startsWith(cognitoKeyPrefix)) s.removeItem(k);
+    clearCognitoTokens(localStorage);
+    clearCognitoTokens(sessionStorage);
   },
 };
 const pool = import.meta.env.VITE_COGNITO_USER_POOL_ID,
@@ -94,32 +106,37 @@ export async function login(
   password: string,
   remember: boolean,
 ) {
-  const previousRemember = sessionStorage.getItem(rememberKey);
-  localStorage.removeItem(devKey);
-  sessionStorage.removeItem(devKey);
-  sessionStorage.setItem(rememberKey, String(remember));
+  pendingLogin = { target: remember ? localStorage : sessionStorage, remember };
   if (devAuthEnabled()) {
+    localStorage.removeItem(devKey);
+    sessionStorage.removeItem(devKey);
     storage().setItem(devKey, email);
+    finishLogin();
     return { isSignedIn: true, nextStep: { signInStep: "DONE" } };
   }
   try {
-    return await signIn({
+    const result = await signIn({
       username: email,
       password,
       options: { authFlowType: "USER_SRP_AUTH" },
     });
+    if (result.isSignedIn) finishLogin();
+    return result;
   } catch (error) {
-    if (previousRemember === null) sessionStorage.removeItem(rememberKey);
-    else sessionStorage.setItem(rememberKey, previousRemember);
+    pendingLogin = null;
     throw error;
   }
 }
-export const completeChallenge = (value: string) =>
-  confirmSignIn({ challengeResponse: value });
+export async function completeChallenge(value: string) {
+  const result = await confirmSignIn({ challengeResponse: value });
+  if (result.isSignedIn) finishLogin();
+  return result;
+}
 export async function logout() {
   try {
     if (!devAuthEnabled()) await signOut();
   } finally {
+    pendingLogin = null;
     await authStorage.clear();
     localStorage.removeItem(devKey);
     sessionStorage.removeItem(devKey);

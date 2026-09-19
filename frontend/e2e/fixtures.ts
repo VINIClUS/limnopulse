@@ -78,7 +78,30 @@ export async function visualApi(page: Page) {
         ],
         has_more: false,
       };
-    else if (path.endsWith("/metrics/latest")) {
+    else if (/^\/v1\/tenants\/[^/]+\/metrics\/latest$/.test(path)) {
+      const tenantId = path.split("/")[3];
+      const tenantPonds =
+        tenantId === "tnt_2"
+          ? [
+              {
+                ...ponds[0],
+                tenant_id: "tnt_2",
+                pond_id: "pond_other",
+                name: "Lago Sul",
+              },
+            ]
+          : ponds;
+      data = {
+        items: tenantPonds.map((pond, i) => ({
+          tenant_id: tenantId,
+          pond_id: pond.pond_id,
+          measured_at: fixedTime.toISOString(),
+          do_mg_l: [6.8, 5.9, 6.4, 4.8][i],
+          ph: [7.4, 7.1, 7.3, 6.9][i],
+          temp_c: [27.8, 28.3, 28.1, 29][i],
+        })),
+      };
+    } else if (path.endsWith("/metrics/latest")) {
       const i = Number(path.match(/pond_(\d)/)?.[1] || 1) - 1;
       data = {
         tenant_id: "tnt_1",

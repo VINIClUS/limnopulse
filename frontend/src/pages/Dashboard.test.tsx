@@ -60,12 +60,16 @@ beforeEach(() => {
     }
     if (path.endsWith("/metrics/latest")) {
       return Promise.resolve({
-        measured_at: new Date().toISOString(),
-        tenant_id: "tnt_1",
-        pond_id: "pond_1",
-        do_mg_l: 4.2,
-        ph: 7.1,
-        temp_c: 26,
+        items: [
+          {
+            measured_at: new Date().toISOString(),
+            tenant_id: "tnt_1",
+            pond_id: "pond_1",
+            do_mg_l: 4.2,
+            ph: 7.1,
+            temp_c: 26,
+          },
+        ],
       });
     }
     if (path.includes("/metrics/summary")) {
@@ -110,6 +114,16 @@ it("polls the bounded active-alert view and marks truncated counts", async () =>
       ),
     ).toBe(true),
   );
+  await waitFor(() =>
+    expect(
+      api.mock.calls.some(([path]) => path === "/tenants/tnt_1/metrics/latest"),
+    ).toBe(true),
+  );
+  expect(
+    api.mock.calls.some(
+      ([path]) => path === "/tenants/tnt_1/ponds/pond_1/metrics/latest",
+    ),
+  ).toBe(false);
   expect(
     await screen.findByText(/Exibindo os 100 alertas mais recentes/),
   ).toBeInTheDocument();

@@ -163,6 +163,60 @@ async def test_query_latest_metrics_returns_newest_record_when_influx_returns_mu
 
 
 @pytest.mark.asyncio
+async def test_query_latest_metrics_for_tenant_batches_and_keeps_newest_row_per_pond() -> None:
+    older_at = datetime(2026, 1, 1, 12, 0, tzinfo=UTC)
+    newer_at = datetime(2026, 1, 1, 12, 10, tzinfo=UTC)
+    query_api = FakeQueryApi(
+        [
+            FakeTable(
+                [
+                    FakeRecord(
+                        {
+                            "_time": older_at,
+                            "tenant_id": "tnt_1",
+                            "pond_id": "pond_1",
+                            "temp_c": 24.0,
+                        }
+                    ),
+                    FakeRecord(
+                        {
+                            "_time": newer_at,
+                            "tenant_id": "tnt_1",
+                            "pond_id": "pond_1",
+                            "temp_c": 25.5,
+                        }
+                    ),
+                    FakeRecord(
+                        {
+                            "_time": older_at,
+                            "tenant_id": "tnt_1",
+                            "pond_id": "pond_2",
+                            "temp_c": 23.5,
+                        }
+                    ),
+                ]
+            )
+        ]
+    )
+    repository = InfluxTelemetryRepository(
+        query_api=query_api,
+        org="limnopulse",
+        bucket="limnopulse_raw",
+    )
+
+    metrics = await repository.query_latest_metrics_for_tenant(tenant_id="tnt_1")
+
+    assert [(item.pond_id, item.temp_c) for item in metrics] == [
+        ("pond_1", 25.5),
+        ("pond_2", 23.5),
+    ]
+    query = query_api.calls[0]["query"]
+    assert 'r["tenant_id"] == "tnt_1"' in query
+    assert 'r["pond_id"]' not in query
+    assert len(query_api.calls) == 1
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize("period,interval", [("24h", "5m"), ("7d", "1h"), ("30d", "1h")])
 async def test_summary_aggregates_raw_samples_without_limits(period, interval):
     now = datetime(2026, 9, 19, tzinfo=UTC)

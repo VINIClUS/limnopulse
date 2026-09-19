@@ -20,3 +20,6 @@ class TelemetryRepository(Protocol):
 
     async def query_latest_metrics(self, *, tenant_id: str, pond_id: str) -> LatestMetrics:
         raise NotImplementedError
+
+    async def query_latest_metrics_for_tenant(self, *, tenant_id: str) -> list[LatestMetrics]:
+        raise NotImplementedError

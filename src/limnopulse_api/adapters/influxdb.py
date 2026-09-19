@@ -51,6 +51,24 @@ class InfluxTelemetryRepository:
             return self._latest_from_values(latest_values, tenant_id=tenant_id, pond_id=pond_id)
         return LatestMetrics(tenant_id=tenant_id, pond_id=pond_id)
 
+    async def query_latest_metrics_for_tenant(self, *, tenant_id: str) -> list[LatestMetrics]:
+        query = self._latest_tenant_query(tenant_id=tenant_id)
+        tables = await to_thread.run_sync(self.query_api.query, query, self.org)
+        latest_by_pond: dict[str, dict[str, Any]] = {}
+        for table in tables:
+            for record in table.records:
+                values = record.values
+                pond_id = str(values.get("pond_id", ""))
+                if not pond_id:
+                    continue
+                current = latest_by_pond.get(pond_id)
+                if current is None or values.get("_time") > current.get("_time"):
+                    latest_by_pond[pond_id] = values
+        return [
+            self._latest_from_values(values, tenant_id=tenant_id, pond_id=pond_id)
+            for pond_id, values in sorted(latest_by_pond.items())
+        ]
+
     async def query_summary(self, *, tenant_id: str, pond_id: str, period: str):
         from limnopulse_api.domain.telemetry import MetricsSummary, MetricStatistics, SummaryPoint
         from limnopulse_api.core.errors import TelemetryQueryError
@@ -131,12 +149,31 @@ class InfluxTelemetryRepository:
             ]
         )
 
+    def _latest_tenant_query(self, *, tenant_id: str) -> str:
+        return "\n".join(
+            [
+                f"from(bucket: {self._flux_string(self.bucket)})",
+                "  |> range(start: -24h)",
+                self._tenant_water_quality_filters(tenant_id=tenant_id),
+                "  |> last()",
+                '  |> pivot(rowKey:["_time", "tenant_id", "pond_id"], columnKey: ["_field"], valueColumn: "_value")',
+                '  |> sort(columns: ["_time"], desc: true)',
+            ]
+        )
+
     def _water_quality_filters(self, *, tenant_id: str, pond_id: str) -> str:
+        return "\n".join(
+            [
+                self._tenant_water_quality_filters(tenant_id=tenant_id),
+                f'  |> filter(fn: (r) => r["pond_id"] == {self._flux_string(pond_id)})',
+            ]
+        )
+
+    def _tenant_water_quality_filters(self, *, tenant_id: str) -> str:
         return "\n".join(
             [
                 '  |> filter(fn: (r) => r["_measurement"] == "water_quality")',
                 f'  |> filter(fn: (r) => r["tenant_id"] == {self._flux_string(tenant_id)})',
-                f'  |> filter(fn: (r) => r["pond_id"] == {self._flux_string(pond_id)})',
             ]
         )
 

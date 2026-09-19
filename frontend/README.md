@@ -77,6 +77,8 @@ O dashboard tem caches separados por usuário/propriedade/viveiro/período, atua
 
 Janelas de 5 minutos para 24h; 1 hora para 7d e 30d. Estatísticas calculadas no Influx sobre todas as amostras originais, incluindo todos os dispositivos do viveiro; não sobre médias de janelas nem leituras limitadas. Sem amostras: série vazia, estatísticas nulas, contagem zero.
 
+`GET /v1/tenants/{tenant_id}/metrics/latest` retorna `{ "items": [...] }` com a última leitura disponível por viveiro em uma consulta agrupada por propriedade. O dashboard usa essa visão única e atualiza os dados a cada minuto.
+
 `POST /v1/leads` é público. Campos: `name`, `email`, `phone?`, `property_name?`, `source`, `consent: true`. Campos extras, inclusive CPF/cartão, são rejeitados. Só responde 201 depois de persistir no DynamoDB, partição `LEADS#YYYY-MM`, chave de ordenação data UTC + UUID. Nenhuma listagem pública. Redis indisponível retorna 503; excesso retorna 429 e `Retry-After`. Limite em janelas fixas de minuto por IP, padrão 5, configurável com `LEAD_RATE_LIMIT_PER_MINUTE`. Não armazena IP no lead; chave temporária usa hash do IP.
 
 O IP vem de `request.client`, não de um cabeçalho encaminhado interpretado pela aplicação. Ao publicar atrás de proxy, configure `--proxy-headers --forwarded-allow-ips=<IPs reais do proxy>` no Uvicorn e restrinja acesso direto à API. Não use confiança irrestrita em cabeçalhos fornecidos pelo público. Leads não expiram automaticamente; a operação deve definir sua política de retenção e acesso.

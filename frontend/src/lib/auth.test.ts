@@ -97,6 +97,17 @@ describe("Cognito session", () => {
     expect(await authStorage.getItem(tokenKey)).toBe("existing-token");
     expect(sessionStorage.getItem("limnopulse:remember")).toBeNull();
   });
+  it("clears the superseded storage backend only after sign-in succeeds", async () => {
+    const oldTokenKey = "CognitoIdentityServiceProvider.existing.accessToken";
+    localStorage.setItem(oldTokenKey, "old-token");
+    sdk.signIn.mockResolvedValue({ isSignedIn: true });
+
+    await login("a@example.com", "secret", false);
+    await authStorage.setItem("new-token", "new-value");
+
+    expect(localStorage.getItem(oldTokenKey)).toBeNull();
+    expect(sessionStorage.getItem("new-token")).toBe("new-value");
+  });
   it("delegates recovery and confirmation to Cognito", async () => {
     await recover("a@example.com");
     await finishRecovery("a@example.com", "123456", "new-password");

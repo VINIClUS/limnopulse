@@ -9,6 +9,7 @@ from limnopulse_api.api.dependencies import (
 )
 from limnopulse_api.api.v1.schemas.common import ErrorResponse
 from limnopulse_api.api.v1.schemas.telemetry import (
+    LatestMetricsListResponse,
     LatestMetricsResponse,
     TelemetryReadingListResponse,
     TelemetryReadingResponse,
@@ -24,6 +25,7 @@ from limnopulse_api.domain.telemetry import (
 from limnopulse_api.services.telemetry import PondTelemetryService
 
 router = APIRouter(prefix="/tenants/{tenant_id}/ponds/{pond_id}", tags=["telemetry"])
+tenant_router = APIRouter(prefix="/tenants/{tenant_id}", tags=["telemetry"])
 
 
 def _telemetry_service(domain_repository, telemetry_repository) -> PondTelemetryService:
@@ -130,6 +132,23 @@ async def query_latest_metrics(
     except NotFoundError as exc:
         raise HTTPException(status_code=404, detail=str(exc) or "not found") from exc
     return _to_latest_response(metrics)
+
+
+@tenant_router.get(
+    "/metrics/latest",
+    response_model=LatestMetricsListResponse,
+    responses={403: {"model": ErrorResponse}, 503: {"model": ErrorResponse}},
+)
+async def query_latest_metrics_for_tenant(
+    tenant_id: str,
+    telemetry_repository: TelemetryRepositoryDep,
+    repository: DomainRepositoryDep,
+    _access: TenantAccess = Depends(require_tenant_role(*tuple(READ_ROLES))),
+) -> LatestMetricsListResponse:
+    metrics = await _telemetry_service(repository, telemetry_repository).query_latest_metrics_for_tenant(
+        tenant_id=tenant_id
+    )
+    return LatestMetricsListResponse(items=[_to_latest_response(item) for item in metrics])
 
 
 from limnopulse_api.domain.telemetry import MetricsSummary

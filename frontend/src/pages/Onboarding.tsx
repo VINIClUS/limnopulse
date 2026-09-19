@@ -25,6 +25,16 @@ type Draft = {
 };
 export function Onboarding() {
   const { user, exit } = useSession();
+  return <OnboardingForm key={user!.id} user={user!} exit={exit} />;
+}
+
+function OnboardingForm({
+  user,
+  exit,
+}: {
+  user: { id: string };
+  exit: () => Promise<void>;
+}) {
   const navigate = useNavigate(),
     cache = useQueryClient();
   const key = `limnopulse:onboarding:${user!.id}`;
