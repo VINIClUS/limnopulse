@@ -71,7 +71,7 @@ async def test_query_readings_builds_flux_with_server_side_filters() -> None:
     assert query_api.calls[0]["org"] == "limnopulse"
     query = query_api.calls[0]["query"]
     assert 'from(bucket: "limnopulse_raw")' in query
-    assert '|> range(start: -30m)' in query
+    assert "|> range(start: -30m)" in query
     assert 'r["_measurement"] == "water_quality"' in query
     assert 'r["tenant_id"] == "tnt_1"' in query
     assert 'r["pond_id"] == "pond_1"' in query
@@ -118,7 +118,9 @@ async def test_query_latest_metrics_uses_latest_and_pivot() -> None:
 
 
 @pytest.mark.asyncio
-async def test_query_latest_metrics_returns_newest_record_when_influx_returns_multiple_rows() -> None:
+async def test_query_latest_metrics_returns_newest_record_when_influx_returns_multiple_rows() -> (
+    None
+):
     older_at = datetime(2026, 1, 1, 12, 0, tzinfo=UTC)
     newer_at = datetime(2026, 1, 1, 12, 10, tzinfo=UTC)
     query_api = FakeQueryApi(
@@ -158,3 +160,27 @@ async def test_query_latest_metrics_returns_newest_record_when_influx_returns_mu
     query = query_api.calls[0]["query"]
     assert '|> sort(columns: ["_time"], desc: true)' in query
     assert "|> limit(n: 1)" in query
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("period,interval", [("24h", "5m"), ("7d", "1h"), ("30d", "1h")])
+async def test_summary_aggregates_raw_samples_without_limits(period, interval):
+    now = datetime(2026, 9, 19, tzinfo=UTC)
+    records = [
+        FakeRecord({"result": r, "_field": "do_mg_l", "_value": v, "_time": now})
+        for r, v in [("mean", 6.1), ("min", 2.0), ("max", 9.0), ("count", 50000), ("series", 6.5)]
+    ]
+    api = FakeQueryApi([FakeTable(records)])
+    result = await InfluxTelemetryRepository(query_api=api, org="org", bucket="raw").query_summary(
+        tenant_id="tnt_1", pond_id="pond_1", period=period
+    )
+    assert result.statistics["do_mg_l"].count == 50000
+    assert result.statistics["do_mg_l"].mean == 6.1
+    assert result.series[0].do_mg_l == 6.5
+    assert result.statistics["ph"].count == 0
+    query = api.calls[0]["query"]
+    assert "limit(" not in query
+    assert f"aggregateWindow(every: {interval}" in query
+    assert "data |> mean()" in query
+    assert 'r["tenant_id"] == "tnt_1"' in query
+    assert 'r["pond_id"] == "pond_1"' in query

@@ -229,3 +229,7 @@ DynamoDB, ElasticMQ, Redis and WireMock services:
 RUN_NOTIFICATION_INTEGRATION=1 \
   python -m pytest -q tests/integration/test_notifications_local.py
 ```
+
+## Frontend React
+
+As sete telas do LimnoPulse ficam em [`frontend/`](frontend/README.md), com Vite na porta 3000 e proxy `/v1` para a API. Consulte o README do frontend para Cognito, modo local, onboarding, leads/CSV, métricas agregadas, testes e publicação na mesma origem. Relatório visual em [`artifacts/visual/index.html`](artifacts/visual/index.html). Nenhum deploy ou cobrança faz parte desta entrega.

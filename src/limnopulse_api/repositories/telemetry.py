@@ -1,9 +1,12 @@
 from typing import Protocol
 
-from limnopulse_api.domain.telemetry import LatestMetrics, TelemetryReading
+from limnopulse_api.domain.telemetry import LatestMetrics, MetricsSummary, TelemetryReading
 
 
 class TelemetryRepository(Protocol):
+    async def query_summary(self, *, tenant_id: str, pond_id: str, period: str) -> MetricsSummary:
+        raise NotImplementedError
+
     async def query_readings(
         self,
         *,

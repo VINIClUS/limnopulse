@@ -1,4 +1,4 @@
-from typing import Annotated
+from typing import Annotated, Literal
 
 from fastapi import APIRouter, Depends, HTTPException, Query
 
@@ -16,7 +16,11 @@ from limnopulse_api.api.v1.schemas.telemetry import (
 from limnopulse_api.core.errors import NotFoundError
 from limnopulse_api.domain.entities import TenantAccess
 from limnopulse_api.domain.roles import READ_ROLES
-from limnopulse_api.domain.telemetry import LatestMetrics, TelemetryReading, validate_flux_time_bound
+from limnopulse_api.domain.telemetry import (
+    LatestMetrics,
+    TelemetryReading,
+    validate_flux_time_bound,
+)
 from limnopulse_api.services.telemetry import PondTelemetryService
 
 router = APIRouter(prefix="/tenants/{tenant_id}/ponds/{pond_id}", tags=["telemetry"])
@@ -65,7 +69,11 @@ def _to_latest_response(metrics: LatestMetrics) -> LatestMetricsResponse:
 @router.get(
     "/readings",
     response_model=TelemetryReadingListResponse,
-    responses={403: {"model": ErrorResponse}, 404: {"model": ErrorResponse}, 503: {"model": ErrorResponse}},
+    responses={
+        403: {"model": ErrorResponse},
+        404: {"model": ErrorResponse},
+        503: {"model": ErrorResponse},
+    },
 )
 async def query_readings(
     tenant_id: str,
@@ -95,13 +103,19 @@ async def query_readings(
         )
     except NotFoundError as exc:
         raise HTTPException(status_code=404, detail=str(exc) or "not found") from exc
-    return TelemetryReadingListResponse(items=[_to_reading_response(reading) for reading in readings])
+    return TelemetryReadingListResponse(
+        items=[_to_reading_response(reading) for reading in readings]
+    )
 
 
 @router.get(
     "/metrics/latest",
     response_model=LatestMetricsResponse,
-    responses={403: {"model": ErrorResponse}, 404: {"model": ErrorResponse}, 503: {"model": ErrorResponse}},
+    responses={
+        403: {"model": ErrorResponse},
+        404: {"model": ErrorResponse},
+        503: {"model": ErrorResponse},
+    },
 )
 async def query_latest_metrics(
     tenant_id: str,
@@ -116,3 +130,25 @@ async def query_latest_metrics(
     except NotFoundError as exc:
         raise HTTPException(status_code=404, detail=str(exc) or "not found") from exc
     return _to_latest_response(metrics)
+
+
+from limnopulse_api.domain.telemetry import MetricsSummary
+
+
+@router.get("/metrics/summary", response_model=MetricsSummary)
+async def query_summary(
+    tenant_id: str,
+    pond_id: str,
+    repository: DomainRepositoryDep,
+    telemetry_repository: TelemetryRepositoryDep,
+    period: Literal["24h", "7d", "30d"] = "24h",
+    _access: TenantAccess = Depends(require_tenant_role(*tuple(READ_ROLES))),
+) -> MetricsSummary:
+    try:
+        return await _telemetry_service(repository, telemetry_repository).query_summary(
+            tenant_id=tenant_id,
+            pond_id=pond_id,
+            period=period,
+        )
+    except NotFoundError as exc:
+        raise HTTPException(404, "pond not found") from exc

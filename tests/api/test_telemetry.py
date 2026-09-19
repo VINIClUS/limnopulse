@@ -129,7 +129,9 @@ def make_app(
         "/v1/tenants/tnt_1/ponds/pond_1/metrics/latest",
     ],
 )
-def test_telemetry_without_membership_returns_403_without_pond_or_telemetry_calls(path: str) -> None:
+def test_telemetry_without_membership_returns_403_without_pond_or_telemetry_calls(
+    path: str,
+) -> None:
     app = make_app(membership=None, pond=make_pond())
     domain_repository = app.state.domain_repository
     telemetry_repository = app.state.telemetry_repository
@@ -240,3 +242,41 @@ def test_latest_metrics_delegates_with_server_side_tenant_and_pond_filters() -> 
     assert response.json()["tenant_id"] == "tnt_1"
     assert response.json()["pond_id"] == "pond_1"
     assert telemetry_repository.latest_calls == [{"tenant_id": "tnt_1", "pond_id": "pond_1"}]
+
+
+@pytest.mark.parametrize(
+    "membership,pond,expected", [(None, make_pond(), 403), (make_membership(), None, 404)]
+)
+def test_summary_requires_membership_and_pond(membership, pond, expected):
+    with TestClient(make_app(membership=membership, pond=pond)) as client:
+        response = client.get(
+            "/v1/tenants/tnt_1/ponds/pond_1/metrics/summary", headers={"X-Dev-User-Sub": "sub_1"}
+        )
+    assert response.status_code == expected
+
+
+def test_summary_returns_statistics_and_validates_period():
+    class SummaryRepository(FakeTelemetryRepository):
+        async def query_summary(self, *, tenant_id, pond_id, period):
+            from limnopulse_api.domain.telemetry import MetricsSummary, MetricStatistics
+
+            return MetricsSummary(
+                tenant_id=tenant_id,
+                pond_id=pond_id,
+                period=period,
+                interval="5m",
+                statistics={"do_mg_l": MetricStatistics(mean=6, min=4, max=8, count=10000)},
+            )
+
+    app = make_app(
+        membership=make_membership(), pond=make_pond(), telemetry_repository=SummaryRepository()
+    )
+    with TestClient(app) as client:
+        path = "/v1/tenants/tnt_1/ponds/pond_1/metrics/summary"
+        response = client.get(path, headers={"X-Dev-User-Sub": "sub_1"})
+        assert response.status_code == 200
+        assert response.json()["statistics"]["do_mg_l"]["count"] == 10000
+        assert (
+            client.get(path + "?period=365d", headers={"X-Dev-User-Sub": "sub_1"}).status_code
+            == 422
+        )

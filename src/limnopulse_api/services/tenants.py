@@ -9,14 +9,26 @@ class TenantService:
 
     async def list_for_user(self, cognito_sub: str) -> list[Tenant]:
         memberships = await self.repository.list_memberships_for_user(cognito_sub)
-        active_memberships = [membership for membership in memberships if membership.status == "active"]
+        active_memberships = [
+            membership for membership in memberships if membership.status == "active"
+        ]
         return await self.repository.list_tenants_for_memberships(active_memberships)
 
-    async def create(self, name: str, owner_sub: str) -> Tenant:
-        return await self.repository.create_tenant_with_owner(new_tenant_id(), name, owner_sub)
+    async def create(self, name: str, owner_sub: str, city: str | None = None) -> Tenant:
+        kwargs = {"settings": {"city": city}} if city is not None else {}
+        return await self.repository.create_tenant_with_owner(
+            new_tenant_id(), name, owner_sub, **kwargs
+        )
 
     async def get(self, tenant_id: str) -> Tenant | None:
         return await self.repository.get_tenant(tenant_id)
 
-    async def update(self, tenant_id: str, expected_version: int, name: str | None) -> Tenant:
-        return await self.repository.update_tenant(tenant_id, expected_version, name)
+    async def update(
+        self,
+        tenant_id: str,
+        expected_version: int,
+        name: str | None,
+        settings_patch: dict | None = None,
+    ) -> Tenant:
+        kwargs = {"settings_patch": settings_patch} if settings_patch is not None else {}
+        return await self.repository.update_tenant(tenant_id, expected_version, name, **kwargs)

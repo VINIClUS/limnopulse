@@ -66,14 +66,16 @@ class DynamoDomainRepository:
         )
         return [self._membership_from_item(item) for item in self._response_items(response)]
 
-    async def create_tenant_with_owner(self, tenant_id: str, name: str, owner_sub: str) -> Tenant:
+    async def create_tenant_with_owner(
+        self, tenant_id: str, name: str, owner_sub: str, settings: dict | None = None
+    ) -> Tenant:
         now = utc_now()
         tenant_item = {
             **self.keys.tenant(tenant_id),
             "entity_type": "tenant",
             "tenant_id": tenant_id,
             "name": name,
-            "settings": {},
+            "settings": settings or {},
             "status": "active",
             "created_at": now.isoformat(),
             "updated_at": now.isoformat(),
@@ -140,15 +142,24 @@ class DynamoDomainRepository:
         tenant_id: str,
         expected_version: int,
         name: str | None,
+        settings_patch: dict | None = None,
     ) -> Tenant:
         existing = await self.get_tenant(tenant_id)
         if existing is None:
             raise NotFoundError(f"Tenant {tenant_id} not found")
 
+        next_settings = None
+        if settings_patch is not None:
+            next_settings = dict(existing.settings)
+            for key, value in settings_patch.items():
+                if value is None:
+                    next_settings.pop(key, None)
+                else:
+                    next_settings[key] = value
         response = self._update_item(
             key=self.keys.tenant(tenant_id),
             expected_version=expected_version,
-            updates={"name": name},
+            updates={"name": name, "settings": next_settings},
         )
         item = self._response_item(response, attribute_name="Attributes")
         if item is None:
@@ -488,8 +499,7 @@ class DynamoDomainRepository:
             return [self._normalize_deserialized_value(item) for item in deserialized]
         if isinstance(deserialized, dict):
             return {
-                key: self._normalize_deserialized_value(item)
-                for key, item in deserialized.items()
+                key: self._normalize_deserialized_value(item) for key, item in deserialized.items()
             }
         return deserialized
 
@@ -501,10 +511,7 @@ class DynamoDomainRepository:
         if isinstance(value, list):
             return [self._normalize_deserialized_value(item) for item in value]
         if isinstance(value, dict):
-            return {
-                key: self._normalize_deserialized_value(item)
-                for key, item in value.items()
-            }
+            return {key: self._normalize_deserialized_value(item) for key, item in value.items()}
         return value
 
     def _raise_if_conflict(self, exc: Exception) -> None:

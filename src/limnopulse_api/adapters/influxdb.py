@@ -5,7 +5,11 @@ from typing import Any
 
 from anyio import to_thread
 
-from limnopulse_api.domain.telemetry import LatestMetrics, TelemetryReading, validate_flux_time_bound
+from limnopulse_api.domain.telemetry import (
+    LatestMetrics,
+    TelemetryReading,
+    validate_flux_time_bound,
+)
 
 
 class InfluxTelemetryRepository:
@@ -32,9 +36,7 @@ class InfluxTelemetryRepository:
         )
         tables = await to_thread.run_sync(self.query_api.query, query, self.org)
         return [
-            self._reading_from_values(record.values)
-            for table in tables
-            for record in table.records
+            self._reading_from_values(record.values) for table in tables for record in table.records
         ]
 
     async def query_latest_metrics(self, *, tenant_id: str, pond_id: str) -> LatestMetrics:
@@ -48,6 +50,53 @@ class InfluxTelemetryRepository:
         if latest_values is not None:
             return self._latest_from_values(latest_values, tenant_id=tenant_id, pond_id=pond_id)
         return LatestMetrics(tenant_id=tenant_id, pond_id=pond_id)
+
+    async def query_summary(self, *, tenant_id: str, pond_id: str, period: str):
+        from limnopulse_api.domain.telemetry import MetricsSummary, MetricStatistics, SummaryPoint
+        from limnopulse_api.core.errors import TelemetryQueryError
+
+        if period not in {"24h", "7d", "30d"}:
+            raise ValueError("invalid period")
+        interval = "5m" if period == "24h" else "1h"
+        query = "\n".join(
+            [
+                f"data = from(bucket: {self._flux_string(self.bucket)})",
+                f"  |> range(start: -{period})",
+                self._water_quality_filters(tenant_id=tenant_id, pond_id=pond_id),
+                '  |> filter(fn: (r) => r._field == "do_mg_l" or r._field == "ph" or r._field == "temp_c")',
+                '  |> group(columns: ["_field"])',
+                f'data |> aggregateWindow(every: {interval}, fn: mean, createEmpty: false) |> yield(name: "series")',
+                'data |> mean() |> yield(name: "mean")',
+                'data |> min() |> yield(name: "min")',
+                'data |> max() |> yield(name: "max")',
+                'data |> count() |> yield(name: "count")',
+            ]
+        )
+        try:
+            tables = await to_thread.run_sync(self.query_api.query, query, self.org)
+        except Exception as exc:
+            raise TelemetryQueryError("summary query failed") from exc
+        stats = {field: {} for field in ("do_mg_l", "ph", "temp_c")}
+        points = {}
+        for table in tables:
+            for record in table.records:
+                values = record.values
+                field, value = values.get("_field"), values.get("_value")
+                if field not in stats or value is None:
+                    continue
+                result = values.get("result")
+                if result == "series":
+                    points.setdefault(values["_time"], {})[field] = value
+                elif result in {"mean", "min", "max", "count"}:
+                    stats[field][result] = value
+        return MetricsSummary(
+            tenant_id=tenant_id,
+            pond_id=pond_id,
+            period=period,
+            interval=interval,
+            series=[SummaryPoint(measured_at=t, **v) for t, v in sorted(points.items())],
+            statistics={k: MetricStatistics(**v) for k, v in stats.items()},
+        )
 
     def _readings_query(
         self,

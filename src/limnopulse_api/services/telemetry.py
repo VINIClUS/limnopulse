@@ -1,5 +1,5 @@
 from limnopulse_api.core.errors import NotFoundError
-from limnopulse_api.domain.telemetry import LatestMetrics, TelemetryReading
+from limnopulse_api.domain.telemetry import LatestMetrics, MetricsSummary, TelemetryReading
 from limnopulse_api.repositories.domain import DomainRepository
 from limnopulse_api.repositories.telemetry import TelemetryRepository
 
@@ -37,6 +37,12 @@ class PondTelemetryService:
         return await self.telemetry_repository.query_latest_metrics(
             tenant_id=tenant_id,
             pond_id=pond_id,
+        )
+
+    async def query_summary(self, *, tenant_id: str, pond_id: str, period: str) -> MetricsSummary:
+        await self._require_pond(tenant_id=tenant_id, pond_id=pond_id)
+        return await self.telemetry_repository.query_summary(
+            tenant_id=tenant_id, pond_id=pond_id, period=period
         )
 
     async def _require_pond(self, *, tenant_id: str, pond_id: str) -> None:

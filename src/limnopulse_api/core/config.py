@@ -20,6 +20,7 @@ class Settings(BaseSettings):
     dynamodb_domain_table: str = "LimnopulseDomain"
     dynamodb_audit_table: str = "LimnopulseAudit"
     dynamodb_endpoint_url: str | None = None
+    lead_rate_limit_per_minute: int = Field(default=5, ge=1, le=100)
     redis_url: str = "redis://localhost:6379/0"
     influxdb_url: str = "http://localhost:8086"
     influxdb_token: str = "local-dev-token"
