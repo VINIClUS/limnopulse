@@ -81,14 +81,12 @@ never automatically deploys production").
 
 ## 4. GHCR package visibility
 
-After the first `build.yml` push to `main`, each package it creates is
-**private** by default regardless of the repo being public — `api`,
-`alert-evaluator` and `notifications` on the first push; `frontend` joins
-once PR #45 merges and its matrix leg stops skipping (see the `hashFiles`
-guard in `build.yml`). In
+After the first `build.yml` push to `main`, each of the four packages it
+creates (`api`, `frontend`, `alert-evaluator`, `notifications`) is
+**private** by default regardless of the repo being public. In
 `https://github.com/users/VINIClUS/packages/container/<name>/settings`,
-switch visibility to public for each one as it appears — otherwise
-`docker compose pull` on the VPS fails `unauthorized` for that image.
+switch visibility to public for all four — otherwise `docker compose pull`
+on the VPS fails `unauthorized`.
 
 ## 5. Caddy — do this alone, deliberately
 

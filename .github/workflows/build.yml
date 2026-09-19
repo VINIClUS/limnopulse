@@ -48,14 +48,7 @@ jobs:
       # secrets. Set as repository Variables once Fase 0's `tofu apply` has
       # run; until then the frontend image builds with blank auth config,
       # which is enough for the build/scan gates but not for a real login.
-      #
-      # `frontend/` does not exist on `main` yet (PR #45, unmerged as of
-      # this writing) — Dockerfile.frontend's context would 404 on
-      # `COPY frontend/...`. This condition skips only that matrix leg until
-      # the directory lands, and re-activates automatically once it does; no
-      # follow-up edit to this file is required.
       - name: Build ${{ matrix.app }}
-        if: matrix.app != 'frontend' || hashFiles('frontend/package.json') != ''
         uses: docker/build-push-action@10e90e3645eae34f1e60eeb005ba3a3d33f178e8 # v6
         with:
           context: .
