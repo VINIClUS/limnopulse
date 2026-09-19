@@ -43,31 +43,29 @@ output "notification_jobs_dlq_url" {
   value       = aws_sqs_queue.notification_jobs_dlq.id
 }
 
-# The outputs below are null when their owning feature flag
-# (var.telegram_delivery / var.email_delivery, see variables.tf) is false.
-
+# Null when var.telegram_delivery = false (see variables.tf and telegram.tf).
 output "telegram_notification_jobs_queue_url" {
-  description = "SQS_TELEGRAM_JOBS_URL (null unless telegram_delivery = true)"
+  description = "SQS_TELEGRAM_JOBS_URL"
   value       = try(aws_sqs_queue.telegram_notification_jobs[0].id, null)
 }
 
 output "telegram_notification_jobs_queue_arn" {
-  description = "Telegram notification jobs queue ARN (null unless telegram_delivery = true)."
+  description = "Telegram notification jobs queue ARN."
   value       = try(aws_sqs_queue.telegram_notification_jobs[0].arn, null)
 }
 
 output "telegram_notification_jobs_dlq_url" {
-  description = "Telegram notification jobs dead-letter queue URL (null unless telegram_delivery = true)."
+  description = "Telegram notification jobs dead-letter queue URL."
   value       = try(aws_sqs_queue.telegram_notification_jobs_dlq[0].id, null)
 }
 
 output "telegram_bot_token_secret_arn" {
-  description = "TELEGRAM_BOT_TOKEN_SECRET_ARN (null unless telegram_delivery = true)"
+  description = "TELEGRAM_BOT_TOKEN_SECRET_ARN"
   value       = try(aws_secretsmanager_secret.telegram_bot_token[0].arn, null)
 }
 
 output "telegram_worker_policy_arn" {
-  description = "IAM policy ARN to attach to the Telegram worker runtime role (null unless telegram_delivery = true)."
+  description = "IAM policy ARN to attach to the Telegram worker runtime role."
   value       = try(aws_iam_policy.telegram_worker[0].arn, null)
 }
 
@@ -82,28 +80,29 @@ output "telegram_webhook_secret_reader_policy_arn" {
   value       = aws_iam_policy.telegram_webhook_secret_reader.arn
 }
 
+# Null when var.email_delivery = false (see variables.tf and ses.tf).
 output "ses_events_queue_url" {
-  description = "SQS_SES_EVENTS_URL (null unless email_delivery = true)"
+  description = "SQS_SES_EVENTS_URL"
   value       = try(aws_sqs_queue.ses_events[0].id, null)
 }
 
 output "ses_events_queue_arn" {
-  description = "SES feedback queue ARN (null unless email_delivery = true)."
+  description = "SES feedback queue ARN."
   value       = try(aws_sqs_queue.ses_events[0].arn, null)
 }
 
 output "ses_events_dlq_url" {
-  description = "SES feedback dead-letter queue URL (null unless email_delivery = true)."
+  description = "SES feedback dead-letter queue URL."
   value       = try(aws_sqs_queue.ses_events_dlq[0].id, null)
 }
 
 output "ses_events_routing_dlq_url" {
-  description = "EventBridge SES routing dead-letter queue URL (null unless email_delivery = true)."
+  description = "EventBridge SES routing dead-letter queue URL."
   value       = try(aws_sqs_queue.ses_events_routing_dlq[0].id, null)
 }
 
 output "ses_configuration_set_name" {
-  description = "SES_CONFIGURATION_SET_NAME (null unless email_delivery = true)"
+  description = "SES_CONFIGURATION_SET_NAME"
   value       = try(aws_sesv2_configuration_set.notifications[0].configuration_set_name, null)
 }
 
