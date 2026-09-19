@@ -6,6 +6,7 @@ from limnopulse_api.api.v1.routers import (
     alert_rules,
     devices,
     health,
+    leads,
     me,
     notification_preferences,
     ponds,
@@ -23,6 +24,9 @@ api_router.include_router(telegram_bindings.router, prefix="/v1")
 api_router.include_router(tenants.router, prefix="/v1")
 api_router.include_router(ponds.router, prefix="/v1")
 api_router.include_router(telemetry.router, prefix="/v1")
+api_router.include_router(telemetry.tenant_router, prefix="/v1")
 api_router.include_router(devices.router, prefix="/v1")
 api_router.include_router(alert_rules.router, prefix="/v1")
 api_router.include_router(alert_events.router, prefix="/v1")
+
+api_router.include_router(leads.router, prefix="/v1")

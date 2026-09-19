@@ -25,6 +25,14 @@ ALERT_INDEXES = (
         "Projection": {"ProjectionType": "ALL"},
     },
     {
+        "IndexName": "ActiveAlertEventsByTenantTime",
+        "KeySchema": [
+            {"AttributeName": "GSI3PK", "KeyType": "HASH"},
+            {"AttributeName": "GSI3SK", "KeyType": "RANGE"},
+        ],
+        "Projection": {"ProjectionType": "ALL"},
+    },
+    {
         "IndexName": "NotificationRelayByAvailableAt",
         "KeySchema": [
             {"AttributeName": "relay_gsi_pk", "KeyType": "HASH"},
@@ -64,6 +72,8 @@ def ensure_table(
                     "GSI1SK",
                     "GSI2PK",
                     "GSI2SK",
+                    "GSI3PK",
+                    "GSI3SK",
                     "relay_gsi_pk",
                     "relay_gsi_sk",
                 )

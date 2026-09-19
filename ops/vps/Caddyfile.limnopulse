@@ -1,0 +1,41 @@
+# Snippet to APPEND (never overwrite) to /opt/cnesdata/caddy/Caddyfile on
+# the Hostinger VPS. That file is root-owned and shared with the unrelated
+# cnesdata stack; see ops/vps/README.md for the full, careful procedure
+# (backup, validate, reload without restart).
+#
+# limnopulse-api, limnopulse-web and limnopulse-influxdb are network aliases
+# on the external cnesdata_edge network, defined in compose.production.yaml
+# — Caddy reaches them only because it also joins that network.
+
+# Same-origin: the SPA calls fetch("/v1/...") with a relative path
+# (frontend/src/lib/api.ts) — no VITE_API_BASE_URL exists. /v1 and
+# /webhooks must therefore be served from this same host, or every API
+# call from the browser 404s. This also means CORS is not needed.
+limnopulse.com {
+    handle /v1/* {
+        reverse_proxy limnopulse-api:8000
+    }
+    handle /webhooks/* {
+        reverse_proxy limnopulse-api:8000
+    }
+    handle {
+        reverse_proxy limnopulse-web:8080
+    }
+}
+
+# Proxies everything, not just /v1/*: /healthz, /readyz and
+# /webhooks/telegram are mounted with no prefix
+# (src/limnopulse_api/api/router.py).
+api.limnopulse.com {
+    reverse_proxy limnopulse-api:8000
+}
+
+# The only Proxmox -> VPS traffic (Fase 2): Telegraf and alert-evaluator in
+# the LXC write/read InfluxDB over this hostname. Auth is the InfluxDB
+# token; Caddy adds TLS. mTLS hardening is a deferred Fase 3 item — it
+# requires mounting a CA into the Caddy container, which means recreating
+# it (a planned-downtime operation for cnesdata too, since it shares the
+# container).
+influx.limnopulse.com {
+    reverse_proxy limnopulse-influxdb:8086
+}

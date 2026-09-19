@@ -29,6 +29,10 @@ class LatestMetricsResponse(WaterQualityFieldsResponse):
     pond_id: str
 
 
+class LatestMetricsListResponse(BaseModel):
+    items: list[LatestMetricsResponse]
+
+
 class TelemetryReadQuery(BaseModel):
     start: str = Field(default="-1h")
     stop: str | None = None

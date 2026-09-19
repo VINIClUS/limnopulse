@@ -10,7 +10,9 @@ class DomainRepository(Protocol):
     async def list_memberships_for_user(self, cognito_sub: str) -> list[Membership]:
         raise NotImplementedError
 
-    async def create_tenant_with_owner(self, tenant_id: str, name: str, owner_sub: str) -> Tenant:
+    async def create_tenant_with_owner(
+        self, tenant_id: str, name: str, owner_sub: str, settings: dict | None = None
+    ) -> Tenant:
         raise NotImplementedError
 
     async def list_tenants_for_memberships(self, memberships: list[Membership]) -> list[Tenant]:
@@ -24,6 +26,7 @@ class DomainRepository(Protocol):
         tenant_id: str,
         expected_version: int,
         name: str | None,
+        settings_patch: dict | None = None,
     ) -> Tenant:
         raise NotImplementedError
 

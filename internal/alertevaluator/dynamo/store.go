@@ -21,6 +21,7 @@ import (
 )
 
 const EvaluationIndex = "AlertEvaluationByDue"
+const ActiveAlertEventsIndex = "ActiveAlertEventsByTenantTime"
 
 type Client interface {
 	Query(context.Context, *dynamodb.QueryInput, ...func(*dynamodb.Options)) (*dynamodb.QueryOutput, error)
@@ -298,6 +299,12 @@ func (store Store) eventPut(request alertevaluator.CommitRequest) (*types.Put, e
 	if err != nil {
 		return nil, err
 	}
+	if status == alertevaluator.StatusOpen || status == alertevaluator.StatusAcknowledged {
+		item, err = addActiveAlertIndex(item, request.Work.Rule.TenantID, request.Decision.EventID, request.Slot)
+		if err != nil {
+			return nil, err
+		}
+	}
 	return &types.Put{TableName: aws.String(store.Table), Item: item, ConditionExpression: aws.String("attribute_not_exists(PK) AND attribute_not_exists(SK)")}, nil
 }
 
@@ -412,13 +419,15 @@ func (store Store) activeEventUpdate(request alertevaluator.CommitRequest, kind 
 		expression = "SET #last_at = :slot, #last_quality = :quality REMOVE #last_value"
 	case activeEventResolution:
 		eventID = request.Decision.ResolvedEventID
-		expression = "SET #status = :resolved, #resolved_at = :slot, #updated_at = :slot, #version = #version + :one, #last_at = :slot, #last_quality = :quality, #last_value = :value"
+		expression = "SET #status = :resolved, #resolved_at = :slot, #updated_at = :slot, #version = #version + :one, #last_at = :slot, #last_quality = :quality, #last_value = :value REMOVE #gsi3pk, #gsi3sk"
 		valueMap[":value"] = request.Evaluation.Value
 		valueMap[":resolved"] = "resolved"
 		valueMap[":one"] = int64(1)
 		names["#resolved_at"] = "resolved_at"
 		names["#updated_at"] = "updated_at"
 		names["#version"] = "version"
+		names["#gsi3pk"] = "GSI3PK"
+		names["#gsi3sk"] = "GSI3SK"
 	default:
 		return nil, fmt.Errorf("unsupported active event update kind %d", kind)
 	}
@@ -432,6 +441,20 @@ func (store Store) activeEventUpdate(request alertevaluator.CommitRequest, kind 
 		ConditionExpression:      aws.String("#status IN (:open, :acknowledged, :suppressed)"),
 		ExpressionAttributeNames: names, ExpressionAttributeValues: values,
 	}, nil
+}
+
+func addActiveAlertIndex(item map[string]types.AttributeValue, tenantID, eventID string, openedAt time.Time) (map[string]types.AttributeValue, error) {
+	values, err := attributevalue.MarshalMap(map[string]string{
+		"GSI3PK": "TENANT#" + tenantID + "#ACTIVE_ALERT_EVENTS",
+		"GSI3SK": alertevaluator.FixedUTCTimestamp(openedAt) + "#EVENT#" + eventID,
+	})
+	if err != nil {
+		return nil, err
+	}
+	for key, value := range values {
+		item[key] = value
+	}
+	return item, nil
 }
 
 type rawRule struct {

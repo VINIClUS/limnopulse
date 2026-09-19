@@ -1,0 +1,46 @@
+name: deploy
+
+on:
+  workflow_dispatch:
+    inputs:
+      image_tag:
+        description: "Image tag to promote (must already exist in GHCR, format main-<40 hex sha>)"
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+jobs:
+  deploy-vps:
+    runs-on: ubuntu-latest
+    # Configured once in repo Settings > Environments as a manual bootstrap
+    # step (Fase 1): add a required reviewer so this job never runs
+    # unattended. Merge to main only builds and pushes (build.yml); this is
+    # the sole path that touches production, and it is always human-gated.
+    environment: production
+    steps:
+      - name: Validate tag format
+        run: |
+          tag="${{ inputs.image_tag }}"
+          if ! [[ "$tag" =~ ^main-[0-9a-f]{7,40}$ ]]; then
+            echo "::error::image_tag must match ^main-[0-9a-f]{7,40}\$, got: $tag"
+            exit 1
+          fi
+
+      - name: Deploy to VPS
+        env:
+          SSH_KEY: ${{ secrets.VPS_SSH_KEY }}
+          SSH_KNOWN_HOSTS: ${{ secrets.VPS_KNOWN_HOSTS }}
+          IMAGE_TAG: ${{ inputs.image_tag }}
+        run: |
+          set -euo pipefail
+          key_file="$(mktemp)"
+          known_hosts_file="$(mktemp)"
+          trap 'rm -f "$key_file" "$known_hosts_file"' EXIT
+          printf '%s\n' "$SSH_KEY" > "$key_file"
+          chmod 600 "$key_file"
+          printf '%s\n' "$SSH_KNOWN_HOSTS" > "$known_hosts_file"
+          ssh -i "$key_file" -o UserKnownHostsFile="$known_hosts_file" \
+              -o StrictHostKeyChecking=yes -o BatchMode=yes -o IdentitiesOnly=yes \
+              limnopulse-deploy@103.199.184.166 "$IMAGE_TAG"

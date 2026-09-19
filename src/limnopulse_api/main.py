@@ -10,6 +10,7 @@ from influxdb_client import InfluxDBClient
 
 from limnopulse_api.adapters.alert_events import DynamoAlertEventRepository
 from limnopulse_api.adapters.alert_rules import DynamoAlertRuleRepository
+from limnopulse_api.adapters.leads import DynamoLeadRepository
 from limnopulse_api.adapters.dynamodb import DynamoDomainRepository
 from limnopulse_api.adapters.influxdb import InfluxTelemetryRepository
 from limnopulse_api.adapters.notification_preferences import (
@@ -90,6 +91,9 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         app.state.domain_repository = DynamoDomainRepository(
             table_name=resolved_settings.dynamodb_domain_table,
             client=dynamodb_client,
+        )
+        app.state.lead_repository = DynamoLeadRepository(
+            resolved_settings.dynamodb_domain_table, dynamodb_client
         )
         app.state.alert_rule_repository = DynamoAlertRuleRepository(
             domain_table_name=resolved_settings.dynamodb_domain_table,

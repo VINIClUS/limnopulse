@@ -8,6 +8,33 @@
 **Primary AWS region:** `us-east-2`; global edge control plane (ACM,
 CloudFront-scoped WAF and Pricing Plan Manager endpoint): `us-east-1`
 
+> **Errata — edge topology overridden (2026-09-19).** The user directed the
+> actual deployment to use the existing Caddy container on the Hostinger VPS
+> as the public edge, not Nginx + Cloudflare Tunnel + CloudFront/S3. The
+> sections below that describe Nginx, the tunnel, real-IP trust via
+> `CF-Connecting-IP`, and the CloudFront/S3 static path (notably §4 Target
+> topology, §6 Static site, §7 FastAPI deployment, §12 Internal synthetic
+> ingestion, §17.3 step 5's "switches Nginx" cutover, and §18 API and edge
+> rate limiting) describe a topology that was **not built** and do not apply.
+> They are left in place as historical record of the reviewed design, not as
+> current instructions.
+>
+> What was actually built, and why, is in
+> `/home/vinicius/.claude/plans/fa-a-o-ci-cd-do-ticklish-dragon.md` and the
+> artifacts it produced: `Dockerfile.api`, `Dockerfile.frontend`,
+> `compose.production.yaml`, `.env.production.example`, and `ops/vps/`
+> (bootstrap runbook, deploy script, Caddyfile snippet). In short: both
+> `limnopulse.com` and `api.limnopulse.com` are served by the VPS's existing
+> `caddy:2-alpine` container (shared with the unrelated `cnesdata` stack via
+> the external `cnesdata_edge` network); the SPA calls the API by relative
+> path (`/v1/...`), so Caddy routes same-origin instead of using CORS; and
+> §17.1's "no self-hosted production runner" holds for the VPS deploy path
+> but is explicitly relaxed for the Fase 2 Proxmox LXC promotion job only
+> (`workflow_dispatch` on `main`, behind a required-reviewer GitHub
+> Environment, never running fork-PR code). A full rewrite of the affected
+> sections is a separate follow-up; do not treat them as current without
+> checking the plan file first.
+
 ## 1. Purpose
 
 Define a small, secure production portfolio deployment of LimnoPulse on the
