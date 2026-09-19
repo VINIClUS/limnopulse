@@ -1,0 +1,156 @@
+# Production stack for the VPS. Independent from compose.yaml (dev): no
+# DynamoDB Local, no ElasticMQ, no WireMock, no build: directives, no mutable
+# tags, no hardcoded credentials. Everything below is either pulled from GHCR
+# by immutable tag or sourced from /opt/limnopulse/.env at deploy time.
+#
+# Invoked as:
+#   docker compose --env-file .env --env-file .env.image -f compose.production.yaml <cmd>
+# --env-file feeds ${VAR} interpolation below (IMAGE_TAG, INFLUXDB_*).
+# env_file: on each service injects the full .env into that container's
+# process environment — a separate mechanism from interpolation.
+
+name: limnopulse
+
+x-logging: &default-logging
+  driver: json-file
+  options:
+    max-size: "10m"
+    max-file: "3"
+
+services:
+  api:
+    image: ghcr.io/viniclus/limnopulse/api:${IMAGE_TAG}
+    restart: unless-stopped
+    env_file:
+      # required: false lets `docker compose config` validate this file in CI,
+      # where /opt/limnopulse/.env does not exist. On the VPS it always exists
+      # (Fase 1 bootstrap step 1) and the app's own startup validator
+      # (core/config.py) refuses to boot if required settings are missing.
+      - path: /opt/limnopulse/.env
+        required: false
+    environment:
+      REDIS_URL: redis://redis:6379/0
+      INFLUXDB_URL: http://influxdb:8086
+    depends_on:
+      redis:
+        condition: service_started
+      influxdb:
+        condition: service_healthy
+    networks:
+      default: {}
+      edge:
+        aliases: [limnopulse-api]
+    read_only: true
+    tmpfs:
+      - /tmp
+    security_opt:
+      - no-new-privileges:true
+    cap_drop: [ALL]
+    deploy:
+      resources:
+        limits:
+          cpus: "0.5"
+          memory: 512M
+          pids: 128
+    healthcheck:
+      test: ["CMD", "python3", "-c", "import urllib.request as u; u.urlopen('http://127.0.0.1:8000/healthz', timeout=3)"]
+      interval: 10s
+      timeout: 3s
+      retries: 6
+      start_period: 15s
+    logging: *default-logging
+
+  web:
+    image: ghcr.io/viniclus/limnopulse/frontend:${IMAGE_TAG}
+    restart: unless-stopped
+    networks:
+      default: {}
+      edge:
+        aliases: [limnopulse-web]
+    read_only: true
+    tmpfs:
+      - /tmp
+      - /var/cache/nginx
+      - /var/run
+    security_opt:
+      - no-new-privileges:true
+    cap_drop: [ALL]
+    deploy:
+      resources:
+        limits:
+          cpus: "0.25"
+          memory: 128M
+          pids: 64
+    logging: *default-logging
+
+  redis:
+    image: redis:7-alpine
+    command: redis-server --save "" --appendonly no --maxmemory 128mb --maxmemory-policy allkeys-lfu
+    restart: unless-stopped
+    networks:
+      default: {}
+    # No cap_drop: the alpine entrypoint uses setpriv/su-exec to drop from
+    # root to the redis user at startup, which needs CAP_SETUID/CAP_SETGID.
+    # Verified empirically: cap_drop: [ALL] makes the container exit with
+    # "setpriv: setresuid failed: Operation not permitted".
+    security_opt:
+      - no-new-privileges:true
+    deploy:
+      resources:
+        limits:
+          cpus: "0.25"
+          memory: 160M
+          pids: 64
+    logging: *default-logging
+
+  influxdb:
+    image: influxdb:2-alpine
+    restart: unless-stopped
+    # DOCKER_INFLUXDB_INIT_* are read via ${...} interpolation from the
+    # --env-file sources above, not from env_file:, so they exist only in
+    # the rendered compose config, never hardcoded in this file.
+    environment:
+      DOCKER_INFLUXDB_INIT_MODE: setup
+      DOCKER_INFLUXDB_INIT_USERNAME: ${INFLUXDB_INIT_USERNAME}
+      DOCKER_INFLUXDB_INIT_PASSWORD: ${INFLUXDB_INIT_PASSWORD}
+      DOCKER_INFLUXDB_INIT_ORG: ${INFLUXDB_ORG}
+      DOCKER_INFLUXDB_INIT_BUCKET: ${INFLUXDB_BUCKET_RAW}
+      DOCKER_INFLUXDB_INIT_ADMIN_TOKEN: ${INFLUXDB_TOKEN}
+    volumes:
+      - influxdb_data:/var/lib/influxdb2
+    networks:
+      default: {}
+      edge:
+        # Reached from the Proxmox LXC through Caddy at influx.limnopulse.com
+        # (see Caddyfile block); this alias is what Caddy's reverse_proxy targets.
+        aliases: [limnopulse-influxdb]
+    # No cap_drop: influxd runs as root and needs CAP_DAC_OVERRIDE/CAP_CHOWN
+    # to manage /var/lib/influxdb2 on the named volume. Verified empirically:
+    # cap_drop: [ALL] causes "mkdir: can't create directory ...: Permission
+    # denied" even though the process is UID 0 — Linux still gates that on
+    # the specific DAC capabilities, which cap_drop: ALL strips from root too.
+    security_opt:
+      - no-new-privileges:true
+    deploy:
+      resources:
+        limits:
+          cpus: "0.75"
+          memory: 768M
+          pids: 128
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://127.0.0.1:8086/health"]
+      interval: 10s
+      timeout: 3s
+      retries: 6
+      start_period: 20s
+    logging: *default-logging
+
+networks:
+  default:
+    name: limnopulse_internal
+  edge:
+    external: true
+    name: cnesdata_edge
+
+volumes:
+  influxdb_data:
