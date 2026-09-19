@@ -24,3 +24,10 @@ Fonte: plano fornecido pelo usuário em 2026-09-19.
 - Decisão: preço anterior demonstrativo do plano Operação usa R$ 799,90 para compatibilidade com a economia ilustrada de R$ 2.400; sem efeito financeiro porque checkout não cobra.
 - Limitação: Cognito remoto não foi exercitado sem IDs e conta de teste. Login/recuperação têm testes de SDK e UI, mais autenticação local de integração.
 - Sem deploy, push ou merge. Entrega preservada na branch feat/frontend-seven-screens.
+
+## Páginas públicas e rodapé — 2026-09-19
+- Produto permanece em `/produto`; funcionamento passa a `/como-funciona` e contato a `/contato`, com o formulário de interesse existente.
+- Cabeçalho e rodapé apontam para as páginas dedicadas. O endereço anterior `/produto#como-funciona` redireciona para a nova página.
+- Rodapé com textos de 14–15 px, contraste reforçado e links com área mínima de 44 px de altura. Identidade visual e layouts responsivos preservados.
+- Verificação: build TypeScript/Vite, 14 testes unitários e 25 testes visuais/estados aprovados. Navegação mobile, recarga direta, envio de contato com API simulada e redirecionamento legado também conferidos no navegador.
+- Capturas atualizadas de início e produto; novas capturas de funcionamento e contato em desktop e mobile. As comparações com as sete referências originais documentam a entrega anterior.

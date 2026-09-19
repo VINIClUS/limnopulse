@@ -4,6 +4,8 @@ import { mkdir } from "node:fs/promises";
 const screens = [
   ["inicio", "/"],
   ["produto", "/produto"],
+  ["como-funciona", "/como-funciona"],
+  ["contato", "/contato"],
   ["planos", "/planos"],
   ["checkout", "/checkout"],
   ["login", "/entrar"],

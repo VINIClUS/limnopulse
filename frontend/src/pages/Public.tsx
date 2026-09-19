@@ -167,7 +167,7 @@ export function Home({ onContact }: Props) {
           </Button>
         </section>
       </main>
-      <Footer onContact={onContact} />
+      <Footer />
     </>
   );
 }
@@ -196,18 +196,84 @@ export function Product({ onContact }: Props) {
                 <Button onClick={onContact}>
                   Solicitar contato <ArrowRight size={18} />
                 </Button>
-                <a className="button secondary" href="#como-funciona">
+                <Link className="button secondary" to="/como-funciona">
                   Como funciona
-                </a>
+                </Link>
               </div>
               <Benefits />
             </div>
             <DemoMonitor small />
           </div>
         </section>
-        <section id="como-funciona" className="how-it-works content-width">
-          <span className="eyebrow">DO DADO À DECISÃO</span>
-          <h2>Como funciona</h2>
+        <section className="platform">
+          <div className="content-width platform-inner">
+            <div>
+              <span className="eyebrow">PLATAFORMA COMPLETA</span>
+              <h2>Tudo em um só lugar</h2>
+              <p>
+                Uma plataforma para simplificar sua rotina
+                <br />e potencializar sua produção.
+              </p>
+            </div>
+            {[
+              {
+                icon: Monitor,
+                title: "Dashboard",
+                text: "Visão clara dos indicadores da sua operação.",
+              },
+              {
+                icon: FileText,
+                title: "Histórico",
+                text: "Dados para análise e tomada de decisão.",
+              },
+              {
+                icon: Smartphone,
+                title: "Multi-dispositivos",
+                text: "Acesse no computador, tablet ou celular.",
+              },
+            ].map(({ icon: Icon, title, text }) => (
+              <article className="card" key={title}>
+                <Icon />
+                <h3>{title}</h3>
+                <p>{text}</p>
+              </article>
+            ))}
+          </div>
+        </section>
+        <PhotoBanner
+          onContact={onContact}
+          title="Tecnologia que trabalha"
+          subtitle="junto com você, em cada ciclo."
+        />
+      </main>
+      <Footer />
+    </>
+  );
+}
+export function HowItWorks({ onContact }: Props) {
+  return (
+    <>
+      <PublicHeader onContact={onContact} />
+      <main>
+        <section className="public-page-intro">
+          <div className="content-width">
+            <span className="eyebrow">DO DADO À DECISÃO</span>
+            <h1>
+              Como funciona
+              <br />
+              <span>o LimnoPulse.</span>
+            </h1>
+            <p>
+              Da leitura da água à decisão no campo, acompanhe cada etapa de uma
+              operação mais conectada.
+            </p>
+          </div>
+        </section>
+        <section
+          id="como-funciona"
+          className="how-it-works process-page content-width"
+        >
+          <h2>Um ciclo contínuo de informação</h2>
           <p>
             Do monitoramento à ação, em um ciclo contínuo de informação e
             resultados.
@@ -291,47 +357,69 @@ export function Product({ onContact }: Props) {
             ))}
           </div>
         </section>
-        <section className="platform">
-          <div className="content-width platform-inner">
-            <div>
-              <span className="eyebrow">PLATAFORMA COMPLETA</span>
-              <h2>Tudo em um só lugar</h2>
-              <p>
-                Uma plataforma para simplificar sua rotina
-                <br />e potencializar sua produção.
-              </p>
-            </div>
-            {[
-              {
-                icon: Monitor,
-                title: "Dashboard",
-                text: "Visão clara dos indicadores da sua operação.",
-              },
-              {
-                icon: FileText,
-                title: "Histórico",
-                text: "Dados para análise e tomada de decisão.",
-              },
-              {
-                icon: Smartphone,
-                title: "Multi-dispositivos",
-                text: "Acesse no computador, tablet ou celular.",
-              },
-            ].map(({ icon: Icon, title, text }) => (
-              <article className="card" key={title}>
-                <Icon />
-                <h3>{title}</h3>
-                <p>{text}</p>
-              </article>
-            ))}
-          </div>
-        </section>
+
         <PhotoBanner
           onContact={onContact}
-          title="Tecnologia que trabalha"
-          subtitle="junto com você, em cada ciclo."
+          title="Informação para agir."
+          subtitle="Em cada etapa da sua produção."
         />
       </main>
+      <Footer />
+    </>
+  );
+}
+export function Contact({ onContact }: Props) {
+  return (
+    <>
+      <PublicHeader onContact={onContact} />
+      <main>
+        <section className="public-page-intro">
+          <div className="content-width">
+            <span className="eyebrow">VAMOS CONVERSAR</span>
+            <h1>
+              Contato com quem
+              <br />
+              <span>entende sua água.</span>
+            </h1>
+            <p>
+              Conte sobre sua operação e descubra como o LimnoPulse pode fazer
+              parte da sua rotina.
+            </p>
+          </div>
+        </section>
+        <section className="contact-page-grid content-width">
+          <div className="contact-page-copy">
+            <span className="icon-circle">
+              <MessageSquare />
+            </span>
+            <h2>O próximo passo começa com uma conversa.</h2>
+            <p>
+              Deixe seus dados para nosso time conhecer sua produção, entender
+              suas necessidades e apresentar a solução.
+            </p>
+            <ul className="check-list">
+              <li>
+                <Check /> Monitoramento e histórico da água
+              </li>
+              <li>
+                <Check /> Alertas para apoiar suas decisões
+              </li>
+              <li>
+                <Check /> Orientação para a sua operação
+              </li>
+            </ul>
+            <p>
+              Registro de interesse sem cobrança ou compromisso de contratação.
+            </p>
+          </div>
+          <div className="card contact-page-form">
+            <h2>Fale com o time</h2>
+            <p>Preencha os campos abaixo. Os campos com * são obrigatórios.</p>
+            <LeadForm source="/contato" />
+          </div>
+        </section>
+      </main>
+      <Footer />
     </>
   );
 }

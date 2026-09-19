@@ -90,18 +90,12 @@ export function PublicHeader({
         <NavLink to="/produto" onClick={() => setOpen(false)}>
           Produto
         </NavLink>
-        <Link to="/produto#como-funciona" onClick={() => setOpen(false)}>
+        <NavLink to="/como-funciona" onClick={() => setOpen(false)}>
           Como funciona
-        </Link>
-        <button
-          className="text-button"
-          onClick={() => {
-            setOpen(false);
-            onContact();
-          }}
-        >
+        </NavLink>
+        <NavLink to="/contato" onClick={() => setOpen(false)}>
           Contato
-        </button>
+        </NavLink>
       </nav>
       <div className="header-actions">
         <Link className="button secondary" to="/entrar">
@@ -161,20 +155,18 @@ export function PhotoBanner({
     </section>
   );
 }
-export function Footer({ onContact }: { onContact: () => void }) {
+export function Footer() {
   return (
     <footer className="footer">
       <div>
         <Brand light />
         <p>Dados de hoje. Aquicultura de amanhã.</p>
       </div>
-      <div>
+      <nav aria-label="Navegação do rodapé">
         <Link to="/produto">Produto</Link>
-        <Link to="/produto#como-funciona">Como funciona</Link>
-        <button className="text-button" onClick={onContact}>
-          Contato
-        </button>
-      </div>
+        <Link to="/como-funciona">Como funciona</Link>
+        <Link to="/contato">Contato</Link>
+      </nav>
       <p>
         © {new Date().getFullYear()} LimnoPulse.
         <br />

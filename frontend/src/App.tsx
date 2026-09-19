@@ -1,6 +1,13 @@
 import { useEffect, useState } from "react";
-import { Routes, Route, useLocation, Link } from "react-router";
-import { Home, Product, Plans, Checkout } from "./pages/Public";
+import { Routes, Route, useLocation, Link, Navigate } from "react-router";
+import {
+  Home,
+  Product,
+  HowItWorks,
+  Contact,
+  Plans,
+  Checkout,
+} from "./pages/Public";
 import { Login } from "./pages/Login";
 import { Onboarding } from "./pages/Onboarding";
 import { Dashboard } from "./pages/Dashboard";
@@ -28,6 +35,8 @@ export function App() {
     const titles: Record<string, string> = {
       "/": "Água em melhores decisões",
       "/produto": "Produto",
+      "/como-funciona": "Como funciona",
+      "/contato": "Contato",
       "/planos": "Planos",
       "/checkout": "Registre seu interesse",
       "/entrar": "Entrar",
@@ -46,7 +55,21 @@ export function App() {
     <>
       <Routes>
         <Route path="/" element={<Home onContact={openContact} />} />
-        <Route path="/produto" element={<Product onContact={openContact} />} />
+        <Route
+          path="/produto"
+          element={
+            location.hash === "#como-funciona" ? (
+              <Navigate to="/como-funciona" replace />
+            ) : (
+              <Product onContact={openContact} />
+            )
+          }
+        />
+        <Route
+          path="/como-funciona"
+          element={<HowItWorks onContact={openContact} />}
+        />
+        <Route path="/contato" element={<Contact onContact={openContact} />} />
         <Route path="/planos" element={<Plans onContact={openContact} />} />
         <Route
           path="/checkout"

@@ -1,6 +1,6 @@
 # LimnoPulse frontend
 
-React 19, TypeScript, Vite, React Router, TanStack Query, Recharts, Lucide e Inter local. As sete telas estão integradas aos contratos `/v1` da API Python. Não há cobrança, criação automática de conta, envio de e-mail, CRM ou deploy nesta entrega.
+React 19, TypeScript, Vite, React Router, TanStack Query, Recharts, Lucide e Inter local. As telas estão integradas aos contratos `/v1` da API Python. Não há cobrança, criação automática de conta, envio de e-mail, CRM ou deploy nesta entrega.
 
 ## Executar localmente
 
@@ -44,7 +44,9 @@ A validação desta entrega cobre o adaptador e os fluxos de formulário com o S
 | Rota | Acesso |
 | --- | --- |
 | `/` | Início público |
-| `/produto` | Produto e funcionamento |
+| `/produto` | Apresentação do produto |
+| `/como-funciona` | Etapas do monitoramento à decisão |
+| `/contato` | Formulário público de registro de interesse |
 | `/planos` | URL direta, sem link na navegação, noindex |
 | `/checkout` | URL direta, apenas registro de interesse, noindex |
 | `/entrar` | Login e recuperação |
@@ -122,7 +124,7 @@ A integração real não intercepta HTTP. Cria registros com identificadores pr�
 
 ## Publicação na mesma origem (sem deploy)
 
-Gere `frontend/dist` com os IDs públicos corretos. Sirva os arquivos estáticos e encaminhe `/v1/` à API. O servidor precisa de fallback SPA (`try_files $uri $uri/ /index.html`) para todas as sete rotas. Sirva `/assets/` com cache imutável; `index.html` sem cache longo. Os fundos e fontes são locais. HTTPS é necessário em produção.
+Gere `frontend/dist` com os IDs públicos corretos. Sirva os arquivos estáticos e encaminhe `/v1/` à API. O servidor precisa de fallback SPA (`try_files $uri $uri/ /index.html`) para todas as rotas. Sirva `/assets/` com cache imutável; `index.html` sem cache longo. Os fundos e fontes são locais. HTTPS é necessário em produção.
 
 Aplique `X-Robots-Tag: noindex, nofollow` também no servidor para `/planos` e `/checkout`, reforçando o meta robots controlado pela aplicação para crawlers sem JavaScript. Não inclua essas URLs no sitemap. Exemplo de localização Nginx (adapte o root/upstream existente):
 
