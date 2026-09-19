@@ -197,6 +197,19 @@ PLAN_SMS_INTEGER_FIELDS = (
     "max_price_usd_minor",
 )
 PLAN_SMS_BOOLEAN_FIELDS = ("critical", "overage")
+
+
+def reject_duplicate_json_keys(
+    pairs: list[tuple[str, object]],
+) -> dict[str, object]:
+    values: dict[str, object] = {}
+    for key, value in pairs:
+        if key in values:
+            raise ValueError(f"duplicate JSON key: {key}")
+        values[key] = value
+    return values
+
+
 REQUIRED_ADR_GATE_PATTERNS = {
     "ADR-001-aws-iot-is-an-integration-adapter.md": (
         r"\bBefore any queued consumer acts, it must recheck the DeviceIntegration "
@@ -1157,14 +1170,16 @@ CODEX_REVIEW_GATE_CASES = (
         "name": "PlanVersion Stripe price resolution",
         "filename": "ADR-010-stripe-is-an-adapter-internal-entitlements-are-canonical.md",
         "required_pattern": (
-            r"\bPhase 4 Checkout must accept only plan, interval, and currency;\s+the "
+            r"\bPhase 4 Checkout must accept plan, interval, and currency plus allowlisted "
+            r"success_path and cancel_path;\s+the "
             r"server must resolve an environment-specific Stripe Price ID from the "
             r"approved immutable PlanVersion catalog and reject client-supplied Price IDs\b"
         ),
         "required_clause": (
-            "Phase 4 Checkout must accept only plan, interval, and currency; the server "
-            "must resolve an environment-specific Stripe Price ID from the approved "
-            "immutable PlanVersion catalog and reject client-supplied Price IDs."
+            "Phase 4 Checkout must accept plan, interval, and currency plus allowlisted "
+            "success_path and cancel_path; the server must resolve an environment-specific "
+            "Stripe Price ID from the approved immutable PlanVersion catalog and reject "
+            "client-supplied Price IDs."
         ),
         "inverted_clause": (
             "Phase 4 Checkout may accept a client-supplied Stripe Price ID instead of "
@@ -1203,13 +1218,15 @@ CODEX_REVIEW_GATE_CASES = (
         "name": "versioned destination lifecycle mutations",
         "filename": "ADR-018-eum-push-and-sms-are-provider-adapters.md",
         "required_pattern": (
-            r"\bEvery Push and SMS destination lifecycle mutation—registration, refresh, "
+            r"\bEvery Push and SMS destination lifecycle mutation—create, verify, "
+            r"registration, refresh, "
             r"revoke, delete, invalidation, and opt-out—must use optimistic versioning/"
             r"conditional writes;\s+stale races must not resurrect or overwrite newer "
             r"state\b"
         ),
         "required_clause": (
-            "Every Push and SMS destination lifecycle mutation—registration, refresh, "
+            "Every Push and SMS destination lifecycle mutation—create, verify, "
+            "registration, refresh, "
             "revoke, delete, invalidation, and opt-out—must use optimistic versioning/"
             "conditional writes; stale races must not resurrect or overwrite newer "
             "state."
@@ -1229,13 +1246,14 @@ CODEX_REVIEW_GATE_CASES = (
         "required_pattern": (
             r"\bBefore any SMS verification challenge sends, Phase 7C must verify "
             r"tenant SMS eligibility and entitlement, including Trial/Starter/suspended "
-            r"denial;\s+only an explicitly audited administrative import may bypass "
-            r"that check\b"
+            r"denial;\s+only an explicitly audited administrative import of already-verified "
+            r"destinations may bypass that check\b"
         ),
         "required_clause": (
             "Before any SMS verification challenge sends, Phase 7C must verify tenant "
             "SMS eligibility and entitlement, including Trial/Starter/suspended denial; "
-            "only an explicitly audited administrative import may bypass that check."
+            "only an explicitly audited administrative import of already-verified "
+            "destinations may bypass that check."
         ),
         "inverted_clause": (
             "SMS verification challenges may send for Trial, Starter, or suspended tenants "
@@ -1875,18 +1893,33 @@ def assert_adr_inventory(adr_root: Path) -> None:
             if filename == (
                 "ADR-010-stripe-is-an-adapter-internal-entitlements-are-canonical.md"
             ):
-                serialized_mapping = re.search(
-                    r"(?ms)Phase 4 must freeze and test this exact serialized launch "
-                    r"SMS mapping; USD fields use integer minor units:\n\n"
-                    r"```json\n(.*?)\n```",
-                    gate_body,
+                serialized_mapping_matches = tuple(
+                    re.finditer(
+                        r"(?ms)Phase 4 must freeze and test this exact serialized launch "
+                        r"SMS mapping; USD fields use integer minor units:\n\n"
+                        r"```json\n(.*?)\n```",
+                        gate_body,
+                    )
                 )
-                assert serialized_mapping, "exact launch SMS mapping is missing"
+                assert serialized_mapping_matches, (
+                    "exact launch SMS mapping is missing"
+                )
+                assert len(serialized_mapping_matches) == 1, (
+                    "exact launch SMS mapping must appear exactly once"
+                )
+                serialized_mapping = serialized_mapping_matches[0]
                 try:
-                    plan_sms_limits = json.loads(serialized_mapping.group(1))
+                    plan_sms_limits = json.loads(
+                        serialized_mapping.group(1),
+                        object_pairs_hook=reject_duplicate_json_keys,
+                    )
                 except json.JSONDecodeError as error:
                     raise AssertionError(
                         "exact launch SMS mapping must be valid JSON"
+                    ) from error
+                except ValueError as error:
+                    raise AssertionError(
+                        "exact launch SMS mapping must not contain duplicate keys"
                     ) from error
                 non_integer_fields = (
                     (("<root>", "<mapping>"),)
@@ -3255,7 +3288,7 @@ def test_codex_review_gate_rejects_missing_requirement(
     adr_root = copy_adr_fixture(tmp_path)
     remove_adr_fragment(adr_root, case["filename"], case["required_clause"])
 
-    assert_adr_rejected(adr_root)
+    assert_adr_rejected(adr_root, match="normative implementation gate markers missing")
 
 
 @pytest.mark.parametrize(
@@ -3270,7 +3303,7 @@ def test_codex_review_gate_rejects_inverted_requirement(
     adr_root = copy_adr_fixture(tmp_path)
     mutate_adr_gate(adr_root, case["filename"], case["inverted_clause"])
 
-    assert_adr_rejected(adr_root)
+    assert_adr_rejected(adr_root, match="normative implementation gate inversions")
 
 
 @pytest.mark.parametrize(
@@ -3351,6 +3384,47 @@ def test_planversion_gate_rejects_non_boolean_exact_launch_sms_critical_type(
 
     with pytest.raises(AssertionError, match="boolean fields"):
         assert_adr_inventory(adr_root)
+
+
+def test_planversion_gate_rejects_duplicate_serialized_launch_sms_mapping(
+    tmp_path: Path,
+) -> None:
+    adr_root = copy_adr_fixture(tmp_path)
+    adr_path = (
+        adr_root
+        / "ADR-010-stripe-is-an-adapter-internal-entitlements-are-canonical.md"
+    )
+    record = adr_path.read_text(encoding="utf-8")
+    mapping_match = re.search(
+        r"(?ms)Phase 4 must freeze and test this exact serialized launch SMS mapping; "
+        r"USD fields use integer minor units:\n\n```json\n.*?\n```",
+        record,
+    )
+    assert mapping_match
+    duplicate_mapping = f"{mapping_match.group(0)}\n\n{mapping_match.group(0)}"
+    duplicated_record = record.replace(mapping_match.group(0), duplicate_mapping, 1)
+    assert duplicated_record != record
+    adr_path.write_text(duplicated_record, encoding="utf-8")
+
+    assert_adr_rejected(adr_root, match="exact launch SMS mapping must appear exactly once")
+
+
+def test_planversion_gate_rejects_duplicate_serialized_launch_sms_key(
+    tmp_path: Path,
+) -> None:
+    adr_root = copy_adr_fixture(tmp_path)
+    adr_path = (
+        adr_root
+        / "ADR-010-stripe-is-an-adapter-internal-entitlements-are-canonical.md"
+    )
+    record = adr_path.read_text(encoding="utf-8")
+    trial_row = '  "Trial": {"critical": false, '
+    duplicated_trial_row = '  "Trial": {"critical": false, "critical": false, '
+    duplicated_record = record.replace(trial_row, duplicated_trial_row, 1)
+    assert duplicated_record != record
+    adr_path.write_text(duplicated_record, encoding="utf-8")
+
+    assert_adr_rejected(adr_root, match="exact launch SMS mapping must not contain duplicate keys")
 
 
 def test_scheduler_gate_requires_lease_and_fencing_clause(tmp_path: Path) -> None:
