@@ -9,6 +9,7 @@ import (
 
 	"github.com/VINIClUS/limnopulse/internal/alertevaluator"
 	"github.com/VINIClUS/limnopulse/internal/notifications"
+	"github.com/aws/aws-sdk-go-v2/aws"
 	"github.com/aws/aws-sdk-go-v2/feature/dynamodb/attributevalue"
 	"github.com/aws/aws-sdk-go-v2/service/dynamodb"
 	"github.com/aws/aws-sdk-go-v2/service/dynamodb/types"
@@ -18,9 +19,11 @@ type fakeClient struct {
 	queryInput    *dynamodb.QueryInput
 	queryOutput   *dynamodb.QueryOutput
 	queryOutputs  []*dynamodb.QueryOutput
+	queryInputs   []*dynamodb.QueryInput
 	queryCalls    int
 	updateInput   *dynamodb.UpdateItemInput
 	updateOutput  *dynamodb.UpdateItemOutput
+	updateErr     error
 	getOutput     *dynamodb.GetItemOutput
 	transactInput *dynamodb.TransactWriteItemsInput
 	updateInputs  []*dynamodb.UpdateItemInput
@@ -28,6 +31,7 @@ type fakeClient struct {
 
 func (client *fakeClient) Query(_ context.Context, input *dynamodb.QueryInput, _ ...func(*dynamodb.Options)) (*dynamodb.QueryOutput, error) {
 	client.queryInput = input
+	client.queryInputs = append(client.queryInputs, input)
 	if len(client.queryOutputs) > 0 {
 		index := client.queryCalls
 		if index >= len(client.queryOutputs) {
@@ -43,7 +47,7 @@ func (client *fakeClient) Query(_ context.Context, input *dynamodb.QueryInput, _
 func (client *fakeClient) UpdateItem(_ context.Context, input *dynamodb.UpdateItemInput, _ ...func(*dynamodb.Options)) (*dynamodb.UpdateItemOutput, error) {
 	client.updateInput = input
 	client.updateInputs = append(client.updateInputs, input)
-	return client.updateOutput, nil
+	return client.updateOutput, client.updateErr
 }
 
 func TestBackfillQueriesExplicitTenantAndOnlyUpdatesEnabledActiveRules(t *testing.T) {
@@ -143,6 +147,9 @@ func TestBackfillActiveAlertIndexDoesNotCountTransitionRowsTowardLimit(t *testin
 	if client.queryCalls != 2 || summary.AlertEventsQueried != 1 || summary.AlertEventsUpdated != 1 || len(client.updateInputs) != 1 {
 		t.Fatalf("summary = %#v, query calls = %d, updates = %d", summary, client.queryCalls, len(client.updateInputs))
 	}
+	if got := client.queryInputs[1].ExclusiveStartKey["SK"].(*types.AttributeValueMemberS).Value; got != "ALERT_EVENT#event_1#TRANSITION#2026-07-15T12:00:00.000000000Z#opened" {
+		t.Fatalf("continuation key = %s", got)
+	}
 }
 
 func TestBackfillActiveAlertIndexDryRunSkipsCompleteProjection(t *testing.T) {
@@ -213,6 +220,27 @@ func TestBackfillActiveAlertIndexCompletesPartialProjection(t *testing.T) {
 	}
 	if !strings.Contains(*client.updateInputs[0].ConditionExpression, "attribute_not_exists(#gsi_pk) OR attribute_not_exists(#gsi_sk)") {
 		t.Fatalf("partial projection condition = %s", *client.updateInputs[0].ConditionExpression)
+	}
+}
+
+func TestBackfillActiveAlertIndexSkipsConditionalConflict(t *testing.T) {
+	active, _ := attributevalue.MarshalMap(map[string]any{
+		"PK": "TENANT#tnt_1", "SK": "ALERT_EVENT#event_1", "tenant_id": "tnt_1",
+		"event_id": "event_1", "status": "open", "opened_at": "2026-07-15T12:00:00.000000000Z",
+	})
+	client := &fakeClient{
+		queryOutput: &dynamodb.QueryOutput{Items: []map[string]types.AttributeValue{active}},
+		updateErr:   &types.ConditionalCheckFailedException{Message: aws.String("already indexed")},
+	}
+
+	summary, err := (Store{Table: "domain", Client: client}).BackfillActiveAlertIndex(
+		context.Background(), BackfillOptions{Tenants: []string{"tnt_1"}, PageSize: 10, Apply: true},
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if summary.AlertEventsEligible != 1 || summary.AlertEventsUpdated != 0 || summary.AlertEventsSkipped != 1 {
+		t.Fatalf("summary = %#v", summary)
 	}
 }
 

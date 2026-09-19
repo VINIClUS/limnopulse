@@ -119,7 +119,7 @@ it("polls the bounded active-alert view and marks truncated counts", async () =>
   ).toBe(false);
 });
 
-it("refreshes the 30-day summary every five minutes", async () => {
+it("uses period-specific summary refresh intervals", async () => {
   const queryClient = new QueryClient({
     defaultOptions: { queries: { retry: false } },
   });
@@ -132,19 +132,26 @@ it("refreshes the 30-day summary every five minutes", async () => {
   );
 
   const period = await screen.findByRole("combobox", { name: "Período" });
-  fireEvent.change(period, { target: { value: "30d" } });
-  await waitFor(() =>
-    expect(
-      api.mock.calls.some(
-        ([path]) =>
-          path === "/tenants/tnt_1/ponds/pond_1/metrics/summary?period=30d",
-      ),
-    ).toBe(true),
-  );
+  for (const [selectedPeriod, interval] of [
+    ["24h", 60000],
+    ["7d", 60000],
+    ["30d", 5 * 60000],
+  ] as const) {
+    fireEvent.change(period, { target: { value: selectedPeriod } });
+    await waitFor(() =>
+      expect(
+        api.mock.calls.some(
+          ([path]) =>
+            path ===
+            `/tenants/tnt_1/ponds/pond_1/metrics/summary?period=${selectedPeriod}`,
+        ),
+      ).toBe(true),
+    );
 
-  const query = queryClient.getQueryCache().find({
-    queryKey: ["summary", "tnt_1", "pond_1", "30d"],
-  });
-  const options = query?.options as { refetchInterval?: number } | undefined;
-  expect(options?.refetchInterval).toBe(5 * 60 * 1000);
+    const query = queryClient.getQueryCache().find({
+      queryKey: ["summary", "tnt_1", "pond_1", selectedPeriod],
+    });
+    const options = query?.options as { refetchInterval?: number } | undefined;
+    expect(options?.refetchInterval).toBe(interval);
+  }
 });

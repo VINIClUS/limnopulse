@@ -94,6 +94,7 @@ export async function login(
   password: string,
   remember: boolean,
 ) {
+  const previousRemember = sessionStorage.getItem(rememberKey);
   localStorage.removeItem(devKey);
   sessionStorage.removeItem(devKey);
   sessionStorage.setItem(rememberKey, String(remember));
@@ -101,11 +102,17 @@ export async function login(
     storage().setItem(devKey, email);
     return { isSignedIn: true, nextStep: { signInStep: "DONE" } };
   }
-  return signIn({
-    username: email,
-    password,
-    options: { authFlowType: "USER_SRP_AUTH" },
-  });
+  try {
+    return await signIn({
+      username: email,
+      password,
+      options: { authFlowType: "USER_SRP_AUTH" },
+    });
+  } catch (error) {
+    if (previousRemember === null) sessionStorage.removeItem(rememberKey);
+    else sessionStorage.setItem(rememberKey, previousRemember);
+    throw error;
+  }
 }
 export const completeChallenge = (value: string) =>
   confirmSignIn({ challengeResponse: value });

@@ -84,6 +84,19 @@ describe("Cognito session", () => {
       ),
     ).toBe("existing-token");
   });
+  it("restores the previous storage choice when an unchecked sign-in fails", async () => {
+    const tokenKey = "CognitoIdentityServiceProvider.existing.accessToken";
+    localStorage.setItem(tokenKey, "existing-token");
+    const error = Object.assign(new Error("invalid credentials"), {
+      name: "NotAuthorizedException",
+    });
+    sdk.signIn.mockRejectedValue(error);
+
+    await expect(login("a@example.com", "wrong", false)).rejects.toBe(error);
+
+    expect(await authStorage.getItem(tokenKey)).toBe("existing-token");
+    expect(sessionStorage.getItem("limnopulse:remember")).toBeNull();
+  });
   it("delegates recovery and confirmation to Cognito", async () => {
     await recover("a@example.com");
     await finishRecovery("a@example.com", "123456", "new-password");

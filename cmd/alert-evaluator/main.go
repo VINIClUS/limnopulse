@@ -92,7 +92,7 @@ func parseActiveAlertIndexBackfillArgs(args []string) (activeAlertIndexBackfillC
 	fs.Var(&config.tenants, "tenant-id", "alias for --tenant; repeat for multiple tenants")
 	fs.BoolVar(&config.apply, "apply", false, "write the active-alert projection; default is dry-run")
 	fs.IntVar(&config.pageSize, "page-size", 25, "DynamoDB query page size")
-	fs.IntVar(&config.limit, "limit", 0, "maximum number of alert events to inspect; zero means unlimited")
+	fs.IntVar(&config.limit, "limit", 0, "maximum number of pending active-alert projections; zero means unlimited")
 	if err := fs.Parse(args); err != nil {
 		return activeAlertIndexBackfillConfig{}, err
 	}
