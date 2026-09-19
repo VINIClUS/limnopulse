@@ -1,4 +1,4 @@
-from fastapi import APIRouter, Depends, HTTPException, Request
+from fastapi import APIRouter, Depends, HTTPException, Query, Request
 
 from limnopulse_api.api.dependencies import AlertEventRepositoryDep, require_tenant_role
 from limnopulse_api.api.v1.schemas.alert_events import (
@@ -43,6 +43,19 @@ async def list_alert_events(
 ) -> AlertEventListResponse:
     events = await _service(repository).list(tenant_id)
     return AlertEventListResponse(items=[_response(event) for event in events])
+
+
+@router.get("/active", response_model=AlertEventListResponse)
+async def list_active_alert_events(
+    tenant_id: str,
+    repository: AlertEventRepositoryDep,
+    limit: int = Query(default=100, ge=1, le=100),
+    _access: TenantAccess = Depends(require_tenant_role(*tuple(READ_ROLES))),
+) -> AlertEventListResponse:
+    events, has_more = await _service(repository).list_active(tenant_id, limit)
+    return AlertEventListResponse(
+        items=[_response(event) for event in events], has_more=has_more
+    )
 
 
 @router.get(

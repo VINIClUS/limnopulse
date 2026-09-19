@@ -37,9 +37,72 @@ func runMain(args []string) int {
 		return runEvaluator(ctx, args[1:])
 	case "backfill-schedule":
 		return runBackfill(ctx, args[1:])
+	case "backfill-active-alert-index":
+		return runActiveAlertIndexBackfill(ctx, args[1:])
 	default:
 		return writeFailure("usage", fmt.Sprintf("unknown command %q", args[0]))
 	}
+}
+
+func runActiveAlertIndexBackfill(ctx context.Context, args []string) int {
+	config, err := parseActiveAlertIndexBackfillArgs(args)
+	if err != nil {
+		return writeFailure("configuration", err.Error())
+	}
+	region := envOr("AWS_REGION", "us-east-1")
+	endpoint := envOr("DYNAMODB_ENDPOINT_URL", "")
+	awsConfig, err := loadAWSConfig(ctx, region, endpoint)
+	if err != nil {
+		return writeFailure("aws_configuration", err.Error())
+	}
+	client := dynamodb.NewFromConfig(awsConfig, func(options *dynamodb.Options) {
+		if endpoint != "" {
+			options.BaseEndpoint = aws.String(endpoint)
+		}
+	})
+	store := dynamoadapter.Store{Table: envOr("DYNAMODB_DOMAIN_TABLE", "LimnopulseDomain"), Client: client}
+	summary, err := store.BackfillActiveAlertIndex(ctx, dynamoadapter.BackfillOptions{Tenants: config.tenants, Apply: config.apply, PageSize: config.pageSize, Limit: config.limit})
+	if err != nil {
+		writeJSON(struct {
+			Result  string                        `json:"result"`
+			Error   string                        `json:"error"`
+			Summary dynamoadapter.BackfillSummary `json:"summary"`
+		}{"fatal_failure", err.Error(), summary})
+		return alertevaluator.ExitFatal
+	}
+	writeJSON(struct {
+		Result string                        `json:"result"`
+		Data   dynamoadapter.BackfillSummary `json:"summary"`
+	}{"success", summary})
+	return alertevaluator.ExitSuccess
+}
+
+type activeAlertIndexBackfillConfig struct {
+	tenants  stringList
+	apply    bool
+	pageSize int
+	limit    int
+}
+
+func parseActiveAlertIndexBackfillArgs(args []string) (activeAlertIndexBackfillConfig, error) {
+	fs := flag.NewFlagSet("alert-evaluator backfill-active-alert-index", flag.ContinueOnError)
+	fs.SetOutput(os.Stderr)
+	var config activeAlertIndexBackfillConfig
+	fs.Var(&config.tenants, "tenant", "explicit tenant id; repeat for multiple tenants")
+	fs.Var(&config.tenants, "tenant-id", "alias for --tenant; repeat for multiple tenants")
+	fs.BoolVar(&config.apply, "apply", false, "write the active-alert projection; default is dry-run")
+	fs.IntVar(&config.pageSize, "page-size", 25, "DynamoDB query page size")
+	fs.IntVar(&config.limit, "limit", 0, "maximum number of pending active-alert projections; zero means unlimited")
+	if err := fs.Parse(args); err != nil {
+		return activeAlertIndexBackfillConfig{}, err
+	}
+	if config.pageSize < 1 {
+		return activeAlertIndexBackfillConfig{}, fmt.Errorf("page size must be positive")
+	}
+	if config.limit < 0 {
+		return activeAlertIndexBackfillConfig{}, fmt.Errorf("limit cannot be negative")
+	}
+	return config, nil
 }
 
 func runEvaluator(ctx context.Context, args []string) int {

@@ -242,6 +242,7 @@ async def test_update_tenant_version_conflict_raises_conflict_with_low_level_upd
     with pytest.raises(ConflictError):
         await repo.update_tenant("tnt_1", expected_version=1, name="Renamed")
 
+    assert client.get_item_calls[0]["ConsistentRead"] is True
     update_call = client.update_item_calls[0]
     assert update_call["Key"] == {"PK": {"S": "TENANT#tnt_1"}, "SK": {"S": "META"}}
     assert update_call["ExpressionAttributeValues"][":expected_version"] == {"N": "1"}

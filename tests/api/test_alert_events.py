@@ -64,9 +64,17 @@ class FakeEventRepository:
     def __init__(self, event: AlertEvent | None = None) -> None:
         self.event = event or make_event()
         self.actions: list[str] = []
+        self.active_limits: list[int] = []
 
     async def list_events(self, tenant_id: str) -> list[AlertEvent]:
         return [self.event] if self.event.tenant_id == tenant_id else []
+
+    async def list_active_events(self, tenant_id: str, limit: int) -> tuple[list[AlertEvent], bool]:
+        self.active_limits.append(limit)
+        event = self.event if self.event.status in {
+            AlertEventStatus.OPEN, AlertEventStatus.ACKNOWLEDGED,
+        } and self.event.tenant_id == tenant_id else None
+        return ([event] if event else []), limit == 1
 
     async def get_event(self, tenant_id: str, event_id: str) -> AlertEvent | None:
         if self.event.tenant_id == tenant_id and self.event.event_id == event_id:
@@ -119,6 +127,24 @@ def test_all_roles_can_list_and_get_events(role: TenantRole) -> None:
 
     assert client.get(base, headers=headers()).json()["items"][0]["event_id"] == "alert_1"
     assert client.get(f"{base}/alert_1", headers=headers()).status_code == 200
+
+
+def test_active_events_are_limited_and_report_more() -> None:
+    app, repository = app_for(TenantRole.VIEWER)
+    response = TestClient(app).get(
+        "/v1/tenants/tnt_1/alert-events/active?limit=1", headers=headers()
+    )
+    assert response.status_code == 200
+    assert response.json()["has_more"] is True
+    assert repository.active_limits == [1]
+
+
+@pytest.mark.parametrize("limit", [0, 101])
+def test_active_events_reject_invalid_limits(limit: int) -> None:
+    app, _ = app_for(TenantRole.VIEWER)
+    assert TestClient(app).get(
+        f"/v1/tenants/tnt_1/alert-events/active?limit={limit}", headers=headers()
+    ).status_code == 422
 
 
 @pytest.mark.parametrize("role", [TenantRole.OWNER, TenantRole.ADMIN, TenantRole.MEMBER])

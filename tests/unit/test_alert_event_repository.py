@@ -32,7 +32,7 @@ class RecordingClient:
         items = [
             item
             for item in self.items.values()
-            if item.get("GSI2PK") == values[":pk"]
+            if item.get("GSI2PK") == values[":pk"] or item.get("GSI3PK") == values[":pk"]
         ]
         return {"Items": [self.encode(item) for item in items]}
 
@@ -73,6 +73,8 @@ def event_item(status: str = "open") -> dict[str, Any]:
         "SK": "ALERT_EVENT#alert_1",
         "GSI2PK": "TENANT#tnt_1#ALERT_EVENTS",
         "GSI2SK": f"{timestamp}#EVENT#alert_1",
+        "GSI3PK": "TENANT#tnt_1#ACTIVE_ALERT_EVENTS",
+        "GSI3SK": f"{timestamp}#EVENT#alert_1",
         "entity_type": "alert_event",
         "tenant_id": "tnt_1",
         "event_id": "alert_1",
@@ -126,6 +128,19 @@ async def test_list_uses_event_gsi_query_without_scan() -> None:
 
 
 @pytest.mark.asyncio
+async def test_list_active_uses_bounded_active_index_query() -> None:
+    client = RecordingClient()
+    client.seed(event_item())
+
+    events, has_more = await repository(client).list_active_events("tnt_1", 1)
+
+    assert [event.event_id for event in events] == ["alert_1"]
+    assert has_more is False
+    assert client.query_calls[0]["IndexName"] == "ActiveAlertEventsByTenantTime"
+    assert client.query_calls[0]["Limit"] == 1
+
+
+@pytest.mark.asyncio
 async def test_acknowledge_atomically_updates_event_transition_and_audit() -> None:
     client = RecordingClient()
     client.seed(event_item())
@@ -167,6 +182,7 @@ async def test_manual_resolution_fences_and_clears_matching_evaluator_state() ->
         {"Put"},
         {"Put"},
     ]
+    assert "REMOVE #gsi3pk, #gsi3sk" in operations[0]["Update"]["UpdateExpression"]
     state_put = client.decode(operations[1]["Put"]["Item"])
     state = json.loads(state_put["state_json"])
     assert state["Mode"] == "healthy"

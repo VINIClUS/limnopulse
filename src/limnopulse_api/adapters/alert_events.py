@@ -63,6 +63,23 @@ class DynamoAlertEventRepository:
                 break
         return [self._event_from_item(item) for item in items]
 
+    async def list_active_events(self, tenant_id: str, limit: int) -> tuple[list[AlertEvent], bool]:
+        request = {
+            "TableName": self.domain_table_name,
+            "IndexName": "ActiveAlertEventsByTenantTime",
+            "KeyConditionExpression": "GSI3PK = :pk",
+            "ExpressionAttributeValues": self._serialize_values(
+                {":pk": f"TENANT#{tenant_id}#ACTIVE_ALERT_EVENTS"}
+            ),
+            "ScanIndexForward": False,
+            "Limit": limit,
+        }
+        response = self.client.query(**request)
+        return (
+            [self._event_from_item(item) for item in self._response_items(response)],
+            response.get("LastEvaluatedKey") is not None,
+        )
+
     async def get_event(self, tenant_id: str, event_id: str) -> AlertEvent | None:
         item = self._get_item(self._event_key(tenant_id, event_id), consistent=True)
         if item is None or item.get("entity_type") != "alert_event":
@@ -148,6 +165,7 @@ class DynamoAlertEventRepository:
                     "updated_at": now.isoformat(),
                     "version": expected_version + 1,
                 },
+                remove_active_index=True,
             ),
             self._transition_put(updated, "resolved", audit.actor_id, now),
             self._audit_put(existing, updated, "alert_event.resolved", audit, now),
@@ -197,6 +215,7 @@ class DynamoAlertEventRepository:
         *,
         allowed_statuses: tuple[AlertEventStatus, ...],
         updates: Mapping[str, Any],
+        remove_active_index: bool = False,
     ) -> dict[str, Any]:
         names = {"#version": "version", "#status": "status"}
         values: dict[str, Any] = {":expected_version": expected_version}
@@ -212,11 +231,17 @@ class DynamoAlertEventRepository:
             token = f":status_{index}"
             values[token] = str(event_status)
             statuses.append(token)
+        if remove_active_index:
+            names["#gsi3pk"] = "GSI3PK"
+            names["#gsi3sk"] = "GSI3SK"
+            update_expression = "SET " + ", ".join(assignments) + " REMOVE #gsi3pk, #gsi3sk"
+        else:
+            update_expression = "SET " + ", ".join(assignments)
         return {
             "Update": {
                 "TableName": self.domain_table_name,
                 "Key": self._serialize_item(self._event_key(tenant_id, event_id)),
-                "UpdateExpression": "SET " + ", ".join(assignments),
+                "UpdateExpression": update_expression,
                 "ConditionExpression": (
                     "#version = :expected_version AND #status IN (" + ", ".join(statuses) + ")"
                 ),
@@ -328,7 +353,10 @@ class DynamoAlertEventRepository:
         values = {
             key: value
             for key, value in item.items()
-            if key not in {"PK", "SK", "GSI2PK", "GSI2SK", "entity_type", "resolution_reason"}
+            if key not in {
+                "PK", "SK", "GSI2PK", "GSI2SK", "GSI3PK", "GSI3SK",
+                "entity_type", "resolution_reason",
+            }
         }
         return AlertEvent.model_validate(values)
 
