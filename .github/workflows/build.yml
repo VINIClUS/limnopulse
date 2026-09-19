@@ -1,0 +1,72 @@
+name: build
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+concurrency:
+  group: build-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+  packages: write
+
+jobs:
+  compose-production-config:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+      - name: Validate compose.production.yaml (parse only, no start)
+        run: docker compose -f compose.production.yaml config --quiet
+
+  image:
+    needs: compose-production-config
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        app:
+          - api
+          - frontend
+          - alert-evaluator
+          - notifications
+    steps:
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+
+      - uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f # v3
+
+      - name: Log in to GHCR
+        if: github.event_name != 'pull_request'
+        uses: docker/login-action@c94ce9fb468520275223c153574b00df6fe4bcc9 # v3.7.0
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      # Cognito IDs are public identifiers baked into the static bundle, not
+      # secrets. Set as repository Variables once Fase 0's `tofu apply` has
+      # run; until then the frontend image builds with blank auth config,
+      # which is enough for the build/scan gates but not for a real login.
+      #
+      # `frontend/` does not exist on `main` yet (PR #45, unmerged as of
+      # this writing) — Dockerfile.frontend's context would 404 on
+      # `COPY frontend/...`. This condition skips only that matrix leg until
+      # the directory lands, and re-activates automatically once it does; no
+      # follow-up edit to this file is required.
+      - name: Build ${{ matrix.app }}
+        if: matrix.app != 'frontend' || hashFiles('frontend/package.json') != ''
+        uses: docker/build-push-action@10e90e3645eae34f1e60eeb005ba3a3d33f178e8 # v6
+        with:
+          context: .
+          file: Dockerfile.${{ matrix.app }}
+          platforms: linux/amd64
+          push: ${{ github.event_name != 'pull_request' }}
+          tags: ghcr.io/viniclus/limnopulse/${{ matrix.app }}:main-${{ github.sha }}
+          build-args: |
+            VITE_COGNITO_USER_POOL_ID=${{ vars.VITE_COGNITO_USER_POOL_ID }}
+            VITE_COGNITO_CLIENT_ID=${{ vars.VITE_COGNITO_CLIENT_ID }}
+          provenance: true
+          sbom: true
+          cache-from: type=gha,scope=${{ matrix.app }}
+          cache-to: type=gha,mode=max,scope=${{ matrix.app }}
