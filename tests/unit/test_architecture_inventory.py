@@ -2,6 +2,7 @@ import glob
 import json
 import re
 import shutil
+from collections.abc import Callable
 from pathlib import Path
 
 import pytest
@@ -253,11 +254,6 @@ REQUIRED_ADR_GATE_PATTERNS = {
         r"\bPhase 4 must prove a BRL Stripe subscription retains the USD-denominated "
         r"SMS budget and that neither entitlement evaluation nor notification "
         r"dispatch performs a synchronous FX call\b",
-        r"\bEvery Enterprise PlanVersion must explicitly set the "
-        r"`notifications\.sms\.critical` boolean, SMS provider-call count, budget "
-        r"amount, budget currency, maximum price, and overage behavior;\s+the "
-        r"contract values may vary, but no missing field may inherit an implicit or "
-        r"unlimited default\b",
         r"\bOn an absent entitlement cache entry, Phase 4 must fetch the durable "
         r"EntitlementSnapshot;\s+if the authoritative store is unavailable, paid SMS "
         r"and command actions must be conservatively denied, never treated as active "
@@ -832,6 +828,104 @@ def semantic_gate_inversions(filename: str, gate_body: str) -> tuple[str, ...]:
     return tuple(inversions)
 
 
+ENTERPRISE_PLAN_VERSION_REQUIREMENTS: tuple[tuple[str, str], ...] = (
+    (
+        "critical flag",
+        r"(?m)^\s*-\s+`notifications\.sms\.critical`:\s+boolean flag\b",
+    ),
+    (
+        "provider-call count",
+        r"(?m)^\s*-\s+`notifications\.sms\.provider_calls`:\s+"
+        r"SMS provider-call count\b",
+    ),
+    (
+        "budget amount",
+        r"(?m)^\s*-\s+`notifications\.sms\.budget\.amount`:\s+"
+        r"budget amount\b",
+    ),
+    (
+        "budget currency",
+        r"(?m)^\s*-\s+`notifications\.sms\.budget\.currency`:\s+"
+        r"budget currency\b",
+    ),
+    (
+        "maximum price",
+        r"(?m)^\s*-\s+`notifications\.sms\.max_price`:\s+maximum price\b",
+    ),
+    (
+        "overage behavior",
+        r"(?m)^\s*-\s+`notifications\.sms\.overage`:\s+overage behavior\b",
+    ),
+    (
+        "no implicit or unlimited default",
+        r"\bno missing field may inherit an implicit or unlimited default\b",
+    ),
+)
+
+
+def copy_adr_fixture(tmp_path: Path) -> Path:
+    adr_root = tmp_path / "adr"
+    shutil.copytree(ROOT / "docs/adr", adr_root)
+    return adr_root
+
+
+def mutate_adr_record(
+    adr_root: Path,
+    filename: str,
+    mutation: Callable[[str], str],
+) -> None:
+    adr_path = adr_root / filename
+    record = adr_path.read_text(encoding="utf-8")
+    mutated = mutation(record)
+    assert mutated != record
+    adr_path.write_text(mutated, encoding="utf-8")
+
+
+def insert_gate_clause(record: str, clause: str) -> str:
+    return record.replace(
+        "\n## Non-goals",
+        f"\n{clause}\n\n## Non-goals",
+        1,
+    )
+
+
+def mutate_adr_gate(adr_root: Path, filename: str, clause: str) -> None:
+    mutate_adr_record(
+        adr_root,
+        filename,
+        lambda record: insert_gate_clause(record, clause),
+    )
+
+
+def remove_adr_fragment(adr_root: Path, filename: str, fragment: str) -> None:
+    mutate_adr_record(
+        adr_root,
+        filename,
+        lambda record: record.replace(fragment, "", 1),
+    )
+
+
+def replace_adr_fragment(
+    adr_root: Path,
+    filename: str,
+    old: str,
+    new: str,
+) -> None:
+    mutate_adr_record(
+        adr_root,
+        filename,
+        lambda record: record.replace(old, new, 1),
+    )
+
+
+def assert_adr_rejected(
+    adr_root: Path,
+    match: str = "normative implementation gate",
+) -> None:
+    with pytest.raises(AssertionError, match=match):
+        assert_adr_inventory(adr_root)
+
+
 def inventory_rows(
     path: Path = ROOT / "docs/current-state.md",
 ) -> dict[str, tuple[str, tuple[str, ...], str, str]]:
@@ -1009,6 +1103,22 @@ def assert_adr_inventory(adr_root: Path) -> None:
                 f"normative implementation gate markers missing in {filename}: "
                 f"{missing_patterns}"
             )
+            if filename == (
+                "ADR-010-stripe-is-an-adapter-internal-entitlements-are-canonical.md"
+            ):
+                missing_enterprise_requirements = tuple(
+                    label
+                    for label, pattern in ENTERPRISE_PLAN_VERSION_REQUIREMENTS
+                    if not re.search(
+                        pattern,
+                        gate_body,
+                        flags=re.IGNORECASE | re.DOTALL,
+                    )
+                )
+                assert not missing_enterprise_requirements, (
+                    "Enterprise PlanVersion requirement missing: "
+                    f"{', '.join(missing_enterprise_requirements)}"
+                )
             forbidden_patterns = tuple(
                 pattern
                 for pattern in FORBIDDEN_ADR_GATE_PATTERNS.get(filename, ())
@@ -1074,8 +1184,7 @@ def test_adr_index_is_complete_and_every_record_is_accepted() -> None:
 
 
 def test_adr_record_requires_dedicated_accepted_status(tmp_path: Path) -> None:
-    adr_root = tmp_path / "adr"
-    shutil.copytree(ROOT / "docs/adr", adr_root)
+    adr_root = copy_adr_fixture(tmp_path)
     adr_path = adr_root / EXPECTED_ADR_FILES[0]
     record = adr_path.read_text(encoding="utf-8")
     proposed_with_history = record.replace(
@@ -1096,8 +1205,7 @@ def test_adr_record_requires_dedicated_accepted_status(tmp_path: Path) -> None:
 
 
 def test_adr_inventory_rejects_unexpected_record(tmp_path: Path) -> None:
-    adr_root = tmp_path / "adr"
-    shutil.copytree(ROOT / "docs/adr", adr_root)
+    adr_root = copy_adr_fixture(tmp_path)
     (adr_root / "ADR-999-stale.md").write_text(
         "# ADR-999 — Stale record\n\n**Status:** Accepted\n",
         encoding="utf-8",
@@ -1108,8 +1216,7 @@ def test_adr_inventory_rejects_unexpected_record(tmp_path: Path) -> None:
 
 
 def test_adr_index_requires_exact_markdown_link_target(tmp_path: Path) -> None:
-    adr_root = tmp_path / "adr"
-    shutil.copytree(ROOT / "docs/adr", adr_root)
+    adr_root = copy_adr_fixture(tmp_path)
     filename = EXPECTED_ADR_FILES[0]
     index_path = adr_root / "README.md"
     index = index_path.read_text(encoding="utf-8")
@@ -1124,8 +1231,7 @@ def test_adr_index_requires_exact_markdown_link_target(tmp_path: Path) -> None:
 
 
 def test_adr_record_requires_exact_headings(tmp_path: Path) -> None:
-    adr_root = tmp_path / "adr"
-    shutil.copytree(ROOT / "docs/adr", adr_root)
+    adr_root = copy_adr_fixture(tmp_path)
     adr_path = adr_root / EXPECTED_ADR_FILES[0]
     record = adr_path.read_text(encoding="utf-8")
     adr_path.write_text(
@@ -1138,8 +1244,7 @@ def test_adr_record_requires_exact_headings(tmp_path: Path) -> None:
 
 
 def test_adr_index_requires_exact_entry_phase_mapping(tmp_path: Path) -> None:
-    adr_root = tmp_path / "adr"
-    shutil.copytree(ROOT / "docs/adr", adr_root)
+    adr_root = copy_adr_fixture(tmp_path)
     filename = "ADR-010-stripe-is-an-adapter-internal-entitlements-are-canonical.md"
     index_path = adr_root / "README.md"
     index = index_path.read_text(encoding="utf-8")
@@ -1153,8 +1258,7 @@ def test_adr_index_requires_exact_entry_phase_mapping(tmp_path: Path) -> None:
 
 
 def test_adr_index_requires_exact_visible_label(tmp_path: Path) -> None:
-    adr_root = tmp_path / "adr"
-    shutil.copytree(ROOT / "docs/adr", adr_root)
+    adr_root = copy_adr_fixture(tmp_path)
     index_path = adr_root / "README.md"
     index = index_path.read_text(encoding="utf-8")
     index_path.write_text(
@@ -1174,8 +1278,7 @@ def test_normative_implementation_gate_cannot_be_removed(
     tmp_path: Path,
     filename: str,
 ) -> None:
-    adr_root = tmp_path / "adr"
-    shutil.copytree(ROOT / "docs/adr", adr_root)
+    adr_root = copy_adr_fixture(tmp_path)
     adr_path = adr_root / filename
     record = adr_path.read_text(encoding="utf-8")
     without_gate_body = re.sub(
@@ -1186,13 +1289,11 @@ def test_normative_implementation_gate_cannot_be_removed(
     assert without_gate_body != record
     adr_path.write_text(without_gate_body, encoding="utf-8")
 
-    with pytest.raises(AssertionError, match="normative implementation gate"):
-        assert_adr_inventory(adr_root)
+    assert_adr_rejected(adr_root)
 
 
 def test_billing_gate_forbids_false_active_monitoring(tmp_path: Path) -> None:
-    adr_root = tmp_path / "adr"
-    shutil.copytree(ROOT / "docs/adr", adr_root)
+    adr_root = copy_adr_fixture(tmp_path)
     adr_path = (
         adr_root
         / "ADR-010-stripe-is-an-adapter-internal-entitlements-are-canonical.md"
@@ -1206,8 +1307,7 @@ def test_billing_gate_forbids_false_active_monitoring(tmp_path: Path) -> None:
     assert weakened_gate != record
     adr_path.write_text(weakened_gate, encoding="utf-8")
 
-    with pytest.raises(AssertionError, match="normative implementation gate"):
-        assert_adr_inventory(adr_root)
+    assert_adr_rejected(adr_root)
 
 
 @pytest.mark.parametrize(
@@ -1232,19 +1332,44 @@ def test_billing_gate_rejects_inverted_state_behavior(
     required_clause: str,
     inverted_clause: str,
 ) -> None:
-    adr_root = tmp_path / "adr"
-    shutil.copytree(ROOT / "docs/adr", adr_root)
-    adr_path = (
-        adr_root
-        / "ADR-010-stripe-is-an-adapter-internal-entitlements-are-canonical.md"
+    adr_root = copy_adr_fixture(tmp_path)
+    replace_adr_fragment(
+        adr_root,
+        "ADR-010-stripe-is-an-adapter-internal-entitlements-are-canonical.md",
+        required_clause,
+        inverted_clause,
     )
-    record = adr_path.read_text(encoding="utf-8")
-    inverted_gate = record.replace(required_clause, inverted_clause, 1)
-    assert inverted_gate != record
-    adr_path.write_text(inverted_gate, encoding="utf-8")
 
-    with pytest.raises(AssertionError, match="normative implementation gate"):
-        assert_adr_inventory(adr_root)
+    assert_adr_rejected(adr_root)
+
+
+@pytest.mark.parametrize(
+    ("requirement", "marker"),
+    (
+        ("critical flag", "`notifications.sms.critical`"),
+        ("provider-call count", "SMS provider-call count"),
+        ("budget amount", "budget amount"),
+        ("budget currency", "budget currency"),
+        ("maximum price", "maximum price"),
+        ("overage behavior", "overage behavior"),
+        (
+            "no implicit or unlimited default",
+            "no missing field may inherit an implicit or unlimited default",
+        ),
+    ),
+)
+def test_enterprise_gate_rejects_each_missing_explicit_requirement(
+    tmp_path: Path,
+    requirement: str,
+    marker: str,
+) -> None:
+    adr_root = copy_adr_fixture(tmp_path)
+    filename = "ADR-010-stripe-is-an-adapter-internal-entitlements-are-canonical.md"
+    remove_adr_fragment(adr_root, filename, marker)
+    assert_adr_rejected(
+        adr_root,
+        match=rf"Enterprise PlanVersion requirement missing: {re.escape(requirement)}",
+    )
 
 
 @pytest.mark.parametrize(
@@ -1266,16 +1391,15 @@ def test_scheduler_gate_rejects_negative_reliability_behavior(
     required_clause: str,
     inverted_clause: str,
 ) -> None:
-    adr_root = tmp_path / "adr"
-    shutil.copytree(ROOT / "docs/adr", adr_root)
-    adr_path = adr_root / "ADR-016-eventbridge-is-selective-sqs-is-durable.md"
-    record = adr_path.read_text(encoding="utf-8")
-    inverted_gate = record.replace(required_clause, inverted_clause, 1)
-    assert inverted_gate != record
-    adr_path.write_text(inverted_gate, encoding="utf-8")
+    adr_root = copy_adr_fixture(tmp_path)
+    replace_adr_fragment(
+        adr_root,
+        "ADR-016-eventbridge-is-selective-sqs-is-durable.md",
+        required_clause,
+        inverted_clause,
+    )
 
-    with pytest.raises(AssertionError, match="normative implementation gate"):
-        assert_adr_inventory(adr_root)
+    assert_adr_rejected(adr_root)
 
 
 @pytest.mark.parametrize(
@@ -1324,20 +1448,10 @@ def test_adr_gate_rejects_round_four_semantic_inversion(
     filename: str,
     inverted_clause: str,
 ) -> None:
-    adr_root = tmp_path / "adr"
-    shutil.copytree(ROOT / "docs/adr", adr_root)
-    adr_path = adr_root / filename
-    record = adr_path.read_text(encoding="utf-8")
-    inverted_gate = record.replace(
-        "\n## Non-goals",
-        f"\n{inverted_clause}\n\n## Non-goals",
-        1,
-    )
-    assert inverted_gate != record
-    adr_path.write_text(inverted_gate, encoding="utf-8")
+    adr_root = copy_adr_fixture(tmp_path)
+    mutate_adr_gate(adr_root, filename, inverted_clause)
 
-    with pytest.raises(AssertionError, match="normative implementation gate"):
-        assert_adr_inventory(adr_root)
+    assert_adr_rejected(adr_root)
 
 
 @pytest.mark.parametrize(
@@ -1390,20 +1504,10 @@ def test_adr_gate_rejects_round_five_semantic_inversion(
     filename: str,
     inverted_clause: str,
 ) -> None:
-    adr_root = tmp_path / "adr"
-    shutil.copytree(ROOT / "docs/adr", adr_root)
-    adr_path = adr_root / filename
-    record = adr_path.read_text(encoding="utf-8")
-    inverted_gate = record.replace(
-        "\n## Non-goals",
-        f"\n{inverted_clause}\n\n## Non-goals",
-        1,
-    )
-    assert inverted_gate != record
-    adr_path.write_text(inverted_gate, encoding="utf-8")
+    adr_root = copy_adr_fixture(tmp_path)
+    mutate_adr_gate(adr_root, filename, inverted_clause)
 
-    with pytest.raises(AssertionError, match="normative implementation gate"):
-        assert_adr_inventory(adr_root)
+    assert_adr_rejected(adr_root)
 
 
 @pytest.mark.parametrize(
@@ -1448,20 +1552,10 @@ def test_adr_gate_rejects_round_six_semantic_inversion(
     filename: str,
     inverted_clause: str,
 ) -> None:
-    adr_root = tmp_path / "adr"
-    shutil.copytree(ROOT / "docs/adr", adr_root)
-    adr_path = adr_root / filename
-    record = adr_path.read_text(encoding="utf-8")
-    inverted_gate = record.replace(
-        "\n## Non-goals",
-        f"\n{inverted_clause}\n\n## Non-goals",
-        1,
-    )
-    assert inverted_gate != record
-    adr_path.write_text(inverted_gate, encoding="utf-8")
+    adr_root = copy_adr_fixture(tmp_path)
+    mutate_adr_gate(adr_root, filename, inverted_clause)
 
-    with pytest.raises(AssertionError, match="normative implementation gate"):
-        assert_adr_inventory(adr_root)
+    assert_adr_rejected(adr_root)
 
 
 @pytest.mark.parametrize(
@@ -1530,20 +1624,10 @@ def test_adr_gate_rejects_round_seven_semantic_inversion(
     filename: str,
     inverted_clause: str,
 ) -> None:
-    adr_root = tmp_path / "adr"
-    shutil.copytree(ROOT / "docs/adr", adr_root)
-    adr_path = adr_root / filename
-    record = adr_path.read_text(encoding="utf-8")
-    inverted_gate = record.replace(
-        "\n## Non-goals",
-        f"\n{inverted_clause}\n\n## Non-goals",
-        1,
-    )
-    assert inverted_gate != record
-    adr_path.write_text(inverted_gate, encoding="utf-8")
+    adr_root = copy_adr_fixture(tmp_path)
+    mutate_adr_gate(adr_root, filename, inverted_clause)
 
-    with pytest.raises(AssertionError, match="normative implementation gate"):
-        assert_adr_inventory(adr_root)
+    assert_adr_rejected(adr_root)
 
 
 @pytest.mark.parametrize(
@@ -1592,20 +1676,10 @@ def test_adr_gate_rejects_round_eight_semantic_inversion(
     filename: str,
     inverted_clause: str,
 ) -> None:
-    adr_root = tmp_path / "adr"
-    shutil.copytree(ROOT / "docs/adr", adr_root)
-    adr_path = adr_root / filename
-    record = adr_path.read_text(encoding="utf-8")
-    inverted_gate = record.replace(
-        "\n## Non-goals",
-        f"\n{inverted_clause}\n\n## Non-goals",
-        1,
-    )
-    assert inverted_gate != record
-    adr_path.write_text(inverted_gate, encoding="utf-8")
+    adr_root = copy_adr_fixture(tmp_path)
+    mutate_adr_gate(adr_root, filename, inverted_clause)
 
-    with pytest.raises(AssertionError, match="normative implementation gate"):
-        assert_adr_inventory(adr_root)
+    assert_adr_rejected(adr_root)
 
 
 @pytest.mark.parametrize(
@@ -1635,8 +1709,7 @@ def test_planversion_gate_rejects_wrong_exact_launch_sms_value(
     expected_value: int,
     wrong_value: int,
 ) -> None:
-    adr_root = tmp_path / "adr"
-    shutil.copytree(ROOT / "docs/adr", adr_root)
+    adr_root = copy_adr_fixture(tmp_path)
     adr_path = (
         adr_root
         / "ADR-010-stripe-is-an-adapter-internal-entitlements-are-canonical.md"
@@ -1686,8 +1759,7 @@ def test_planversion_gate_rejects_non_integer_exact_launch_sms_type(
     integer_token: str,
     wrong_type_token: str,
 ) -> None:
-    adr_root = tmp_path / "adr"
-    shutil.copytree(ROOT / "docs/adr", adr_root)
+    adr_root = copy_adr_fixture(tmp_path)
     adr_path = (
         adr_root
         / "ADR-010-stripe-is-an-adapter-internal-entitlements-are-canonical.md"
@@ -1723,20 +1795,14 @@ def test_vendor_connector_gate_rejects_round_nine_semantic_inversion(
     tmp_path: Path,
     inverted_clause: str,
 ) -> None:
-    adr_root = tmp_path / "adr"
-    shutil.copytree(ROOT / "docs/adr", adr_root)
-    adr_path = adr_root / "ADR-009-edge-is-optional-and-customer-hosted.md"
-    record = adr_path.read_text(encoding="utf-8")
-    inverted_gate = record.replace(
-        "\n## Non-goals",
-        f"\n{inverted_clause}\n\n## Non-goals",
-        1,
+    adr_root = copy_adr_fixture(tmp_path)
+    mutate_adr_gate(
+        adr_root,
+        "ADR-009-edge-is-optional-and-customer-hosted.md",
+        inverted_clause,
     )
-    assert inverted_gate != record
-    adr_path.write_text(inverted_gate, encoding="utf-8")
 
-    with pytest.raises(AssertionError, match="normative implementation gate"):
-        assert_adr_inventory(adr_root)
+    assert_adr_rejected(adr_root)
 
 
 @pytest.mark.parametrize(
@@ -1817,20 +1883,10 @@ def test_adr_gate_rejects_round_ten_semantic_inversion(
     filename: str,
     inverted_clause: str,
 ) -> None:
-    adr_root = tmp_path / "adr"
-    shutil.copytree(ROOT / "docs/adr", adr_root)
-    adr_path = adr_root / filename
-    record = adr_path.read_text(encoding="utf-8")
-    inverted_gate = record.replace(
-        "\n## Non-goals",
-        f"\n{inverted_clause}\n\n## Non-goals",
-        1,
-    )
-    assert inverted_gate != record
-    adr_path.write_text(inverted_gate, encoding="utf-8")
+    adr_root = copy_adr_fixture(tmp_path)
+    mutate_adr_gate(adr_root, filename, inverted_clause)
 
-    with pytest.raises(AssertionError, match="normative implementation gate"):
-        assert_adr_inventory(adr_root)
+    assert_adr_rejected(adr_root)
 
 
 @pytest.mark.parametrize(
@@ -1947,20 +2003,10 @@ def test_adr_gate_rejects_round_eleven_semantic_inversion(
     filename: str,
     inverted_clause: str,
 ) -> None:
-    adr_root = tmp_path / "adr"
-    shutil.copytree(ROOT / "docs/adr", adr_root)
-    adr_path = adr_root / filename
-    record = adr_path.read_text(encoding="utf-8")
-    inverted_gate = record.replace(
-        "\n## Non-goals",
-        f"\n{inverted_clause}\n\n## Non-goals",
-        1,
-    )
-    assert inverted_gate != record
-    adr_path.write_text(inverted_gate, encoding="utf-8")
+    adr_root = copy_adr_fixture(tmp_path)
+    mutate_adr_gate(adr_root, filename, inverted_clause)
 
-    with pytest.raises(AssertionError, match="normative implementation gate"):
-        assert_adr_inventory(adr_root)
+    assert_adr_rejected(adr_root)
 
 
 @pytest.mark.parametrize(
@@ -2017,20 +2063,10 @@ def test_adr_gate_rejects_round_twelve_semantic_inversion(
     filename: str,
     inverted_clause: str,
 ) -> None:
-    adr_root = tmp_path / "adr"
-    shutil.copytree(ROOT / "docs/adr", adr_root)
-    adr_path = adr_root / filename
-    record = adr_path.read_text(encoding="utf-8")
-    inverted_gate = record.replace(
-        "\n## Non-goals",
-        f"\n{inverted_clause}\n\n## Non-goals",
-        1,
-    )
-    assert inverted_gate != record
-    adr_path.write_text(inverted_gate, encoding="utf-8")
+    adr_root = copy_adr_fixture(tmp_path)
+    mutate_adr_gate(adr_root, filename, inverted_clause)
 
-    with pytest.raises(AssertionError, match="normative implementation gate"):
-        assert_adr_inventory(adr_root)
+    assert_adr_rejected(adr_root)
 
 
 @pytest.mark.parametrize(
@@ -2107,20 +2143,10 @@ def test_adr_gate_rejects_round_thirteen_semantic_inversion(
     filename: str,
     inverted_clause: str,
 ) -> None:
-    adr_root = tmp_path / "adr"
-    shutil.copytree(ROOT / "docs/adr", adr_root)
-    adr_path = adr_root / filename
-    record = adr_path.read_text(encoding="utf-8")
-    inverted_gate = record.replace(
-        "\n## Non-goals",
-        f"\n{inverted_clause}\n\n## Non-goals",
-        1,
-    )
-    assert inverted_gate != record
-    adr_path.write_text(inverted_gate, encoding="utf-8")
+    adr_root = copy_adr_fixture(tmp_path)
+    mutate_adr_gate(adr_root, filename, inverted_clause)
 
-    with pytest.raises(AssertionError, match="normative implementation gate"):
-        assert_adr_inventory(adr_root)
+    assert_adr_rejected(adr_root)
 
 
 @pytest.mark.parametrize(
@@ -2241,20 +2267,10 @@ def test_adr_gate_rejects_round_fourteen_semantic_inversion(
     filename: str,
     inverted_clause: str,
 ) -> None:
-    adr_root = tmp_path / "adr"
-    shutil.copytree(ROOT / "docs/adr", adr_root)
-    adr_path = adr_root / filename
-    record = adr_path.read_text(encoding="utf-8")
-    inverted_gate = record.replace(
-        "\n## Non-goals",
-        f"\n{inverted_clause}\n\n## Non-goals",
-        1,
-    )
-    assert inverted_gate != record
-    adr_path.write_text(inverted_gate, encoding="utf-8")
+    adr_root = copy_adr_fixture(tmp_path)
+    mutate_adr_gate(adr_root, filename, inverted_clause)
 
-    with pytest.raises(AssertionError, match="normative implementation gate"):
-        assert_adr_inventory(adr_root)
+    assert_adr_rejected(adr_root)
 
 
 @pytest.mark.parametrize(
@@ -2299,20 +2315,10 @@ def test_adr_gate_rejects_round_fourteen_b_semantic_inversion(
     filename: str,
     inverted_clause: str,
 ) -> None:
-    adr_root = tmp_path / "adr"
-    shutil.copytree(ROOT / "docs/adr", adr_root)
-    adr_path = adr_root / filename
-    record = adr_path.read_text(encoding="utf-8")
-    inverted_gate = record.replace(
-        "\n## Non-goals",
-        f"\n{inverted_clause}\n\n## Non-goals",
-        1,
-    )
-    assert inverted_gate != record
-    adr_path.write_text(inverted_gate, encoding="utf-8")
+    adr_root = copy_adr_fixture(tmp_path)
+    mutate_adr_gate(adr_root, filename, inverted_clause)
 
-    with pytest.raises(AssertionError, match="normative implementation gate"):
-        assert_adr_inventory(adr_root)
+    assert_adr_rejected(adr_root)
 
 
 @pytest.mark.parametrize(
@@ -2349,17 +2355,8 @@ def test_adr_gate_allows_round_fourteen_c_normative_prohibition(
     filename: str,
     safe_clause: str,
 ) -> None:
-    adr_root = tmp_path / "adr"
-    shutil.copytree(ROOT / "docs/adr", adr_root)
-    adr_path = adr_root / filename
-    record = adr_path.read_text(encoding="utf-8")
-    safe_gate = record.replace(
-        "\n## Non-goals",
-        f"\n{safe_clause}\n\n## Non-goals",
-        1,
-    )
-    assert safe_gate != record
-    adr_path.write_text(safe_gate, encoding="utf-8")
+    adr_root = copy_adr_fixture(tmp_path)
+    mutate_adr_gate(adr_root, filename, safe_clause)
 
     assert_adr_inventory(adr_root)
 
@@ -2390,20 +2387,10 @@ def test_adr_gate_rejects_round_fourteen_e_predicate_local_permission(
     filename: str,
     inverted_clause: str,
 ) -> None:
-    adr_root = tmp_path / "adr"
-    shutil.copytree(ROOT / "docs/adr", adr_root)
-    adr_path = adr_root / filename
-    record = adr_path.read_text(encoding="utf-8")
-    inverted_gate = record.replace(
-        "\n## Non-goals",
-        f"\n{inverted_clause}\n\n## Non-goals",
-        1,
-    )
-    assert inverted_gate != record
-    adr_path.write_text(inverted_gate, encoding="utf-8")
+    adr_root = copy_adr_fixture(tmp_path)
+    mutate_adr_gate(adr_root, filename, inverted_clause)
 
-    with pytest.raises(AssertionError, match="normative implementation gate"):
-        assert_adr_inventory(adr_root)
+    assert_adr_rejected(adr_root)
 
 
 @pytest.mark.parametrize(
@@ -2428,17 +2415,8 @@ def test_adr_gate_allows_round_fourteen_e_predicate_local_prohibition(
     filename: str,
     safe_clause: str,
 ) -> None:
-    adr_root = tmp_path / "adr"
-    shutil.copytree(ROOT / "docs/adr", adr_root)
-    adr_path = adr_root / filename
-    record = adr_path.read_text(encoding="utf-8")
-    safe_gate = record.replace(
-        "\n## Non-goals",
-        f"\n{safe_clause}\n\n## Non-goals",
-        1,
-    )
-    assert safe_gate != record
-    adr_path.write_text(safe_gate, encoding="utf-8")
+    adr_root = copy_adr_fixture(tmp_path)
+    mutate_adr_gate(adr_root, filename, safe_clause)
 
     assert_adr_inventory(adr_root)
 
@@ -2485,20 +2463,10 @@ def test_adr_gate_rejects_round_fourteen_f_common_permission_forms(
     filename: str,
     inverted_clause: str,
 ) -> None:
-    adr_root = tmp_path / "adr"
-    shutil.copytree(ROOT / "docs/adr", adr_root)
-    adr_path = adr_root / filename
-    record = adr_path.read_text(encoding="utf-8")
-    inverted_gate = record.replace(
-        "\n## Non-goals",
-        f"\n{inverted_clause}\n\n## Non-goals",
-        1,
-    )
-    assert inverted_gate != record
-    adr_path.write_text(inverted_gate, encoding="utf-8")
+    adr_root = copy_adr_fixture(tmp_path)
+    mutate_adr_gate(adr_root, filename, inverted_clause)
 
-    with pytest.raises(AssertionError, match="normative implementation gate"):
-        assert_adr_inventory(adr_root)
+    assert_adr_rejected(adr_root)
 
 
 @pytest.mark.parametrize(
@@ -2523,24 +2491,14 @@ def test_adr_gate_allows_round_fourteen_f_emphatic_local_prohibition(
     filename: str,
     safe_clause: str,
 ) -> None:
-    adr_root = tmp_path / "adr"
-    shutil.copytree(ROOT / "docs/adr", adr_root)
-    adr_path = adr_root / filename
-    record = adr_path.read_text(encoding="utf-8")
-    safe_gate = record.replace(
-        "\n## Non-goals",
-        f"\n{safe_clause}\n\n## Non-goals",
-        1,
-    )
-    assert safe_gate != record
-    adr_path.write_text(safe_gate, encoding="utf-8")
+    adr_root = copy_adr_fixture(tmp_path)
+    mutate_adr_gate(adr_root, filename, safe_clause)
 
     assert_adr_inventory(adr_root)
 
 
 def test_scheduler_gate_requires_lease_and_fencing_clause(tmp_path: Path) -> None:
-    adr_root = tmp_path / "adr"
-    shutil.copytree(ROOT / "docs/adr", adr_root)
+    adr_root = copy_adr_fixture(tmp_path)
     adr_path = adr_root / "ADR-016-eventbridge-is-selective-sqs-is-durable.md"
     record = adr_path.read_text(encoding="utf-8")
     required_clause = (
@@ -2557,5 +2515,4 @@ def test_scheduler_gate_requires_lease_and_fencing_clause(tmp_path: Path) -> Non
     assert without_clause != record_with_clause
     adr_path.write_text(without_clause, encoding="utf-8")
 
-    with pytest.raises(AssertionError, match="normative implementation gate"):
-        assert_adr_inventory(adr_root)
+    assert_adr_rejected(adr_root)
