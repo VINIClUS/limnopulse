@@ -24,6 +24,8 @@ Phase 7A must pass no-Redis integration tests for quotas, anti-storm behavior, d
 
 Phase 7A must prove that raw Push tokens, phone numbers, Telegram chat IDs, and secrets are never used as Redis/Valkey keys or metric labels; cache-enabled and no-cache tests must preserve this privacy boundary. Anti-storm windows must be enforced independently per tenant and event family; one tenant or event family's burst must not consume or suppress another's allowance, and Redis/no-Redis tests must prove isolation.
 
+Phase 7A must test Redis/Valkey becoming unavailable during active worker processing; workers must fall back to conservative durable limits without losing quota, anti-storm, destination, or worker-bound protections and must never fail open.
+
 ## Non-goals
 
 This record does not ban Redis, promise equal no-cache performance, move durable queues into Redis, or allow fail-open limits during cache failure.

@@ -24,6 +24,8 @@ Phase 9 may ship an edge contract only after authentication, local buffer/replay
 
 Phase 9 vendor polling cursor recovery must derive the same canonical event identity from the IntegrationAccount plus stable vendor event or observation fields; replay after a write-before-cursor-advance crash must target the same canonical point.
 
+Phase 9 vendor connector acceptance must prove an independent disable and rollback path that stops new connector work while preserving imported history and Device records.
+
 ## Non-goals
 
 This record does not require LimnoPulse appliances, arbitrary customer code in SaaS, a custom broker, or cloud-dependent critical interlocks.

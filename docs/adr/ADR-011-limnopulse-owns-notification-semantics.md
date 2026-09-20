@@ -26,6 +26,12 @@ Unsupported destination locales must be rejected or use only an explicit version
 
 At BeginAttempt, acknowledgement and escalation dispatch must contend in one conditional DynamoDB transaction so exactly one outcome wins; a concurrent acknowledgement must prevent the provider call and charge.
 
+Phase 7A must evaluate quiet hours with an explicit critical override; acceptance tests must prove a critical incident remains eligible for its configured critical notification and escalation during quiet hours, subject to acknowledgement and other independent gates.
+
+Phase 7A must provide independent kill switches for email, Telegram, Push, and SMS; disabling one delivery lane must preserve durable state and leave every other lane dispatchable, with rollback tests for each lane.
+
+Phase 7A must require owner/admin authorization, optimistic versioning, and immutable audit for every tenant NotificationPolicy write, not only asset_context; ordinary members and viewers must be rejected.
+
 ## Non-goals
 
 This record does not make provider acceptance human acknowledgement, expose precise telemetry on a lock screen, authorize asset context for members/viewers, or create a marketing notification platform.

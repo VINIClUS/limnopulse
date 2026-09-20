@@ -1625,6 +1625,48 @@ CODEX_REVIEW_GATE_CASES += tuple(
             "Phase 4 Stripe webhook ingress must allowlist supported event types and reject or safely discard signed but unsupported types before durable enqueue.",
             "Phase 4 Stripe webhook ingress may enqueue any signed event type before checking whether the event is supported.",
         ),
+        (
+            "quiet-hours critical override",
+            "ADR-011-limnopulse-owns-notification-semantics.md",
+            "Phase 7A must evaluate quiet hours with an explicit critical override; acceptance tests must prove a critical incident remains eligible for its configured critical notification and escalation during quiet hours, subject to acknowledgement and other independent gates.",
+            "Phase 7A may suppress critical notifications during quiet hours without an explicit critical override.",
+        ),
+        (
+            "independent delivery-lane shutdown",
+            "ADR-011-limnopulse-owns-notification-semantics.md",
+            "Phase 7A must provide independent kill switches for email, Telegram, Push, and SMS; disabling one delivery lane must preserve durable state and leave every other lane dispatchable, with rollback tests for each lane.",
+            "Phase 7A may require one shared delivery kill switch and omit independent email or Telegram lane shutdown tests.",
+        ),
+        (
+            "active Redis failure fallback",
+            "ADR-019-redis-valkey-is-optional-acceleration.md",
+            "Phase 7A must test Redis/Valkey becoming unavailable during active worker processing; workers must fall back to conservative durable limits without losing quota, anti-storm, destination, or worker-bound protections and must never fail open.",
+            "Phase 7A may fail open or lose quota and anti-storm protection when Redis/Valkey becomes unavailable during active worker processing.",
+        ),
+        (
+            "pinned Stripe API version",
+            "ADR-010-stripe-is-an-adapter-internal-entitlements-are-canonical.md",
+            "Phase 4 must pin and test the Stripe API version used for Checkout, webhook parsing, and subscription reconciliation; provider or SDK default-version drift must fail readiness.",
+            "Phase 4 may rely on the Stripe account or SDK default API version without pinning and testing it.",
+        ),
+        (
+            "billing suspension decision audit",
+            "ADR-010-stripe-is-an-adapter-internal-entitlements-are-canonical.md",
+            "Phase 4 must audit every billing suspension decision, including webhook or reconciliation transitions into or out of suspension, with actor or worker, source, prior and resulting state, timestamp, and triggering provider evidence.",
+            "Phase 4 may change billing suspension state without an immutable audit record of the source, prior state, resulting state, and provider evidence.",
+        ),
+        (
+            "tenant notification policy authorization",
+            "ADR-011-limnopulse-owns-notification-semantics.md",
+            "Phase 7A must require owner/admin authorization, optimistic versioning, and immutable audit for every tenant NotificationPolicy write, not only asset_context; ordinary members and viewers must be rejected.",
+            "Phase 7A may allow ordinary members or viewers to write NotificationPolicy fields outside asset_context without owner/admin authorization or an immutable audit.",
+        ),
+        (
+            "vendor connector independent rollback",
+            "ADR-009-edge-is-optional-and-customer-hosted.md",
+            "Phase 9 vendor connector acceptance must prove an independent disable and rollback path that stops new connector work while preserving imported history and Device records.",
+            "Phase 9 may disable a vendor connector only by deleting or rewriting imported history and Device records.",
+        ),
     )
 )
 

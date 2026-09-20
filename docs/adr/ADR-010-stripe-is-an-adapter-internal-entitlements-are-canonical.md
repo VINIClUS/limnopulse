@@ -63,6 +63,10 @@ Phase 4 Stripe webhook ingress and workers must never log raw signed webhook bod
 
 Phase 4 must periodically recompute ordinary resource UsageCounter values with partition-scoped Query operations, never Scan, audit each repair, and preserve existing tenant resources.
 
+Phase 4 must pin and test the Stripe API version used for Checkout, webhook parsing, and subscription reconciliation; provider or SDK default-version drift must fail readiness.
+
+Phase 4 must audit every billing suspension decision, including webhook or reconciliation transitions into or out of suspension, with actor or worker, source, prior and resulting state, timestamp, and triggering provider evidence.
+
 ## Non-goals
 
 This record does not make Stripe authoritative for tenant identity, command safety, monitoring truth, or direct deletion of over-limit resources.
