@@ -23,23 +23,34 @@ def _repository_output_path(value: str) -> Path:
     return resolved
 
 
+def _output_option(value: str) -> str:
+    if _repository_output_path(value) != DEFAULT_OUTPUT:
+        raise argparse.ArgumentTypeError(
+            "--output must refer to the checked-in OpenAPI golden"
+        )
+    return "golden"
+
+
 def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument(
-        "--output", type=_repository_output_path, default=str(DEFAULT_OUTPUT)
+        "--output", type=_output_option, default=None, metavar="PATH"
     )
     parser.add_argument("--check", action="store_true")
     args = parser.parse_args()
+    try:
+        output = _repository_output_path(str(DEFAULT_OUTPUT))
+    except argparse.ArgumentTypeError as error:
+        parser.error(str(error))
     rendered = render_v1_openapi_contract(
         create_app(Settings(app_env="test", auth_mode="dev"))
     )
     if args.check:
         return int(
-            not args.output.exists()
-            or args.output.read_text(encoding="utf-8") != rendered
+            not output.exists() or output.read_text(encoding="utf-8") != rendered
         )
-    args.output.parent.mkdir(parents=True, exist_ok=True)
-    args.output.write_text(rendered, encoding="utf-8")
+    output.parent.mkdir(parents=True, exist_ok=True)
+    output.write_text(rendered, encoding="utf-8")
     return 0
 
 

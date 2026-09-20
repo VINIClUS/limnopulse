@@ -151,6 +151,12 @@ def test_exporter_rejects_output_outside_repository(tmp_path, monkeypatch) -> No
     assert not output.exists()
 
 
+def test_exporter_checks_default_output(monkeypatch) -> None:
+    monkeypatch.setattr(sys, "argv", ["export_v1_openapi.py", "--check"])
+
+    assert export_v1_openapi.main() == 0
+
+
 def test_exporter_rejects_default_output_symlink_escape(tmp_path, monkeypatch) -> None:
     repository = tmp_path / "repository"
     output = repository / "tests/contracts/openapi/v1.json"
@@ -173,8 +179,26 @@ def test_exporter_rejects_default_output_symlink_escape(tmp_path, monkeypatch) -
 def test_exporter_preserves_cwd_relative_output_paths(monkeypatch) -> None:
     monkeypatch.chdir(export_v1_openapi.REPOSITORY_ROOT / "scripts/dev")
 
-    output = export_v1_openapi._repository_output_path(
+    output = export_v1_openapi._output_option(
         "../../tests/contracts/openapi/v1.json"
     )
 
-    assert output == export_v1_openapi.DEFAULT_OUTPUT
+    assert output == "golden"
+
+
+def test_exporter_rejects_non_golden_output_path(monkeypatch) -> None:
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        [
+            "export_v1_openapi.py",
+            "--output",
+            "tests/contracts/openapi/alternate.json",
+            "--check",
+        ],
+    )
+
+    with pytest.raises(SystemExit) as error:
+        export_v1_openapi.main()
+
+    assert error.value.code == 2
