@@ -106,6 +106,12 @@ variable "ses_eventbridge_rule_name" {
   default     = "limnopulse-ses-events"
 }
 
+variable "ses_from_address" {
+  description = "Bare mailbox the notification worker sends from (no display name - e.g. alerts@example.com, not \"Limnopulse <alerts@example.com>\"). Scopes ses.tf's email_worker policy via ses:FromAddress, which SES compares against the parsed mailbox only. The runtime SES_FROM_EMAIL env var may still use the friendly-name form; that's set out of band and is not required to match this value verbatim, only to resolve to the same mailbox. Must be set to a real address before var.email_delivery = true is applied, or every send is denied - left as the empty default here since it's out of scope for the initial Fase 1 apply."
+  type        = string
+  default     = ""
+}
+
 variable "redis_url" {
   description = "Cloud Redis endpoint for application configuration. Provisioning is intentionally out of scope here."
   type        = string
@@ -158,9 +164,14 @@ variable "telegram_webhook" {
 }
 
 locals {
+  # Owner=vinisantana matches the design spec's tagging contract (§ resource
+  # tagging): every taggable resource carries Project/Environment/ManagedBy/
+  # Owner. Applying it here in the shared local means every resource in this
+  # module gets it, not just the ones touched in a given change.
   common_tags = {
     Project     = var.project_name
     Environment = var.environment
     ManagedBy   = "opentofu"
+    Owner       = "vinisantana"
   }
 }

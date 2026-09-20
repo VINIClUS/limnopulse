@@ -225,6 +225,32 @@ def test_ses_eventbridge_rules_match_only_the_notifications_configuration_set() 
         assert '"ses:configuration-set" = [var.ses_configuration_set_name]' in match.group("body")
 
 
+def test_email_worker_policy_scopes_send_email_to_configured_sender() -> None:
+    ses = _read("ses.tf")
+
+    policy_match = re.search(
+        r'data "aws_iam_policy_document" "email_worker"\s*\{(?P<body>.*?)(?=\ndata |\nresource |\Z)',
+        ses,
+        re.DOTALL,
+    )
+    assert policy_match is not None
+    body = policy_match.group("body")
+    assert "count = var.email_delivery ? 1 : 0" in body
+
+    statement_match = re.search(
+        r'sid\s*=\s*"SesSendEmail".*?\}(?=\n\s*\}\s*\n\s*statement|\Z)',
+        body,
+        re.DOTALL,
+    )
+    assert statement_match is not None
+    statement = statement_match.group(0)
+    assert '"ses:SendEmail"' in statement
+    assert '"sesv2:SendEmail"' not in statement
+    assert 'variable = "ses:FromAddress"' in statement
+    assert "values   = [var.ses_from_address]" in statement
+    assert "precondition" not in body
+
+
 def test_ses_eventbridge_targets_emit_only_parseable_non_pii_feedback() -> None:
     ses = _read("ses.tf")
     transformers = _eventbridge_transformers(ses)

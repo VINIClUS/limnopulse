@@ -83,6 +83,16 @@ data "aws_iam_policy_document" "telegram_worker" {
     resources = [aws_sqs_queue.telegram_notification_jobs[0].arn]
   }
 
+  # notifications relay (cmd/notifications/main.go) publishes onto this
+  # queue under the same "workers" IAM identity that the telegram-worker
+  # consumer above uses — both processes share one runtime credential.
+  statement {
+    sid       = "TelegramJobsProducer"
+    effect    = "Allow"
+    actions   = ["sqs:SendMessage"]
+    resources = [aws_sqs_queue.telegram_notification_jobs[0].arn]
+  }
+
   statement {
     sid       = "TelegramBotToken"
     effect    = "Allow"
