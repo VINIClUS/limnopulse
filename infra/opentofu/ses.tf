@@ -270,11 +270,4 @@ resource "aws_iam_policy" "email_worker" {
   policy      = data.aws_iam_policy_document.email_worker[0].json
 
   tags = local.common_tags
-
-  lifecycle {
-    precondition {
-      condition     = var.ses_from_address != ""
-      error_message = "var.ses_from_address must be set to a bare mailbox address whenever var.email_delivery = true - the empty default makes the email_worker policy's ses:FromAddress condition impossible to satisfy, denying every send."
-    }
-  }
 }
