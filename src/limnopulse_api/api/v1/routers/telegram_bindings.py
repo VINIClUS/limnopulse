@@ -1,4 +1,4 @@
-from fastapi import APIRouter, Response, status
+from fastapi import APIRouter, HTTPException, Request, Response, status
 
 from limnopulse_api.api.dependencies import TelegramBindingServiceDep, TenantAccessDep
 from limnopulse_api.api.v1.schemas.telegram_bindings import (
@@ -28,7 +28,10 @@ async def create_telegram_binding_token(
     tenant_id: str,
     access: TenantAccessDep,
     service: TelegramBindingServiceDep,
+    request: Request,
 ) -> TelegramBindingTokenResponse:
+    if not request.app.state.settings.telegram_webhook_enabled:
+        raise HTTPException(status_code=404, detail="not found")
     issued = await service.issue(tenant_id, access.principal.cognito_sub)
     return TelegramBindingTokenResponse(
         request_id=issued.request_id,

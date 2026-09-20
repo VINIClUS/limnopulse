@@ -43,64 +43,68 @@ output "notification_jobs_dlq_url" {
   value       = aws_sqs_queue.notification_jobs_dlq.id
 }
 
+# Null when var.telegram_delivery = false (see variables.tf and telegram.tf).
 output "telegram_notification_jobs_queue_url" {
   description = "SQS_TELEGRAM_JOBS_URL"
-  value       = aws_sqs_queue.telegram_notification_jobs.id
+  value       = try(aws_sqs_queue.telegram_notification_jobs[0].id, null)
 }
 
 output "telegram_notification_jobs_queue_arn" {
   description = "Telegram notification jobs queue ARN."
-  value       = aws_sqs_queue.telegram_notification_jobs.arn
+  value       = try(aws_sqs_queue.telegram_notification_jobs[0].arn, null)
 }
 
 output "telegram_notification_jobs_dlq_url" {
   description = "Telegram notification jobs dead-letter queue URL."
-  value       = aws_sqs_queue.telegram_notification_jobs_dlq.id
+  value       = try(aws_sqs_queue.telegram_notification_jobs_dlq[0].id, null)
 }
 
 output "telegram_bot_token_secret_arn" {
   description = "TELEGRAM_BOT_TOKEN_SECRET_ARN"
-  value       = aws_secretsmanager_secret.telegram_bot_token.arn
-}
-
-output "telegram_webhook_secret_arn" {
-  description = "TELEGRAM_WEBHOOK_SECRET_ARN"
-  value       = aws_secretsmanager_secret.telegram_webhook_secret.arn
+  value       = try(aws_secretsmanager_secret.telegram_bot_token[0].arn, null)
 }
 
 output "telegram_worker_policy_arn" {
   description = "IAM policy ARN to attach to the Telegram worker runtime role."
-  value       = aws_iam_policy.telegram_worker.arn
+  value       = try(aws_iam_policy.telegram_worker[0].arn, null)
+}
+
+# Null when var.telegram_webhook = false (see variables.tf and telegram.tf).
+# Only required when TELEGRAM_WEBHOOK_ENABLED=true (core/config.py).
+output "telegram_webhook_secret_arn" {
+  description = "TELEGRAM_WEBHOOK_SECRET_ARN"
+  value       = try(aws_secretsmanager_secret.telegram_webhook_secret[0].arn, null)
 }
 
 output "telegram_webhook_secret_reader_policy_arn" {
   description = "IAM policy ARN to attach to the FastAPI runtime role."
-  value       = aws_iam_policy.telegram_webhook_secret_reader.arn
+  value       = try(aws_iam_policy.telegram_webhook_secret_reader[0].arn, null)
 }
 
+# Null when var.email_delivery = false (see variables.tf and ses.tf).
 output "ses_events_queue_url" {
   description = "SQS_SES_EVENTS_URL"
-  value       = aws_sqs_queue.ses_events.id
+  value       = try(aws_sqs_queue.ses_events[0].id, null)
 }
 
 output "ses_events_queue_arn" {
   description = "SES feedback queue ARN."
-  value       = aws_sqs_queue.ses_events.arn
+  value       = try(aws_sqs_queue.ses_events[0].arn, null)
 }
 
 output "ses_events_dlq_url" {
   description = "SES feedback dead-letter queue URL."
-  value       = aws_sqs_queue.ses_events_dlq.id
+  value       = try(aws_sqs_queue.ses_events_dlq[0].id, null)
 }
 
 output "ses_events_routing_dlq_url" {
   description = "EventBridge SES routing dead-letter queue URL."
-  value       = aws_sqs_queue.ses_events_routing_dlq.id
+  value       = try(aws_sqs_queue.ses_events_routing_dlq[0].id, null)
 }
 
 output "ses_configuration_set_name" {
   description = "SES_CONFIGURATION_SET_NAME"
-  value       = aws_sesv2_configuration_set.notifications.configuration_set_name
+  value       = try(aws_sesv2_configuration_set.notifications[0].configuration_set_name, null)
 }
 
 output "redis_url" {
@@ -111,4 +115,17 @@ output "redis_url" {
 output "influxdb_url" {
   description = "Cloud InfluxDB endpoint placeholder only. Mark or split sensitive values before real credentials are introduced."
   value       = var.influxdb_url
+}
+
+# IAM user names only — never a secret. Access keys are created out of
+# band (see iam_runtime.tf) with `aws iam create-access-key --user-name
+# <this value>` and pasted directly into the VPS/.env and LXC env.
+output "api_iam_user_name" {
+  description = "IAM user name to generate the API runtime's access key for."
+  value       = aws_iam_user.api.name
+}
+
+output "workers_iam_user_name" {
+  description = "IAM user name to generate the workers runtime's access key for."
+  value       = aws_iam_user.workers.name
 }

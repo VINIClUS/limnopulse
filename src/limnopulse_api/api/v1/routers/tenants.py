@@ -6,7 +6,13 @@ from limnopulse_api.api.dependencies import (
     require_tenant_read_access,
     require_tenant_role,
 )
-from limnopulse_api.api.v1.schemas import ErrorResponse, TenantCreate, TenantListResponse, TenantResponse, TenantUpdate
+from limnopulse_api.api.v1.schemas import (
+    ErrorResponse,
+    TenantCreate,
+    TenantListResponse,
+    TenantResponse,
+    TenantUpdate,
+)
 from limnopulse_api.core.errors import ConflictError, NotFoundError
 from limnopulse_api.domain.entities import Tenant, TenantAccess
 from limnopulse_api.domain.roles import TenantRole, WRITE_ROLES
@@ -23,6 +29,7 @@ def _to_tenant_response(tenant: Tenant) -> TenantResponse:
     return TenantResponse(
         tenant_id=tenant.tenant_id,
         name=tenant.name,
+        city=tenant.settings.get("city"),
         created_at=tenant.created_at.isoformat(),
         updated_at=tenant.updated_at.isoformat(),
         version=tenant.version,
@@ -53,7 +60,7 @@ async def create_tenant(
 ) -> TenantResponse:
     service = _tenant_service(repository)
     try:
-        tenant = await service.create(payload.name, principal.cognito_sub)
+        tenant = await service.create(payload.name, principal.cognito_sub, payload.city)
     except ConflictError as exc:
         raise HTTPException(status_code=409, detail=str(exc) or "conflict") from exc
     return _to_tenant_response(tenant)
@@ -62,7 +69,11 @@ async def create_tenant(
 @router.get(
     "/{tenant_id}",
     response_model=TenantResponse,
-    responses={403: {"model": ErrorResponse}, 404: {"model": ErrorResponse}, 503: {"model": ErrorResponse}},
+    responses={
+        403: {"model": ErrorResponse},
+        404: {"model": ErrorResponse},
+        503: {"model": ErrorResponse},
+    },
 )
 async def get_tenant(
     tenant_id: str,
@@ -82,7 +93,12 @@ async def get_tenant(
 @router.patch(
     "/{tenant_id}",
     response_model=TenantResponse,
-    responses={403: {"model": ErrorResponse}, 404: {"model": ErrorResponse}, 409: {"model": ErrorResponse}, 503: {"model": ErrorResponse}},
+    responses={
+        403: {"model": ErrorResponse},
+        404: {"model": ErrorResponse},
+        409: {"model": ErrorResponse},
+        503: {"model": ErrorResponse},
+    },
 )
 async def update_tenant(
     tenant_id: str,
@@ -92,7 +108,12 @@ async def update_tenant(
 ) -> TenantResponse:
     service = _tenant_service(repository)
     try:
-        tenant = await service.update(tenant_id, payload.expected_version, payload.name)
+        tenant = await service.update(
+            tenant_id,
+            payload.expected_version,
+            payload.name,
+            {"city": payload.city} if "city" in payload.model_fields_set else None,
+        )
     except NotFoundError as exc:
         raise HTTPException(status_code=404, detail=str(exc) or "not found") from exc
     except ConflictError as exc:

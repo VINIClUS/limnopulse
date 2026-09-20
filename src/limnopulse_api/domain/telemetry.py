@@ -1,7 +1,7 @@
 import re
 from datetime import datetime
 
-from pydantic import BaseModel, ConfigDict
+from pydantic import BaseModel, ConfigDict, Field
 
 
 _RELATIVE_DURATION_PATTERN = re.compile(r"^-\d+(ns|us|ms|s|m|h|d|w)$")
@@ -38,3 +38,26 @@ class LatestMetrics(WaterQualityFields):
     measured_at: datetime | None = None
     tenant_id: str
     pond_id: str
+
+
+class MetricStatistics(BaseModel):
+    mean: float | None = None
+    min: float | None = None
+    max: float | None = None
+    count: int = 0
+
+
+class SummaryPoint(BaseModel):
+    measured_at: datetime
+    do_mg_l: float | None = None
+    ph: float | None = None
+    temp_c: float | None = None
+
+
+class MetricsSummary(BaseModel):
+    tenant_id: str
+    pond_id: str
+    period: str
+    interval: str
+    series: list[SummaryPoint] = Field(default_factory=list)
+    statistics: dict[str, MetricStatistics] = Field(default_factory=dict)

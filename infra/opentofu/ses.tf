@@ -1,8 +1,14 @@
+# All resources in this file are gated by var.email_delivery (see
+# variables.tf): none are wired to any current consumer.
 data "aws_cloudwatch_event_bus" "default" {
+  count = var.email_delivery ? 1 : 0
+
   name = "default"
 }
 
 resource "aws_sesv2_configuration_set" "notifications" {
+  count = var.email_delivery ? 1 : 0
+
   configuration_set_name = var.ses_configuration_set_name
 
   reputation_options {
@@ -15,7 +21,9 @@ resource "aws_sesv2_configuration_set" "notifications" {
 }
 
 resource "aws_sesv2_configuration_set_event_destination" "eventbridge" {
-  configuration_set_name = aws_sesv2_configuration_set.notifications.configuration_set_name
+  count = var.email_delivery ? 1 : 0
+
+  configuration_set_name = aws_sesv2_configuration_set.notifications[0].configuration_set_name
   event_destination_name = "limnopulse-ses-events"
 
   event_destination {
@@ -30,12 +38,14 @@ resource "aws_sesv2_configuration_set_event_destination" "eventbridge" {
     ]
 
     event_bridge_destination {
-      event_bus_arn = data.aws_cloudwatch_event_bus.default.arn
+      event_bus_arn = data.aws_cloudwatch_event_bus.default[0].arn
     }
   }
 }
 
 resource "aws_cloudwatch_event_rule" "ses_notifications" {
+  count = var.email_delivery ? 1 : 0
+
   name        = var.ses_eventbridge_rule_name
   description = "Route Limnopulse SES delivery feedback to SQS"
 
@@ -53,6 +63,8 @@ resource "aws_cloudwatch_event_rule" "ses_notifications" {
 }
 
 resource "aws_cloudwatch_event_rule" "ses_notifications_bounce" {
+  count = var.email_delivery ? 1 : 0
+
   name        = "${var.ses_eventbridge_rule_name}-bounce"
   description = "Route sanitized Limnopulse SES bounce feedback to SQS"
 
@@ -70,6 +82,8 @@ resource "aws_cloudwatch_event_rule" "ses_notifications_bounce" {
 }
 
 resource "aws_cloudwatch_event_rule" "ses_notifications_reject" {
+  count = var.email_delivery ? 1 : 0
+
   name        = "${var.ses_eventbridge_rule_name}-reject"
   description = "Route sanitized Limnopulse SES reject feedback to SQS"
 
@@ -87,9 +101,11 @@ resource "aws_cloudwatch_event_rule" "ses_notifications_reject" {
 }
 
 resource "aws_cloudwatch_event_target" "ses_events" {
-  rule      = aws_cloudwatch_event_rule.ses_notifications.name
+  count = var.email_delivery ? 1 : 0
+
+  rule      = aws_cloudwatch_event_rule.ses_notifications[0].name
   target_id = "limnopulse-ses-events"
-  arn       = aws_sqs_queue.ses_events.arn
+  arn       = aws_sqs_queue.ses_events[0].arn
 
   input_transformer {
     input_paths = {
@@ -108,7 +124,7 @@ resource "aws_cloudwatch_event_target" "ses_events" {
   }
 
   dead_letter_config {
-    arn = aws_sqs_queue.ses_events_routing_dlq.arn
+    arn = aws_sqs_queue.ses_events_routing_dlq[0].arn
   }
 
   retry_policy {
@@ -123,9 +139,11 @@ resource "aws_cloudwatch_event_target" "ses_events" {
 }
 
 resource "aws_cloudwatch_event_target" "ses_events_bounce" {
-  rule      = aws_cloudwatch_event_rule.ses_notifications_bounce.name
+  count = var.email_delivery ? 1 : 0
+
+  rule      = aws_cloudwatch_event_rule.ses_notifications_bounce[0].name
   target_id = "limnopulse-ses-events-bounce"
-  arn       = aws_sqs_queue.ses_events.arn
+  arn       = aws_sqs_queue.ses_events[0].arn
 
   input_transformer {
     input_paths = {
@@ -145,7 +163,7 @@ resource "aws_cloudwatch_event_target" "ses_events_bounce" {
   }
 
   dead_letter_config {
-    arn = aws_sqs_queue.ses_events_routing_dlq.arn
+    arn = aws_sqs_queue.ses_events_routing_dlq[0].arn
   }
 
   retry_policy {
@@ -160,9 +178,11 @@ resource "aws_cloudwatch_event_target" "ses_events_bounce" {
 }
 
 resource "aws_cloudwatch_event_target" "ses_events_reject" {
-  rule      = aws_cloudwatch_event_rule.ses_notifications_reject.name
+  count = var.email_delivery ? 1 : 0
+
+  rule      = aws_cloudwatch_event_rule.ses_notifications_reject[0].name
   target_id = "limnopulse-ses-events-reject"
-  arn       = aws_sqs_queue.ses_events.arn
+  arn       = aws_sqs_queue.ses_events[0].arn
 
   input_transformer {
     input_paths = {
@@ -182,7 +202,7 @@ resource "aws_cloudwatch_event_target" "ses_events_reject" {
   }
 
   dead_letter_config {
-    arn = aws_sqs_queue.ses_events_routing_dlq.arn
+    arn = aws_sqs_queue.ses_events_routing_dlq[0].arn
   }
 
   retry_policy {
@@ -194,4 +214,60 @@ resource "aws_cloudwatch_event_target" "ses_events_reject" {
     aws_sqs_queue_policy.ses_events,
     aws_sqs_queue_policy.ses_events_routing_dlq,
   ]
+}
+
+# Runtime access for the notification-worker's email path
+# (cmd/notifications/worker_command.go, internal/notifications/worker/ses).
+# Gated the same as the rest of this file: var.email_delivery.
+data "aws_iam_policy_document" "email_worker" {
+  count = var.email_delivery ? 1 : 0
+
+  statement {
+    sid    = "SesSendEmail"
+    effect = "Allow"
+    # IAM authorizes the SESv2 SendEmail API under the "ses:" prefix, not
+    # "sesv2:" - SES was never split into a separate IAM service namespace
+    # when the v2 API was introduced. resources stays "*": SES identity
+    # verification is handled out of band, not by a Terraform-managed
+    # resource in this stack (see the identity boundary test), so there's
+    # no local ARN to scope this to. ses:FromAddress narrows the grant
+    # instead, to the one mailbox the worker actually sends from - SES
+    # compares this context key against the parsed address only, so
+    # var.ses_from_address must be the bare mailbox, never the
+    # "Display Name <addr>" form the runtime SES_FROM_EMAIL env var is
+    # also allowed to use. Not ses:configuration-set: that's a message tag
+    # SES emits in events, not an IAM request context key SendEmail
+    # evaluates - a condition on it would never match and would deny
+    # every send.
+    actions   = ["ses:SendEmail"]
+    resources = ["*"]
+
+    condition {
+      test     = "StringEquals"
+      variable = "ses:FromAddress"
+      values   = [var.ses_from_address]
+    }
+  }
+
+  statement {
+    sid    = "SesEventsQueueConsumer"
+    effect = "Allow"
+    actions = [
+      "sqs:ReceiveMessage",
+      "sqs:DeleteMessage",
+      "sqs:ChangeMessageVisibility",
+      "sqs:GetQueueAttributes",
+    ]
+    resources = [aws_sqs_queue.ses_events[0].arn]
+  }
+}
+
+resource "aws_iam_policy" "email_worker" {
+  count = var.email_delivery ? 1 : 0
+
+  name        = "${var.project_name}-${var.environment}-email-worker"
+  description = "Least-privilege data-plane access for the notification worker's email path."
+  policy      = data.aws_iam_policy_document.email_worker[0].json
+
+  tags = local.common_tags
 }

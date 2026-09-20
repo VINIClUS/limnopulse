@@ -20,6 +20,7 @@ class Settings(BaseSettings):
     dynamodb_domain_table: str = "LimnopulseDomain"
     dynamodb_audit_table: str = "LimnopulseAudit"
     dynamodb_endpoint_url: str | None = None
+    lead_rate_limit_per_minute: int = Field(default=5, ge=1, le=100)
     redis_url: str = "redis://localhost:6379/0"
     influxdb_url: str = "http://localhost:8086"
     influxdb_token: str = "local-dev-token"
@@ -31,6 +32,7 @@ class Settings(BaseSettings):
     membership_cache_ttl_seconds: int = Field(default=120, ge=60, le=300)
     device_cache_ttl_seconds: int = Field(default=1_800, ge=900, le=3_600)
     tenant_settings_cache_ttl_seconds: int = Field(default=1_800, ge=900, le=3_600)
+    telegram_webhook_enabled: bool = True
     telegram_bot_username: str = Field(
         default="limnopulse_local_bot",
         pattern=r"^[A-Za-z0-9_]{5,32}$",
@@ -48,7 +50,7 @@ class Settings(BaseSettings):
     def validate_auth_mode_for_environment(self) -> "Settings":
         if self.auth_mode == "dev" and self.app_env not in {"local", "test"}:
             raise ValueError("AUTH_MODE=dev is only allowed when APP_ENV is local or test")
-        if self.app_env in {"staging", "prod"}:
+        if self.app_env in {"staging", "prod"} and self.telegram_webhook_enabled:
             if self.telegram_webhook_secret is not None:
                 raise ValueError(
                     "TELEGRAM_WEBHOOK_SECRET is only allowed when APP_ENV is local or test"

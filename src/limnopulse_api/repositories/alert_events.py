@@ -8,6 +8,9 @@ class AlertEventRepository(Protocol):
     async def list_events(self, tenant_id: str) -> list[AlertEvent]:
         raise NotImplementedError
 
+    async def list_active_events(self, tenant_id: str, limit: int) -> tuple[list[AlertEvent], bool]:
+        raise NotImplementedError
+
     async def get_event(self, tenant_id: str, event_id: str) -> AlertEvent | None:
         raise NotImplementedError
 

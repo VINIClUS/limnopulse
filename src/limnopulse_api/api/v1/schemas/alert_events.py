@@ -9,6 +9,7 @@ class AlertEventResponse(AlertEvent):
 
 class AlertEventListResponse(BaseModel):
     items: list[AlertEventResponse]
+    has_more: bool = False
 
 
 class AlertEventTransitionRequest(BaseModel):

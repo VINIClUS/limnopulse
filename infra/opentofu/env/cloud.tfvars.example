@@ -20,6 +20,24 @@ ses_events_dlq_name           = "limnopulse-ses-events-dlq"
 ses_events_routing_dlq_name   = "limnopulse-ses-events-routing-dlq"
 ses_configuration_set_name   = "limnopulse-notifications"
 ses_eventbridge_rule_name     = "limnopulse-ses-events"
+# Must be set (bare mailbox, no display name) before setting
+# email_delivery = true, or every send is denied - see variables.tf. This
+# must be the mailbox only, never the "Display Name <addr>" form the
+# runtime SES_FROM_EMAIL env var may use.
+ses_from_address = ""
 
 redis_url    = ""
 influxdb_url = ""
+
+# Feature boundaries (see variables.tf and design spec §16). All three stay
+# false for the Fase 1 core deploy (API + frontend + Redis + InfluxDB, no
+# Telegram at all): src/limnopulse_api/core/config.py's TELEGRAM_WEBHOOK_ENABLED
+# now independently gates the /webhooks/telegram route and its
+# APP_ENV=prod secret-ARN requirement, so this profile really does apply
+# zero Telegram resources and boots with zero Telegram configuration. Flip
+# telegram_webhook to true (and TELEGRAM_WEBHOOK_ENABLED=true in the API's
+# .env) once a real bot is being wired up; flip telegram_delivery once the
+# Fase 2 Proxmox worker is being provisioned.
+email_delivery    = false
+telegram_delivery = false
+telegram_webhook  = false

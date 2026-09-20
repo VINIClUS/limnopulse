@@ -8,6 +8,33 @@
 **Primary AWS region:** `us-east-2`; global edge control plane (ACM,
 CloudFront-scoped WAF and Pricing Plan Manager endpoint): `us-east-1`
 
+> **Errata — edge topology overridden (2026-09-19).** The user directed the
+> actual deployment to use the existing Caddy container on the Hostinger VPS
+> as the public edge, not Nginx + Cloudflare Tunnel + CloudFront/S3. The
+> sections below that describe Nginx, the tunnel, real-IP trust via
+> `CF-Connecting-IP`, and the CloudFront/S3 static path (notably §4 Target
+> topology, §6 Static site, §7 FastAPI deployment, §12 Internal synthetic
+> ingestion, §17.3 step 5's "switches Nginx" cutover, and §18 API and edge
+> rate limiting) describe a topology that was **not built** and do not apply.
+> They are left in place as historical record of the reviewed design, not as
+> current instructions.
+>
+> What was actually built, and why, is in
+> `/home/vinicius/.claude/plans/fa-a-o-ci-cd-do-ticklish-dragon.md` and the
+> artifacts it produced: `Dockerfile.api`, `Dockerfile.frontend`,
+> `compose.production.yaml`, `.env.production.example`, and `ops/vps/`
+> (bootstrap runbook, deploy script, Caddyfile snippet). In short: both
+> `limnopulse.com` and `api.limnopulse.com` are served by the VPS's existing
+> `caddy:2-alpine` container (shared with the unrelated `cnesdata` stack via
+> the external `cnesdata_edge` network); the SPA calls the API by relative
+> path (`/v1/...`), so Caddy routes same-origin instead of using CORS; and
+> §17.1's "no self-hosted production runner" holds for the VPS deploy path
+> but is explicitly relaxed for the Fase 2 Proxmox LXC promotion job only
+> (`workflow_dispatch` on `main`, behind a required-reviewer GitHub
+> Environment, never running fork-PR code). A full rewrite of the affected
+> sections is a separate follow-up; do not treat them as current without
+> checking the plan file first.
+
 ## 1. Purpose
 
 Define a small, secure production portfolio deployment of LimnoPulse on the
@@ -407,6 +434,31 @@ No static AWS key exists in GitHub, Compose or a persistent `.env` file.
 Separate IAM policies cover API, evaluator, SQS canary validation, backup,
 GitHub plan/apply and break-glass operations.
 
+> **Update (2026-09-19):** `infra/opentofu/iam_runtime.tf` diverges from
+> "no static AWS key" for the current VPS + Proxmox LXC topology: neither
+> host can assume an IAM role without either instance-profile-style
+> metadata (neither has it) or IAM Roles Anywhere (deferred to Fase 3 — it
+> needs a CA and certificate renewal this repo doesn't have yet, matching
+> the plan file's Fase 0 decision). Two `aws_iam_user` resources (`api`,
+> `workers`) carry least-privilege policies instead: full DynamoDB access
+> to the domain table for both plus transact-write-only access to the
+> audit table for the API (every write it makes there goes through a
+> `TransactWriteItems` "Put", never a standalone call), the core
+> notification-jobs SQS queue for the workers, plus the existing
+> conditional Telegram policies from `telegram.tf` (extended with an
+> `sqs:SendMessage` statement so `notifications relay` can publish, not
+> just the Telegram worker consume) and a conditional `ses:SendEmail` +
+> SES-feedback-queue policy attached via matching `count`. No policy grants
+> `cognito-idp:GetUser` — it's one of Cognito's unauthenticated-API
+> operations, authorized by the caller's own access token, and never
+> evaluates the calling IAM identity's policies; a grant for it would be a
+> no-op. Access keys themselves are deliberately not `aws_iam_access_key`
+> resources — that would write the secret into tfstate in plaintext with
+> no backend encryption configured yet — and are instead created out of
+> band with
+> `aws iam create-access-key` and pasted directly into the VPS/LXC `.env`
+> files, same as the Telegram secrets' "populated out of band" pattern.
+
 ## 16. OpenTofu changes
 
 The existing scaffold is evolved into modules with explicit production feature
@@ -425,9 +477,59 @@ aws_iot             = false
 redis               = false
 ```
 
-Disabled modules produce no resources or secret containers. The current
-unconditional SES, EventBridge and Telegram resources must be made conditional
-before a real production plan.
+Disabled modules produce no resources or secret containers.
+
+> **Update (2026-09-19):** `email_delivery` and `telegram_delivery` now exist
+> as real `bool` variables in `infra/opentofu/variables.tf` (default
+> `false`), gating the SES/EventBridge resources in `ses.tf` and the
+> Telegram bot-token secret, outbound jobs queue and worker IAM policy in
+> `telegram.tf`/`queues.tf` behind `count`. A third flag, `telegram_webhook`
+> (default `false`), independently gates the Telegram webhook secret and its
+> reader policy.
+>
+> An automated PR review (Codex, on PR #47) went through two rounds here.
+> Round 1 correctly flagged a draft that kept the webhook secret
+> unconditional as violating this section's own "disabled produces no
+> resource or secret container" acceptance criteria. Splitting it into its
+> own flag wasn't enough on its own: round 2 pointed out that
+> `env/cloud.tfvars.example` — the repo's only documented real-cloud
+> profile — set `telegram_webhook = true`, so the zero-resources profile,
+> while representable, was never the one operators were told to deploy. The
+> real blocker underneath both rounds was `src/limnopulse_api/core/config.py`:
+> its `APP_ENV=prod` validator hard-required `TELEGRAM_WEBHOOK_SECRET_ARN`
+> unconditionally, and `POST /webhooks/telegram` was mounted unconditionally
+> in `api/router.py`, so no OpenTofu-only flag could make a truly
+> Telegram-free profile bootable.
+>
+> Resolved by adding `TELEGRAM_WEBHOOK_ENABLED` (default `true`, preserving
+> existing behavior) to `Settings`: the ARN/username validation in
+> `validate_auth_mode_for_environment` and the `/webhooks/telegram` route
+> mount (`api/router.py`'s `build_api_router`) are now both conditional on
+> it. `env/cloud.tfvars.example` sets `telegram_webhook = false` and
+> `.env.production.example` documents `TELEGRAM_WEBHOOK_ENABLED` unset/false
+> as the Fase 1 default — the profile operators are actually told to deploy
+> now genuinely creates zero Telegram resources and boots with zero
+> Telegram configuration. Verified with `tofu plan` against a throwaway
+> local state: `env/cloud.tfvars.example` defaults (all three flags
+> `false`) created 7 resources before `iam_runtime.tf` (§15 update above);
+> with it, 15 (Cognito, DynamoDB ×2, the core notification-jobs queue, plus
+> `iam_runtime.tf`'s 8 always-created resources: 2 `aws_iam_user`, 3
+> `aws_iam_policy`, 3 `aws_iam_user_policy_attachment` — no Cognito IAM
+> policy, since `cognito-idp:GetUser` is authorized by the caller's own
+> access token and never evaluates the calling identity's IAM policies).
+> All delivery/webhook flags `true` produces 40: the original unconditional
+> 28, `iam_runtime.tf`'s 8 unconditional resources, its 3 conditional
+> attachments (Telegram webhook/delivery, email), and `ses.tf`'s
+> email_worker policy. Verified on the application side with
+> `pytest`: `APP_ENV=prod` + `TELEGRAM_WEBHOOK_ENABLED=false` boots and
+> 404s on `/webhooks/telegram` without any Telegram secret configured
+> (`tests/api/test_app_runtime.py`, `tests/api/test_telegram_webhook.py`,
+> `tests/unit/test_settings.py`). `core_dynamodb`, `core_cognito`,
+> `core_sqs` were not made toggleable — every profile needs them, so they
+> stay unconditional rather than adding always-`true` flags with no real
+> branch. `push_delivery`, `sms_delivery`, `stripe_billing`, `aws_iot` and
+> `redis` have no corresponding resources in this file yet; nothing to
+> gate.
 
 Additional application-owned modules cover:
 
