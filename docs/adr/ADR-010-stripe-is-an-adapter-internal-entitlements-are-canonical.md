@@ -61,7 +61,7 @@ Phase 4 Stripe webhook ingress must allowlist supported event types and reject o
 
 Phase 4 Stripe webhook ingress and workers must never log raw signed webhook bodies or customer/payment payloads; fixtures must prove billing PII is redacted or excluded from application logs.
 
-Phase 4 billing persistence must store only provider IDs and sanitized reconciliation state; provider-event receipts and billing records must reject raw Stripe event, customer, payment, invoice, and subscription payloads, including PII, and tests must allowlist every retained field after reconciliation.
+Phase 4 billing persistence must use closed allowlists: ExternalProviderEventReceipt may retain only tenant ID, provider name, provider event ID/type, provider object IDs, receipt status, idempotency/reconciliation version, timestamps/expiry, and sanitized error codes; BillingAccount and EntitlementSnapshot may retain only tenant ID, provider customer/subscription/price IDs, internal PlanVersion/EntitlementSnapshot IDs and versions, billing status/interval/currency, period timestamps, and sanitized reconciliation state; raw Stripe event, customer, payment, invoice, subscription payloads and PII are rejected, and tests must reject every field outside these lists.
 
 Phase 4 must periodically recompute ordinary resource UsageCounter values with partition-scoped Query operations, never Scan, audit each repair, and preserve existing tenant resources.
 

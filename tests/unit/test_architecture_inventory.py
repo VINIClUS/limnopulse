@@ -1563,8 +1563,8 @@ CODEX_REVIEW_GATE_CASES += tuple(
         (
             "Stripe persistence sanitization",
             "ADR-010-stripe-is-an-adapter-internal-entitlements-are-canonical.md",
-            "Phase 4 billing persistence must store only provider IDs and sanitized reconciliation state; provider-event receipts and billing records must reject raw Stripe event, customer, payment, invoice, and subscription payloads, including PII, and tests must allowlist every retained field after reconciliation.",
-            "Phase 4 billing persistence may store complete raw Stripe event, customer, payment, invoice, or subscription payloads in provider-event receipts or billing records.",
+            "Phase 4 billing persistence must use closed allowlists: ExternalProviderEventReceipt may retain only tenant ID, provider name, provider event ID/type, provider object IDs, receipt status, idempotency/reconciliation version, timestamps/expiry, and sanitized error codes; BillingAccount and EntitlementSnapshot may retain only tenant ID, provider customer/subscription/price IDs, internal PlanVersion/EntitlementSnapshot IDs and versions, billing status/interval/currency, period timestamps, and sanitized reconciliation state; raw Stripe event, customer, payment, invoice, subscription payloads and PII are rejected, and tests must reject every field outside these lists.",
+            "Phase 4 billing persistence may retain arbitrary Stripe payload fields or add raw customer, payment, invoice, or subscription data outside the allowlists in provider-event receipts, BillingAccount, or EntitlementSnapshot.",
         ),
         (
             "Enterprise automatic overage prohibition",
@@ -1695,8 +1695,8 @@ CODEX_REVIEW_GATE_CASES += tuple(
         (
             "deterministic retry successor creation",
             "ADR-018-eum-push-and-sms-are-provider-adapters.md",
-            "Before creating a retry Attempt for a definite temporary failure, the worker must derive a deterministic successor identity from the Delivery, failed Attempt, and retry ordinal; a conditional write must create at most one successor Attempt for that identity, so concurrent workers converge on one Attempt and only that Attempt may contact the provider.",
-            "Concurrent workers may derive different retry identities and create multiple successor Attempts for one failed Attempt.",
+            "Before creating a retry Attempt for a definite temporary failure, the worker must derive a deterministic successor identity from the Delivery ID, failed Attempt ID, and the failed Attempt's persisted retry ordinal plus one; a conditional write must atomically bind that ordinal to the Delivery and failed Attempt and create at most one successor Attempt, so concurrent workers converge on one identity and only that Attempt may contact the provider.",
+            "Concurrent workers may choose different retry ordinals or retry identities and create multiple successor Attempts for one failed Attempt.",
         ),
     )
 )

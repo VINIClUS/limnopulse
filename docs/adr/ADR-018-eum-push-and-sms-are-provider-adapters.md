@@ -36,7 +36,7 @@ Phase 7C current SMS charge guard must include both provider country price and c
 
 Phase 7C must enforce durable SMS storm/rate windows independently per recipient, tenant, and event family before provider dispatch; recipient-scoped limits must prevent one recipient from receiving every family allowance.
 
-Before creating a retry Attempt for a definite temporary failure, the worker must derive a deterministic successor identity from the Delivery, failed Attempt, and retry ordinal; a conditional write must create at most one successor Attempt for that identity, so concurrent workers converge on one Attempt and only that Attempt may contact the provider.
+Before creating a retry Attempt for a definite temporary failure, the worker must derive a deterministic successor identity from the Delivery ID, failed Attempt ID, and the failed Attempt's persisted retry ordinal plus one; a conditional write must atomically bind that ordinal to the Delivery and failed Attempt and create at most one successor Attempt, so concurrent workers converge on one identity and only that Attempt may contact the provider.
 
 ## Non-goals
 
