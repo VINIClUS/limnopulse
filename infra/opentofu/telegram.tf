@@ -3,6 +3,12 @@
 # pending-deletion name conflict within the normal 7-day recovery window;
 # the value is populated out of band regardless, so there's nothing to
 # recover.
+#
+# Force-deletion is asynchronous: an apply that disables this flag and an
+# apply that re-enables it seconds later can still race and fail with
+# EntityAlreadyExists / "scheduled for deletion". This is an AWS API
+# timing limit, not something OpenTofu config can await — if a re-enable
+# apply fails this way, wait ~30-60s and re-run `tofu apply`.
 resource "aws_secretsmanager_secret" "telegram_webhook_secret" {
   count = var.telegram_webhook ? 1 : 0
 
@@ -34,7 +40,9 @@ resource "aws_iam_policy" "telegram_webhook_secret_reader" {
 }
 
 # Everything below is the outbound delivery path (Fase 2 Proxmox worker) and
-# is gated by var.telegram_delivery.
+# is gated by var.telegram_delivery. Same recovery_window_in_days = 0
+# tradeoff and same async-deletion race on rapid re-enable as
+# telegram_webhook_secret above.
 resource "aws_secretsmanager_secret" "telegram_bot_token" {
   count = var.telegram_delivery ? 1 : 0
 
