@@ -1,12 +1,15 @@
 import importlib
 import json
+import sys
 from pathlib import Path
 from typing import Annotated
 
 import fastapi.routing as fastapi_routing
+import pytest
 from fastapi import FastAPI, Security
 from fastapi.security import APIKeyHeader, HTTPAuthorizationCredentials, HTTPBearer
 
+from scripts.dev import export_v1_openapi
 from limnopulse_api.api import openapi_contract
 from limnopulse_api.api.openapi_contract import build_v1_openapi_contract
 from limnopulse_api.api.v1.schemas.common import ErrorResponse
@@ -131,3 +134,47 @@ def test_v1_openapi_keeps_only_security_schemes_used_by_v1_operations() -> None:
     assert actual["components"]["securitySchemes"] == {
         "UsedBearer": {"scheme": "bearer", "type": "http"}
     }
+
+
+def test_exporter_rejects_output_outside_repository(tmp_path, monkeypatch) -> None:
+    output = tmp_path / "outside.json"
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        ["export_v1_openapi.py", "--output", str(output)],
+    )
+
+    with pytest.raises(SystemExit) as error:
+        export_v1_openapi.main()
+
+    assert error.value.code == 2
+    assert not output.exists()
+
+
+def test_exporter_rejects_default_output_symlink_escape(tmp_path, monkeypatch) -> None:
+    repository = tmp_path / "repository"
+    output = repository / "tests/contracts/openapi/v1.json"
+    output.parent.mkdir(parents=True)
+    outside = tmp_path / "outside.json"
+    outside.write_text("sentinel", encoding="utf-8")
+    output.symlink_to(outside)
+
+    monkeypatch.setattr(export_v1_openapi, "REPOSITORY_ROOT", repository)
+    monkeypatch.setattr(export_v1_openapi, "DEFAULT_OUTPUT", output)
+    monkeypatch.setattr(sys, "argv", ["export_v1_openapi.py"])
+
+    with pytest.raises(SystemExit) as error:
+        export_v1_openapi.main()
+
+    assert error.value.code == 2
+    assert outside.read_text(encoding="utf-8") == "sentinel"
+
+
+def test_exporter_preserves_cwd_relative_output_paths(monkeypatch) -> None:
+    monkeypatch.chdir(export_v1_openapi.REPOSITORY_ROOT / "scripts/dev")
+
+    output = export_v1_openapi._repository_output_path(
+        "../../tests/contracts/openapi/v1.json"
+    )
+
+    assert output == export_v1_openapi.DEFAULT_OUTPUT

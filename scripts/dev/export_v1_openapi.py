@@ -5,11 +5,28 @@ from limnopulse_api.api.openapi_contract import render_v1_openapi_contract
 from limnopulse_api.core.config import Settings
 from limnopulse_api.main import create_app
 
+REPOSITORY_ROOT = Path(__file__).resolve().parents[2]
+DEFAULT_OUTPUT = REPOSITORY_ROOT / "tests/contracts/openapi/v1.json"
+
+
+def _repository_output_path(value: str) -> Path:
+    candidate = Path(value)
+    try:
+        resolved = (
+            candidate if candidate.is_absolute() else Path.cwd() / candidate
+        ).resolve()
+        resolved.relative_to(REPOSITORY_ROOT)
+    except (OSError, RuntimeError, ValueError) as error:
+        raise argparse.ArgumentTypeError(
+            "--output must resolve to a path inside the repository"
+        ) from error
+    return resolved
+
 
 def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument(
-        "--output", type=Path, default=Path("tests/contracts/openapi/v1.json")
+        "--output", type=_repository_output_path, default=str(DEFAULT_OUTPUT)
     )
     parser.add_argument("--check", action="store_true")
     args = parser.parse_args()
