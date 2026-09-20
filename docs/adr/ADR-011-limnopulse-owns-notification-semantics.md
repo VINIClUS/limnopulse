@@ -1,0 +1,37 @@
+# ADR-011 — LimnoPulse owns notification semantics, destinations and durable delivery state; providers are replaceable.
+
+**Status:** Accepted
+
+## Context
+
+The existing SES and Telegram paths already depend on durable membership gates, immutable delivery identity, attempts, feedback, and incident relationships. Provider-owned orchestration would fragment those semantics and weaken tenant, privacy, acknowledgement, and rollback controls.
+
+## Decision
+
+LimnoPulse owns notification policy revisions, typed destinations, localized content revisions, escalation, budgets, Delivery/Attempt state, and provider-result interpretation. Providers implement a narrow delivery port and never become the notification ledger or policy authority.
+
+## Consequences
+
+Email, Telegram, Push, and SMS share durable semantics while retaining isolated lanes and provider-specific feedback. LimnoPulse must operate the policy and ledger machinery and preserve existing SES/Telegram identities during additive migration.
+
+## V4 traceability
+
+V4 §§17, 24 Phase 7A, 27, and 31 require versioned `pt-BR`/`en-US` content; generic lock-screen previews by default; bounded, revisioned, audited owner/admin asset-context opt-in; one canonical Android/iOS destination and Delivery model; and SMS country/readiness plus immutable PlanVersion controls.
+
+## Implementation gate
+
+Phase 7A must keep SES/Telegram suites green, fence destination and policy revisions at attempt start, keep PII out of jobs, default unknown preview policy to generic, and remain correct without Redis. Before queue dispatch, the same deterministic Delivery ID must create at most one logical Delivery even when outbox or fanout expansion retries. At `BeginAttempt`, Phase 7A must recheck final incident and acknowledgement state; if a queued escalation was acknowledged before the provider call, dispatch must deterministically perform no send and incur no charge. At `BeginAttempt`, Phase 7A must recheck current active tenant membership for every channel; if a queued recipient lost membership before the provider call, dispatch must deterministically perform no send and incur no charge. At `BeginAttempt`, Phase 7A must recheck recipient preference independently of destination and policy state; if the channel was disabled after queueing, the Attempt must make no provider call and incur no charge. The destination snapshot selected at fanout must remain immutable after Delivery creation; later token, phone, or provider-binding changes must not rewrite queued or historical Delivery evidence. The content snapshot selected at fanout must remain immutable alongside the destination snapshot after Delivery creation; later template or content-revision changes must not rewrite queued or historical Delivery evidence. Phase 7A must freeze and test the exact generic visible templates: pt-BR title `LimnoPulse: ação necessária` and body `Abra o aplicativo para ver os detalhes.`; en-US title `LimnoPulse: action required` and body `Open the app to view the details.`; template mutations must fail acceptance. Its visible-payload allowlist must exclude tenant, site/asset, location, precise telemetry, personal/phone, command, actuator, credential, token, and other sensitive fields; its data payload is limited to an opaque incident/notification ID, authenticated deep link, version, and minimal routing metadata. Phase 7A must restrict `asset_context` policy writes to owners and admins; each write must be revisioned and audited, and member or viewer updates must be rejected. Each `asset_context` preview may add at most one approved site/asset label, must record explicit exposure acknowledgement, and must never include sensitive telemetry, location, personal data, or free-form operational content. Detailed incident fetch must require fresh membership authorization. Phases 7B/7C consume this contract only after those gates pass.
+
+Unsupported destination locales must be rejected or use only an explicit versioned template fallback; no implicit locale fallback is allowed.
+
+At BeginAttempt, acknowledgement and escalation dispatch must contend in one conditional DynamoDB transaction so exactly one outcome wins; a concurrent acknowledgement must prevent the provider call and charge.
+
+Phase 7A must evaluate quiet hours with an explicit critical override; acceptance tests must prove a critical incident remains eligible for its configured critical notification and escalation during quiet hours, subject to acknowledgement and other independent gates.
+
+Phase 7A must provide independent kill switches for email, Telegram, Push, and SMS; disabling one delivery lane must preserve durable state and leave every other lane dispatchable, with rollback tests for each lane.
+
+Phase 7A must require owner/admin authorization, optimistic versioning, and immutable audit for every tenant NotificationPolicy write, not only asset_context; ordinary members and viewers must be rejected.
+
+## Non-goals
+
+This record does not make provider acceptance human acknowledgement, expose precise telemetry on a lock screen, authorize asset context for members/viewers, or create a marketing notification platform.

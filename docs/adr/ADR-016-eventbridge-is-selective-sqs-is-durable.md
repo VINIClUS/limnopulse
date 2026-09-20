@@ -1,0 +1,35 @@
+# ADR-016 — EventBridge is selective integration routing/scheduling; SQS remains the durable work boundary.
+
+**Status:** Accepted
+
+## Context
+
+EventBridge is useful for SES feedback and scheduling, but a custom domain bus would add schemas, routing rules, replay policy, IAM, and cost without removing the need for durable consumer backpressure.
+
+## Decision
+
+Use EventBridge selectively where managed routing or scheduling fits. Put asynchronous work behind SQS/DLQ or an equivalent durable consumer boundary, with domain state correct even if event publication is unavailable.
+
+## Consequences
+
+Workers retain retry isolation and bounded backlog behavior. Producers need fenced publication/outbox semantics, while a broader EventBridge bus remains subject to consumer and cost evidence.
+
+## V4 traceability
+
+V4 §§7, 17, 21, 24, 27, and the future EventBridge decision gate preserve SES feedback and Scheduler while deferring a custom domain bus.
+
+## Implementation gate
+
+Current SES feedback remains intact. Phase 3 HTTPS ingress must return accepted only after a durable SQS write; a failed write must not return accepted. Phase 3 must prove at-least-once replay is safe and test DLQ redrive. Phase 3 must authenticate the provider source before resolving ownership mapping and must reject missing, invalid, or mismatched credentials. Phase 3 must deny ingress credentials or mapping data when an IntegrationAccount attempts to claim a tenant it does not own. When EventBridge Scheduler is selected for evaluator, relay, reconciliation, or backfill work, the selected IAM role and target invocation, idempotent duplicate delivery, retry behavior, and Scheduler DLQ operation where appropriate must be proven. Because Scheduler is at-least-once, every selected target must remain leased and fenced; Scheduler verification must prove retry overlap with a slow invocation cannot let two workers act on the same work unit. Any future bus requires multiple justified consumers, versioned schemas, PII review, transactional publication fencing, durable target queues, failure/replay tests, IAM review, cost comparison, and reversible publication.
+
+Phase 3 HTTP batch ingress must require an `Idempotency-Key` or stable `source_event_id`; if the durable SQS write succeeds but the HTTP response is lost, retrying with that identity must not create a second canonical observation.
+
+Phase 3 HTTPS ingress must enforce bounded request payload size, per-IntegrationAccount rate limits, and entitlement limits before durable enqueue; oversized or over-rate requests must be rejected without unbounded buffering or queue admission.
+
+Phase 3 HTTPS normalization must resolve site, asset, deployment, and component ownership exclusively from the authenticated IntegrationAccount mapping; payload-supplied ownership identifiers must be ignored or rejected and must never override that mapping.
+
+Any future EventBridge consumer must prove duplicate- and order-independent idempotent handling before adoption; no consumer may assume exactly-once delivery or ordering.
+
+## Non-goals
+
+This record does not make EventBridge a ledger, queue, ordering guarantee, or mandatory transport between all internal components.
