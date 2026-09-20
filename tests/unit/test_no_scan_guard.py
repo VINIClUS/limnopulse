@@ -30,6 +30,24 @@ GO_DYNAMODB_SINGLE_IMPORT = re.compile(
 )
 
 
+def _is_scan_paginator_call(node: ast.Call) -> bool:
+    if not isinstance(node.func, ast.Attribute) or node.func.attr != "get_paginator":
+        return False
+    positional_name = node.args[0] if node.args else None
+    keyword_name = next(
+        (
+            keyword.value
+            for keyword in node.keywords
+            if keyword.arg == "operation_name"
+        ),
+        None,
+    )
+    return any(
+        isinstance(value, ast.Constant) and value.value == "scan"
+        for value in (positional_name, keyword_name)
+    )
+
+
 def python_offenders(root: Path) -> list[str]:
     offenders: list[str] = []
     for path in root.rglob("*.py"):
@@ -58,13 +76,7 @@ def python_offenders(root: Path) -> list[str]:
                     isinstance(node.func, ast.Name)
                     and node.func.id in scan_aliases
                 )
-                or (
-                    isinstance(node.func, ast.Attribute)
-                    and node.func.attr == "get_paginator"
-                    and node.args
-                    and isinstance(node.args[0], ast.Constant)
-                    and node.args[0].value == "scan"
-                )
+                or _is_scan_paginator_call(node)
             )
             for node in ast.walk(tree)
         ):
@@ -227,6 +239,20 @@ def test_python_offenders_detect_scan_paginator_calls(tmp_path, monkeypatch) -> 
     )
     (root / "allowed.py").write_text(
         'client.get_paginator("query").paginate()\n',
+        encoding="utf-8",
+    )
+
+    assert python_offenders(root) == ["src/offender.py"]
+
+
+def test_python_offenders_detect_keyword_scan_paginator_calls(
+    tmp_path, monkeypatch
+) -> None:
+    monkeypatch.setitem(globals(), "ROOT", tmp_path)
+    root = tmp_path / "src"
+    root.mkdir()
+    (root / "offender.py").write_text(
+        'client.get_paginator(operation_name="scan").paginate()\n',
         encoding="utf-8",
     )
 

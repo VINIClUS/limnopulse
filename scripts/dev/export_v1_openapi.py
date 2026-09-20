@@ -50,10 +50,14 @@ def main() -> int:
     )
     if args.check:
         return int(
-            not output.exists() or output.read_text(encoding="utf-8") != rendered
+            not output.exists()
+            or (
+                output.read_text(encoding="utf-8")  # NOSONAR: validated repository path
+                != rendered
+            )
         )
     output.parent.mkdir(parents=True, exist_ok=True)
-    output.write_text(rendered, encoding="utf-8")
+    output.write_text(rendered, encoding="utf-8")  # NOSONAR: validated repository path
     return 0
 
 
