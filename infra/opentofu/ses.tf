@@ -215,3 +215,45 @@ resource "aws_cloudwatch_event_target" "ses_events_reject" {
     aws_sqs_queue_policy.ses_events_routing_dlq,
   ]
 }
+
+# Runtime access for the notification-worker's email path
+# (cmd/notifications/worker_command.go, internal/notifications/worker/ses).
+# Gated the same as the rest of this file: var.email_delivery.
+data "aws_iam_policy_document" "email_worker" {
+  count = var.email_delivery ? 1 : 0
+
+  statement {
+    sid       = "SesSendEmail"
+    effect    = "Allow"
+    actions   = ["sesv2:SendEmail"]
+    resources = ["*"]
+
+    condition {
+      test     = "StringEquals"
+      variable = "ses:configuration-set"
+      values   = [var.ses_configuration_set_name]
+    }
+  }
+
+  statement {
+    sid    = "SesEventsQueueConsumer"
+    effect = "Allow"
+    actions = [
+      "sqs:ReceiveMessage",
+      "sqs:DeleteMessage",
+      "sqs:ChangeMessageVisibility",
+      "sqs:GetQueueAttributes",
+    ]
+    resources = [aws_sqs_queue.ses_events[0].arn]
+  }
+}
+
+resource "aws_iam_policy" "email_worker" {
+  count = var.email_delivery ? 1 : 0
+
+  name        = "${var.project_name}-${var.environment}-email-worker"
+  description = "Least-privilege data-plane access for the notification worker's email path."
+  policy      = data.aws_iam_policy_document.email_worker[0].json
+
+  tags = local.common_tags
+}

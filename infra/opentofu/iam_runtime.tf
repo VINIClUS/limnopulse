@@ -17,24 +17,32 @@
 # already used for the Telegram bot token and webhook secrets in
 # telegram.tf ("populated out of band").
 
+# force_destroy = true: the runbook above creates access keys out of band,
+# which AWS otherwise refuses to delete the user underneath (a plain
+# `tofu destroy`, or any replacement from changing project_name/
+# environment, would fail with keys still attached).
 resource "aws_iam_user" "api" {
-  name = "${var.project_name}-${var.environment}-api"
+  name          = "${var.project_name}-${var.environment}-api"
+  force_destroy = true
 
   tags = local.common_tags
 }
 
 resource "aws_iam_user" "workers" {
-  name = "${var.project_name}-${var.environment}-workers"
+  name          = "${var.project_name}-${var.environment}-workers"
+  force_destroy = true
 
   tags = local.common_tags
 }
 
 # DynamoDB actions match what the adapters actually call (see
-# src/limnopulse_api/adapters/*.py and internal/notifications/**): GetItem,
-# PutItem, Query, TransactWriteItems, UpdateItem. Both tables, both
-# runtimes — the audit table is written by the same request path that
-# writes the domain table (see adapters/alert_rules.py,
-# adapters/alert_events.py).
+# src/limnopulse_api/adapters/*.py): GetItem, PutItem, Query,
+# TransactWriteItems, UpdateItem. The audit table is API-only — grep
+# confirms every Go binary (cmd/notifications, cmd/alert-evaluator,
+# internal/notifications/**) reads DYNAMODB_DOMAIN_TABLE and never
+# DYNAMODB_AUDIT_TABLE, so the workers policy is deliberately narrower
+# than the API's: compromised worker credentials should not be able to
+# read or alter the audit trail.
 data "aws_iam_policy_document" "dynamodb_domain_access" {
   statement {
     sid    = "DomainAndAuditTableAccess"
@@ -68,9 +76,35 @@ resource "aws_iam_user_policy_attachment" "api_dynamodb" {
   policy_arn = aws_iam_policy.dynamodb_domain_access.arn
 }
 
+data "aws_iam_policy_document" "dynamodb_domain_access_workers" {
+  statement {
+    sid    = "DomainTableAccess"
+    effect = "Allow"
+    actions = [
+      "dynamodb:GetItem",
+      "dynamodb:PutItem",
+      "dynamodb:Query",
+      "dynamodb:TransactWriteItems",
+      "dynamodb:UpdateItem",
+    ]
+    resources = [
+      aws_dynamodb_table.domain.arn,
+      "${aws_dynamodb_table.domain.arn}/index/*",
+    ]
+  }
+}
+
+resource "aws_iam_policy" "dynamodb_domain_access_workers" {
+  name        = "${var.project_name}-${var.environment}-dynamodb-domain-access-workers"
+  description = "Read/write access to the domain DynamoDB table only — no audit table."
+  policy      = data.aws_iam_policy_document.dynamodb_domain_access_workers.json
+
+  tags = local.common_tags
+}
+
 resource "aws_iam_user_policy_attachment" "workers_dynamodb" {
   user       = aws_iam_user.workers.name
-  policy_arn = aws_iam_policy.dynamodb_domain_access.arn
+  policy_arn = aws_iam_policy.dynamodb_domain_access_workers.arn
 }
 
 # The API's only other AWS call is cognito-idp:GetUser, authenticated with
@@ -149,4 +183,11 @@ resource "aws_iam_user_policy_attachment" "workers_telegram" {
 
   user       = aws_iam_user.workers.name
   policy_arn = aws_iam_policy.telegram_worker[0].arn
+}
+
+resource "aws_iam_user_policy_attachment" "workers_email" {
+  count = var.email_delivery ? 1 : 0
+
+  user       = aws_iam_user.workers.name
+  policy_arn = aws_iam_policy.email_worker[0].arn
 }
