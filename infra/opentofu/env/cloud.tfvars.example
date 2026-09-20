@@ -20,11 +20,12 @@ ses_events_dlq_name           = "limnopulse-ses-events-dlq"
 ses_events_routing_dlq_name   = "limnopulse-ses-events-routing-dlq"
 ses_configuration_set_name   = "limnopulse-notifications"
 ses_eventbridge_rule_name     = "limnopulse-ses-events"
-# Required (non-empty) before setting email_delivery = true: iam_runtime.tf
-# scopes the worker's ses:SendEmail grant to exactly this address via
-# ses:FromAddress, so a real send with a different From address, or any
-# send while this is left at the empty-string default, is denied.
-ses_from_email = ""
+# Required (non-empty, bare mailbox, no display name) before setting
+# email_delivery = true - a lifecycle precondition on
+# aws_iam_policy.email_worker blocks the apply otherwise. See
+# variables.tf: this must be the mailbox only, never the
+# "Display Name <addr>" form the runtime SES_FROM_EMAIL env var may use.
+ses_from_address = ""
 
 redis_url    = ""
 influxdb_url = ""

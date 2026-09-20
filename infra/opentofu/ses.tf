@@ -231,18 +231,21 @@ data "aws_iam_policy_document" "email_worker" {
     # verification is handled out of band, not by a Terraform-managed
     # resource in this stack (see the identity boundary test), so there's
     # no local ARN to scope this to. ses:FromAddress narrows the grant
-    # instead, to the one address the worker actually sends from
-    # (internal/notifications/worker/config, SES_FROM_EMAIL). Not
-    # ses:configuration-set: that's a message tag SES emits in events, not
-    # an IAM request context key SendEmail evaluates - a condition on it
-    # would never match and would deny every send.
+    # instead, to the one mailbox the worker actually sends from - SES
+    # compares this context key against the parsed address only, so
+    # var.ses_from_address must be the bare mailbox, never the
+    # "Display Name <addr>" form the runtime SES_FROM_EMAIL env var is
+    # also allowed to use. Not ses:configuration-set: that's a message tag
+    # SES emits in events, not an IAM request context key SendEmail
+    # evaluates - a condition on it would never match and would deny
+    # every send.
     actions   = ["ses:SendEmail"]
     resources = ["*"]
 
     condition {
       test     = "StringEquals"
       variable = "ses:FromAddress"
-      values   = [var.ses_from_email]
+      values   = [var.ses_from_address]
     }
   }
 
@@ -267,4 +270,11 @@ resource "aws_iam_policy" "email_worker" {
   policy      = data.aws_iam_policy_document.email_worker[0].json
 
   tags = local.common_tags
+
+  lifecycle {
+    precondition {
+      condition     = var.ses_from_address != ""
+      error_message = "var.ses_from_address must be set to a bare mailbox address whenever var.email_delivery = true - the empty default makes the email_worker policy's ses:FromAddress condition impossible to satisfy, denying every send."
+    }
+  }
 }
