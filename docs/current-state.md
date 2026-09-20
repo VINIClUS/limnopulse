@@ -1,7 +1,7 @@
 # LimnoPulse Current-State Inventory
 
-**Execution baseline:** `main@141e108a479c983ed3a5efcbe729a30a43ab0ecb`  
-**Runtime baseline:** `4953601fbbc2f95c79e34439cce855307b7db2c8`  
+**Execution baseline:** `main@141e108a479c983ed3a5efcbe729a30a43ab0ecb`<br>
+**Runtime baseline:** `4953601fbbc2f95c79e34439cce855307b7db2c8`
 **Reconciliation:** `141e108` adds the approved V4 planning documents; `4953601` hardens the alert-evaluator container runtime and updates Go dependencies, so it is the current runtime baseline.
 
 | Surface | Status | Evidence | V4 treatment | Owning phase |
