@@ -1,10 +1,10 @@
 # LimnoPulse Current-State Inventory
 
 **Execution baseline:** `main@141e108a479c983ed3a5efcbe729a30a43ab0ecb`<br>
-**Runtime baseline:** `f0ce773a08131c340a54d12824427a5a3fcbb25a`
-**Reconciliation:** `141e108` adds the approved V4 planning documents; `f0ce773` is the current main baseline and includes the alert-evaluator runtime, frontend and lead API, production containers, and deployment configuration.
+**Runtime baseline:** `37dd32e68e4bd7d00993eeda38276420a775cc5c`
+**Reconciliation:** `141e108` adds the approved V4 planning documents; `f0ce773` is the pre-#47 runtime baseline and includes the alert-evaluator runtime, frontend and lead API, production containers, and deployment configuration; `37dd32e` is the current main baseline and additionally includes feature-gated SES/EventBridge/Telegram delivery and conditional Telegram webhook behavior.
 
-The nine rows below intentionally inventory V4 domain surfaces rather than every runtime feature; current-main additions outside this table include frontend/lead API, production containers/deployment, and alert-evaluator changes.
+The nine rows below intentionally inventory V4 domain surfaces rather than every runtime feature; current-main additions outside this table include frontend/lead API, production containers/deployment, alert-evaluator changes, and feature-gated email/Telegram delivery and webhook behavior.
 
 | Surface | Status | Evidence | V4 treatment | Owning phase |
 |---|---|---|---|---|
@@ -18,4 +18,4 @@ The nine rows below intentionally inventory V4 domain surfaces rather than every
 | Billing/AWS IoT/Push/SMS/commands | `planned` | `docs/superpowers/specs/2026-08-16-limnopulse-platform-redesign-tech-spec-v4.md` | Add through canonical internal contracts and replaceable provider or safety adapters. | Phases 4, 5, 7B, 7C, 8 |
 | Device permanently bound to a pond | `obsolete` | `src/limnopulse_api/domain/entities.py` | Replace canonical v2 `pond_id` with temporal Deployment while projecting legacy behavior. | Phase 1 |
 
-The execution baseline above is the frozen approved V4 planning point. Issue #28 originally branched from `main@e95d3eee9c813e3946d43f297071a80b62dd123b`; after Issue #27 merged, the branch was updated with current `main@f0ce773a08131c340a54d12824427a5a3fcbb25a`. The current-main runtime additions are included in the runtime baseline; documentation and tests after that baseline do not change runtime behavior.
+The execution baseline above is the frozen approved V4 planning point. Issue #28 originally branched from `main@e95d3eee9c813e3946d43f297071a80b62dd123b`; after Issue #27 merged, the branch was updated with the pre-#47 `main@f0ce773a08131c340a54d12824427a5a3fcbb25a`, then reconciled with current `main@37dd32e68e4bd7d00993eeda38276420a775cc5c`. The current-main runtime additions are included in the runtime baseline; documentation and tests after that baseline do not change runtime behavior.

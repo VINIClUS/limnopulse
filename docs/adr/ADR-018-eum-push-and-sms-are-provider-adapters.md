@@ -36,6 +36,8 @@ Phase 7C current SMS charge guard must include both provider country price and c
 
 Phase 7C must enforce durable SMS storm/rate windows independently per recipient, tenant, and event family before provider dispatch; recipient-scoped limits must prevent one recipient from receiving every family allowance.
 
+Before creating a retry Attempt for a definite temporary failure, the worker must derive a deterministic successor identity from the Delivery, failed Attempt, and retry ordinal; a conditional write must create at most one successor Attempt for that identity, so concurrent workers converge on one Attempt and only that Attempt may contact the provider.
+
 ## Non-goals
 
 This record does not make AWS EUM canonical, equate acceptance with receipt or acknowledgement, provision a Brazilian short code, add 10DLC, support marketing traffic, or implement direct FCM/APNs or Web Push now.

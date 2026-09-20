@@ -13,7 +13,7 @@ EXPECTED_EXECUTION_BASELINE = (
     "141e108a479c983ed3a5efcbe729a30a43ab0ecb"
 )
 EXPECTED_RUNTIME_BASELINE = (
-    "f0ce773a08131c340a54d12824427a5a3fcbb25a"
+    "37dd32e68e4bd7d00993eeda38276420a775cc5c"
 )
 EXPECTED = {
     "FastAPI control plane": "implemented",
@@ -1561,6 +1561,12 @@ CODEX_REVIEW_GATE_CASES += tuple(
             "Phase 4 Stripe webhook ingress and workers may log raw signed webhook bodies or customer/payment payloads.",
         ),
         (
+            "Stripe persistence sanitization",
+            "ADR-010-stripe-is-an-adapter-internal-entitlements-are-canonical.md",
+            "Phase 4 billing persistence must store only provider IDs and sanitized reconciliation state; provider-event receipts and billing records must reject raw Stripe event, customer, payment, invoice, and subscription payloads, including PII, and tests must allowlist every retained field after reconciliation.",
+            "Phase 4 billing persistence may store complete raw Stripe event, customer, payment, invoice, or subscription payloads in provider-event receipts or billing records.",
+        ),
+        (
             "Enterprise automatic overage prohibition",
             "ADR-010-stripe-is-an-adapter-internal-entitlements-are-canonical.md",
             "For launch, every Enterprise PlanVersion must set `notifications.sms.overage` explicitly to false; automatic SMS overage remains disabled until a separately approved versioned billing decision.",
@@ -1685,6 +1691,12 @@ CODEX_REVIEW_GATE_CASES += tuple(
             "ADR-018-eum-push-and-sms-are-provider-adapters.md",
             "Duplicate standard SQS Push or SMS jobs, including concurrent multiprocess delivery, must be idempotent per scheduled attempt: the same logical job and retry-attempt identity yields one durable Attempt, one provider attempt, and one cost commitment; a bounded retry of a definite temporary failure creates a new explicit retry Attempt identity while retaining one Delivery, and duplicate redelivery of that retry attempt must not call the provider twice.",
             "Duplicate standard SQS Push or SMS jobs may reuse one Attempt identity for repeated provider retries or call the provider twice for the same retry attempt.",
+        ),
+        (
+            "deterministic retry successor creation",
+            "ADR-018-eum-push-and-sms-are-provider-adapters.md",
+            "Before creating a retry Attempt for a definite temporary failure, the worker must derive a deterministic successor identity from the Delivery, failed Attempt, and retry ordinal; a conditional write must create at most one successor Attempt for that identity, so concurrent workers converge on one Attempt and only that Attempt may contact the provider.",
+            "Concurrent workers may derive different retry identities and create multiple successor Attempts for one failed Attempt.",
         ),
     )
 )
@@ -1987,9 +1999,11 @@ def assert_architecture_baseline_metadata(
     )
     assert f"**Runtime baseline:** `{EXPECTED_RUNTIME_BASELINE}`" in current_state
     assert (
-        "`f0ce773` is the current main baseline and includes the alert-evaluator "
+        "`f0ce773` is the pre-#47 runtime baseline and includes the alert-evaluator "
         "runtime, frontend and lead API, production containers, and deployment "
-        "configuration"
+        "configuration; `37dd32e` is the current main baseline and additionally "
+        "includes feature-gated SES/EventBridge/Telegram delivery and conditional "
+        "Telegram webhook behavior"
     ) in current_state
     assert (
         "The nine rows below intentionally inventory V4 domain surfaces rather than "
