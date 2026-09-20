@@ -37,15 +37,19 @@ resource "aws_iam_user" "workers" {
 
 # DynamoDB actions match what the adapters actually call (see
 # src/limnopulse_api/adapters/*.py): GetItem, PutItem, Query,
-# TransactWriteItems, UpdateItem. The audit table is API-only — grep
-# confirms every Go binary (cmd/notifications, cmd/alert-evaluator,
-# internal/notifications/**) reads DYNAMODB_DOMAIN_TABLE and never
-# DYNAMODB_AUDIT_TABLE, so the workers policy is deliberately narrower
-# than the API's: compromised worker credentials should not be able to
-# read or alter the audit trail.
+# TransactWriteItems, UpdateItem on the domain table. The audit table is
+# API-only — grep confirms every Go binary (cmd/notifications,
+# cmd/alert-evaluator, internal/notifications/**) reads
+# DYNAMODB_DOMAIN_TABLE and never DYNAMODB_AUDIT_TABLE, so the workers
+# policy (below) omits it entirely. The API itself never issues a
+# standalone Get/Put/Query/Update against the audit table either — every
+# write goes through _conditioned_put() as a TransactWriteItems "Put"
+# element (adapters/alert_rules.py, alert_events.py,
+# notification_preferences.py) — so its audit-table grant is narrower
+# than its domain-table grant too.
 data "aws_iam_policy_document" "dynamodb_domain_access" {
   statement {
-    sid    = "DomainAndAuditTableAccess"
+    sid    = "DomainTableAccess"
     effect = "Allow"
     actions = [
       "dynamodb:GetItem",
@@ -57,15 +61,20 @@ data "aws_iam_policy_document" "dynamodb_domain_access" {
     resources = [
       aws_dynamodb_table.domain.arn,
       "${aws_dynamodb_table.domain.arn}/index/*",
-      aws_dynamodb_table.audit.arn,
-      "${aws_dynamodb_table.audit.arn}/index/*",
     ]
+  }
+
+  statement {
+    sid       = "AuditTableTransactionalWritesOnly"
+    effect    = "Allow"
+    actions   = ["dynamodb:TransactWriteItems"]
+    resources = [aws_dynamodb_table.audit.arn]
   }
 }
 
 resource "aws_iam_policy" "dynamodb_domain_access" {
   name        = "${var.project_name}-${var.environment}-dynamodb-domain-access"
-  description = "Read/write access to the domain and audit DynamoDB tables."
+  description = "Read/write access to the domain table; transactional-write-only access to the audit table."
   policy      = data.aws_iam_policy_document.dynamodb_domain_access.json
 
   tags = local.common_tags

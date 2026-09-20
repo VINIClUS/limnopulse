@@ -223,9 +223,12 @@ data "aws_iam_policy_document" "email_worker" {
   count = var.email_delivery ? 1 : 0
 
   statement {
-    sid       = "SesSendEmail"
-    effect    = "Allow"
-    actions   = ["sesv2:SendEmail"]
+    sid    = "SesSendEmail"
+    effect = "Allow"
+    # IAM authorizes the SESv2 SendEmail API under the "ses:" prefix, not
+    # "sesv2:" — SES was never split into a separate IAM service namespace
+    # when the v2 API was introduced.
+    actions   = ["ses:SendEmail"]
     resources = ["*"]
 
     condition {

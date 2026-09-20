@@ -503,11 +503,13 @@ Disabled modules produce no resources or secret containers.
 > Telegram configuration. Verified with `tofu plan` against a throwaway
 > local state: `env/cloud.tfvars.example` defaults (all three flags
 > `false`) created 7 resources before `iam_runtime.tf` (§15 update above);
-> with it, 16 (Cognito, DynamoDB ×2, the core notification-jobs queue, 2
-> `aws_iam_user`, 3 `aws_iam_policy`, 4 `aws_iam_user_policy_attachment`);
-> all delivery/webhook flags `true` now produces 39 (the original
-> unconditional 28, plus `iam_runtime.tf`'s 9 unconditional resources, plus
-> 2 more conditional Telegram policy attachments). Verified on the application side with
+> with it, 17 (Cognito, DynamoDB ×2, the core notification-jobs queue, 2
+> `aws_iam_user`, 4 `aws_iam_policy` — the API and workers DynamoDB
+> policies are separate resources — and 4 `aws_iam_user_policy_attachment`);
+> all delivery/webhook flags `true` now produces 42 (the original
+> unconditional 28, `iam_runtime.tf`'s 10 unconditional resources, 3 more
+> conditional attachments for Telegram/email, and `ses.tf`'s email_worker
+> policy). Verified on the application side with
 > `pytest`: `APP_ENV=prod` + `TELEGRAM_WEBHOOK_ENABLED=false` boots and
 > 404s on `/webhooks/telegram` without any Telegram secret configured
 > (`tests/api/test_app_runtime.py`, `tests/api/test_telegram_webhook.py`,
