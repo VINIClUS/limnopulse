@@ -21,6 +21,11 @@
       },
       "AlertEventListResponse": {
         "properties": {
+          "has_more": {
+            "default": false,
+            "title": "Has More",
+            "type": "boolean"
+          },
           "items": {
             "items": {
               "$ref": "#/components/schemas/AlertEventResponse"
@@ -1008,6 +1013,22 @@
         "title": "HTTPValidationError",
         "type": "object"
       },
+      "LatestMetricsListResponse": {
+        "properties": {
+          "items": {
+            "items": {
+              "$ref": "#/components/schemas/LatestMetricsResponse"
+            },
+            "title": "Items",
+            "type": "array"
+          }
+        },
+        "required": [
+          "items"
+        ],
+        "title": "LatestMetricsListResponse",
+        "type": "object"
+      },
       "LatestMetricsResponse": {
         "properties": {
           "battery_v": {
@@ -1125,6 +1146,85 @@
         "title": "LatestMetricsResponse",
         "type": "object"
       },
+      "LeadCreate": {
+        "additionalProperties": false,
+        "properties": {
+          "consent": {
+            "title": "Consent",
+            "type": "boolean"
+          },
+          "email": {
+            "format": "email",
+            "maxLength": 254,
+            "title": "Email",
+            "type": "string"
+          },
+          "name": {
+            "maxLength": 120,
+            "minLength": 2,
+            "title": "Name",
+            "type": "string"
+          },
+          "phone": {
+            "anyOf": [
+              {
+                "maxLength": 30,
+                "pattern": "^[+()\\d\\s.-]*$",
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Phone"
+          },
+          "property_name": {
+            "anyOf": [
+              {
+                "maxLength": 120,
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Property Name"
+          },
+          "source": {
+            "maxLength": 200,
+            "minLength": 1,
+            "title": "Source",
+            "type": "string"
+          }
+        },
+        "required": [
+          "name",
+          "email",
+          "source",
+          "consent"
+        ],
+        "title": "LeadCreate",
+        "type": "object"
+      },
+      "LeadResponse": {
+        "properties": {
+          "lead_id": {
+            "title": "Lead Id",
+            "type": "string"
+          },
+          "status": {
+            "const": "received",
+            "default": "received",
+            "title": "Status",
+            "type": "string"
+          }
+        },
+        "required": [
+          "lead_id"
+        ],
+        "title": "LeadResponse",
+        "type": "object"
+      },
       "MeResponse": {
         "properties": {
           "cognito_sub": {
@@ -1155,6 +1255,92 @@
           "cognito_sub"
         ],
         "title": "MeResponse",
+        "type": "object"
+      },
+      "MetricStatistics": {
+        "properties": {
+          "count": {
+            "default": 0,
+            "title": "Count",
+            "type": "integer"
+          },
+          "max": {
+            "anyOf": [
+              {
+                "type": "number"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Max"
+          },
+          "mean": {
+            "anyOf": [
+              {
+                "type": "number"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Mean"
+          },
+          "min": {
+            "anyOf": [
+              {
+                "type": "number"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Min"
+          }
+        },
+        "title": "MetricStatistics",
+        "type": "object"
+      },
+      "MetricsSummary": {
+        "properties": {
+          "interval": {
+            "title": "Interval",
+            "type": "string"
+          },
+          "period": {
+            "title": "Period",
+            "type": "string"
+          },
+          "pond_id": {
+            "title": "Pond Id",
+            "type": "string"
+          },
+          "series": {
+            "items": {
+              "$ref": "#/components/schemas/SummaryPoint"
+            },
+            "title": "Series",
+            "type": "array"
+          },
+          "statistics": {
+            "additionalProperties": {
+              "$ref": "#/components/schemas/MetricStatistics"
+            },
+            "title": "Statistics",
+            "type": "object"
+          },
+          "tenant_id": {
+            "title": "Tenant Id",
+            "type": "string"
+          }
+        },
+        "required": [
+          "tenant_id",
+          "pond_id",
+          "period",
+          "interval"
+        ],
+        "title": "MetricsSummary",
         "type": "object"
       },
       "NotificationPreferenceResponse": {
@@ -1367,6 +1553,53 @@
           "expected_version"
         ],
         "title": "PondUpdate",
+        "type": "object"
+      },
+      "SummaryPoint": {
+        "properties": {
+          "do_mg_l": {
+            "anyOf": [
+              {
+                "type": "number"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Do Mg L"
+          },
+          "measured_at": {
+            "format": "date-time",
+            "title": "Measured At",
+            "type": "string"
+          },
+          "ph": {
+            "anyOf": [
+              {
+                "type": "number"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Ph"
+          },
+          "temp_c": {
+            "anyOf": [
+              {
+                "type": "number"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Temp C"
+          }
+        },
+        "required": [
+          "measured_at"
+        ],
+        "title": "SummaryPoint",
         "type": "object"
       },
       "TelegramBindingResponse": {
@@ -1680,6 +1913,19 @@
       },
       "TenantCreate": {
         "properties": {
+          "city": {
+            "anyOf": [
+              {
+                "maxLength": 120,
+                "minLength": 1,
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "City"
+          },
           "name": {
             "maxLength": 120,
             "minLength": 1,
@@ -1711,6 +1957,17 @@
       },
       "TenantResponse": {
         "properties": {
+          "city": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "City"
+          },
           "created_at": {
             "title": "Created At",
             "type": "string"
@@ -1749,6 +2006,19 @@
       },
       "TenantUpdate": {
         "properties": {
+          "city": {
+            "anyOf": [
+              {
+                "maxLength": 120,
+                "minLength": 1,
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "City"
+          },
           "expected_version": {
             "title": "Expected Version",
             "type": "integer"
@@ -1821,6 +2091,47 @@
   },
   "openapi": "3.1.0",
   "paths": {
+    "/v1/leads": {
+      "post": {
+        "operationId": "create_lead_v1_leads_post",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/LeadCreate"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "201": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/LeadResponse"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Create Lead",
+        "tags": [
+          "leads"
+        ]
+      }
+    },
     "/v1/me": {
       "get": {
         "operationId": "get_me_v1_me_get",
@@ -2121,6 +2432,60 @@
           }
         },
         "summary": "List Alert Events",
+        "tags": [
+          "alert-events"
+        ]
+      }
+    },
+    "/v1/tenants/{tenant_id}/alert-events/active": {
+      "get": {
+        "operationId": "list_active_alert_events_v1_tenants__tenant_id__alert_events_active_get",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "tenant_id",
+            "required": true,
+            "schema": {
+              "title": "Tenant Id",
+              "type": "string"
+            }
+          },
+          {
+            "in": "query",
+            "name": "limit",
+            "required": false,
+            "schema": {
+              "default": 100,
+              "maximum": 100,
+              "minimum": 1,
+              "title": "Limit",
+              "type": "integer"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/AlertEventListResponse"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "List Active Alert Events",
         "tags": [
           "alert-events"
         ]
@@ -3315,6 +3680,68 @@
         ]
       }
     },
+    "/v1/tenants/{tenant_id}/metrics/latest": {
+      "get": {
+        "operationId": "query_latest_metrics_for_tenant_v1_tenants__tenant_id__metrics_latest_get",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "tenant_id",
+            "required": true,
+            "schema": {
+              "title": "Tenant Id",
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/LatestMetricsListResponse"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "403": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            },
+            "description": "Forbidden"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          },
+          "503": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            },
+            "description": "Service Unavailable"
+          }
+        },
+        "summary": "Query Latest Metrics For Tenant",
+        "tags": [
+          "telemetry"
+        ]
+      }
+    },
     "/v1/tenants/{tenant_id}/ponds": {
       "get": {
         "operationId": "list_ponds_v1_tenants__tenant_id__ponds_get",
@@ -3713,6 +4140,72 @@
           }
         },
         "summary": "Query Latest Metrics",
+        "tags": [
+          "telemetry"
+        ]
+      }
+    },
+    "/v1/tenants/{tenant_id}/ponds/{pond_id}/metrics/summary": {
+      "get": {
+        "operationId": "query_summary_v1_tenants__tenant_id__ponds__pond_id__metrics_summary_get",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "tenant_id",
+            "required": true,
+            "schema": {
+              "title": "Tenant Id",
+              "type": "string"
+            }
+          },
+          {
+            "in": "path",
+            "name": "pond_id",
+            "required": true,
+            "schema": {
+              "title": "Pond Id",
+              "type": "string"
+            }
+          },
+          {
+            "in": "query",
+            "name": "period",
+            "required": false,
+            "schema": {
+              "default": "24h",
+              "enum": [
+                "24h",
+                "7d",
+                "30d"
+              ],
+              "title": "Period",
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/MetricsSummary"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Query Summary",
         "tags": [
           "telemetry"
         ]

@@ -18,7 +18,7 @@ def test_every_mounted_tenant_route_requires_membership() -> None:
         for route in iter_effective_api_routes(app)
         if "{tenant_id}" in route.path_format
     ]
-    assert len(routes) == 25
+    assert len(routes) == 28
     for route in routes:
         assert require_tenant_access in set(dependency_calls(route.dependant))
 
