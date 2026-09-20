@@ -89,9 +89,11 @@ data "aws_iam_policy_document" "dynamodb_domain_access_workers" {
   statement {
     sid    = "DomainTableAccess"
     effect = "Allow"
+    # No dynamodb:PutItem: grep across cmd/ and internal/ confirms the Go
+    # workers never call PutItem directly - their writes go through
+    # UpdateItem or a TransactWriteItems Put, both already covered.
     actions = [
       "dynamodb:GetItem",
-      "dynamodb:PutItem",
       "dynamodb:Query",
       "dynamodb:TransactWriteItems",
       "dynamodb:UpdateItem",
