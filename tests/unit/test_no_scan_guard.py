@@ -5,7 +5,6 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[2]
 DYNAMODB_IMPORT_PATH = "github.com/aws/aws-sdk-go-v2/service/dynamodb"
 DYNAMODB_IMPORT_MARKER = "__DYNAMODB_IMPORT__"
-GO_SCAN_METHOD_ACCESS = re.compile(r"\.\s*Scan\b")
 GO_SCAN_PAGINATOR_CALL = re.compile(r"\bNewScanPaginator\s*\(")
 GO_PAGINATOR_DECLARATION_PREFIX = re.compile(
     r"\bfunc(?:\s*\([^)]*\))?\s*$"
@@ -35,15 +34,19 @@ def python_offenders(root: Path) -> list[str]:
     offenders: list[str] = []
     for path in root.rglob("*.py"):
         tree = ast.parse(path.read_text(encoding="utf-8"), filename=str(path))
-        scan_aliases = {
-            target.id
-            for node in ast.walk(tree)
-            if isinstance(node, ast.Assign)
-            and isinstance(node.value, ast.Attribute)
-            and node.value.attr == "scan"
-            for target in node.targets
-            if isinstance(target, ast.Name)
-        }
+        scan_aliases: set[str] = set()
+        for node in ast.walk(tree):
+            if isinstance(node, ast.Assign):
+                targets = node.targets
+            elif isinstance(node, ast.AnnAssign):
+                targets = (node.target,)
+            else:
+                continue
+            if not isinstance(node.value, ast.Attribute) or node.value.attr != "scan":
+                continue
+            scan_aliases.update(
+                target.id for target in targets if isinstance(target, ast.Name)
+            )
         if any(
             isinstance(node, ast.Call)
             and (
@@ -101,6 +104,41 @@ def _dynamodb_import_aliases(source: str) -> set[str]:
     return aliases
 
 
+def _dynamodb_client_names(code: str, aliases: set[str]) -> set[str]:
+    client_types = [
+        rf"{re.escape(alias)}\s*\.\s*Client"
+        for alias in aliases
+        if alias != "."
+    ]
+    if "." in aliases:
+        client_types.append(r"Client")
+    if not client_types:
+        return set()
+
+    type_pattern = re.compile(
+        rf"\b(?P<name>[A-Za-z_]\w*)\s+(?:\*\s*)?(?:{'|'.join(client_types)})\b"
+    )
+    names = {match.group("name") for match in type_pattern.finditer(code)}
+    for alias in aliases - {"."}:
+        names.update(
+            match.group("name")
+            for match in re.finditer(
+                rf"\b(?P<name>[A-Za-z_]\w*)\s*:=\s*"
+                rf"{re.escape(alias)}\s*\.\s*NewFromConfig\s*\(",
+                code,
+            )
+        )
+    if "." in aliases:
+        names.update(
+            match.group("name")
+            for match in re.finditer(
+                r"\b(?P<name>[A-Za-z_]\w*)\s*:=\s*NewFromConfig\s*\(",
+                code,
+            )
+        )
+    return names
+
+
 def _has_unqualified_scan_paginator_call(code: str) -> bool:
     for match in GO_SCAN_PAGINATOR_CALL.finditer(code):
         prefix = code[: match.start()]
@@ -115,12 +153,17 @@ def _has_unqualified_scan_paginator_call(code: str) -> bool:
 def _has_go_scan_call(source: str) -> bool:
     aliases = _dynamodb_import_aliases(_go_import_structure(source))
     code = GO_TOKEN.sub(lambda match: _blank_go_token(match.group()), source)
+    client_names = _dynamodb_client_names(code, aliases)
+    client_scan_call = any(
+        re.search(rf"\b{re.escape(name)}\s*\.\s*Scan\b", code)
+        for name in client_names
+    )
     qualified_paginator_call = any(
         re.search(rf"\b{re.escape(alias)}\s*\.\s*NewScanPaginator\s*\(", code)
         for alias in aliases - {"."}
     )
     return (
-        bool(GO_SCAN_METHOD_ACCESS.search(code))
+        client_scan_call
         or (
             "." in aliases
             and _has_unqualified_scan_paginator_call(code)
@@ -160,6 +203,20 @@ def test_python_offenders_detect_scan_method_values(tmp_path, monkeypatch) -> No
     assert python_offenders(root) == ["src/offender.py"]
 
 
+def test_python_offenders_detect_annotated_scan_method_values(
+    tmp_path, monkeypatch
+) -> None:
+    monkeypatch.setitem(globals(), "ROOT", tmp_path)
+    root = tmp_path / "src"
+    root.mkdir()
+    (root / "offender.py").write_text(
+        "scan: Callable = client.scan\nscan({})\n",
+        encoding="utf-8",
+    )
+
+    assert python_offenders(root) == ["src/offender.py"]
+
+
 def test_python_offenders_detect_scan_paginator_calls(tmp_path, monkeypatch) -> None:
     monkeypatch.setitem(globals(), "ROOT", tmp_path)
     root = tmp_path / "src"
@@ -180,18 +237,40 @@ def test_go_offenders_detect_scan_calls_but_exclude_test_files(tmp_path, monkeyp
     monkeypatch.setitem(globals(), "ROOT", tmp_path)
     root = tmp_path / "internal"
     root.mkdir()
-    source = "package store\nfunc f(client Client) { client . Scan (nil) }\n"
+    source = (
+        "package store\n"
+        'import "github.com/aws/aws-sdk-go-v2/service/dynamodb"\n'
+        "func f(client *dynamodb.Client) { client . Scan (nil) }\n"
+    )
     (root / "store.go").write_text(source, encoding="utf-8")
     (root / "store_test.go").write_text(source, encoding="utf-8")
 
     assert go_offenders(root) == ["internal/store.go"]
 
 
+def test_go_offenders_ignore_non_dynamodb_scan_methods(tmp_path, monkeypatch) -> None:
+    monkeypatch.setitem(globals(), "ROOT", tmp_path)
+    root = tmp_path / "internal"
+    root.mkdir()
+    source = (
+        "package store\n"
+        'import "database/sql"\n'
+        "func f(rows *sql.Rows) { rows.Scan(nil) }\n"
+    )
+    (root / "store.go").write_text(source, encoding="utf-8")
+
+    assert go_offenders(root) == []
+
+
 def test_go_offenders_detect_scan_method_values(tmp_path, monkeypatch) -> None:
     monkeypatch.setitem(globals(), "ROOT", tmp_path)
     root = tmp_path / "internal"
     root.mkdir()
-    source = "package store\nfunc f(client Client) { scan := client.Scan; scan(nil) }\n"
+    source = (
+        "package store\n"
+        'import "github.com/aws/aws-sdk-go-v2/service/dynamodb"\n'
+        "func f(client *dynamodb.Client) { scan := client.Scan; scan(nil) }\n"
+    )
     (root / "store.go").write_text(source, encoding="utf-8")
 
     assert go_offenders(root) == ["internal/store.go"]

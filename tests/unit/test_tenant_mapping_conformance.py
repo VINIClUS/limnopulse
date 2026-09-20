@@ -25,6 +25,10 @@ def test_every_mounted_tenant_route_requires_membership() -> None:
 
 def test_legacy_tenant_keys_cannot_cross_partitions() -> None:
     keys = DynamoKeyBuilder()
+    assert keys.tenant("tnt_a") != keys.tenant("tnt_b")
     assert keys.pond("tnt_a", "pond_1")["PK"] == "TENANT#tnt_a"
     assert keys.device("tnt_a", "dev_1") != keys.device("tnt_b", "dev_1")
     assert keys.membership("sub_1", "tnt_a")["SK"] == "TENANT#tnt_a"
+    assert keys.tenant_member("tnt_a", "sub_1") != keys.tenant_member(
+        "tnt_b", "sub_1"
+    )

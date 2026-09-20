@@ -23,7 +23,7 @@ GOLDEN = ROOT / "tests/contracts/openapi/v1.json"
 def test_v1_openapi_matches_checked_in_golden() -> None:
     app = create_app(Settings(app_env="test", auth_mode="dev"))
     actual = build_v1_openapi_contract(app)
-    assert all(path.startswith("/v1/") for path in actual["paths"])
+    assert all(path == "/v1" or path.startswith("/v1/") for path in actual["paths"])
     assert actual == json.loads(GOLDEN.read_text(encoding="utf-8"))
 
 
@@ -136,6 +136,18 @@ def test_v1_openapi_keeps_only_security_schemes_used_by_v1_operations() -> None:
     }
 
 
+def test_v1_openapi_includes_exact_v1_path() -> None:
+    app = FastAPI()
+
+    @app.get("/v1")
+    async def exact_v1_path() -> dict[str, bool]:
+        return {"ok": True}
+
+    actual = build_v1_openapi_contract(app)
+
+    assert "/v1" in actual["paths"]
+
+
 def test_exporter_rejects_output_outside_repository(tmp_path, monkeypatch) -> None:
     output = tmp_path / "outside.json"
     monkeypatch.setattr(
@@ -176,6 +188,45 @@ def test_exporter_rejects_default_output_symlink_escape(tmp_path, monkeypatch) -
     assert outside.read_text(encoding="utf-8") == "sentinel"
 
 
+def test_exporter_rejects_default_output_symlink_inside_repository(
+    tmp_path, monkeypatch
+) -> None:
+    repository = tmp_path / "repository"
+    output = repository / "tests/contracts/openapi/v1.json"
+    output.parent.mkdir(parents=True)
+    target = repository / "tests/contracts/openapi/other.json"
+    target.write_text("sentinel", encoding="utf-8")
+    output.symlink_to(target)
+
+    monkeypatch.setattr(export_v1_openapi, "REPOSITORY_ROOT", repository)
+    monkeypatch.setattr(export_v1_openapi, "DEFAULT_OUTPUT", output)
+    monkeypatch.setattr(sys, "argv", ["export_v1_openapi.py"])
+
+    with pytest.raises(SystemExit) as error:
+        export_v1_openapi.main()
+
+    assert error.value.code == 2
+    assert target.read_text(encoding="utf-8") == "sentinel"
+
+
+def test_exporter_honors_repository_output_path(tmp_path, monkeypatch) -> None:
+    repository = tmp_path / "repository"
+    default_output = repository / "tests/contracts/openapi/v1.json"
+    output = repository / "artifacts/openapi.json"
+
+    monkeypatch.setattr(export_v1_openapi, "REPOSITORY_ROOT", repository)
+    monkeypatch.setattr(export_v1_openapi, "DEFAULT_OUTPUT", default_output)
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        ["export_v1_openapi.py", "--output", str(output)],
+    )
+
+    assert export_v1_openapi.main() == 0
+    assert output.exists()
+    assert not default_output.exists()
+
+
 def test_exporter_preserves_cwd_relative_output_paths(monkeypatch) -> None:
     monkeypatch.chdir(export_v1_openapi.REPOSITORY_ROOT / "scripts/dev")
 
@@ -183,10 +234,10 @@ def test_exporter_preserves_cwd_relative_output_paths(monkeypatch) -> None:
         "../../tests/contracts/openapi/v1.json"
     )
 
-    assert output == "golden"
+    assert output == export_v1_openapi.DEFAULT_OUTPUT
 
 
-def test_exporter_rejects_non_golden_output_path(monkeypatch) -> None:
+def test_exporter_checks_requested_repository_output(monkeypatch) -> None:
     monkeypatch.setattr(
         sys,
         "argv",
@@ -198,7 +249,4 @@ def test_exporter_rejects_non_golden_output_path(monkeypatch) -> None:
         ],
     )
 
-    with pytest.raises(SystemExit) as error:
-        export_v1_openapi.main()
-
-    assert error.value.code == 2
+    assert export_v1_openapi.main() == 1

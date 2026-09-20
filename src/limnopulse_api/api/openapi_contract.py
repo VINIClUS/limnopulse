@@ -131,7 +131,7 @@ def build_v1_openapi_contract(app: FastAPI) -> dict[str, Any]:
     paths = {
         path: deepcopy(schema["paths"][path])
         for path in sorted(schema["paths"])
-        if path.startswith("/v1/")
+        if path == "/v1" or path.startswith("/v1/")
     }
     _normalize_422_descriptions(paths, _implicit_422_operations(app))
     return {
