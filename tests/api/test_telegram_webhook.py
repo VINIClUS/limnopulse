@@ -81,6 +81,19 @@ def test_webhook_authenticates_secret_before_parsing_body() -> None:
     assert service.calls == []
 
 
+def test_webhook_route_is_absent_when_telegram_webhook_disabled() -> None:
+    app = create_app(Settings(app_env="test", auth_mode="dev", telegram_webhook_enabled=False))
+    client = TestClient(app)
+
+    response = client.post(
+        PATH,
+        json=telegram_update("/stop"),
+        headers={"X-Telegram-Bot-Api-Secret-Token": SECRET},
+    )
+
+    assert response.status_code == 404
+
+
 def test_webhook_extracts_start_and_stop_from_private_chat() -> None:
     service = RecordingBindingService()
     client = build_client(service)

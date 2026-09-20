@@ -73,3 +73,17 @@ def test_hosted_telegram_webhook_requires_secret_arn_and_rejects_direct_secret(
         telegram_bot_username="limnopulse_staging_bot",
     )
     assert settings.telegram_webhook_secret is None
+
+
+@pytest.mark.parametrize("app_env", ["staging", "prod"])
+def test_disabled_telegram_webhook_skips_secret_and_username_requirements(
+    app_env: str,
+) -> None:
+    settings = Settings(
+        app_env=app_env,
+        auth_mode="cognito",
+        telegram_webhook_enabled=False,
+    )
+
+    assert settings.telegram_webhook_secret_arn is None
+    assert settings.telegram_bot_username == "limnopulse_local_bot"

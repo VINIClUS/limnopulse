@@ -118,6 +118,45 @@ variable "influxdb_url" {
   default     = ""
 }
 
+# Feature boundaries from docs/superpowers/specs/2026-08-29-limnopulse-production-deployment-design.md
+# §16: "The current unconditional SES, EventBridge and Telegram resources
+# must be made conditional before a real production plan." DynamoDB, Cognito
+# and the core notification-jobs queue are load-bearing for every profile and
+# stay unconditional; only the two delivery channels below are gated.
+variable "email_delivery" {
+  description = "Provision SES, its EventBridge feedback routing, and the ses_events SQS queues. False until the email channel is actually wired up (ops/vps and Fase 2 do not use it yet)."
+  type        = bool
+  default     = false
+}
+
+variable "telegram_delivery" {
+  description = <<-EOT
+    Provision the Telegram bot token secret, the outbound telegram-jobs SQS
+    queue, and the Telegram worker's IAM policy — the Fase 2 async delivery
+    path. Independent of var.telegram_webhook (see telegram.tf); a profile
+    can run the inbound webhook without the outbound worker, or vice versa.
+  EOT
+  type        = bool
+  default     = false
+}
+
+variable "telegram_webhook" {
+  description = <<-EOT
+    Provision the Telegram webhook secret and its reader IAM policy
+    (telegram.tf). Independent of var.telegram_delivery. Both false (the
+    default) is the zero-Telegram-resources profile from §16/§3 of the
+    design spec, and is fully bootable in APP_ENV=prod:
+    src/limnopulse_api/core/config.py's TELEGRAM_WEBHOOK_ENABLED (default
+    true, set to false in that profile) independently gates both the
+    inbound POST /webhooks/telegram route and the APP_ENV=prod requirement
+    for TELEGRAM_WEBHOOK_SECRET_ARN. Set both this flag and
+    TELEGRAM_WEBHOOK_ENABLED=true together when a real bot is wired up —
+    see cloud.tfvars.example and .env.production.example.
+  EOT
+  type        = bool
+  default     = false
+}
+
 locals {
   common_tags = {
     Project     = var.project_name
