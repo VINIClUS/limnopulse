@@ -69,9 +69,17 @@ class RecordingBindingService:
         self.calls.append(("revoke", tenant_id, recipient_id))
 
 
-def build_client(*, active: bool = True) -> tuple[TestClient, RecordingBindingService]:
+def build_client(
+    *, active: bool = True, telegram_webhook_enabled: bool = True
+) -> tuple[TestClient, RecordingBindingService]:
     service = RecordingBindingService()
-    app = create_app(Settings(app_env="test", auth_mode="dev"))
+    app = create_app(
+        Settings(
+            app_env="test",
+            auth_mode="dev",
+            telegram_webhook_enabled=telegram_webhook_enabled,
+        )
+    )
     app.state.auth_provider = StaticAuthProvider()
     app.state.membership_service = FakeMembershipService(active)
     app.state.telegram_binding_service = service
@@ -111,6 +119,15 @@ def test_token_endpoint_returns_raw_token_once_without_changing_preferences() ->
     }
     assert "token_hash" not in response.json()
     assert service.calls == [("issue", "tnt_1", "sub_1")]
+
+
+def test_token_endpoint_is_absent_when_telegram_webhook_disabled() -> None:
+    client, service = build_client(telegram_webhook_enabled=False)
+
+    response = client.post(f"{PATH}-token")
+
+    assert response.status_code == 404
+    assert service.calls == []
 
 
 def test_delete_is_idempotent_no_content_and_membership_protected() -> None:

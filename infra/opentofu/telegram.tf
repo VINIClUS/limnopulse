@@ -1,3 +1,12 @@
+# No `tofu apply` has ever run against this stack (no tfstate, no
+# backend.hcl — see design spec §16 update). The `count` gating below is
+# therefore the resource addresses' first real allocation, not a change to
+# an existing one: no `moved` block is needed, and there is no attached
+# IAM policy anywhere to detach before a future `count = 0` — that
+# attachment doesn't exist in this repo yet (see the deferred
+# infra/opentofu/iam_runtime.tf in the design spec's Fase 0 list). Both
+# will need re-checking once a real apply and iam_runtime.tf exist.
+
 # Gated by var.telegram_webhook (see variables.tf). recovery_window_in_days
 # stays at the default 7: a 0-day window still deletes asynchronously in
 # Secrets Manager, so it doesn't actually make a rapid disable/re-enable
