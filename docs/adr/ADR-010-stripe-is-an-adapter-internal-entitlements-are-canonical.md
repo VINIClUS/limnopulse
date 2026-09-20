@@ -69,6 +69,8 @@ Phase 4 must pin and test the Stripe API version used for Checkout, webhook pars
 
 Phase 4 must audit every billing suspension decision, including webhook or reconciliation transitions into or out of suspension, with actor or worker, source, prior and resulting state, timestamp, and triggering provider evidence.
 
+Phase 4 Stripe reconciliation must be order-independent: an older valid event arriving after a newer suspension/restriction must not overwrite the newer durable EntitlementSnapshot; processing must use monotonic provider-state/version checks or current Stripe-object retrieval, and reverse-order fixtures must converge to the same state.
+
 ## Non-goals
 
 This record does not make Stripe authoritative for tenant identity, command safety, monitoring truth, or direct deletion of over-limit resources.

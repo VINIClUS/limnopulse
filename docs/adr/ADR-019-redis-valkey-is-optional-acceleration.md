@@ -26,6 +26,8 @@ Phase 7A must prove that raw Push tokens, phone numbers, Telegram chat IDs, and 
 
 Phase 7A must test Redis/Valkey becoming unavailable during active worker processing; workers must fall back to conservative durable limits without losing quota, anti-storm, destination, or worker-bound protections and must never fail open.
 
+Any cache-enabled authorization path must treat membership, destination, and policy entries as bounded-TTL/versioned hints only; at `BeginAttempt`, a newer durable revision or revocation must win over a stale cache entry, and tests must prove stale cached authorization cannot dispatch a notification.
+
 ## Non-goals
 
 This record does not ban Redis, promise equal no-cache performance, move durable queues into Redis, or allow fail-open limits during cache failure.

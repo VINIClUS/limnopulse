@@ -26,6 +26,8 @@ Phase 9 vendor polling cursor recovery must derive the same canonical event iden
 
 Phase 9 vendor connector acceptance must prove an independent disable and rollback path that stops new connector work while preserving imported history and Device records.
 
+Phase 9 vendor connector acceptance must test expired API/OAuth credentials; authentication failure must enter an observable reauthorization/error state, preserve the last durable cursor, and avoid unbounded retry or silent ingestion stop.
+
 ## Non-goals
 
 This record does not require LimnoPulse appliances, arbitrary customer code in SaaS, a custom broker, or cloud-dependent critical interlocks.

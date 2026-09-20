@@ -24,6 +24,10 @@ Phase 1 freezes provider-neutral IntegrationAccount and DeviceIntegration contra
 
 Phase 5 ingest must resolve the complete source-to-tenant-to-site-to-asset-to-deployment-to-component ownership chain from trusted authenticated mapping; every payload-supplied site, asset, deployment, or component ID must be ignored or rejected and must never override that chain.
 
+Phase 5 must emit immutable audit events for every DeviceIntegration credential link, credential rotation, credential revocation, Device provisioning, and Device decommissioning; each event must record actor or worker, tenant/device/integration identity, action, outcome, timestamp, and authoritative provider evidence.
+
+Phase 5 AWS IoT policy fixtures must positively allow only the mapped client ID, device telemetry/health/reported publication paths, and required command/shadow subscriptions, and must negatively reject other device IDs, wildcard actions/topics, and command/system publication paths.
+
 ## Non-goals
 
 This record does not require every deployment to use AWS IoT, define a custom broker, or place AWS identifiers on Device, Component, Deployment, or telemetry entities.

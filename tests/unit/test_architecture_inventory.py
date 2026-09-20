@@ -1698,6 +1698,36 @@ CODEX_REVIEW_GATE_CASES += tuple(
             "Before creating a retry Attempt for a definite temporary failure, the worker must derive a deterministic successor identity from the Delivery ID, failed Attempt ID, and the failed Attempt's persisted retry ordinal plus one; a conditional write must atomically bind that ordinal to the Delivery and failed Attempt and create at most one successor Attempt, so concurrent workers converge on one identity and only that Attempt may contact the provider.",
             "Concurrent workers may choose different retry ordinals or retry identities and create multiple successor Attempts for one failed Attempt.",
         ),
+        (
+            "AWS IoT lifecycle audit",
+            "ADR-001-aws-iot-is-an-integration-adapter.md",
+            "Phase 5 must emit immutable audit events for every DeviceIntegration credential link, credential rotation, credential revocation, Device provisioning, and Device decommissioning; each event must record actor or worker, tenant/device/integration identity, action, outcome, timestamp, and authoritative provider evidence.",
+            "Phase 5 may link, rotate, or revoke credentials or provision or decommission devices without immutable audit events or actor and provider-evidence fields.",
+        ),
+        (
+            "AWS IoT policy action allowlist",
+            "ADR-001-aws-iot-is-an-integration-adapter.md",
+            "Phase 5 AWS IoT policy fixtures must positively allow only the mapped client ID, device telemetry/health/reported publication paths, and required command/shadow subscriptions, and must negatively reject other device IDs, wildcard actions/topics, and command/system publication paths.",
+            "Phase 5 AWS IoT policies may grant wildcard actions or topics or allow a device to publish command/system paths or subscribe beyond the mapped device's required channels.",
+        ),
+        (
+            "expired vendor connector credentials",
+            "ADR-009-edge-is-optional-and-customer-hosted.md",
+            "Phase 9 vendor connector acceptance must test expired API/OAuth credentials; authentication failure must enter an observable reauthorization/error state, preserve the last durable cursor, and avoid unbounded retry or silent ingestion stop.",
+            "Phase 9 vendor polling may retry indefinitely or silently stop when an API/OAuth credential expires and may advance or lose the durable cursor.",
+        ),
+        (
+            "stale cache authorization fencing",
+            "ADR-019-redis-valkey-is-optional-acceleration.md",
+            "Any cache-enabled authorization path must treat membership, destination, and policy entries as bounded-TTL/versioned hints only; at `BeginAttempt`, a newer durable revision or revocation must win over a stale cache entry, and tests must prove stale cached authorization cannot dispatch a notification.",
+            "Cache-enabled authorization may let stale membership, destination, or policy entries authorize notification dispatch after a newer durable revision or revocation.",
+        ),
+        (
+            "order-independent Stripe reconciliation",
+            "ADR-010-stripe-is-an-adapter-internal-entitlements-are-canonical.md",
+            "Phase 4 Stripe reconciliation must be order-independent: an older valid event arriving after a newer suspension/restriction must not overwrite the newer durable EntitlementSnapshot; processing must use monotonic provider-state/version checks or current Stripe-object retrieval, and reverse-order fixtures must converge to the same state.",
+            "Phase 4 may let an older Stripe event overwrite a newer suspension or restriction or skip monotonic state and current-object checks when events arrive out of order.",
+        ),
     )
 )
 
