@@ -434,6 +434,22 @@ No static AWS key exists in GitHub, Compose or a persistent `.env` file.
 Separate IAM policies cover API, evaluator, SQS canary validation, backup,
 GitHub plan/apply and break-glass operations.
 
+> **Update (2026-09-19):** `infra/opentofu/iam_runtime.tf` diverges from
+> "no static AWS key" for the current VPS + Proxmox LXC topology: neither
+> host can assume an IAM role without either instance-profile-style
+> metadata (neither has it) or IAM Roles Anywhere (deferred to Fase 3 — it
+> needs a CA and certificate renewal this repo doesn't have yet, matching
+> the plan file's Fase 0 decision). Two `aws_iam_user` resources (`api`,
+> `workers`) carry least-privilege policies instead: DynamoDB table access
+> for both, `cognito-idp:GetUser` for the API, the core notification-jobs
+> SQS queue for the workers, plus the existing conditional Telegram
+> policies from `telegram.tf` attached via matching `count`. Access keys
+> themselves are deliberately not `aws_iam_access_key` resources — that
+> would write the secret into tfstate in plaintext with no backend
+> encryption configured yet — and are instead created out of band with
+> `aws iam create-access-key` and pasted directly into the VPS/LXC `.env`
+> files, same as the Telegram secrets' "populated out of band" pattern.
+
 ## 16. OpenTofu changes
 
 The existing scaffold is evolved into modules with explicit production feature
@@ -486,10 +502,12 @@ Disabled modules produce no resources or secret containers.
 > now genuinely creates zero Telegram resources and boots with zero
 > Telegram configuration. Verified with `tofu plan` against a throwaway
 > local state: `env/cloud.tfvars.example` defaults (all three flags
-> `false`) create 7 resources (Cognito, DynamoDB ×2, the core
-> notification-jobs queue); all delivery/webhook flags `true` reproduces
-> the original unconditional plan exactly (28 resources, matching
-> pre-gating `tofu plan` output). Verified on the application side with
+> `false`) created 7 resources before `iam_runtime.tf` (§15 update above);
+> with it, 16 (Cognito, DynamoDB ×2, the core notification-jobs queue, 2
+> `aws_iam_user`, 3 `aws_iam_policy`, 4 `aws_iam_user_policy_attachment`);
+> all delivery/webhook flags `true` now produces 39 (the original
+> unconditional 28, plus `iam_runtime.tf`'s 9 unconditional resources, plus
+> 2 more conditional Telegram policy attachments). Verified on the application side with
 > `pytest`: `APP_ENV=prod` + `TELEGRAM_WEBHOOK_ENABLED=false` boots and
 > 404s on `/webhooks/telegram` without any Telegram secret configured
 > (`tests/api/test_app_runtime.py`, `tests/api/test_telegram_webhook.py`,

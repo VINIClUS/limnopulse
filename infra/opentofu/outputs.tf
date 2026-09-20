@@ -116,3 +116,16 @@ output "influxdb_url" {
   description = "Cloud InfluxDB endpoint placeholder only. Mark or split sensitive values before real credentials are introduced."
   value       = var.influxdb_url
 }
+
+# IAM user names only — never a secret. Access keys are created out of
+# band (see iam_runtime.tf) with `aws iam create-access-key --user-name
+# <this value>` and pasted directly into the VPS/.env and LXC env.
+output "api_iam_user_name" {
+  description = "IAM user name to generate the API runtime's access key for."
+  value       = aws_iam_user.api.name
+}
+
+output "workers_iam_user_name" {
+  description = "IAM user name to generate the workers runtime's access key for."
+  value       = aws_iam_user.workers.name
+}

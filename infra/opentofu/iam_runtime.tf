@@ -1,0 +1,152 @@
+# Least-privilege runtime credentials for the two processes that talk to
+# AWS directly: the FastAPI API (src/limnopulse_api) and the Go workers
+# (cmd/notifications, cmd/alert-evaluator). Both are aws_iam_user, not
+# roles — see the design spec §15/§24 note: this repo's runtime is a VPS
+# container and a Proxmox LXC, neither of which can assume an IAM role
+# without either instance-profile-style metadata (VPS/LXC has none) or IAM
+# Roles Anywhere (deferred to Fase 3, needs a CA and cert renewal this repo
+# doesn't have yet). Long-lived access keys are the accepted interim
+# tradeoff.
+#
+# Deliberately NOT managed here: aws_iam_access_key. Generating one in
+# OpenTofu writes the secret access key into tfstate in plaintext; with no
+# S3 backend/state encryption configured yet (see backend.example.hcl),
+# that's a real credential sitting in a file on disk. Access keys are
+# created out of band with `aws iam create-access-key` after apply and
+# pasted directly into the VPS/.env and the LXC's env — same pattern
+# already used for the Telegram bot token and webhook secrets in
+# telegram.tf ("populated out of band").
+
+resource "aws_iam_user" "api" {
+  name = "${var.project_name}-${var.environment}-api"
+
+  tags = local.common_tags
+}
+
+resource "aws_iam_user" "workers" {
+  name = "${var.project_name}-${var.environment}-workers"
+
+  tags = local.common_tags
+}
+
+# DynamoDB actions match what the adapters actually call (see
+# src/limnopulse_api/adapters/*.py and internal/notifications/**): GetItem,
+# PutItem, Query, TransactWriteItems, UpdateItem. Both tables, both
+# runtimes — the audit table is written by the same request path that
+# writes the domain table (see adapters/alert_rules.py,
+# adapters/alert_events.py).
+data "aws_iam_policy_document" "dynamodb_domain_access" {
+  statement {
+    sid    = "DomainAndAuditTableAccess"
+    effect = "Allow"
+    actions = [
+      "dynamodb:GetItem",
+      "dynamodb:PutItem",
+      "dynamodb:Query",
+      "dynamodb:TransactWriteItems",
+      "dynamodb:UpdateItem",
+    ]
+    resources = [
+      aws_dynamodb_table.domain.arn,
+      "${aws_dynamodb_table.domain.arn}/index/*",
+      aws_dynamodb_table.audit.arn,
+      "${aws_dynamodb_table.audit.arn}/index/*",
+    ]
+  }
+}
+
+resource "aws_iam_policy" "dynamodb_domain_access" {
+  name        = "${var.project_name}-${var.environment}-dynamodb-domain-access"
+  description = "Read/write access to the domain and audit DynamoDB tables."
+  policy      = data.aws_iam_policy_document.dynamodb_domain_access.json
+
+  tags = local.common_tags
+}
+
+resource "aws_iam_user_policy_attachment" "api_dynamodb" {
+  user       = aws_iam_user.api.name
+  policy_arn = aws_iam_policy.dynamodb_domain_access.arn
+}
+
+resource "aws_iam_user_policy_attachment" "workers_dynamodb" {
+  user       = aws_iam_user.workers.name
+  policy_arn = aws_iam_policy.dynamodb_domain_access.arn
+}
+
+# The API's only other AWS call is cognito-idp:GetUser, authenticated with
+# the caller's own Cognito access token (services/cognito_identity.py) —
+# the IAM identity still needs the action allowed, scoped to this pool.
+data "aws_iam_policy_document" "cognito_get_user" {
+  statement {
+    sid       = "CognitoGetUser"
+    effect    = "Allow"
+    actions   = ["cognito-idp:GetUser"]
+    resources = [aws_cognito_user_pool.main.arn]
+  }
+}
+
+resource "aws_iam_policy" "cognito_get_user" {
+  name        = "${var.project_name}-${var.environment}-cognito-get-user"
+  description = "Allows the API to call cognito-idp:GetUser for access-token identity checks."
+  policy      = data.aws_iam_policy_document.cognito_get_user.json
+
+  tags = local.common_tags
+}
+
+resource "aws_iam_user_policy_attachment" "api_cognito" {
+  user       = aws_iam_user.api.name
+  policy_arn = aws_iam_policy.cognito_get_user.arn
+}
+
+# Workers both produce onto and consume from the core notification-jobs
+# queue: notification-relay sends (internal/notifications/relay/sqs),
+# notification-worker receives/deletes/extends visibility
+# (internal/notifications/worker/sqs). Unconditional — this queue always
+# exists (queues.tf).
+data "aws_iam_policy_document" "notification_jobs_access" {
+  statement {
+    sid    = "NotificationJobsQueueAccess"
+    effect = "Allow"
+    actions = [
+      "sqs:ChangeMessageVisibility",
+      "sqs:DeleteMessage",
+      "sqs:GetQueueAttributes",
+      "sqs:ReceiveMessage",
+      "sqs:SendMessage",
+    ]
+    resources = [aws_sqs_queue.notification_jobs.arn]
+  }
+}
+
+resource "aws_iam_policy" "notification_jobs_access" {
+  name        = "${var.project_name}-${var.environment}-notification-jobs-access"
+  description = "Send/receive access to the core notification-jobs SQS queue."
+  policy      = data.aws_iam_policy_document.notification_jobs_access.json
+
+  tags = local.common_tags
+}
+
+resource "aws_iam_user_policy_attachment" "workers_notification_jobs" {
+  user       = aws_iam_user.workers.name
+  policy_arn = aws_iam_policy.notification_jobs_access.arn
+}
+
+# Attach the already-conditional policies from telegram.tf. count here
+# mirrors their own gating exactly, so toggling var.telegram_webhook /
+# var.telegram_delivery off removes the attachment in the same apply that
+# removes the underlying policy — no separate detach step, and no
+# order-of-deletion issue (see the PR #47 discussion on telegram.tf: no
+# attachment resource existed anywhere before this file).
+resource "aws_iam_user_policy_attachment" "api_telegram_webhook_secret" {
+  count = var.telegram_webhook ? 1 : 0
+
+  user       = aws_iam_user.api.name
+  policy_arn = aws_iam_policy.telegram_webhook_secret_reader[0].arn
+}
+
+resource "aws_iam_user_policy_attachment" "workers_telegram" {
+  count = var.telegram_delivery ? 1 : 0
+
+  user       = aws_iam_user.workers.name
+  policy_arn = aws_iam_policy.telegram_worker[0].arn
+}
