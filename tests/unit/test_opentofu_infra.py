@@ -104,6 +104,8 @@ def test_versions_pin_opentofu_and_aws_provider_with_backend_placeholder() -> No
     assert re.search(r'bucket\s+=\s+"replace-with-remote-state-bucket"', backend)
     assert re.search(r'key\s+=\s+"limnopulse/cloud/terraform.tfstate"', backend)
     assert re.search(r'region\s+=\s+"us-east-2"', backend)
+    assert re.search(r"^use_lockfile\s*=\s*true$", backend, re.MULTILINE)
+    assert "dynamodb_table" not in backend
 
 
 def test_cloud_dynamodb_tables_match_domain_contract() -> None:
