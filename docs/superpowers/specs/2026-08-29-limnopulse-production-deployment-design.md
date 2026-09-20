@@ -440,13 +440,22 @@ GitHub plan/apply and break-glass operations.
 > metadata (neither has it) or IAM Roles Anywhere (deferred to Fase 3 — it
 > needs a CA and certificate renewal this repo doesn't have yet, matching
 > the plan file's Fase 0 decision). Two `aws_iam_user` resources (`api`,
-> `workers`) carry least-privilege policies instead: DynamoDB table access
-> for both, `cognito-idp:GetUser` for the API, the core notification-jobs
-> SQS queue for the workers, plus the existing conditional Telegram
-> policies from `telegram.tf` attached via matching `count`. Access keys
-> themselves are deliberately not `aws_iam_access_key` resources — that
-> would write the secret into tfstate in plaintext with no backend
-> encryption configured yet — and are instead created out of band with
+> `workers`) carry least-privilege policies instead: full DynamoDB access
+> to the domain table for both plus transact-write-only access to the
+> audit table for the API (every write it makes there goes through a
+> `TransactWriteItems` "Put", never a standalone call), the core
+> notification-jobs SQS queue for the workers, plus the existing
+> conditional Telegram policies from `telegram.tf` (extended with an
+> `sqs:SendMessage` statement so `notifications relay` can publish, not
+> just the Telegram worker consume) and a conditional `ses:SendEmail` +
+> SES-feedback-queue policy attached via matching `count`. No policy grants
+> `cognito-idp:GetUser` — it's one of Cognito's unauthenticated-API
+> operations, authorized by the caller's own access token, and never
+> evaluates the calling IAM identity's policies; a grant for it would be a
+> no-op. Access keys themselves are deliberately not `aws_iam_access_key`
+> resources — that would write the secret into tfstate in plaintext with
+> no backend encryption configured yet — and are instead created out of
+> band with
 > `aws iam create-access-key` and pasted directly into the VPS/LXC `.env`
 > files, same as the Telegram secrets' "populated out of band" pattern.
 
@@ -503,13 +512,15 @@ Disabled modules produce no resources or secret containers.
 > Telegram configuration. Verified with `tofu plan` against a throwaway
 > local state: `env/cloud.tfvars.example` defaults (all three flags
 > `false`) created 7 resources before `iam_runtime.tf` (§15 update above);
-> with it, 17 (Cognito, DynamoDB ×2, the core notification-jobs queue, 2
-> `aws_iam_user`, 4 `aws_iam_policy` — the API and workers DynamoDB
-> policies are separate resources — and 4 `aws_iam_user_policy_attachment`);
-> all delivery/webhook flags `true` now produces 42 (the original
-> unconditional 28, `iam_runtime.tf`'s 10 unconditional resources, 3 more
-> conditional attachments for Telegram/email, and `ses.tf`'s email_worker
-> policy). Verified on the application side with
+> with it, 15 (Cognito, DynamoDB ×2, the core notification-jobs queue, plus
+> `iam_runtime.tf`'s 8 always-created resources: 2 `aws_iam_user`, 3
+> `aws_iam_policy`, 3 `aws_iam_user_policy_attachment` — no Cognito IAM
+> policy, since `cognito-idp:GetUser` is authorized by the caller's own
+> access token and never evaluates the calling identity's IAM policies).
+> All delivery/webhook flags `true` produces 40: the original unconditional
+> 28, `iam_runtime.tf`'s 8 unconditional resources, its 3 conditional
+> attachments (Telegram webhook/delivery, email), and `ses.tf`'s
+> email_worker policy. Verified on the application side with
 > `pytest`: `APP_ENV=prod` + `TELEGRAM_WEBHOOK_ENABLED=false` boots and
 > 404s on `/webhooks/telegram` without any Telegram secret configured
 > (`tests/api/test_app_runtime.py`, `tests/api/test_telegram_webhook.py`,

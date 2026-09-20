@@ -227,15 +227,14 @@ data "aws_iam_policy_document" "email_worker" {
     effect = "Allow"
     # IAM authorizes the SESv2 SendEmail API under the "ses:" prefix, not
     # "sesv2:" — SES was never split into a separate IAM service namespace
-    # when the v2 API was introduced.
+    # when the v2 API was introduced. No condition here: "ses:configuration-set"
+    # is a message tag emitted in SES events, not an IAM request context
+    # key SendEmail evaluates — a condition on it would never match and
+    # would deny every send. SES has no resource-level ARN scoping for the
+    # calling identity the way DynamoDB does, so this grant is unavoidably
+    # account-wide.
     actions   = ["ses:SendEmail"]
     resources = ["*"]
-
-    condition {
-      test     = "StringEquals"
-      variable = "ses:configuration-set"
-      values   = [var.ses_configuration_set_name]
-    }
   }
 
   statement {

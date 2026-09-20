@@ -116,30 +116,11 @@ resource "aws_iam_user_policy_attachment" "workers_dynamodb" {
   policy_arn = aws_iam_policy.dynamodb_domain_access_workers.arn
 }
 
-# The API's only other AWS call is cognito-idp:GetUser, authenticated with
-# the caller's own Cognito access token (services/cognito_identity.py) —
-# the IAM identity still needs the action allowed, scoped to this pool.
-data "aws_iam_policy_document" "cognito_get_user" {
-  statement {
-    sid       = "CognitoGetUser"
-    effect    = "Allow"
-    actions   = ["cognito-idp:GetUser"]
-    resources = [aws_cognito_user_pool.main.arn]
-  }
-}
-
-resource "aws_iam_policy" "cognito_get_user" {
-  name        = "${var.project_name}-${var.environment}-cognito-get-user"
-  description = "Allows the API to call cognito-idp:GetUser for access-token identity checks."
-  policy      = data.aws_iam_policy_document.cognito_get_user.json
-
-  tags = local.common_tags
-}
-
-resource "aws_iam_user_policy_attachment" "api_cognito" {
-  user       = aws_iam_user.api.name
-  policy_arn = aws_iam_policy.cognito_get_user.arn
-}
+# No IAM policy for cognito-idp:GetUser: it's one of Cognito's
+# unauthenticated-API operations (services/cognito_identity.py calls it
+# with AccessToken=token, not admin credentials) — authorized entirely by
+# the caller's own Cognito access token, and doesn't evaluate the calling
+# IAM identity's policies at all. A policy granting it would be a no-op.
 
 # Workers both produce onto and consume from the core notification-jobs
 # queue: notification-relay sends (internal/notifications/relay/sqs),
