@@ -143,13 +143,15 @@ variable "telegram_delivery" {
 variable "telegram_webhook" {
   description = <<-EOT
     Provision the Telegram webhook secret and its reader IAM policy
-    (telegram.tf). Both false (the default, matching var.telegram_delivery)
-    gives the true zero-Telegram-resources profile from §16/§3 of the design
-    spec. Set to true for any APP_ENV=prod apply of this repo's API: its
-    inbound POST /webhooks/telegram route is mounted unconditionally, and
-    src/limnopulse_api/core/config.py refuses to boot with APP_ENV=prod
-    unless TELEGRAM_WEBHOOK_SECRET_ARN is set — see cloud.tfvars.example
-    and ops/vps/README.md, where this flag is turned on.
+    (telegram.tf). Independent of var.telegram_delivery. Both false (the
+    default) is the zero-Telegram-resources profile from §16/§3 of the
+    design spec, and is fully bootable in APP_ENV=prod:
+    src/limnopulse_api/core/config.py's TELEGRAM_WEBHOOK_ENABLED (default
+    true, set to false in that profile) independently gates both the
+    inbound POST /webhooks/telegram route and the APP_ENV=prod requirement
+    for TELEGRAM_WEBHOOK_SECRET_ARN. Set both this flag and
+    TELEGRAM_WEBHOOK_ENABLED=true together when a real bot is wired up —
+    see cloud.tfvars.example and .env.production.example.
   EOT
   type        = bool
   default     = false

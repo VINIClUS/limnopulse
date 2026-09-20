@@ -215,6 +215,43 @@ def test_app_lifespan_wires_runtime_dependencies(monkeypatch) -> None:
     assert app.state.influxdb_client.closed is True
 
 
+def test_prod_boots_without_telegram_webhook_when_disabled(monkeypatch) -> None:
+    fake_redis = FakeRedisClient()
+
+    class FakeInfluxClient:
+        def __init__(self, **kwargs) -> None:
+            pass
+
+        def query_api(self):
+            return object()
+
+        def close(self) -> None:
+            pass
+
+    monkeypatch.setattr(
+        "limnopulse_api.main.boto3.client", lambda service_name, **kwargs: object()
+    )
+    monkeypatch.setattr("limnopulse_api.main.redis.from_url", lambda url: fake_redis)
+    monkeypatch.setattr("limnopulse_api.main.InfluxDBClient", FakeInfluxClient)
+
+    settings = Settings(
+        app_env="prod",
+        auth_mode="cognito",
+        aws_region="us-east-1",
+        cognito_user_pool_id="pool_1",
+        cognito_client_id="client_1",
+        telegram_webhook_enabled=False,
+    )
+
+    app = create_app(settings)
+
+    with TestClient(app) as client:
+        assert not hasattr(app.state, "telegram_webhook_secret_verifier")
+        response = client.post("/webhooks/telegram", json={})
+
+    assert response.status_code == 404
+
+
 def test_lifespan_uses_only_official_influx_client_and_closes_it(monkeypatch) -> None:
     created_clients = []
     fake_query_api = object()

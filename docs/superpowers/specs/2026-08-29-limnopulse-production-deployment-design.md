@@ -460,28 +460,45 @@ Disabled modules produce no resources or secret containers.
 > Telegram bot-token secret, outbound jobs queue and worker IAM policy in
 > `telegram.tf`/`queues.tf` behind `count`. A third flag, `telegram_webhook`
 > (default `false`), independently gates the Telegram webhook secret and its
-> reader policy — an automated PR review (Codex, on PR #47) correctly
-> flagged an earlier draft that kept the webhook secret unconditional as
-> violating this section's own "disabled produces no resource or secret
-> container" acceptance criteria; splitting it into its own flag resolves
-> that without touching `src/limnopulse_api/core/config.py`, whose
-> `APP_ENV=prod` validator still hard-requires
-> `TELEGRAM_WEBHOOK_SECRET_ARN` (`env/cloud.tfvars.example` sets
-> `telegram_webhook = true` for exactly that reason — the API's inbound
-> `POST /webhooks/telegram` route is mounted unconditionally, independent of
-> outbound delivery). Fully relaxing that validator so the API can boot with
-> zero Telegram resources at all (the portfolio-demo gate in §3) is an
-> application-side change, out of scope here. Verified with `tofu plan`
-> against a throwaway local state: all three flags `false` creates 7
-> resources (Cognito, DynamoDB ×2, the core notification-jobs queue);
-> `env/cloud.tfvars.example` defaults (`telegram_webhook = true` only)
-> create 9; all delivery/webhook flags `true` reproduces the original
-> unconditional plan exactly (28 resources, matching pre-gating `tofu plan`
-> output). `core_dynamodb`, `core_cognito`, `core_sqs` were not made
-> toggleable — every profile needs them, so they stay unconditional rather
-> than adding always-`true` flags with no real branch. `push_delivery`,
-> `sms_delivery`, `stripe_billing`, `aws_iot` and `redis` have no
-> corresponding resources in this file yet; nothing to gate.
+> reader policy.
+>
+> An automated PR review (Codex, on PR #47) went through two rounds here.
+> Round 1 correctly flagged a draft that kept the webhook secret
+> unconditional as violating this section's own "disabled produces no
+> resource or secret container" acceptance criteria. Splitting it into its
+> own flag wasn't enough on its own: round 2 pointed out that
+> `env/cloud.tfvars.example` — the repo's only documented real-cloud
+> profile — set `telegram_webhook = true`, so the zero-resources profile,
+> while representable, was never the one operators were told to deploy. The
+> real blocker underneath both rounds was `src/limnopulse_api/core/config.py`:
+> its `APP_ENV=prod` validator hard-required `TELEGRAM_WEBHOOK_SECRET_ARN`
+> unconditionally, and `POST /webhooks/telegram` was mounted unconditionally
+> in `api/router.py`, so no OpenTofu-only flag could make a truly
+> Telegram-free profile bootable.
+>
+> Resolved by adding `TELEGRAM_WEBHOOK_ENABLED` (default `true`, preserving
+> existing behavior) to `Settings`: the ARN/username validation in
+> `validate_auth_mode_for_environment` and the `/webhooks/telegram` route
+> mount (`api/router.py`'s `build_api_router`) are now both conditional on
+> it. `env/cloud.tfvars.example` sets `telegram_webhook = false` and
+> `.env.production.example` documents `TELEGRAM_WEBHOOK_ENABLED` unset/false
+> as the Fase 1 default — the profile operators are actually told to deploy
+> now genuinely creates zero Telegram resources and boots with zero
+> Telegram configuration. Verified with `tofu plan` against a throwaway
+> local state: `env/cloud.tfvars.example` defaults (all three flags
+> `false`) create 7 resources (Cognito, DynamoDB ×2, the core
+> notification-jobs queue); all delivery/webhook flags `true` reproduces
+> the original unconditional plan exactly (28 resources, matching
+> pre-gating `tofu plan` output). Verified on the application side with
+> `pytest`: `APP_ENV=prod` + `TELEGRAM_WEBHOOK_ENABLED=false` boots and
+> 404s on `/webhooks/telegram` without any Telegram secret configured
+> (`tests/api/test_app_runtime.py`, `tests/api/test_telegram_webhook.py`,
+> `tests/unit/test_settings.py`). `core_dynamodb`, `core_cognito`,
+> `core_sqs` were not made toggleable — every profile needs them, so they
+> stay unconditional rather than adding always-`true` flags with no real
+> branch. `push_delivery`, `sms_delivery`, `stripe_billing`, `aws_iot` and
+> `redis` have no corresponding resources in this file yet; nothing to
+> gate.
 
 Additional application-owned modules cover:
 

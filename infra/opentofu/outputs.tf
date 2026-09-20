@@ -70,7 +70,7 @@ output "telegram_worker_policy_arn" {
 }
 
 # Null when var.telegram_webhook = false (see variables.tf and telegram.tf).
-# Required for any APP_ENV=prod apply of this repo's API.
+# Only required when TELEGRAM_WEBHOOK_ENABLED=true (core/config.py).
 output "telegram_webhook_secret_arn" {
   description = "TELEGRAM_WEBHOOK_SECRET_ARN"
   value       = try(aws_secretsmanager_secret.telegram_webhook_secret[0].arn, null)

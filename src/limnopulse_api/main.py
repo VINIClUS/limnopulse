@@ -18,7 +18,7 @@ from limnopulse_api.adapters.notification_preferences import (
 )
 from limnopulse_api.adapters.redis import RedisCacheRepository
 from limnopulse_api.adapters.telegram_bindings import DynamoTelegramBindingRepository
-from limnopulse_api.api.router import api_router
+from limnopulse_api.api.router import build_api_router
 from limnopulse_api.auth.providers import build_auth_provider
 from limnopulse_api.core.config import Settings, get_settings
 from limnopulse_api.core.errors import TelemetryQueryError
@@ -133,22 +133,25 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             app.state.membership_service,
             bot_username=resolved_settings.telegram_bot_username,
         )
-        if resolved_settings.app_env in {"local", "test"}:
-            app.state.telegram_webhook_secret_verifier = StaticTelegramWebhookSecretVerifier(
-                resolved_settings.telegram_webhook_secret or "local-telegram-webhook-secret"
-            )
-        else:
-            secrets_client = boto3.client(
-                "secretsmanager",
-                region_name=resolved_settings.aws_region,
-            )
-            app.state.telegram_webhook_secret_verifier = (
-                SecretsManagerTelegramWebhookSecretVerifier(
-                    secrets_client,
-                    resolved_settings.telegram_webhook_secret_arn or "",
-                    cache_ttl_seconds=(resolved_settings.telegram_webhook_secret_cache_ttl_seconds),
+        if resolved_settings.telegram_webhook_enabled:
+            if resolved_settings.app_env in {"local", "test"}:
+                app.state.telegram_webhook_secret_verifier = StaticTelegramWebhookSecretVerifier(
+                    resolved_settings.telegram_webhook_secret or "local-telegram-webhook-secret"
                 )
-            )
+            else:
+                secrets_client = boto3.client(
+                    "secretsmanager",
+                    region_name=resolved_settings.aws_region,
+                )
+                app.state.telegram_webhook_secret_verifier = (
+                    SecretsManagerTelegramWebhookSecretVerifier(
+                        secrets_client,
+                        resolved_settings.telegram_webhook_secret_arn or "",
+                        cache_ttl_seconds=(
+                            resolved_settings.telegram_webhook_secret_cache_ttl_seconds
+                        ),
+                    )
+                )
         app.state.auth_provider = build_auth_provider(
             resolved_settings,
             cache=app.state.cache_repository,
@@ -176,7 +179,9 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     app.add_exception_handler(BotoCoreError, _handle_infrastructure_error)
     app.add_exception_handler(ClientError, _handle_infrastructure_error)
     app.add_exception_handler(TelemetryQueryError, _handle_infrastructure_error)
-    app.include_router(api_router)
+    app.include_router(
+        build_api_router(telegram_webhook_enabled=resolved_settings.telegram_webhook_enabled)
+    )
     return app
 
 
