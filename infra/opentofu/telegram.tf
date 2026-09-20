@@ -1,19 +1,16 @@
 # Gated by var.telegram_webhook (see variables.tf). recovery_window_in_days
-# = 0 so toggling this off then back on doesn't hit Secrets Manager's
-# pending-deletion name conflict within the normal 7-day recovery window;
-# the value is populated out of band regardless, so there's nothing to
-# recover.
-#
-# Force-deletion is asynchronous: an apply that disables this flag and an
-# apply that re-enables it seconds later can still race and fail with
-# EntityAlreadyExists / "scheduled for deletion". This is an AWS API
-# timing limit, not something OpenTofu config can await — if a re-enable
-# apply fails this way, wait ~30-60s and re-run `tofu apply`.
+# stays at the default 7: a 0-day window still deletes asynchronously in
+# Secrets Manager, so it doesn't actually make a rapid disable/re-enable
+# apply race-free — it only trades that unresolved race for irreversible
+# loss of an out-of-band-populated secret. Toggling this flag off and back
+# on inside 7 days therefore requires `tofu import`-ing the still-pending
+# secret rather than recreating it; this is a deliberate, rare-operation
+# tradeoff, not an oversight.
 resource "aws_secretsmanager_secret" "telegram_webhook_secret" {
   count = var.telegram_webhook ? 1 : 0
 
   name                    = var.telegram_webhook_secret_name
-  recovery_window_in_days = 0
+  recovery_window_in_days = 7
 
   tags = local.common_tags
 }
@@ -40,14 +37,13 @@ resource "aws_iam_policy" "telegram_webhook_secret_reader" {
 }
 
 # Everything below is the outbound delivery path (Fase 2 Proxmox worker) and
-# is gated by var.telegram_delivery. Same recovery_window_in_days = 0
-# tradeoff and same async-deletion race on rapid re-enable as
-# telegram_webhook_secret above.
+# is gated by var.telegram_delivery. Same recovery_window_in_days tradeoff
+# as telegram_webhook_secret above.
 resource "aws_secretsmanager_secret" "telegram_bot_token" {
   count = var.telegram_delivery ? 1 : 0
 
   name                    = var.telegram_bot_token_secret_name
-  recovery_window_in_days = 0
+  recovery_window_in_days = 7
 
   tags = local.common_tags
 }
