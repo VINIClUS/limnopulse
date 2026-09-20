@@ -55,6 +55,13 @@ def python_offenders(root: Path) -> list[str]:
                     isinstance(node.func, ast.Name)
                     and node.func.id in scan_aliases
                 )
+                or (
+                    isinstance(node.func, ast.Attribute)
+                    and node.func.attr == "get_paginator"
+                    and node.args
+                    and isinstance(node.args[0], ast.Constant)
+                    and node.args[0].value == "scan"
+                )
             )
             for node in ast.walk(tree)
         ):
@@ -147,6 +154,22 @@ def test_python_offenders_detect_scan_method_values(tmp_path, monkeypatch) -> No
     root.mkdir()
     (root / "offender.py").write_text(
         "scan = client.scan\nscan({})\n",
+        encoding="utf-8",
+    )
+
+    assert python_offenders(root) == ["src/offender.py"]
+
+
+def test_python_offenders_detect_scan_paginator_calls(tmp_path, monkeypatch) -> None:
+    monkeypatch.setitem(globals(), "ROOT", tmp_path)
+    root = tmp_path / "src"
+    root.mkdir()
+    (root / "offender.py").write_text(
+        'client.get_paginator("scan").paginate()\n',
+        encoding="utf-8",
+    )
+    (root / "allowed.py").write_text(
+        'client.get_paginator("query").paginate()\n',
         encoding="utf-8",
     )
 
