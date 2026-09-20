@@ -5,7 +5,7 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[2]
 DYNAMODB_IMPORT_PATH = "github.com/aws/aws-sdk-go-v2/service/dynamodb"
 DYNAMODB_IMPORT_MARKER = "__DYNAMODB_IMPORT__"
-GO_SCAN_METHOD_CALL = re.compile(r"\.\s*Scan\s*\(")
+GO_SCAN_METHOD_ACCESS = re.compile(r"\.\s*Scan\b")
 GO_SCAN_PAGINATOR_CALL = re.compile(r"\bNewScanPaginator\s*\(")
 GO_PAGINATOR_DECLARATION_PREFIX = re.compile(
     r"\bfunc(?:\s*\([^)]*\))?\s*$"
@@ -35,10 +35,27 @@ def python_offenders(root: Path) -> list[str]:
     offenders: list[str] = []
     for path in root.rglob("*.py"):
         tree = ast.parse(path.read_text(encoding="utf-8"), filename=str(path))
+        scan_aliases = {
+            target.id
+            for node in ast.walk(tree)
+            if isinstance(node, ast.Assign)
+            and isinstance(node.value, ast.Attribute)
+            and node.value.attr == "scan"
+            for target in node.targets
+            if isinstance(target, ast.Name)
+        }
         if any(
             isinstance(node, ast.Call)
-            and isinstance(node.func, ast.Attribute)
-            and node.func.attr == "scan"
+            and (
+                (
+                    isinstance(node.func, ast.Attribute)
+                    and node.func.attr == "scan"
+                )
+                or (
+                    isinstance(node.func, ast.Name)
+                    and node.func.id in scan_aliases
+                )
+            )
             for node in ast.walk(tree)
         ):
             offenders.append(str(path.relative_to(ROOT)))
@@ -96,7 +113,7 @@ def _has_go_scan_call(source: str) -> bool:
         for alias in aliases - {"."}
     )
     return (
-        bool(GO_SCAN_METHOD_CALL.search(code))
+        bool(GO_SCAN_METHOD_ACCESS.search(code))
         or (
             "." in aliases
             and _has_unqualified_scan_paginator_call(code)
@@ -124,6 +141,18 @@ def test_python_offenders_detect_only_scan_attribute_calls(tmp_path, monkeypatch
     assert python_offenders(root) == ["src/offender.py"]
 
 
+def test_python_offenders_detect_scan_method_values(tmp_path, monkeypatch) -> None:
+    monkeypatch.setitem(globals(), "ROOT", tmp_path)
+    root = tmp_path / "src"
+    root.mkdir()
+    (root / "offender.py").write_text(
+        "scan = client.scan\nscan({})\n",
+        encoding="utf-8",
+    )
+
+    assert python_offenders(root) == ["src/offender.py"]
+
+
 def test_go_offenders_detect_scan_calls_but_exclude_test_files(tmp_path, monkeypatch) -> None:
     monkeypatch.setitem(globals(), "ROOT", tmp_path)
     root = tmp_path / "internal"
@@ -131,6 +160,16 @@ def test_go_offenders_detect_scan_calls_but_exclude_test_files(tmp_path, monkeyp
     source = "package store\nfunc f(client Client) { client . Scan (nil) }\n"
     (root / "store.go").write_text(source, encoding="utf-8")
     (root / "store_test.go").write_text(source, encoding="utf-8")
+
+    assert go_offenders(root) == ["internal/store.go"]
+
+
+def test_go_offenders_detect_scan_method_values(tmp_path, monkeypatch) -> None:
+    monkeypatch.setitem(globals(), "ROOT", tmp_path)
+    root = tmp_path / "internal"
+    root.mkdir()
+    source = "package store\nfunc f(client Client) { scan := client.Scan; scan(nil) }\n"
+    (root / "store.go").write_text(source, encoding="utf-8")
 
     assert go_offenders(root) == ["internal/store.go"]
 
