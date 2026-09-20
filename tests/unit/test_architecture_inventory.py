@@ -13,7 +13,7 @@ EXPECTED_EXECUTION_BASELINE = (
     "141e108a479c983ed3a5efcbe729a30a43ab0ecb"
 )
 EXPECTED_RUNTIME_BASELINE = (
-    "4953601fbbc2f95c79e34439cce855307b7db2c8"
+    "f0ce773a08131c340a54d12824427a5a3fcbb25a"
 )
 EXPECTED = {
     "FastAPI control plane": "implemented",
@@ -320,8 +320,11 @@ REQUIRED_ADR_GATE_PATTERNS = {
         r"include sensitive telemetry, location, personal data, or free-form "
         r"operational content\b",
         r"\bDetailed incident fetch must require fresh membership authorization\b",
-        r"\bGeneric preview must use the exact localized `pt-BR` and `en-US` "
-        r"templates\.\s+Its visible-payload allowlist must exclude tenant, site/asset, "
+        r"\bPhase 7A must freeze and test the exact generic visible templates: "
+        r"pt-BR title `LimnoPulse: ação necessária` and body `Abra o aplicativo para "
+        r"ver os detalhes\.`; en-US title `LimnoPulse: action required` and body "
+        r"`Open the app to view the details\.`; template mutations must fail acceptance\.\s+"
+        r"Its visible-payload allowlist must exclude tenant, site/asset, "
         r"location, precise telemetry, personal/phone, command, actuator, credential, "
         r"token, and other sensitive fields;\s+its data payload is limited to an "
         r"opaque incident/notification ID, authenticated deep link, version, and "
@@ -434,8 +437,12 @@ REQUIRED_ADR_GATE_PATTERNS = {
         r"plaintext phone numbers must remain excluded from ordinary reads, queue "
         r"jobs, logs, metrics, and ordinary audit records\b",
         r"\bDuplicate standard SQS Push or SMS jobs, including concurrent "
-        r"multiprocess delivery, must be idempotent:\s+the same logical job yields "
-        r"one durable Attempt, one provider attempt, and one cost commitment\b",
+        r"multiprocess delivery, must be idempotent per scheduled attempt:\s+the same "
+        r"logical job and retry-attempt identity yields one durable Attempt, one "
+        r"provider attempt, and one cost commitment;\s+a bounded retry of a definite "
+        r"temporary failure creates a new explicit retry Attempt identity while "
+        r"retaining one Delivery, and duplicate redelivery of that retry attempt must "
+        r"not call the provider twice\b",
         r"\bEach Push destination must be keyed by tenant, recipient, client app, "
         r"and client app instance;\s+multiple devices for one user must coexist and "
         r"fan out independently, and registration or rotation of one instance must "
@@ -1667,6 +1674,18 @@ CODEX_REVIEW_GATE_CASES += tuple(
             "Phase 9 vendor connector acceptance must prove an independent disable and rollback path that stops new connector work while preserving imported history and Device records.",
             "Phase 9 may disable a vendor connector only by deleting or rewriting imported history and Device records.",
         ),
+        (
+            "exact generic Push visible templates",
+            "ADR-011-limnopulse-owns-notification-semantics.md",
+            "Phase 7A must freeze and test the exact generic visible templates: pt-BR title `LimnoPulse: ação necessária` and body `Abra o aplicativo para ver os detalhes.`; en-US title `LimnoPulse: action required` and body `Open the app to view the details.`; template mutations must fail acceptance.",
+            "Phase 7A may change the generic pt-BR or en-US Push title or body without a versioned approval and acceptance test.",
+        ),
+        (
+            "Push retry attempt identity",
+            "ADR-018-eum-push-and-sms-are-provider-adapters.md",
+            "Duplicate standard SQS Push or SMS jobs, including concurrent multiprocess delivery, must be idempotent per scheduled attempt: the same logical job and retry-attempt identity yields one durable Attempt, one provider attempt, and one cost commitment; a bounded retry of a definite temporary failure creates a new explicit retry Attempt identity while retaining one Delivery, and duplicate redelivery of that retry attempt must not call the provider twice.",
+            "Duplicate standard SQS Push or SMS jobs may reuse one Attempt identity for repeated provider retries or call the provider twice for the same retry attempt.",
+        ),
     )
 )
 
@@ -1967,7 +1986,15 @@ def assert_architecture_baseline_metadata(
         current_state
     )
     assert f"**Runtime baseline:** `{EXPECTED_RUNTIME_BASELINE}`" in current_state
-    assert "`4953601` hardens the alert-evaluator container runtime and updates Go dependencies" in current_state
+    assert (
+        "`f0ce773` is the current main baseline and includes the alert-evaluator "
+        "runtime, frontend and lead API, production containers, and deployment "
+        "configuration"
+    ) in current_state
+    assert (
+        "The nine rows below intentionally inventory V4 domain surfaces rather than "
+        "every runtime feature"
+    ) in current_state
     assert "documentation and tests after that baseline do not change runtime behavior" in current_state
 
     architecture = architecture_path.read_text(encoding="utf-8")
@@ -1993,7 +2020,7 @@ def test_architecture_baseline_metadata_is_pinned() -> None:
         (
             "docs/current-state.md",
             f"**Runtime baseline:** `{EXPECTED_RUNTIME_BASELINE}`",
-            "**Runtime baseline:** `ce46b47fd646de762098a632b12e02d482c66485`",
+            "**Runtime baseline:** `4953601fbbc2f95c79e34439cce855307b7db2c8`",
         ),
         ("docs/architecture.md", "**Version:** 1.4", "**Version:** 1.3"),
         (
@@ -3629,6 +3656,30 @@ def test_codex_review_gate_rejects_inverted_requirement(
     mutate_adr_gate(adr_root, case["filename"], case["inverted_clause"])
 
     assert_adr_rejected(adr_root, match="normative implementation gate inversions")
+
+
+@pytest.mark.parametrize(
+    "old",
+    (
+        "LimnoPulse: ação necessária",
+        "Abra o aplicativo para ver os detalhes.",
+        "LimnoPulse: action required",
+        "Open the app to view the details.",
+    ),
+)
+def test_generic_push_template_gate_rejects_content_mutation(
+    tmp_path: Path,
+    old: str,
+) -> None:
+    adr_root = copy_adr_fixture(tmp_path)
+    replace_adr_fragment(
+        adr_root,
+        "ADR-011-limnopulse-owns-notification-semantics.md",
+        old,
+        f"{old} changed",
+    )
+
+    assert_adr_rejected(adr_root)
 
 
 @pytest.mark.parametrize(

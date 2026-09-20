@@ -1,8 +1,10 @@
 # LimnoPulse Current-State Inventory
 
 **Execution baseline:** `main@141e108a479c983ed3a5efcbe729a30a43ab0ecb`<br>
-**Runtime baseline:** `4953601fbbc2f95c79e34439cce855307b7db2c8`
-**Reconciliation:** `141e108` adds the approved V4 planning documents; `4953601` hardens the alert-evaluator container runtime and updates Go dependencies, so it is the current runtime baseline.
+**Runtime baseline:** `f0ce773a08131c340a54d12824427a5a3fcbb25a`
+**Reconciliation:** `141e108` adds the approved V4 planning documents; `f0ce773` is the current main baseline and includes the alert-evaluator runtime, frontend and lead API, production containers, and deployment configuration.
+
+The nine rows below intentionally inventory V4 domain surfaces rather than every runtime feature; current-main additions outside this table include frontend/lead API, production containers/deployment, and alert-evaluator changes.
 
 | Surface | Status | Evidence | V4 treatment | Owning phase |
 |---|---|---|---|---|
@@ -16,4 +18,4 @@
 | Billing/AWS IoT/Push/SMS/commands | `planned` | `docs/superpowers/specs/2026-08-16-limnopulse-platform-redesign-tech-spec-v4.md` | Add through canonical internal contracts and replaceable provider or safety adapters. | Phases 4, 5, 7B, 7C, 8 |
 | Device permanently bound to a pond | `obsolete` | `src/limnopulse_api/domain/entities.py` | Replace canonical v2 `pond_id` with temporal Deployment while projecting legacy behavior. | Phase 1 |
 
-The execution baseline above is the frozen approved V4 planning point. Issue #28 originally branched from `main@e95d3eee9c813e3946d43f297071a80b62dd123b`; after Issue #27 merged, the branch was updated with current `main@4953601fbbc2f95c79e34439cce855307b7db2c8`. The `4953601` runtime hardening and dependency updates are included in the runtime baseline; documentation and tests after that baseline do not change runtime behavior.
+The execution baseline above is the frozen approved V4 planning point. Issue #28 originally branched from `main@e95d3eee9c813e3946d43f297071a80b62dd123b`; after Issue #27 merged, the branch was updated with current `main@f0ce773a08131c340a54d12824427a5a3fcbb25a`. The current-main runtime additions are included in the runtime baseline; documentation and tests after that baseline do not change runtime behavior.
