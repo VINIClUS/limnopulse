@@ -7,9 +7,10 @@ configuration inputs; they do not promise byte-identical local toolchains.
 ## Prerequisites
 
 Install GNU Make, Python 3.12 or newer, uv, the Go version declared by
-`go.mod`, OpenTofu 1.8.0 or newer, and Docker with the Compose plugin. The uv
-and OpenTofu binaries can be overridden with the `UV` and `TOFU` Make
-variables when a controlled local binary is required.
+`go.mod`, OpenTofu 1.10.0 or newer (required for the S3 backend's native
+locking used by `infra/opentofu/backend.example.hcl`), and Docker with the
+Compose plugin. The uv and OpenTofu binaries can be overridden with the `UV`
+and `TOFU` Make variables when a controlled local binary is required.
 
 ## Local gates
 

@@ -97,7 +97,7 @@ def test_versions_pin_opentofu_and_aws_provider_with_backend_placeholder() -> No
     versions = _read("versions.tf")
     backend = _read("backend.example.hcl")
 
-    assert 'required_version = ">= 1.8.0"' in versions
+    assert 'required_version = ">= 1.10.0"' in versions
     assert 'source  = "hashicorp/aws"' in versions
     assert re.search(r'version\s+=\s+"~>\s*6\.33"', versions)
     assert 'backend "s3" {}' in versions
