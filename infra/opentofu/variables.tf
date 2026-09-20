@@ -106,6 +106,12 @@ variable "ses_eventbridge_rule_name" {
   default     = "limnopulse-ses-events"
 }
 
+variable "ses_from_email" {
+  description = "Verified SES sender address (SES_FROM_EMAIL) the notification worker sends from. Scopes iam_runtime.tf's email_worker policy via ses:FromAddress; the SES identity itself is verified out of band (no aws_ses_email_identity resource — see the identity boundary test)."
+  type        = string
+  default     = ""
+}
+
 variable "redis_url" {
   description = "Cloud Redis endpoint for application configuration. Provisioning is intentionally out of scope here."
   type        = string
@@ -158,9 +164,14 @@ variable "telegram_webhook" {
 }
 
 locals {
+  # Owner=vinisantana matches the design spec's tagging contract (§ resource
+  # tagging): every taggable resource carries Project/Environment/ManagedBy/
+  # Owner. Applying it here in the shared local means every resource in this
+  # module gets it, not just the ones touched in a given change.
   common_tags = {
     Project     = var.project_name
     Environment = var.environment
     ManagedBy   = "opentofu"
+    Owner       = "vinisantana"
   }
 }

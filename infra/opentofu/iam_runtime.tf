@@ -105,7 +105,7 @@ data "aws_iam_policy_document" "dynamodb_domain_access_workers" {
 
 resource "aws_iam_policy" "dynamodb_domain_access_workers" {
   name        = "${var.project_name}-${var.environment}-dynamodb-domain-access-workers"
-  description = "Read/write access to the domain DynamoDB table only — no audit table."
+  description = "Read/write access to the domain DynamoDB table only - no audit table."
   policy      = data.aws_iam_policy_document.dynamodb_domain_access_workers.json
 
   tags = local.common_tags

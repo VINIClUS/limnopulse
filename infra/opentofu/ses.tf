@@ -226,15 +226,24 @@ data "aws_iam_policy_document" "email_worker" {
     sid    = "SesSendEmail"
     effect = "Allow"
     # IAM authorizes the SESv2 SendEmail API under the "ses:" prefix, not
-    # "sesv2:" — SES was never split into a separate IAM service namespace
-    # when the v2 API was introduced. No condition here: "ses:configuration-set"
-    # is a message tag emitted in SES events, not an IAM request context
-    # key SendEmail evaluates — a condition on it would never match and
-    # would deny every send. SES has no resource-level ARN scoping for the
-    # calling identity the way DynamoDB does, so this grant is unavoidably
-    # account-wide.
+    # "sesv2:" - SES was never split into a separate IAM service namespace
+    # when the v2 API was introduced. resources stays "*": SES identity
+    # verification is handled out of band, not by a Terraform-managed
+    # resource in this stack (see the identity boundary test), so there's
+    # no local ARN to scope this to. ses:FromAddress narrows the grant
+    # instead, to the one address the worker actually sends from
+    # (internal/notifications/worker/config, SES_FROM_EMAIL). Not
+    # ses:configuration-set: that's a message tag SES emits in events, not
+    # an IAM request context key SendEmail evaluates - a condition on it
+    # would never match and would deny every send.
     actions   = ["ses:SendEmail"]
     resources = ["*"]
+
+    condition {
+      test     = "StringEquals"
+      variable = "ses:FromAddress"
+      values   = [var.ses_from_email]
+    }
   }
 
   statement {
