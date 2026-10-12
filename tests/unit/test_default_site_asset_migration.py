@@ -89,6 +89,8 @@ class FakeMigrationDynamo:
         self.scan_calls: list[dict[str, Any]] = []
         self.before_transact: Callable[[FakeMigrationDynamo, list[dict]], None] | None = None
         self.fail_operation: tuple[str, Exception] | None = None
+        self.fail_once: dict[str, Exception] = {}
+        self.before_get_item: Callable[[FakeMigrationDynamo, tuple[str, str]], None] | None = None
 
     # Builders ---------------------------------------------------------------------------------
 
@@ -170,6 +172,8 @@ class FakeMigrationDynamo:
         self.calls.append(("get_item", kwargs))
         self._maybe_fail("get_item")
         key = self.deserialize(kwargs["Key"])
+        if self.before_get_item is not None:
+            self.before_get_item(self, (key["PK"], key["SK"]))
         item = self.items.get((key["PK"], key["SK"]))
         return {} if item is None else {"Item": self.serialize(item)}
 
@@ -256,6 +260,8 @@ class FakeMigrationDynamo:
         return {key: self.deserializer.deserialize(value) for key, value in item.items()}
 
     def _maybe_fail(self, operation: str) -> None:
+        if operation in self.fail_once:
+            raise self.fail_once.pop(operation)
         if self.fail_operation is not None and self.fail_operation[0] == operation:
             raise self.fail_operation[1]
 
@@ -1098,3 +1104,266 @@ def test_tenant_normalization_and_exit_codes() -> None:
     assert exit_code_for("schema_conflict") == 2
     for result in ("deadline_exceeded", "dynamodb_error", "configuration_error", "failed"):
         assert exit_code_for(result) == 1
+
+
+# Audit regressions: overlapping runs, /v1 moves, transaction conflicts, counters ---------------
+
+
+def _transaction_conflict() -> ClientError:
+    return ClientError(
+        {
+            "Error": {"Code": "TransactionCanceledException", "Message": "cancelled"},
+            "CancellationReasons": [{"Code": "TransactionConflict"}, {"Code": "None"}],
+        },
+        "TransactWriteItems",
+    )
+
+
+def _deployment_history_key() -> tuple[str, str]:
+    deployment = deployment_for_legacy_device(
+        device_model("probe-1", "pond_1"),
+        asset_id_for_legacy_pond("tnt_1", "pond_1"),
+        default_site_id("tnt_1"),
+    )
+    key = KEYS.deployment_history(
+        deployment.component_id, deployment.started_at, deployment.deployment_id
+    )
+    return key["PK"], key["SK"]
+
+
+def _move_device(fake: FakeMigrationDynamo, pond_id: str) -> None:
+    for key in (("TENANT#tnt_1", "DEVICE#probe-1"), ("DEVICE#probe-1", "META")):
+        fake.items[key]["pond_id"] = pond_id
+        fake.items[key]["version"] += 1
+
+
+@pytest.mark.parametrize(
+    "trigger",
+    [
+        "deployment_history",
+        "asset",
+        "component_canonical",
+    ],
+)
+@pytest.mark.parametrize("apply", [True, False])
+def test_identical_run_committing_between_known_key_reads_converges(
+    trigger: str, apply: bool
+) -> None:
+    client = FakeMigrationDynamo.with_legacy_tenant(
+        tenant_id="tnt_1",
+        ponds=[legacy_pond("pond_1")],
+        devices=[legacy_device("probe-1", "pond_1")],
+    )
+    component_id = default_component_id_for_legacy_device("tnt_1", "probe-1")
+    trigger_key = {
+        "deployment_history": _deployment_history_key(),
+        "asset": tuple(KEYS.asset("tnt_1", asset_id_for_legacy_pond("tnt_1", "pond_1")).values()),
+        "component_canonical": tuple(KEYS.component(component_id).values()),
+    }[trigger]
+
+    def other_run(fake: FakeMigrationDynamo, key: tuple[str, str]) -> None:
+        if key == trigger_key:
+            fake.before_get_item = None
+            other = DefaultSiteAssetMigrator(fake, clock=second_clock).run(
+                ["tnt_1"], apply=True, page_size=25, deadline_seconds=300
+            )
+            assert other.result == "success"
+
+    client.before_get_item = other_run
+
+    result = run(client, apply=apply)
+
+    assert result.result == "success"
+    assert result.conflicts == []
+    if apply:
+        assert result.default_sites_created == 0
+        assert result.assets_created == 0
+        assert result.components_created == 0
+        assert result.deployments_created == 0
+        assert result.already_migrated == 2
+
+
+def test_device_moved_by_v1_during_planning_is_replanned() -> None:
+    client = FakeMigrationDynamo.with_legacy_tenant(
+        tenant_id="tnt_1",
+        ponds=[legacy_pond("pond_1"), legacy_pond("pond_2")],
+        devices=[legacy_device("probe-1", "pond_1")],
+    )
+
+    def move_on_lookup_read(fake: FakeMigrationDynamo, key: tuple[str, str]) -> None:
+        if key == ("DEVICE#probe-1", "META"):
+            fake.before_get_item = None
+            _move_device(fake, "pond_2")
+
+    client.before_get_item = move_on_lookup_read
+
+    result = run(client, apply=True)
+
+    component_id = default_component_id_for_legacy_device("tnt_1", "probe-1")
+    assert result.result == "success"
+    assert result.deployments_created == 1
+    current = client.get_raw(*KEYS.current_deployment(component_id).values())
+    assert current["asset_id"] == asset_id_for_legacy_pond("tnt_1", "pond_2")
+    assert client.get_raw("TENANT#tnt_1", "DEVICE#probe-1")["version"] == 4
+
+
+def test_persistent_lookup_mismatch_is_a_conflict_after_bounded_rereads() -> None:
+    client = FakeMigrationDynamo.with_legacy_tenant(
+        tenant_id="tnt_1",
+        ponds=[legacy_pond("pond_1"), legacy_pond("pond_2")],
+        devices=[legacy_device("probe-1", "pond_1")],
+    )
+    client.items[("DEVICE#probe-1", "META")]["pond_id"] = "pond_2"
+
+    result = run(client, apply=True)
+
+    assert result.result == "schema_conflict"
+    assert [(c.kind, c.key) for c in result.conflicts] == [("device_lookup", "DEVICE#probe-1/META")]
+    device_reads = [
+        request
+        for name, request in client.calls
+        if name == "get_item" and client.deserialize(request["Key"])["SK"] == "DEVICE#probe-1"
+    ]
+    assert len(device_reads) == 2  # the Query page plus two bounded re-reads in total
+    assert client.write_calls == []
+
+
+def test_device_moved_to_pond_created_during_planning_plans_that_pond() -> None:
+    client = FakeMigrationDynamo.with_legacy_tenant(
+        tenant_id="tnt_1",
+        ponds=[legacy_pond("pond_1")],
+        devices=[legacy_device("probe-1", "pond_1")],
+    )
+
+    def create_pond_and_move(fake: FakeMigrationDynamo, key: tuple[str, str]) -> None:
+        if key == ("DEVICE#probe-1", "META"):
+            fake.before_get_item = None
+            fake.put_raw(legacy_pond("pond_new"))
+            _move_device(fake, "pond_new")
+
+    client.before_get_item = create_pond_and_move
+
+    result = run(client, apply=True)
+
+    component_id = default_component_id_for_legacy_device("tnt_1", "probe-1")
+    new_asset_id = asset_id_for_legacy_pond("tnt_1", "pond_new")
+    assert result.result == "success"
+    assert result.assets_created == 2
+    assert client.get_raw(*KEYS.current_deployment(component_id).values())["asset_id"] == (
+        new_asset_id
+    )
+    assert client.get_raw("TENANT#tnt_1", "POND#pond_new")["v2_asset_id"] == new_asset_id
+
+
+def test_device_moved_to_new_pond_between_plan_and_write_applies_that_pond_first() -> None:
+    client = FakeMigrationDynamo.with_legacy_tenant(
+        tenant_id="tnt_1",
+        ponds=[legacy_pond("pond_1")],
+        devices=[legacy_device("probe-1", "pond_1")],
+    )
+
+    def create_pond_and_move(fake: FakeMigrationDynamo, actions: list[dict]) -> None:
+        fake.put_raw(legacy_pond("pond_new"))
+        _move_device(fake, "pond_new")
+
+    def arm_for_device_transaction(fake: FakeMigrationDynamo, actions: list[dict]) -> None:
+        fake.before_transact = create_pond_and_move
+
+    client.before_transact = arm_for_device_transaction
+
+    result = run(client, apply=True)
+
+    component_id = default_component_id_for_legacy_device("tnt_1", "probe-1")
+    assert result.result == "success"
+    assert result.assets_created == 2
+    assert result.deployments_created == 1
+    assert client.get_raw(*KEYS.current_deployment(component_id).values())["asset_id"] == (
+        asset_id_for_legacy_pond("tnt_1", "pond_new")
+    )
+
+
+def test_transaction_conflict_cancellation_is_retried_after_backoff() -> None:
+    client = FakeMigrationDynamo.with_legacy_tenant(
+        tenant_id="tnt_1",
+        ponds=[legacy_pond("pond_1")],
+        devices=[legacy_device("probe-1", "pond_1")],
+    )
+    client.fail_once["transact_write_items"] = _transaction_conflict()
+    client.fail_once["put_item"] = ClientError(
+        {"Error": {"Code": "TransactionConflictException", "Message": "busy"}}, "PutItem"
+    )
+    sleeps: list[float] = []
+
+    result = DefaultSiteAssetMigrator(client, clock=fixed_clock, sleep=sleeps.append).run(
+        ["tnt_1"], apply=True, page_size=25, deadline_seconds=300
+    )
+
+    assert result.result == "success"
+    assert (result.default_sites_created, result.assets_created) == (1, 1)
+    assert result.deployments_created == 1
+    assert len(sleeps) == 2
+    assert all(0 <= delay <= 0.05 for delay in sleeps)
+
+
+def test_exhausted_transaction_conflicts_fail_only_that_tenant() -> None:
+    class BusyTenantDynamo(FakeMigrationDynamo):
+        def transact_write_items(self, **kwargs: Any) -> dict[str, Any]:
+            if "TENANT#tnt_1" in str(kwargs):
+                self.calls.append(("transact_write_items", kwargs))
+                raise _transaction_conflict()
+            return super().transact_write_items(**kwargs)
+
+    client = BusyTenantDynamo()
+    client.add_legacy_tenant("tnt_1", ponds=[legacy_pond("pond_1")], devices=[])
+    client.add_legacy_tenant("tnt_2", ponds=[legacy_pond("pond_2", tenant_id="tnt_2")], devices=[])
+    sleeps: list[float] = []
+
+    result = DefaultSiteAssetMigrator(client, clock=fixed_clock, sleep=sleeps.append).run(
+        ["tnt_1", "tnt_2"], apply=True, page_size=25, deadline_seconds=300
+    )
+
+    assert result.result == "failed"
+    assert exit_code_for(result.result) == 1
+    assert result.tenants_completed == 1
+    assert result.scope_completed is False
+    assert result.assets_created == 1  # tnt_2
+    assert len(sleeps) == 3
+    assert client.get_raw(*KEYS.migration_receipt("tnt_1").values()) is None
+    assert client.get_raw(*KEYS.migration_receipt("tnt_2").values()) is not None
+
+
+def test_profile_repair_for_existing_asset_is_not_counted_as_asset_created() -> None:
+    client = FakeMigrationDynamo.with_legacy_tenant(
+        tenant_id="tnt_1", ponds=[legacy_pond("pond_1")], devices=[]
+    )
+    projection = asset_and_profile_for_legacy_pond(pond_model("pond_1"), default_site_id("tnt_1"))
+    client.put_raw(asset_to_item(projection.asset))
+
+    dry = run(client, apply=False)
+    applied = run(client, apply=True)
+
+    assert (dry.would_create_assets, dry.would_update_legacy_links) == (0, 1)
+    assert (applied.assets_created, applied.legacy_links_updated) == (0, 1)
+    profile = pond_profile_to_item(projection.pond_profile)
+    assert client.get_raw(profile["PK"], profile["SK"]) == normalized(profile)
+
+
+def test_link_only_device_is_not_counted_as_projected() -> None:
+    client = migrated_store()
+    for key, names in (
+        (("TENANT#tnt_1", "POND#pond_1"), ("v2_site_id", "v2_asset_id", "v2_projection_version")),
+        (("TENANT#tnt_1", "DEVICE#probe-1"), ("default_component_id", "v2_projection_version")),
+        (("DEVICE#probe-1", "META"), ("default_component_id", "v2_projection_version")),
+    ):
+        for name in names:
+            del client.items[key][name]
+
+    dry = run(client, apply=False)
+    applied = run(client, apply=True)
+
+    assert (dry.would_project_devices, dry.would_update_legacy_links) == (0, 2)
+    assert applied.devices_projected == 0
+    assert applied.components_created == 0
+    assert applied.deployments_created == 0
+    assert applied.legacy_links_updated == 2
+    assert applied.already_migrated == 0

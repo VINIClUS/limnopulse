@@ -21,15 +21,29 @@ it is byte-identical to the `/v1` compatibility projection. Timestamps and versi
 legacy rows; the injected clock only stamps the per-tenant migration receipt.
 
 Each Pond and each Device is written in one transaction of `attribute_not_exists` puts and
-version-fenced link updates. A conditional failure re-reads the source row and the known keys and
-re-plans the record: content that now matches on ownership/identity converges as already
-migrated, divergent content is a schema conflict. Ownership comparisons never look at names,
+version-fenced link updates. A conditional failure, or a cancellation caused only by
+`TransactionConflict` (after a small jittered backoff), re-reads the source row and the known keys
+and re-plans the record: content that now matches on ownership/identity converges as already
+migrated, divergent content is a schema conflict. Known keys of one transaction group are read
+siblings-first and the primary row last (Deployment CURRENT/history/marker before its mirror), so
+a present primary proves the group. Any mixed state that a concurrent commit or a `/v1` move can
+explain (a lookup that disagrees with the queried Device row, a Device whose Pond is unknown, a
+partial Deployment group) re-reads the record, bounded by `MAX_RECORD_ATTEMPTS`, before it is
+reported as a conflict; a Pond created during the run is read and planned before its Device.
+Exhausted retries mark only that tenant failed (result `failed`, exit 1); other tenants continue.
+The run is idempotent, so rerunning it converges any tenant left incomplete.
+
+Counters: `assets_created` counts Asset puts only. A PondProfile written for an existing Asset
+counts under `legacy_links_updated`, because the profile's `legacy_pond_id` is the reverse
+v2 -> v1 link. `devices_projected` counts Devices whose Component or Deployment is created; a
+Device that only gains links counts under `legacy_links_updated`. Ownership comparisons never look at names,
 descriptions, status, version or `updated_at`, which later `/v1` or `/v2` edits may change. A
 Device whose deterministic Deployment exists but is no longer CURRENT (it has since moved) is
 already migrated. The receipt records each completed run and is never used to skip validation.
 """
 
 import logging
+import random
 import time
 from collections import Counter
 from collections.abc import Callable, Iterable, Mapping, Sequence
@@ -84,6 +98,7 @@ MAX_PAGE_SIZE = 100
 MIN_DEADLINE_SECONDS = 1
 MAX_DEADLINE_SECONDS = 3600
 MAX_RECORD_ATTEMPTS = 3
+BACKOFF_BASE_SECONDS = 0.05
 
 MigrationResult = Literal[
     "success",
@@ -196,8 +211,32 @@ class _DeadlineExceeded(Exception):
     pass
 
 
+class _Unstable(Exception):
+    """A mixed state that a concurrent commit can explain; re-read and re-plan the record."""
+
+    def __init__(self, kind: str, key: Mapping[str, str]) -> None:
+        super().__init__(kind)
+        self.kind = kind
+        self.key = dict(key)
+
+
 class _RetryExhausted(Exception):
     pass
+
+
+def _is_transaction_conflict(exc: ClientError) -> bool:
+    """A write lost only to concurrent transactions (no conditional failure): retryable."""
+    code = exc.response.get("Error", {}).get("Code")
+    if code == "TransactionConflictException":
+        return True
+    if code != "TransactionCanceledException":
+        return False
+    reasons = [
+        reason.get("Code")
+        for reason in exc.response.get("CancellationReasons") or []
+        if isinstance(reason, Mapping) and reason.get("Code") not in (None, "None")
+    ]
+    return bool(reasons) and all(reason == "TransactionConflict" for reason in reasons)
 
 
 @dataclass(frozen=True)
@@ -206,6 +245,7 @@ class _RecordPlan:
     source_key: dict[str, str]
     actions: tuple[dict[str, Any], ...]
     asset_created: bool = False
+    profile_created: bool = False
     component_created: bool = False
     deployment_created: bool = False
     link_updated: bool = False
@@ -214,12 +254,12 @@ class _RecordPlan:
         if not self.actions:
             return Counter(already_migrated=1)
         counts: Counter[str] = Counter()
-        if self.kind == "device":
-            counts["devices_projected"] += 1
+        counts["devices_projected"] += int(self.component_created or self.deployment_created)
         counts["assets_created"] += int(self.asset_created)
         counts["components_created"] += int(self.component_created)
         counts["deployments_created"] += int(self.deployment_created)
-        counts["legacy_links_updated"] += int(self.link_updated)
+        # The PondProfile carries `legacy_pond_id`, the reverse v2 -> v1 link.
+        counts["legacy_links_updated"] += int(self.link_updated or self.profile_created)
         return counts
 
 
@@ -246,17 +286,20 @@ class _RunState:
     apply: bool
     tenants_requested: int
     tenants_completed: int = 0
+    tenants_failed: int = 0
     counts: Counter[str] = field(default_factory=Counter)
     conflicts: list[MigrationConflict] = field(default_factory=list)
 
     def add_conflicts(self, tenant_id: str, conflicts: Sequence[_SchemaConflict]) -> None:
-        self.conflicts.extend(
-            MigrationConflict(tenant_id=tenant_id, kind=conflict.kind, key=conflict.key)
-            for conflict in conflicts
-        )
+        for conflict in conflicts:
+            entry = MigrationConflict(tenant_id=tenant_id, kind=conflict.kind, key=conflict.key)
+            if entry not in self.conflicts:
+                self.conflicts.append(entry)
 
     def summary(self, fatal: MigrationResult | None) -> MigrationSummary:
-        result: MigrationResult = fatal or ("schema_conflict" if self.conflicts else "success")
+        result: MigrationResult = fatal or (
+            "failed" if self.tenants_failed else "schema_conflict" if self.conflicts else "success"
+        )
         values = {name: self.counts[name] for name in (*_CREATED_TO_WOULD, "already_migrated")}
         values.update({would: self.counts[would] for would in _CREATED_TO_WOULD.values()})
         return MigrationSummary(
@@ -309,11 +352,13 @@ class DefaultSiteAssetMigrator:
         table_name: str = DEFAULT_TABLE_NAME,
         clock: Callable[[], datetime] = utc_now,
         monotonic: Callable[[], float] = time.monotonic,
+        sleep: Callable[[float], None] = time.sleep,
     ) -> None:
         self.store = DynamoDefaultSiteAssetMigrationStore(table_name, client, clock=clock)
         self.keys = self.store.keys
         self._clock = clock
         self._monotonic = monotonic
+        self._sleep = sleep
 
     def run(
         self,
@@ -376,6 +421,10 @@ class DefaultSiteAssetMigrator:
         except _SchemaConflict as conflict:
             state.add_conflicts(tenant_id, [conflict])
             return
+        except _RetryExhausted as exc:
+            _LOGGER.error("tenant %s not completed: retries exhausted on %s", tenant_id, exc)
+            state.tenants_failed += 1
+            return
         finally:
             state.counts.update(tenant_counts)
         self.store.record_migration_receipt(
@@ -406,9 +455,9 @@ class DefaultSiteAssetMigrator:
             for pond_item in page:
                 self._check_deadline(deadline)
                 try:
-                    pond = self._parse_pond(tenant_id, pond_item)
-                    plan.ponds[pond.pond_id] = pond
-                    plan.records.append(self._plan_pond(pond, pond_item, site_id))
+                    plan.records.append(
+                        self._plan_record("pond", pond_item, plan, plan.records.append)
+                    )
                 except _SchemaConflict as conflict:
                     plan.conflicts.append(conflict)
 
@@ -421,13 +470,73 @@ class DefaultSiteAssetMigrator:
                 if not is_legacy_device_item(device_item):
                     continue
                 try:
-                    device = self._parse_device(tenant_id, device_item)
-                    plan.records.append(self._plan_device(device, device_item, plan.ponds, site_id))
+                    plan.records.append(
+                        self._plan_record("device", device_item, plan, plan.records.append)
+                    )
                 except _SchemaConflict as conflict:
                     plan.conflicts.append(conflict)
         return plan
 
     # Planning -------------------------------------------------------------------------------
+
+    def _plan_record(
+        self,
+        kind: Literal["pond", "device"],
+        item: Mapping[str, Any],
+        plan: _TenantPlan,
+        on_new_pond: Callable[[_RecordPlan], None],
+    ) -> _RecordPlan:
+        """Plan one record; a mixed state re-reads the source row and re-plans, bounded."""
+        source_key = _source_key(item)
+        unstable: _Unstable | None = None
+        for attempt in range(MAX_RECORD_ATTEMPTS):
+            if attempt:
+                fresh = self.store.get_known_item(source_key)
+                if fresh is None:
+                    raise _SchemaConflict(f"{kind}_missing", source_key)
+                item = fresh
+            try:
+                return self._plan_from_item(kind, item, plan, on_new_pond)
+            except _Unstable as exc:
+                unstable = exc
+        assert unstable is not None
+        raise _SchemaConflict(unstable.kind, unstable.key)
+
+    def _plan_from_item(
+        self,
+        kind: Literal["pond", "device"],
+        item: Mapping[str, Any],
+        plan: _TenantPlan,
+        on_new_pond: Callable[[_RecordPlan], None],
+    ) -> _RecordPlan:
+        tenant_id = plan.tenant.tenant_id
+        if kind == "pond":
+            pond = self._parse_pond(tenant_id, item)
+            plan.ponds[pond.pond_id] = pond
+            return self._plan_pond(pond, item, plan.site_id)
+        if not is_legacy_device_item(item):
+            raise _SchemaConflict("device_invalid", _source_key(item))
+        device = self._parse_device(tenant_id, item)
+        self._ensure_pond(device, item, plan, on_new_pond)
+        return self._plan_device(device, item, plan.site_id)
+
+    def _ensure_pond(
+        self,
+        device: Device,
+        item: Mapping[str, Any],
+        plan: _TenantPlan,
+        on_new_pond: Callable[[_RecordPlan], None],
+    ) -> None:
+        """Resolve the Device's Pond; one created during the run is read and planned first."""
+        if device.pond_id in plan.ponds:
+            return
+        pond_item = self.store.get_known_item(
+            self.keys.legacy_pond(device.tenant_id, device.pond_id)
+        )
+        if pond_item is None:
+            # The Device row may be stale (moved since it was read): re-read it before failing.
+            raise _Unstable("device_missing_pond", _source_key(item))
+        on_new_pond(self._plan_record("pond", pond_item, plan, on_new_pond))
 
     def _plan_site(self, tenant: Tenant) -> tuple[str, dict[str, Any] | None]:
         site = default_site_for_tenant(tenant)
@@ -464,19 +573,12 @@ class DefaultSiteAssetMigrator:
             raise _SchemaConflict("pond_invalid", source_key) from exc
         asset_item = asset_to_item(projection.asset)
         profile_item = pond_profile_to_item(projection.pond_profile)
-        actions: list[dict[str, Any]] = []
-        asset_created = False
-        for target, fields, kind in (
-            (asset_item, _ASSET_FIELDS, "asset"),
-            (profile_item, _PROFILE_FIELDS, "pond_profile"),
-        ):
-            key = {"PK": target["PK"], "SK": target["SK"]}
-            existing = self.store.get_known_item(key)
-            if existing is None:
-                actions.append({"Put": self.store.put_new_request(target)})
-                asset_created = True
-            else:
-                _require_identity(existing, target, fields, kind, key)
+        # Asset, PondProfile and the Pond links commit in one transaction and absent rows are
+        # planned as conditional puts, so a concurrent commit between these reads only makes
+        # the transaction fail and the record re-plan; it never raises a conflict.
+        profile_put = self._plan_put(profile_item, _PROFILE_FIELDS, "pond_profile")
+        asset_put = self._plan_put(asset_item, _ASSET_FIELDS, "asset")
+        actions = [action for action in (asset_put, profile_put) if action is not None]
 
         asset_id = projection.asset.asset_id
         link_updated = _links_needed(
@@ -505,20 +607,13 @@ class DefaultSiteAssetMigrator:
             kind="pond",
             source_key=source_key,
             actions=tuple(actions),
-            asset_created=asset_created,
+            asset_created=asset_put is not None,
+            profile_created=profile_put is not None,
             link_updated=link_updated,
         )
 
-    def _plan_device(
-        self,
-        device: Device,
-        item: Mapping[str, Any],
-        ponds: Mapping[str, Pond],
-        site_id: str,
-    ) -> _RecordPlan:
+    def _plan_device(self, device: Device, item: Mapping[str, Any], site_id: str) -> _RecordPlan:
         source_key = _source_key(item)
-        if device.pond_id not in ponds:
-            raise _SchemaConflict("device_missing_pond", source_key)
         tenant_id = device.tenant_id
         asset_id = asset_id_for_legacy_pond(tenant_id, device.pond_id)
         try:
@@ -535,18 +630,23 @@ class DefaultSiteAssetMigrator:
             or lookup.get("device_id") != device.device_id
             or lookup.get("pond_id") != device.pond_id
         ):
-            raise _SchemaConflict("device_lookup", lookup_key)
+            # The Device row came from an earlier Query page; a /v1 move since then shows up
+            # as a lookup mismatch, so re-read the row before calling it a conflict.
+            raise _Unstable("device_lookup", lookup_key)
 
-        puts: list[dict[str, Any]] = []
-        component_created = False
-        for target in (component_to_item(component), component_to_item(component, canonical=False)):
-            key = {"PK": target["PK"], "SK": target["SK"]}
-            existing = self.store.get_known_item(key)
-            if existing is None:
-                puts.append({"Put": self.store.put_new_request(target)})
-                component_created = True
-            else:
-                _require_identity(existing, target, _COMPONENT_FIELDS, "component", key)
+        # Mirror, then canonical; both commit together and absent rows are conditional puts.
+        component_puts = [
+            action
+            for action in (
+                self._plan_put(
+                    component_to_item(component, canonical=False), _COMPONENT_FIELDS, "component"
+                ),
+                self._plan_put(component_to_item(component), _COMPONENT_FIELDS, "component"),
+            )
+            if action is not None
+        ]
+        puts = list(reversed(component_puts))
+        component_created = bool(component_puts)
 
         deployment_puts = self._plan_deployment(
             deployment, active=component.status is not ComponentStatus.DECOMMISSIONED
@@ -601,19 +701,22 @@ class DefaultSiteAssetMigrator:
         current_key = {"PK": current_item["PK"], "SK": current_item["SK"]}
         marker_key = deployment_marker_key(deployment.component_id)
 
-        mirror = self.store.get_known_item(mirror_key)
+        # All four rows commit in one transaction. Siblings are read first and the mirror last,
+        # so a present mirror proves the whole group; any other mix is re-read before it can
+        # become a conflict (it may be a concurrent commit landing between these reads).
         current = self.store.get_known_item(current_key)
+        history = self.store.get_known_item(history_key)
+        marker = self.store.get_known_item(marker_key)
+        mirror = self.store.get_known_item(mirror_key)
         if mirror is not None:
             _require_identity(mirror, mirror_item, _DEPLOYMENT_FIELDS, "deployment", mirror_key)
-            history = self.store.get_known_item(history_key)
             if history is None:
-                raise _SchemaConflict("deployment_history", history_key)
+                raise _Unstable("deployment_history", history_key)
             _require_identity(
                 history, history_item, _DEPLOYMENT_FIELDS, "deployment_history", history_key
             )
-            marker = self.store.get_known_item(marker_key)
             if marker is None:
-                raise _SchemaConflict("deployment_marker", marker_key)
+                raise _Unstable("deployment_marker", marker_key)
             _require_identity(marker, marker_item, _MARKER_FIELDS, "deployment_marker", marker_key)
             # A later CURRENT means the Device has since moved: already migrated.
             if current is not None and current.get("deployment_id") == deployment.deployment_id:
@@ -622,13 +725,13 @@ class DefaultSiteAssetMigrator:
                 )
             return []
         if current is not None:
-            raise _SchemaConflict("deployment_current", current_key)
+            raise _Unstable("deployment_current", current_key)
         if not active:
             return []
-        if self.store.get_known_item(history_key) is not None:
-            raise _SchemaConflict("deployment_history", history_key)
-        if self.store.get_known_item(marker_key) is not None:
-            raise _SchemaConflict("deployment_marker", marker_key)
+        if history is not None:
+            raise _Unstable("deployment_history", history_key)
+        if marker is not None:
+            raise _Unstable("deployment_marker", marker_key)
         return [
             {"Put": self.store.put_new_request(target)}
             for target in (mirror_item, history_item, current_item, marker_item)
@@ -646,10 +749,15 @@ class DefaultSiteAssetMigrator:
             try:
                 self.store.put_item_sync(action)
             except DynamoConditionalConflict:
-                _, action = self._plan_site(plan.tenant)
-                continue
-            counts["default_sites_created"] += 1
-            return
+                pass
+            except ClientError as exc:
+                if not _is_transaction_conflict(exc):
+                    raise
+                self._backoff(attempt)
+            else:
+                counts["default_sites_created"] += 1
+                return
+            _, action = self._plan_site(plan.tenant)
         raise _RetryExhausted("default site")
 
     def _apply_record(self, record: _RecordPlan, plan: _TenantPlan, counts: Counter[str]) -> None:
@@ -662,28 +770,44 @@ class DefaultSiteAssetMigrator:
             try:
                 self.store.transact_write_sync(record.actions)
             except DynamoConditionalConflict:
-                record = self._replan(record, plan)
-                continue
-            counts.update(record.counts())
-            return
+                pass
+            except ClientError as exc:
+                if not _is_transaction_conflict(exc):
+                    raise
+                self._backoff(attempt)
+            else:
+                counts.update(record.counts())
+                return
+            record = self._replan(record, plan, counts)
         raise _RetryExhausted(record.kind)
 
-    def _replan(self, record: _RecordPlan, plan: _TenantPlan) -> _RecordPlan:
-        """Re-read the source row and known keys after a conditional failure."""
-        tenant_id = plan.tenant.tenant_id
+    def _replan(self, record: _RecordPlan, plan: _TenantPlan, counts: Counter[str]) -> _RecordPlan:
+        """Re-read the source row and known keys after a failed write."""
         item = self.store.get_known_item(record.source_key)
         if item is None:
             raise _SchemaConflict(f"{record.kind}_missing", record.source_key)
-        if record.kind == "pond":
-            pond = self._parse_pond(tenant_id, item)
-            plan.ponds[pond.pond_id] = pond
-            return self._plan_pond(pond, item, plan.site_id)
-        if not is_legacy_device_item(item):
-            raise _SchemaConflict("device_invalid", record.source_key)
-        device = self._parse_device(tenant_id, item)
-        return self._plan_device(device, item, plan.ponds, plan.site_id)
+        return self._plan_record(
+            record.kind,
+            item,
+            plan,
+            lambda pond_record: self._apply_record(pond_record, plan, counts),
+        )
 
     # Helpers --------------------------------------------------------------------------------
+
+    def _plan_put(
+        self, target: Mapping[str, Any], fields: Sequence[str], kind: str
+    ) -> dict[str, Any] | None:
+        """Conditional put for an absent row; an existing row must match on identity."""
+        key = {"PK": target["PK"], "SK": target["SK"]}
+        existing = self.store.get_known_item(key)
+        if existing is None:
+            return {"Put": self.store.put_new_request(target)}
+        _require_identity(existing, target, fields, kind, key)
+        return None
+
+    def _backoff(self, attempt: int) -> None:
+        self._sleep(random.uniform(0, BACKOFF_BASE_SECONDS * 2**attempt))
 
     def _check_deadline(self, deadline: float) -> None:
         if self._monotonic() >= deadline:
