@@ -20,7 +20,9 @@ from collections.abc import Iterator, Mapping
 from datetime import datetime
 from typing import Any
 
+from limnopulse_api.adapters.dynamodb_deployments import deployment_to_item
 from limnopulse_api.adapters.dynamodb_v2 import DynamoV2RepositoryBase, canonical_timestamp_key
+from limnopulse_api.domain.deployments import Deployment, DeploymentStatus
 from limnopulse_api.domain.entities import Device, Pond, Tenant
 
 V2_SITE_ID_ATTRIBUTE = "v2_site_id"
@@ -208,6 +210,70 @@ class DynamoDefaultSiteAssetMigrationStore(DynamoV2RepositoryBase):
             condition="attribute_exists(PK) AND #tenant_id = :tenant_id",
             names={"#tenant_id": "tenant_id"},
             values={":tenant_id": tenant_id},
+        )
+
+    def component_active_check_request(self, tenant_id: str, component_id: str) -> dict[str, Any]:
+        return self.condition_check_request(
+            self.keys.component(component_id),
+            condition="attribute_exists(PK) AND #status = :active AND #tenant_id = :tenant_id",
+            names={"#status": "status", "#tenant_id": "tenant_id"},
+            values={":active": "active", ":tenant_id": tenant_id},
+        )
+
+    def end_deployment_row_request(
+        self, key: Mapping[str, str], current: Deployment, ended: Deployment
+    ) -> dict[str, Any]:
+        """End one active row of `current` (mirror or history), fenced on its observed version."""
+        return self.update_request(
+            key,
+            update_expression=(
+                "SET #status = :status, #ended_at = :ended_at, "
+                "#updated_at = :updated_at, #version = :version"
+            ),
+            condition=(
+                "attribute_exists(PK) AND #version = :expected_version AND #status = :active"
+                " AND #tenant_id = :tenant_id AND #deployment_id = :deployment_id"
+            ),
+            names={
+                "#status": "status",
+                "#ended_at": "ended_at",
+                "#updated_at": "updated_at",
+                "#version": "version",
+                "#tenant_id": "tenant_id",
+                "#deployment_id": "deployment_id",
+            },
+            values={
+                ":status": ended.status.value,
+                ":ended_at": canonical_timestamp_key(ended.ended_at),
+                ":updated_at": canonical_timestamp_key(ended.updated_at),
+                ":version": ended.version,
+                ":expected_version": current.version,
+                ":active": DeploymentStatus.ACTIVE.value,
+                ":tenant_id": current.tenant_id,
+                ":deployment_id": current.deployment_id,
+            },
+        )
+
+    def replace_current_request(
+        self, current: Deployment, replacement: Deployment
+    ) -> dict[str, Any]:
+        """Overwrite `DEPLOYMENT#CURRENT` only while it still names the observed Deployment."""
+        return self.put_request(
+            deployment_to_item(replacement, form="current"),
+            condition=(
+                "attribute_exists(PK) AND #deployment_id = :deployment_id"
+                " AND #version = :expected_version AND #tenant_id = :tenant_id"
+            ),
+            names={
+                "#deployment_id": "deployment_id",
+                "#version": "version",
+                "#tenant_id": "tenant_id",
+            },
+            values={
+                ":deployment_id": current.deployment_id,
+                ":expected_version": current.version,
+                ":tenant_id": current.tenant_id,
+            },
         )
 
     # Migration receipt ---------------------------------------------------------------------

@@ -1,6 +1,7 @@
+import asyncio
 import re
 from collections.abc import Callable
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from decimal import Decimal
 from typing import Any
 
@@ -9,7 +10,10 @@ from boto3.dynamodb.types import TypeDeserializer, TypeSerializer
 from botocore.exceptions import ClientError
 
 from limnopulse_api.adapters.dynamodb_deployments import (
+    DynamoDeploymentRepository,
+    deployment_from_item,
     deployment_marker_item,
+    deployment_marker_key,
     deployment_to_item,
 )
 from limnopulse_api.adapters.dynamodb_devices_v2 import component_to_item
@@ -180,20 +184,33 @@ class FakeMigrationDynamo:
     def query(self, **kwargs: Any) -> dict[str, Any]:
         self.calls.append(("query", kwargs))
         self._maybe_fail("query")
-        assert kwargs["KeyConditionExpression"] == "PK = :pk AND begins_with(SK, :sk_prefix)"
         values = self.deserialize(kwargs["ExpressionAttributeValues"])
+        condition = kwargs["KeyConditionExpression"]
+        if condition == "PK = :pk AND begins_with(SK, :sk_prefix)":
+
+            def wanted(sk: str) -> bool:
+                return sk.startswith(values[":sk_prefix"])
+        else:
+            # Only the history range read used by `get_deployment_at` (verification only).
+            assert condition == "PK = :pk AND SK BETWEEN :sk_lower AND :sk_upper"
+
+            def wanted(sk: str) -> bool:
+                return values[":sk_lower"] <= sk <= values[":sk_upper"]
+
+        forward = kwargs.get("ScanIndexForward", True)
         matches = sorted(
-            (
-                item
-                for (pk, sk), item in self.items.items()
-                if pk == values[":pk"] and sk.startswith(values[":sk_prefix"])
-            ),
+            (item for (pk, sk), item in self.items.items() if pk == values[":pk"] and wanted(sk)),
             key=lambda item: item["SK"],
+            reverse=not forward,
         )
         start = kwargs.get("ExclusiveStartKey")
         if start is not None:
             start_sk = self.deserialize(start)["SK"]
-            matches = [item for item in matches if item["SK"] > start_sk]
+            matches = [
+                item
+                for item in matches
+                if (item["SK"] > start_sk if forward else item["SK"] < start_sk)
+            ]
         limit = kwargs.get("Limit")
         page = matches if limit is None else matches[:limit]
         response: dict[str, Any] = {"Items": [self.serialize(item) for item in page]}
@@ -802,22 +819,7 @@ def test_device_whose_deterministic_deployment_has_moved_is_already_migrated() -
     assert result.assets_created == 1  # pond_2 gets its own projection
 
 
-def test_still_current_deterministic_deployment_on_another_asset_conflicts() -> None:
-    client = migrated_store()
-    for key in (("TENANT#tnt_1", "DEVICE#probe-1"), ("DEVICE#probe-1", "META")):
-        client.items[key]["pond_id"] = "pond_2"
-    client.put_raw(legacy_pond("pond_2"))
-
-    result = run(client, apply=False)
-
-    component_id = default_component_id_for_legacy_device("tnt_1", "probe-1")
-    assert result.result == "schema_conflict"
-    assert [(c.kind, c.key) for c in result.conflicts] == [
-        ("deployment_current", f"COMPONENT#{component_id}/DEPLOYMENT#CURRENT")
-    ]
-
-
-def test_foreign_current_deployment_without_deterministic_one_conflicts() -> None:
+def test_malformed_current_deployment_is_a_conflict() -> None:
     client = FakeMigrationDynamo.with_legacy_tenant(
         tenant_id="tnt_1",
         ponds=[legacy_pond("pond_1")],
@@ -1367,3 +1369,277 @@ def test_link_only_device_is_not_counted_as_projected() -> None:
     assert applied.deployments_created == 0
     assert applied.legacy_links_updated == 2
     assert applied.already_migrated == 0
+
+
+# Drift repair: CURRENT is authoritative, whoever wrote it ---------------------------------------
+
+MOVED_AT = datetime(2026, 6, 1, 9, tzinfo=UTC)
+FOREIGN_STARTED = datetime(2026, 7, 1, 8, tzinfo=UTC)
+FOREIGN_DEPLOYMENT_ID = "dep_" + "7" * 32
+COMPONENT_ID = default_component_id_for_legacy_device("tnt_1", "probe-1")
+
+
+def _item_key(item: dict[str, Any]) -> tuple[str, str]:
+    return item["PK"], item["SK"]
+
+
+def _move_device_at(fake: FakeMigrationDynamo, pond_id: str, updated_at: datetime) -> None:
+    for key in (("TENANT#tnt_1", "DEVICE#probe-1"), ("DEVICE#probe-1", "META")):
+        fake.items[key].update(
+            {
+                "pond_id": pond_id,
+                "version": fake.items[key]["version"] + 1,
+                "updated_at": updated_at.isoformat(),
+            }
+        )
+
+
+def _deterministic_deployment() -> Deployment:
+    return deployment_for_legacy_device(
+        device_model("probe-1", "pond_1"),
+        asset_id_for_legacy_pond("tnt_1", "pond_1"),
+        default_site_id("tnt_1"),
+    )
+
+
+def _foreign_deployment(pond_id: str) -> Deployment:
+    """A non-deterministic interval as the flag-on `/v1` projection or `/v2` would write it."""
+    return Deployment(
+        tenant_id="tnt_1",
+        deployment_id=FOREIGN_DEPLOYMENT_ID,
+        component_id=COMPONENT_ID,
+        site_id=default_site_id("tnt_1"),
+        asset_id=asset_id_for_legacy_pond("tnt_1", pond_id),
+        started_at=FOREIGN_STARTED,
+        created_at=FOREIGN_STARTED,
+        updated_at=FOREIGN_STARTED,
+        version=1,
+    )
+
+
+def _replace_deterministic_with_foreign(fake: FakeMigrationDynamo, pond_id: str) -> Deployment:
+    deterministic = _deterministic_deployment()
+    for form in ("mirror", "history", "current"):
+        del fake.items[_item_key(deployment_to_item(deterministic, form=form))]
+    foreign = _foreign_deployment(pond_id)
+    for form in ("mirror", "history", "current"):
+        fake.put_raw(deployment_to_item(foreign, form=form))
+    return foreign
+
+
+def _deployment_at(fake: FakeMigrationDynamo, observed_at: datetime) -> Deployment | None:
+    repository = DynamoDeploymentRepository(TABLE, fake)
+    return asyncio.run(repository.get_deployment_at("tnt_1", COMPONENT_ID, observed_at))
+
+
+def _history_rows(fake: FakeMigrationDynamo) -> list[dict[str, Any]]:
+    lower, upper = KEYS.deployment_history_bounds()
+    return [
+        item
+        for (pk, sk), item in sorted(fake.items.items())
+        if pk == f"COMPONENT#{COMPONENT_ID}" and lower <= sk <= upper
+    ]
+
+
+def _current(fake: FakeMigrationDynamo) -> dict[str, Any]:
+    return fake.get_raw(*KEYS.current_deployment(COMPONENT_ID).values())
+
+
+def moved_after_migration() -> FakeMigrationDynamo:
+    client = migrated_store()
+    client.put_raw(legacy_pond("pond_2"))
+    _move_device_at(client, "pond_2", MOVED_AT)
+    return client
+
+
+def test_device_moved_after_migration_is_drift_repaired() -> None:
+    client = moved_after_migration()
+    client.calls.clear()
+
+    dry = run(client, apply=False)
+
+    assert client.write_calls == []
+    assert (dry.would_create_deployments, dry.would_project_devices) == (1, 1)
+    assert (dry.would_create_assets, dry.would_create_components) == (1, 0)
+    assert dry.result == "success"
+
+    result = run(client, apply=True)
+
+    assert result.result == "success"
+    assert (result.deployments_created, result.devices_projected) == (1, 1)
+    assert (result.assets_created, result.components_created) == (1, 0)
+    deterministic = _deterministic_deployment()
+    for form in ("mirror", "history"):
+        ended = client.get_raw(*_item_key(deployment_to_item(deterministic, form=form)))
+        assert ended["status"] == "ended"
+        assert ended["ended_at"] == "2026-06-01T09:00:00.000000Z"
+        assert ended["version"] == 2
+    current = _current(client)
+    pond_2_asset = asset_id_for_legacy_pond("tnt_1", "pond_2")
+    assert current["asset_id"] == pond_2_asset
+    assert current["started_at"] == "2026-06-01T09:00:00.000000Z"
+    assert current["deployment_id"] != deterministic.deployment_id
+    assert client.get_raw(*_item_key(deployment_to_item(deployment_from_item(current))))
+    marker = client.get_raw(*deployment_marker_key(COMPONENT_ID).values())
+    assert (marker["seq"], marker["last_ended_at"]) == (2, "2026-06-01T09:00:00.000000Z")
+    before = _deployment_at(client, MOVED_AT - timedelta(microseconds=1))
+    after = _deployment_at(client, MOVED_AT)
+    assert before.asset_id == asset_id_for_legacy_pond("tnt_1", "pond_1")
+    assert after.asset_id == pond_2_asset
+
+    second = run(client, apply=True, clock=second_clock)
+
+    assert second.result == "success"
+    assert second.deployments_created == 0
+    assert second.devices_projected == 0
+    assert second.already_migrated == 3
+
+
+def test_drift_repair_transaction_is_fenced_and_bounded() -> None:
+    client = moved_after_migration()
+
+    run(client, apply=True)
+
+    device_tx = client.transactions[-1]
+    assert len(device_tx) <= 25
+    assert [next(iter(action)) for action in device_tx] == [
+        "Put",
+        "Put",
+        "Update",
+        "Update",
+        "Put",
+        "Update",
+        "ConditionCheck",
+        "ConditionCheck",
+    ]
+    replace_current = device_tx[4]["Put"]
+    assert "#deployment_id = :deployment_id" in replace_current["ConditionExpression"]
+    assert "#version = :expected_version" in replace_current["ConditionExpression"]
+    for index in (2, 3):
+        assert "#version = :expected_version" in device_tx[index]["Update"]["ConditionExpression"]
+    assert "#seq = :observed_seq" in device_tx[5]["Update"]["ConditionExpression"]
+
+
+def test_non_deterministic_current_on_the_pond_asset_is_already_migrated() -> None:
+    client = migrated_store()
+    _replace_deterministic_with_foreign(client, "pond_1")
+    client.calls.clear()
+
+    result = run(client, apply=True)
+
+    assert result.result == "success"
+    assert result.already_migrated == 2
+    assert result.deployments_created == 0
+    assert client.transactions == []
+    assert [name for name, _ in client.write_calls] == ["update_item"]  # migration receipt only
+
+
+def test_non_deterministic_current_on_another_asset_is_drift_repaired() -> None:
+    client = migrated_store()
+    client.put_raw(legacy_pond("pond_2"))
+    foreign = _replace_deterministic_with_foreign(client, "pond_2")
+
+    result = run(client, apply=True)
+
+    # The Device row (updated_at LATER) predates the foreign start: transition = start + 1µs.
+    transition = FOREIGN_STARTED + timedelta(microseconds=1)
+    assert result.result == "success"
+    assert result.deployments_created == 1
+    ended = client.get_raw(*_item_key(deployment_to_item(foreign)))
+    assert (ended["status"], ended["ended_at"]) == ("ended", "2026-07-01T08:00:00.000001Z")
+    assert _current(client)["asset_id"] == asset_id_for_legacy_pond("tnt_1", "pond_1")
+    assert _deployment_at(client, FOREIGN_STARTED).asset_id == foreign.asset_id
+    assert _deployment_at(client, transition).asset_id == asset_id_for_legacy_pond(
+        "tnt_1", "pond_1"
+    )
+    assert run(client, apply=True).deployments_created == 0
+
+
+def test_ended_deterministic_deployment_without_current_is_already_migrated() -> None:
+    client = migrated_store()
+    deterministic = _deterministic_deployment()
+    del client.items[_item_key(deployment_to_item(deterministic, form="current"))]
+    for form in ("mirror", "history"):
+        client.items[_item_key(deployment_to_item(deterministic, form=form))].update(
+            {"status": "ended", "ended_at": "2026-06-01T09:00:00.000000Z", "version": 2}
+        )
+    client.calls.clear()
+
+    result = run(client, apply=True)
+
+    assert result.result == "success"
+    assert result.already_migrated == 2
+    assert result.deployments_created == 0
+    assert client.transactions == []
+
+
+def test_inactive_component_is_not_drift_repaired() -> None:
+    client = moved_after_migration()
+    client.items[_item_key(KEYS.component(COMPONENT_ID))]["status"] = "decommissioned"
+
+    result = run(client, apply=True)
+
+    assert result.result == "success"
+    assert (result.deployments_created, result.devices_projected) == (0, 0)
+    assert result.already_migrated == 2  # pond_1 and the Device; pond_2 gets its Asset
+    assert _current(client)["asset_id"] == asset_id_for_legacy_pond("tnt_1", "pond_1")
+
+
+def _scenario(name: str) -> tuple[FakeMigrationDynamo, tuple[str, str], str, int]:
+    """Store, history key named by CURRENT, expected final pond and expected history rows."""
+    if name == "moved_after_migration":
+        return moved_after_migration(), _deployment_history_key(), "pond_2", 2
+    client = migrated_store()
+    pond_id = "pond_2" if name == "foreign_wrong_asset" else "pond_1"
+    if pond_id == "pond_2":
+        client.put_raw(legacy_pond("pond_2"))
+    foreign = _replace_deterministic_with_foreign(client, pond_id)
+    history_key = _item_key(deployment_to_item(foreign, form="history"))
+    return client, history_key, "pond_1", 2 if pond_id == "pond_2" else 1
+
+
+@pytest.mark.parametrize(
+    "scenario", ["moved_after_migration", "foreign_wrong_asset", "foreign_right_asset"]
+)
+@pytest.mark.parametrize("interleave", ["between_reads", "before_device_transaction"])
+def test_concurrent_identical_runs_converge_on_drift(scenario: str, interleave: str) -> None:
+    client, history_key, final_pond, history_rows = _scenario(scenario)
+    others: list[Any] = []
+
+    def other_run(fake: FakeMigrationDynamo) -> None:
+        others.append(
+            DefaultSiteAssetMigrator(fake, clock=second_clock).run(
+                ["tnt_1"], apply=True, page_size=25, deadline_seconds=300
+            )
+        )
+
+    if interleave == "between_reads":
+
+        def on_read(fake: FakeMigrationDynamo, key: tuple[str, str]) -> None:
+            if key == history_key:
+                fake.before_get_item = None
+                other_run(fake)
+
+        client.before_get_item = on_read
+    else:
+
+        def on_transaction(fake: FakeMigrationDynamo, actions: list[dict]) -> None:
+            if "DEPLOYMENT#CURRENT" not in str(actions):
+                fake.before_transact = on_transaction
+                return
+            other_run(fake)
+
+        client.before_transact = on_transaction
+
+    result = run(client, apply=True)
+
+    assert result.result == "success"
+    assert result.conflicts == []
+    # A Pond-asset CURRENT needs no device transaction, so only the read interleaving applies.
+    assert len(others) == int(scenario != "foreign_right_asset" or interleave == "between_reads")
+    assert all(other.result == "success" for other in others)
+    created = result.deployments_created + sum(other.deployments_created for other in others)
+    assert created == (history_rows - 1)
+    assert _current(client)["asset_id"] == asset_id_for_legacy_pond("tnt_1", final_pond)
+    assert len(_history_rows(client)) == history_rows
+    assert sum(row["status"] == "active" for row in _history_rows(client)) == 1

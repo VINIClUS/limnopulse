@@ -16,6 +16,32 @@ ownership conflict receives no writes; other tenants continue. Planned writes ar
   gets a DECOMMISSIONED Component and no Deployment, because a decommissioned Component cannot
   hold an active interval.
 
+Legacy state is mirrored; v2 start/move rules apply only to new writes. A Device in an archived
+Pond therefore gets an ACTIVE Deployment on the ARCHIVED Asset, exactly as the legacy rows say.
+
+The default Component's `DEPLOYMENT#CURRENT` is authoritative history whoever wrote it (this
+migration, the flag-on `/v1` projection, which also starts non-deterministic intervals, or
+`/v2`). It is validated (tenant, Component, ACTIVE, and the active mirror/history rows it names)
+together with the marker (present, `seq >= 1`):
+
+- CURRENT on the Asset of the Device's `pond_id`: already migrated (links may still be set).
+- CURRENT on another Asset (a `/v1` move while the projection flag was off): DRIFT REPAIR in the
+  Device transaction. CURRENT's mirror and history are ended at `transition_at`, a new
+  `new_deployment_id()` interval starts there on the Pond's Asset (mirror, history, CURRENT
+  overwritten only while it still names the old Deployment and version), the marker advances
+  fenced on its observed `seq`, and the target Asset and the Component are checked. The real
+  move time is unknown, so `transition_at = max(device.updated_at, CURRENT.started_at + 1µs)`
+  approximates it from the legacy row; the clock is never used. A repair counts under
+  `deployments_created` and `devices_projected`. Concurrent identical repairs converge: the
+  loser re-reads a CURRENT already on the right Asset and reports already migrated.
+- A DECOMMISSIONED Device or an inactive Component is never repaired or deployed: it counts as
+  already migrated.
+- No CURRENT and an ended deterministic Deployment: already migrated. Only an explicit `/v2` end
+  produces that state; restarting an interval would invent history, and a conflict would block
+  the tenant on every rerun with nothing the migration could repair.
+- No CURRENT and no deterministic Deployment: the deterministic projection is created; a stray
+  history row or marker there is a conflict.
+
 All v2 content comes from `domain.legacy_projection` builders and the bounded-context codecs, so
 it is byte-identical to the `/v1` compatibility projection. Timestamps and versions come from the
 legacy rows; the injected clock only stamps the per-tenant migration receipt.
@@ -48,7 +74,7 @@ import time
 from collections import Counter
 from collections.abc import Callable, Iterable, Mapping, Sequence
 from dataclasses import dataclass, field
-from datetime import datetime
+from datetime import datetime, timedelta
 from typing import Any, Literal
 
 from botocore.exceptions import BotoCoreError, ClientError
@@ -70,6 +96,10 @@ from limnopulse_api.adapters.dynamodb_default_site_asset_migration import (
     legacy_tenant_from_item,
 )
 from limnopulse_api.adapters.dynamodb_deployments import (
+    MARKER_SEQ_ATTRIBUTE,
+    deployment_from_item,
+    deployment_item_key,
+    deployment_marker_advance_request,
     deployment_marker_item,
     deployment_marker_key,
     deployment_to_item,
@@ -81,15 +111,16 @@ from limnopulse_api.adapters.dynamodb_sites_assets import (
     site_to_item,
 )
 from limnopulse_api.adapters.dynamodb_v2 import DynamoConditionalConflict, utc_now
-from limnopulse_api.domain.deployments import Deployment
+from limnopulse_api.domain.deployments import Deployment, DeploymentStatus
 from limnopulse_api.domain.devices_v2 import ComponentStatus
 from limnopulse_api.domain.entities import Device, Pond, Tenant
-from limnopulse_api.domain.ids import asset_id_for_legacy_pond
+from limnopulse_api.domain.ids import asset_id_for_legacy_pond, new_deployment_id
 from limnopulse_api.domain.legacy_projection import (
     asset_and_profile_for_legacy_pond,
     component_for_legacy_device,
     default_site_for_tenant,
     deployment_for_legacy_device,
+    legacy_timestamp_to_utc,
 )
 
 DEFAULT_TABLE_NAME = "LimnopulseDomain"
@@ -635,29 +666,32 @@ class DefaultSiteAssetMigrator:
             raise _Unstable("device_lookup", lookup_key)
 
         # Mirror, then canonical; both commit together and absent rows are conditional puts.
-        component_puts = [
-            action
-            for action in (
-                self._plan_put(
-                    component_to_item(component, canonical=False), _COMPONENT_FIELDS, "component"
-                ),
-                self._plan_put(component_to_item(component), _COMPONENT_FIELDS, "component"),
-            )
-            if action is not None
-        ]
-        puts = list(reversed(component_puts))
-        component_created = bool(component_puts)
-
-        deployment_puts = self._plan_deployment(
-            deployment, active=component.status is not ComponentStatus.DECOMMISSIONED
+        mirror_put = self._plan_put(
+            component_to_item(component, canonical=False), _COMPONENT_FIELDS, "component"
         )
-        puts.extend(deployment_puts)
-        checks: list[dict[str, Any]] = []
-        if deployment_puts:
-            checks.append(
-                {"ConditionCheck": self.store.asset_exists_check_request(tenant_id, asset_id)}
+        canonical_item = component_to_item(component)
+        canonical_key = {"PK": canonical_item["PK"], "SK": canonical_item["SK"]}
+        canonical = self.store.get_known_item(canonical_key)
+        if canonical is None:
+            canonical_put = {"Put": self.store.put_new_request(canonical_item)}
+        else:
+            _require_identity(
+                canonical, canonical_item, _COMPONENT_FIELDS, "component", canonical_key
             )
+            canonical_put = None
+        component_puts = [action for action in (canonical_put, mirror_put) if action is not None]
+        # A DECOMMISSIONED Device or an inactive Component never gets a Deployment written.
+        active = (
+            component.status is not ComponentStatus.DECOMMISSIONED
+            and (canonical or canonical_item).get("status") == ComponentStatus.ACTIVE.value
+        )
 
+        deployment_actions = self._plan_deployment(
+            device,
+            deployment,
+            active=active,
+            component_planned=canonical_put is not None,
+        )
         expected_links = {
             DEFAULT_COMPONENT_ID_ATTRIBUTE: component.component_id,
             V2_PROJECTION_VERSION_ATTRIBUTE: V2_PROJECTION_VERSION,
@@ -682,50 +716,65 @@ class DefaultSiteAssetMigrator:
         return _RecordPlan(
             kind="device",
             source_key=source_key,
-            actions=(*puts, *checks, *updates),
-            component_created=component_created,
-            deployment_created=bool(deployment_puts),
+            actions=(*component_puts, *deployment_actions, *updates),
+            component_created=bool(component_puts),
+            deployment_created=bool(deployment_actions),
             link_updated=bool(updates),
         )
 
-    def _plan_deployment(self, deployment: Deployment, *, active: bool) -> list[dict[str, Any]]:
-        """Puts creating the deterministic Deployment, or `[]` when it exists or must not."""
+    def _plan_deployment(
+        self,
+        device: Device,
+        deployment: Deployment,
+        *,
+        active: bool,
+        component_planned: bool,
+    ) -> list[dict[str, Any]]:
+        """Actions creating or repairing the default Component's Deployment, or `[]`.
+
+        CURRENT is authoritative whoever wrote it (this migration, the `/v1` projection or
+        `/v2`): on the Pond's Asset nothing changes, elsewhere the drift is repaired. Without
+        CURRENT the deterministic Deployment is created unless it already exists (ended).
+        """
+        tenant_id = device.tenant_id
+        current_key = self.keys.current_deployment(deployment.component_id)
+        # CURRENT changes in every Deployment transaction of the Component, so it is read
+        # first; the rows it names and the marker are then checked against it, and any mix a
+        # concurrent commit can explain is re-read before it may become a conflict.
+        current_item = self.store.get_known_item(current_key)
+        if current_item is not None:
+            current = self._current_deployment(current_item, deployment, current_key)
+            marker = self._require_marker(tenant_id, deployment.component_id)
+            if current.asset_id == deployment.asset_id or not active:
+                return []
+            return self._drift_repair_actions(
+                device, current, marker, deployment, component_planned=component_planned
+            )
+
         mirror_item = deployment_to_item(deployment)
         history_item = deployment_to_item(deployment, form="history")
-        current_item = deployment_to_item(deployment, form="current")
         marker_item = deployment_marker_item(
-            deployment.tenant_id, deployment.component_id, seq=1, last_ended_at=None
+            tenant_id, deployment.component_id, seq=1, last_ended_at=None
         )
         mirror_key = {"PK": mirror_item["PK"], "SK": mirror_item["SK"]}
         history_key = {"PK": history_item["PK"], "SK": history_item["SK"]}
-        current_key = {"PK": current_item["PK"], "SK": current_item["SK"]}
         marker_key = deployment_marker_key(deployment.component_id)
-
-        # All four rows commit in one transaction. Siblings are read first and the mirror last,
-        # so a present mirror proves the whole group; any other mix is re-read before it can
-        # become a conflict (it may be a concurrent commit landing between these reads).
-        current = self.store.get_known_item(current_key)
         history = self.store.get_known_item(history_key)
         marker = self.store.get_known_item(marker_key)
         mirror = self.store.get_known_item(mirror_key)
         if mirror is not None:
             _require_identity(mirror, mirror_item, _DEPLOYMENT_FIELDS, "deployment", mirror_key)
+            if mirror.get("status") == DeploymentStatus.ACTIVE.value:
+                # Active but not CURRENT: CURRENT was absent when read, so this is a commit
+                # landing between the reads.
+                raise _Unstable("deployment_current", current_key)
             if history is None:
                 raise _Unstable("deployment_history", history_key)
-            _require_identity(
-                history, history_item, _DEPLOYMENT_FIELDS, "deployment_history", history_key
-            )
             if marker is None:
                 raise _Unstable("deployment_marker", marker_key)
-            _require_identity(marker, marker_item, _MARKER_FIELDS, "deployment_marker", marker_key)
-            # A later CURRENT means the Device has since moved: already migrated.
-            if current is not None and current.get("deployment_id") == deployment.deployment_id:
-                _require_identity(
-                    current, current_item, _CURRENT_FIELDS, "deployment_current", current_key
-                )
+            # Ended with nothing CURRENT: already migrated. The migration never restarts an
+            # ended interval, because that would invent history.
             return []
-        if current is not None:
-            raise _Unstable("deployment_current", current_key)
         if not active:
             return []
         if history is not None:
@@ -733,9 +782,147 @@ class DefaultSiteAssetMigrator:
         if marker is not None:
             raise _Unstable("deployment_marker", marker_key)
         return [
-            {"Put": self.store.put_new_request(target)}
-            for target in (mirror_item, history_item, current_item, marker_item)
+            *(
+                {"Put": self.store.put_new_request(target)}
+                for target in (
+                    mirror_item,
+                    history_item,
+                    deployment_to_item(deployment, form="current"),
+                    marker_item,
+                )
+            ),
+            {
+                "ConditionCheck": self.store.asset_exists_check_request(
+                    tenant_id, deployment.asset_id
+                )
+            },
         ]
+
+    def _current_deployment(
+        self, current_item: Mapping[str, Any], expected: Deployment, current_key: Mapping[str, str]
+    ) -> Deployment:
+        """Validate CURRENT and the active mirror/history rows it names."""
+        try:
+            current = deployment_from_item(current_item)
+        except (KeyError, TypeError, ValueError) as exc:
+            raise _SchemaConflict("deployment_current", current_key) from exc
+        if (
+            current.tenant_id != expected.tenant_id
+            or current.component_id != expected.component_id
+            or current.status is not DeploymentStatus.ACTIVE
+        ):
+            raise _SchemaConflict("deployment_current", current_key)
+        if current.deployment_id == expected.deployment_id:
+            _require_identity(
+                current_item,
+                deployment_to_item(expected, form="current"),
+                _DEPLOYMENT_FIELDS,
+                "deployment_current",
+                current_key,
+            )
+        named = deployment_to_item(current)
+        for form in ("mirror", "history"):
+            key = deployment_item_key(current, form)
+            row = self.store.get_known_item(key)
+            if row is None or any(
+                row.get(name) != named.get(name)
+                for name in (*_CURRENT_FIELDS, "site_id", "status", "version")
+            ):
+                raise _Unstable("deployment_current", current_key)
+        return current
+
+    def _require_marker(self, tenant_id: str, component_id: str) -> Mapping[str, Any]:
+        marker_key = deployment_marker_key(component_id)
+        marker = self.store.get_known_item(marker_key)
+        if marker is None:
+            raise _Unstable("deployment_marker", marker_key)
+        seq = marker.get(MARKER_SEQ_ATTRIBUTE)
+        if (
+            marker.get("tenant_id") != tenant_id
+            or marker.get("component_id") != component_id
+            or not isinstance(seq, int)
+            or seq < 1
+        ):
+            raise _SchemaConflict("deployment_marker", marker_key)
+        return marker
+
+    def _drift_repair_actions(
+        self,
+        device: Device,
+        current: Deployment,
+        marker: Mapping[str, Any],
+        target: Deployment,
+        *,
+        component_planned: bool,
+    ) -> list[dict[str, Any]]:
+        """End CURRENT and start a new interval on the Pond's Asset in one transaction.
+
+        The real move time is unknown; `transition_at` approximates it from the legacy row as
+        `max(device.updated_at, CURRENT.started_at + 1µs)` and never reads the clock.
+        """
+        transition_at = max(
+            legacy_timestamp_to_utc(device.updated_at),
+            current.started_at + timedelta(microseconds=1),
+        )
+        ended = Deployment.model_validate(
+            {
+                **current.model_dump(),
+                "status": DeploymentStatus.ENDED,
+                "ended_at": transition_at,
+                "updated_at": max(transition_at, current.updated_at),
+                "version": current.version + 1,
+            }
+        )
+        started = Deployment(
+            tenant_id=current.tenant_id,
+            deployment_id=new_deployment_id(),
+            component_id=current.component_id,
+            site_id=target.site_id,
+            asset_id=target.asset_id,
+            started_at=transition_at,
+            status=DeploymentStatus.ACTIVE,
+            created_at=transition_at,
+            updated_at=transition_at,
+            version=1,
+        )
+        actions: list[dict[str, Any]] = [
+            {"Put": self.store.put_new_request(deployment_to_item(started))},
+            {"Put": self.store.put_new_request(deployment_to_item(started, form="history"))},
+            {
+                "Update": self.store.end_deployment_row_request(
+                    deployment_item_key(current, "mirror"), current, ended
+                )
+            },
+            {
+                "Update": self.store.end_deployment_row_request(
+                    deployment_item_key(current, "history"), current, ended
+                )
+            },
+            {"Put": self.store.replace_current_request(current, started)},
+            {
+                "Update": deployment_marker_advance_request(
+                    self.store.table_name,
+                    current.tenant_id,
+                    current.component_id,
+                    observed_seq=int(marker[MARKER_SEQ_ATTRIBUTE]),
+                    ended_at=transition_at,
+                )
+            },
+            {
+                "ConditionCheck": self.store.asset_exists_check_request(
+                    current.tenant_id, target.asset_id
+                )
+            },
+        ]
+        if not component_planned:
+            actions.append(
+                {
+                    "ConditionCheck": self.store.component_active_check_request(
+                        current.tenant_id, current.component_id
+                    )
+                }
+            )
+        return actions
 
     # Apply ----------------------------------------------------------------------------------
 
