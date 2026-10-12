@@ -3,6 +3,9 @@ from typing import Annotated, Any
 
 from fastapi import Depends, HTTPException, Request
 
+from limnopulse_api.adapters.dynamodb_v1_pond_device_projection import (
+    DynamoV1PondDeviceProjection,
+)
 from limnopulse_api.auth.models import Principal
 from limnopulse_api.auth.providers import build_auth_provider
 from limnopulse_api.core.errors import AuthError
@@ -16,6 +19,7 @@ from limnopulse_api.repositories.notification_preferences import (
 )
 from limnopulse_api.repositories.telegram_bindings import TelegramBindingRepository
 from limnopulse_api.repositories.telemetry import TelemetryRepository
+from limnopulse_api.repositories.v1_pond_device_projection import V1PondDeviceProjection
 from limnopulse_api.services.cognito_identity import CognitoIdentityVerifier
 from limnopulse_api.services.memberships import MembershipService
 from limnopulse_api.services.telegram_bindings import TelegramBindingService
@@ -46,6 +50,30 @@ def _get_state_dependency(request: Request, attribute_name: str) -> Any:
 
 def get_domain_repository(request: Request) -> DomainRepository:
     return _get_state_dependency(request, "domain_repository")
+
+
+_V1_PROJECTION_STATE = (
+    "site_asset_repository",
+    "device_component_repository",
+    "integration_repository",
+    "deployment_repository",
+)
+
+
+def get_v1_pond_device_projection(request: Request) -> V1PondDeviceProjection:
+    """Legacy repository unless the projection flag is on; then all M1 state is required."""
+    settings = getattr(request.app.state, "settings", None)
+    if getattr(settings, "v1_pond_device_projection_enabled", False) is not True:
+        return _get_state_dependency(request, "domain_repository")
+    repositories = [getattr(request.app.state, name, None) for name in _V1_PROJECTION_STATE]
+    if any(repository is None for repository in repositories):
+        raise HTTPException(status_code=503, detail="service unavailable")
+    site_assets = repositories[0]
+    table_name = getattr(site_assets, "table_name", None)
+    client = getattr(site_assets, "client", None)
+    if table_name is None or client is None:
+        raise HTTPException(status_code=503, detail="service unavailable")
+    return DynamoV1PondDeviceProjection(table_name=table_name, client=client)
 
 
 def get_telemetry_repository(request: Request) -> TelemetryRepository:
@@ -83,6 +111,9 @@ def get_telegram_binding_service(request: Request) -> TelegramBindingService:
 
 
 DomainRepositoryDep = Annotated[DomainRepository, Depends(get_domain_repository)]
+V1PondDeviceProjectionDep = Annotated[
+    V1PondDeviceProjection, Depends(get_v1_pond_device_projection)
+]
 AlertRuleRepositoryDep = Annotated[AlertRuleRepository, Depends(get_alert_rule_repository)]
 AlertEventRepositoryDep = Annotated[AlertEventRepository, Depends(get_alert_event_repository)]
 TelemetryRepositoryDep = Annotated[TelemetryRepository, Depends(get_telemetry_repository)]

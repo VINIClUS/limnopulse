@@ -1,6 +1,6 @@
 from fastapi import APIRouter, Depends, HTTPException, status
 
-from limnopulse_api.api.dependencies import DomainRepositoryDep, require_tenant_role
+from limnopulse_api.api.dependencies import V1PondDeviceProjectionDep, require_tenant_role
 from limnopulse_api.api.v1.schemas.common import ErrorResponse
 from limnopulse_api.api.v1.schemas.ponds import PondCreate, PondListResponse, PondResponse, PondUpdate
 from limnopulse_api.core.errors import ConflictError, NotFoundError
@@ -35,7 +35,7 @@ def _to_pond_response(pond: Pond) -> PondResponse:
 )
 async def list_ponds(
     tenant_id: str,
-    repository: DomainRepositoryDep,
+    repository: V1PondDeviceProjectionDep,
     _access: TenantAccess = Depends(require_tenant_role(*tuple(READ_ROLES))),
 ) -> PondListResponse:
     service = _pond_service(repository)
@@ -51,7 +51,7 @@ async def list_ponds(
 async def get_pond(
     tenant_id: str,
     pond_id: str,
-    repository: DomainRepositoryDep,
+    repository: V1PondDeviceProjectionDep,
     _access: TenantAccess = Depends(require_tenant_role(*tuple(READ_ROLES))),
 ) -> PondResponse:
     service = _pond_service(repository)
@@ -70,7 +70,7 @@ async def get_pond(
 async def create_pond(
     tenant_id: str,
     payload: PondCreate,
-    repository: DomainRepositoryDep,
+    repository: V1PondDeviceProjectionDep,
     _access: TenantAccess = Depends(require_tenant_role(*tuple(WRITE_ROLES))),
 ) -> PondResponse:
     service = _pond_service(repository)
@@ -90,7 +90,7 @@ async def update_pond(
     tenant_id: str,
     pond_id: str,
     payload: PondUpdate,
-    repository: DomainRepositoryDep,
+    repository: V1PondDeviceProjectionDep,
     _access: TenantAccess = Depends(require_tenant_role(*tuple(WRITE_ROLES))),
 ) -> PondResponse:
     service = _pond_service(repository)

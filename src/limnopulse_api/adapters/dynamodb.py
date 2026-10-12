@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from collections.abc import Mapping
 from datetime import UTC, datetime
 from decimal import Decimal
 from typing import Any
@@ -13,6 +14,54 @@ from limnopulse_api.domain.roles import TenantRole
 
 def utc_now() -> datetime:
     return datetime.now(UTC).replace(microsecond=0)
+
+
+def legacy_tenant_from_item(item: Mapping[str, Any]) -> Tenant:
+    return Tenant(
+        tenant_id=item["tenant_id"],
+        name=item["name"],
+        settings=item.get("settings", {}),
+        status=item.get("status", "active"),
+        created_at=datetime.fromisoformat(item["created_at"]),
+        updated_at=datetime.fromisoformat(item["updated_at"]),
+        version=int(item["version"]),
+        schema_version=int(item.get("schema_version", 1)),
+    )
+
+
+def legacy_pond_from_item(item: Mapping[str, Any]) -> Pond:
+    return Pond(
+        tenant_id=item["tenant_id"],
+        pond_id=item["pond_id"],
+        name=item["name"],
+        description=item.get("description"),
+        status=item.get("status", "active"),
+        created_at=datetime.fromisoformat(item["created_at"]),
+        updated_at=datetime.fromisoformat(item["updated_at"]),
+        version=int(item["version"]),
+        schema_version=int(item.get("schema_version", 1)),
+    )
+
+
+def is_legacy_device_item(item: Mapping[str, Any]) -> bool:
+    """Native v2 Device rows share the key space but carry no legacy `pond_id`."""
+    return isinstance(item.get("pond_id"), str)
+
+
+def legacy_device_from_item(item: Mapping[str, Any]) -> Device:
+    return Device(
+        tenant_id=item["tenant_id"],
+        pond_id=item["pond_id"],
+        device_id=item["device_id"],
+        name=item["name"],
+        auth_type=item.get("auth_type", "mtls"),
+        firmware_version=item.get("firmware_version"),
+        status=item.get("status", "active"),
+        created_at=datetime.fromisoformat(item["created_at"]),
+        updated_at=datetime.fromisoformat(item["updated_at"]),
+        version=int(item["version"]),
+        schema_version=int(item.get("schema_version", 1)),
+    )
 
 
 class DynamoKeyBuilder:
@@ -168,17 +217,8 @@ class DynamoDomainRepository:
         return self._tenant_from_item(item)
 
     async def list_ponds(self, tenant_id: str) -> list[Pond]:
-        response = self.client.query(
-            TableName=self.table_name,
-            KeyConditionExpression="PK = :pk AND begins_with(SK, :sk_prefix)",
-            ExpressionAttributeValues=self._serialize_values(
-                {
-                    ":pk": f"TENANT#{tenant_id}",
-                    ":sk_prefix": "POND#",
-                }
-            ),
-        )
-        return [self._pond_from_item(item) for item in self._response_items(response)]
+        items = self._query_tenant_prefix(tenant_id, "POND#")
+        return [self._pond_from_item(item) for item in items]
 
     async def get_pond(self, tenant_id: str, pond_id: str) -> Pond | None:
         response = self.client.get_item(
@@ -241,17 +281,9 @@ class DynamoDomainRepository:
         return self._pond_from_item(item)
 
     async def list_devices(self, tenant_id: str) -> list[Device]:
-        response = self.client.query(
-            TableName=self.table_name,
-            KeyConditionExpression="PK = :pk AND begins_with(SK, :sk_prefix)",
-            ExpressionAttributeValues=self._serialize_values(
-                {
-                    ":pk": f"TENANT#{tenant_id}",
-                    ":sk_prefix": "DEVICE#",
-                }
-            ),
-        )
-        return [self._device_from_item(item) for item in self._response_items(response)]
+        items = self._query_tenant_prefix(tenant_id, "DEVICE#")
+        # Native v2 Device rows share this prefix; `/v1` never lists them.
+        return [self._device_from_item(item) for item in items if is_legacy_device_item(item)]
 
     async def get_device(self, tenant_id: str, device_id: str) -> Device | None:
         response = self.client.get_item(
@@ -259,7 +291,7 @@ class DynamoDomainRepository:
             Key=self._serialize_item(self.keys.device(tenant_id, device_id)),
         )
         item = self._response_item(response)
-        if item is None:
+        if item is None or not is_legacy_device_item(item):
             return None
         return self._device_from_item(item)
 
@@ -372,6 +404,27 @@ class DynamoDomainRepository:
             "version": next_version,
         }
         return self._device_from_item(merged_item)
+
+    def _query_tenant_prefix(self, tenant_id: str, sk_prefix: str) -> list[dict[str, Any]]:
+        """Every page of a tenant-partition prefix Query, in key order."""
+        items: list[dict[str, Any]] = []
+        request: dict[str, Any] = {
+            "TableName": self.table_name,
+            "KeyConditionExpression": "PK = :pk AND begins_with(SK, :sk_prefix)",
+            "ExpressionAttributeValues": self._serialize_values(
+                {
+                    ":pk": f"TENANT#{tenant_id}",
+                    ":sk_prefix": sk_prefix,
+                }
+            ),
+        }
+        while True:
+            response = self.client.query(**request)
+            items.extend(self._response_items(response))
+            last_evaluated_key = response.get("LastEvaluatedKey")
+            if not last_evaluated_key:
+                return items
+            request["ExclusiveStartKey"] = last_evaluated_key
 
     def _conditioned_put(self, item: dict[str, Any]) -> dict[str, Any]:
         return {
@@ -524,16 +577,7 @@ class DynamoDomainRepository:
             raise ConflictError(str(exc)) from exc
 
     def _tenant_from_item(self, item: dict[str, Any]) -> Tenant:
-        return Tenant(
-            tenant_id=item["tenant_id"],
-            name=item["name"],
-            settings=item.get("settings", {}),
-            status=item.get("status", "active"),
-            created_at=datetime.fromisoformat(item["created_at"]),
-            updated_at=datetime.fromisoformat(item["updated_at"]),
-            version=int(item["version"]),
-            schema_version=int(item.get("schema_version", 1)),
-        )
+        return legacy_tenant_from_item(item)
 
     def _membership_from_item(self, item: dict[str, Any]) -> Membership:
         return Membership(
@@ -548,29 +592,7 @@ class DynamoDomainRepository:
         )
 
     def _pond_from_item(self, item: dict[str, Any]) -> Pond:
-        return Pond(
-            tenant_id=item["tenant_id"],
-            pond_id=item["pond_id"],
-            name=item["name"],
-            description=item.get("description"),
-            status=item.get("status", "active"),
-            created_at=datetime.fromisoformat(item["created_at"]),
-            updated_at=datetime.fromisoformat(item["updated_at"]),
-            version=int(item["version"]),
-            schema_version=int(item.get("schema_version", 1)),
-        )
+        return legacy_pond_from_item(item)
 
     def _device_from_item(self, item: dict[str, Any]) -> Device:
-        return Device(
-            tenant_id=item["tenant_id"],
-            pond_id=item["pond_id"],
-            device_id=item["device_id"],
-            name=item["name"],
-            auth_type=item.get("auth_type", "mtls"),
-            firmware_version=item.get("firmware_version"),
-            status=item.get("status", "active"),
-            created_at=datetime.fromisoformat(item["created_at"]),
-            updated_at=datetime.fromisoformat(item["updated_at"]),
-            version=int(item["version"]),
-            schema_version=int(item.get("schema_version", 1)),
-        )
+        return legacy_device_from_item(item)
