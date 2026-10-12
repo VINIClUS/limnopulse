@@ -13,7 +13,7 @@ from collections.abc import Callable
 from datetime import UTC, datetime
 from typing import Annotated
 
-from pydantic import AfterValidator, BaseModel, ConfigDict, Field
+from pydantic import AfterValidator, BaseModel, BeforeValidator, ConfigDict, Field
 
 from limnopulse_api.adapters.dynamodb_v2 import (
     canonical_request_hash,
@@ -49,10 +49,22 @@ class DeploymentInputError(LimnopulseError):
 def _aware_utc(value: datetime) -> datetime:
     if value.tzinfo is None or value.utcoffset() is None:
         raise ValueError("timestamp must include a UTC offset")
-    return value.astimezone(UTC)
+    try:
+        return value.astimezone(UTC)
+    except OverflowError as exc:
+        raise ValueError("timestamp out of range") from exc
 
 
-AwareUtcDatetime = Annotated[datetime, AfterValidator(_aware_utc)]
+def _reject_epoch_numbers(value: object) -> object:
+    if not isinstance(value, (str, datetime)):
+        # Pydantic maps only ValueError to a 422; a TypeError would surface as a 500.
+        raise ValueError("timestamp must be an ISO 8601 string")  # noqa: TRY004
+    return value
+
+
+AwareUtcDatetime = Annotated[
+    datetime, BeforeValidator(_reject_epoch_numbers), AfterValidator(_aware_utc)
+]
 
 
 def _require_component_id(value: str) -> str:

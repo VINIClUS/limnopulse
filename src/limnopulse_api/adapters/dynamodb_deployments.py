@@ -8,6 +8,15 @@ holds the latest `last_ended_at` and a `seq` counter bumped by every start and e
 that observed an older marker cannot commit after a concurrent end (D10): intervals never
 overlap. CURRENT and MARKER sort after `deployment_history_bounds()`, so history queries never
 see them. No Scan and no GSI.
+
+Marker contract for writers that persist Deployments directly (compatibility projection,
+migration): the marker attributes are `MARKER_SEQ_ATTRIBUTE` (int, bumped by every start and
+end) and `MARKER_LAST_ENDED_AT_ATTRIBUTE` (always `canonical_timestamp_key`, fixed-6 `Z`, the
+latest end of any interval of the Component). Create it with `deployment_marker_item` in the
+same transaction as the first history row (conditioned on `attribute_not_exists(PK)`), and
+advance it whenever an interval ends with `deployment_marker_advance_request` in the same
+transaction that ends the interval, passing the `seq` observed by a consistent read (`None`
+when the marker does not exist yet).
 """
 
 from collections.abc import Mapping
@@ -32,6 +41,8 @@ DEPLOYMENT_HISTORY_ENTITY_TYPE = "deployment_history"
 DEPLOYMENT_CURRENT_ENTITY_TYPE = "deployment_current"
 DEPLOYMENT_MARKER_ENTITY_TYPE = "deployment_marker"
 DEPLOYMENT_MARKER_SK = "DEPLOYMENT#MARKER"
+MARKER_SEQ_ATTRIBUTE = "seq"
+MARKER_LAST_ENDED_AT_ATTRIBUTE = "last_ended_at"
 
 DeploymentItemForm = Literal["mirror", "history", "current"]
 
@@ -72,11 +83,57 @@ def deployment_marker_item(
         "entity_type": DEPLOYMENT_MARKER_ENTITY_TYPE,
         "tenant_id": tenant_id,
         "component_id": component_id,
-        "seq": seq,
+        MARKER_SEQ_ATTRIBUTE: seq,
     }
     if last_ended_at is not None:
-        item["last_ended_at"] = canonical_timestamp_key(last_ended_at)
+        item[MARKER_LAST_ENDED_AT_ATTRIBUTE] = canonical_timestamp_key(last_ended_at)
     return item
+
+
+def deployment_marker_advance_request(
+    table_name: str,
+    tenant_id: str,
+    component_id: str,
+    *,
+    observed_seq: int | None,
+    ended_at: datetime,
+) -> dict[str, Any]:
+    """Serialized transaction `Update` that records an interval end on the marker.
+
+    Conditioned on the observed `seq` (or on the marker being absent when `observed_seq` is
+    `None`); sets `seq` to the next value and `last_ended_at` to the canonical end.
+    """
+    names = {
+        "#seq": MARKER_SEQ_ATTRIBUTE,
+        "#last_ended_at": MARKER_LAST_ENDED_AT_ATTRIBUTE,
+        "#entity_type": "entity_type",
+        "#tenant_id": "tenant_id",
+        "#component_id": "component_id",
+    }
+    values: dict[str, Any] = {
+        ":last_ended_at": canonical_timestamp_key(ended_at),
+        ":entity_type": DEPLOYMENT_MARKER_ENTITY_TYPE,
+        ":tenant_id": tenant_id,
+        ":component_id": component_id,
+    }
+    if observed_seq is None:
+        condition = "attribute_not_exists(PK)"
+        values[":next_seq"] = 1
+    else:
+        condition = "#seq = :observed_seq AND #tenant_id = :tenant_id"
+        values.update({":observed_seq": observed_seq, ":next_seq": observed_seq + 1})
+    # The base request builder is pure: it only serializes and never touches the client.
+    return DynamoV2RepositoryBase(table_name, None).update_request(
+        deployment_marker_key(component_id),
+        update_expression=(
+            "SET #seq = :next_seq, #last_ended_at = :last_ended_at, "
+            "#entity_type = :entity_type, #tenant_id = :tenant_id, "
+            "#component_id = :component_id"
+        ),
+        condition=condition,
+        names=names,
+        values=values,
+    )
 
 
 def deployment_item_key(deployment: Deployment, form: DeploymentItemForm) -> dict[str, str]:
@@ -100,6 +157,8 @@ def deployment_to_item(
     deployment: Deployment, *, form: DeploymentItemForm = "mirror"
 ) -> dict[str, Any]:
     """Tenant mirror (default), timestamped history row, or current pointer of a Deployment."""
+    if form == "current" and deployment.status is not DeploymentStatus.ACTIVE:
+        raise ValueError("only an active deployment has a current pointer")
     item: dict[str, Any] = {
         **deployment_item_key(deployment, form),
         "entity_type": _ENTITY_TYPES[form],
@@ -197,12 +256,12 @@ class DynamoDeploymentRepository(DynamoV2RepositoryBase):
         marker = await self.get_item(
             deployment_marker_key(deployment.component_id), consistent=True
         )
-        await self._ensure_after_previous(deployment, marker)
+        previous_ended_at = await self._ensure_after_previous(deployment, marker)
         actions = [
             {"Put": self.put_new_request(deployment_to_item(deployment, form="mirror"))},
             {"Put": self.put_new_request(deployment_to_item(deployment, form="history"))},
             {"Put": self.put_new_request(deployment_to_item(deployment, form="current"))},
-            {"Update": self._start_marker_request(deployment, marker)},
+            {"Update": self._start_marker_request(deployment, marker, previous_ended_at)},
             {"Put": self.receipt_put_request(receipt)},
             # Parents are fenced at commit time, not only by the service's earlier reads.
             {
@@ -296,7 +355,15 @@ class DynamoDeploymentRepository(DynamoV2RepositoryBase):
                     },
                 )
             },
-            {"Update": self._end_marker_request(ended, marker)},
+            {
+                "Update": deployment_marker_advance_request(
+                    self.table_name,
+                    tenant_id,
+                    current.component_id,
+                    observed_seq=None if marker is None else int(marker[MARKER_SEQ_ATTRIBUTE]),
+                    ended_at=ended_at,
+                )
+            },
         ]
         try:
             await self.transact_write(actions)
@@ -310,9 +377,13 @@ class DynamoDeploymentRepository(DynamoV2RepositoryBase):
 
     async def _ensure_after_previous(
         self, deployment: Deployment, marker: Mapping[str, Any] | None
-    ) -> None:
-        """Half-open intervals: a start equal to the previous end is the exact transition."""
-        last_ended_at = None if marker is None else marker.get("last_ended_at")
+    ) -> datetime | None:
+        """Half-open intervals: a start equal to the previous end is the exact transition.
+
+        Returns the end of the latest history row, so a marker created over markerless history
+        still holds the latest end.
+        """
+        last_ended_at = None if marker is None else marker.get(MARKER_LAST_ENDED_AT_ATTRIBUTE)
         if last_ended_at is not None and deployment.started_at < parse_canonical_timestamp(
             last_ended_at
         ):
@@ -328,12 +399,13 @@ class DynamoDeploymentRepository(DynamoV2RepositoryBase):
             consistent=True,
         )
         if not latest:
-            return
+            return None
         previous = deployment_from_item(latest[0])
         if previous.ended_at is None:
             raise ConflictError(ACTIVE_DEPLOYMENT_CONFLICT)
         if deployment.started_at < previous.ended_at:
             raise ConflictError(OVERLAP_CONFLICT)
+        return previous.ended_at
 
     def _active_check_request(
         self, key: Mapping[str, str], tenant_id: str, active: str
@@ -346,10 +418,13 @@ class DynamoDeploymentRepository(DynamoV2RepositoryBase):
         )
 
     def _start_marker_request(
-        self, deployment: Deployment, marker: Mapping[str, Any] | None
+        self,
+        deployment: Deployment,
+        marker: Mapping[str, Any] | None,
+        previous_ended_at: datetime | None,
     ) -> dict[str, Any]:
         names = {
-            "#seq": "seq",
+            "#seq": MARKER_SEQ_ATTRIBUTE,
             "#entity_type": "entity_type",
             "#tenant_id": "tenant_id",
             "#component_id": "component_id",
@@ -359,12 +434,20 @@ class DynamoDeploymentRepository(DynamoV2RepositoryBase):
             ":tenant_id": deployment.tenant_id,
             ":component_id": deployment.component_id,
         }
+        update_expression = (
+            "SET #seq = :next_seq, #entity_type = :entity_type, "
+            "#tenant_id = :tenant_id, #component_id = :component_id"
+        )
         if marker is None:
             condition = "attribute_not_exists(PK)"
             values[":next_seq"] = 1
+            if previous_ended_at is not None:
+                names["#last_ended_at"] = MARKER_LAST_ENDED_AT_ATTRIBUTE
+                values[":last_ended_at"] = canonical_timestamp_key(previous_ended_at)
+                update_expression += ", #last_ended_at = :last_ended_at"
         else:
-            observed_seq = int(marker["seq"])
-            names["#last_ended_at"] = "last_ended_at"
+            observed_seq = int(marker[MARKER_SEQ_ATTRIBUTE])
+            names["#last_ended_at"] = MARKER_LAST_ENDED_AT_ATTRIBUTE
             condition = (
                 "#seq = :observed_seq AND #tenant_id = :tenant_id AND "
                 "(attribute_not_exists(#last_ended_at) OR #last_ended_at <= :started_at)"
@@ -378,47 +461,7 @@ class DynamoDeploymentRepository(DynamoV2RepositoryBase):
             )
         return self.update_request(
             deployment_marker_key(deployment.component_id),
-            update_expression=(
-                "SET #seq = :next_seq, #entity_type = :entity_type, "
-                "#tenant_id = :tenant_id, #component_id = :component_id"
-            ),
-            condition=condition,
-            names=names,
-            values=values,
-        )
-
-    def _end_marker_request(
-        self, ended: Deployment, marker: Mapping[str, Any] | None
-    ) -> dict[str, Any]:
-        if ended.ended_at is None:
-            raise ValueError("an ended deployment needs ended_at")
-        names = {
-            "#seq": "seq",
-            "#last_ended_at": "last_ended_at",
-            "#entity_type": "entity_type",
-            "#tenant_id": "tenant_id",
-            "#component_id": "component_id",
-        }
-        values: dict[str, Any] = {
-            ":last_ended_at": canonical_timestamp_key(ended.ended_at),
-            ":entity_type": DEPLOYMENT_MARKER_ENTITY_TYPE,
-            ":tenant_id": ended.tenant_id,
-            ":component_id": ended.component_id,
-        }
-        if marker is None:
-            condition = "attribute_not_exists(PK)"
-            values[":next_seq"] = 1
-        else:
-            observed_seq = int(marker["seq"])
-            condition = "#seq = :observed_seq AND #tenant_id = :tenant_id"
-            values.update({":observed_seq": observed_seq, ":next_seq": observed_seq + 1})
-        return self.update_request(
-            deployment_marker_key(ended.component_id),
-            update_expression=(
-                "SET #seq = :next_seq, #last_ended_at = :last_ended_at, "
-                "#entity_type = :entity_type, #tenant_id = :tenant_id, "
-                "#component_id = :component_id"
-            ),
+            update_expression=update_expression,
             condition=condition,
             names=names,
             values=values,

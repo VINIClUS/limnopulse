@@ -338,6 +338,9 @@ def test_start_requires_an_idempotency_key() -> None:
         {"component_id": "cmp_1"},
         {"asset_id": "pond_1"},
         {"started_at": "2999-01-01T00:00:00Z"},
+        {"started_at": "0001-01-01T00:00:00+01:00"},
+        {"started_at": 1756116000},
+        {"started_at": 1756116000.5},
     ],
 )
 def test_start_rejects_invalid_bodies(overrides) -> None:
@@ -457,6 +460,9 @@ def test_end_errors() -> None:
     assert end_request(client, deployment_id, ended_at=STARTED).status_code == 422
     assert end_request(client, deployment_id, ended_at="2999-01-01T00:00:00Z").status_code == 422
     assert end_request(client, deployment_id, expected_version=0).status_code == 422
+    out_of_range = end_request(client, deployment_id, ended_at="0001-01-01T00:00:00+01:00")
+    assert out_of_range.status_code == 422
+    assert end_request(client, deployment_id, ended_at=1756119600).status_code == 422
     stale = end_request(client, deployment_id, expected_version=7)
     assert stale.status_code == 409
     assert stale.json() == {"detail": "deployment version conflict"}

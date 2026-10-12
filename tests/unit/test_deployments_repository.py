@@ -7,8 +7,11 @@ from pydantic import ValidationError
 
 from limnopulse_api.adapters.dynamodb_deployments import (
     DEPLOYMENT_MARKER_SK,
+    MARKER_LAST_ENDED_AT_ATTRIBUTE,
+    MARKER_SEQ_ATTRIBUTE,
     DynamoDeploymentRepository,
     deployment_from_item,
+    deployment_marker_advance_request,
     deployment_marker_item,
     deployment_marker_key,
     deployment_to_item,
@@ -211,12 +214,40 @@ def test_repository_implements_the_frozen_protocol() -> None:
     ],
 )
 def test_codecs_round_trip_every_form(form, key) -> None:
-    value = ended()
+    value = deployment() if form == "current" else ended()
     item = deployment_to_item(value, form=form)
     assert (item["PK"], item["SK"]) == key
-    assert item["ended_at"] == "2026-08-25T11:00:00.000000Z"
+    if form != "current":
+        assert item["ended_at"] == "2026-08-25T11:00:00.000000Z"
     assert "expires_at" not in item
     assert deployment_from_item(item) == value
+
+
+def test_only_an_active_deployment_has_a_current_pointer_item() -> None:
+    with pytest.raises(ValueError, match="current pointer"):
+        deployment_to_item(ended(), form="current")
+
+
+@pytest.mark.parametrize(("observed_seq", "next_seq"), [(None, 1), (4, 5)])
+def test_marker_advance_request_is_public_and_canonical(observed_seq, next_seq) -> None:
+    ended_at = datetime.fromisoformat("2026-08-25T13:00:00+02:00")
+    request = deployment_marker_advance_request(
+        TABLE, TENANT, COMPONENT_ID, observed_seq=observed_seq, ended_at=ended_at
+    )
+    client = FakeDynamoClient()
+    assert request["TableName"] == TABLE
+    assert client._plain(request["Key"]) == deployment_marker_key(COMPONENT_ID)
+    names = request["ExpressionAttributeNames"]
+    assert names["#seq"] == MARKER_SEQ_ATTRIBUTE == "seq"
+    assert names["#last_ended_at"] == MARKER_LAST_ENDED_AT_ATTRIBUTE == "last_ended_at"
+    values = client._plain(request["ExpressionAttributeValues"])
+    assert values[":last_ended_at"] == "2026-08-25T11:00:00.000000Z"
+    assert values[":next_seq"] == next_seq
+    if observed_seq is None:
+        assert request["ConditionExpression"] == "attribute_not_exists(PK)"
+    else:
+        assert values[":observed_seq"] == observed_seq
+        assert request["ConditionExpression"] == "#seq = :observed_seq AND #tenant_id = :tenant_id"
 
 
 def test_marker_key_sorts_outside_history_bounds() -> None:
@@ -305,6 +336,32 @@ async def test_start_before_the_previous_end_is_an_overlap() -> None:
             receipt(),
         )
     assert not [name for name, _ in client.calls if name == "transact_write_items"]
+
+
+@pytest.mark.asyncio
+async def test_start_over_markerless_ended_history_records_the_previous_end() -> None:
+    client = FakeDynamoClient()
+    previous = ended(deployment_id=NEXT_DEPLOYMENT_ID)
+    seed_deployment(client, previous)
+
+    await repository_for(client).start_deployment(
+        deployment(started_at=previous.ended_at, created_at=NOW, updated_at=NOW), receipt()
+    )
+
+    marker = client.transaction()[3]["Update"]
+    values = client._plain(marker["ExpressionAttributeValues"])
+    assert marker["ConditionExpression"] == "attribute_not_exists(PK)"
+    assert "#last_ended_at = :last_ended_at" in marker["UpdateExpression"]
+    assert values[":last_ended_at"] == "2026-08-25T11:00:00.000000Z"
+    assert values[":next_seq"] == 1
+
+
+@pytest.mark.asyncio
+async def test_start_without_history_creates_a_marker_without_an_end() -> None:
+    client = FakeDynamoClient()
+    await repository_for(client).start_deployment(deployment(), receipt())
+    marker = client.transaction()[3]["Update"]
+    assert "last_ended_at" not in marker["ExpressionAttributeNames"].values()
 
 
 @pytest.mark.asyncio
@@ -449,7 +506,9 @@ async def test_end_creates_the_marker_for_markerless_history() -> None:
     await repository_for(client).end_deployment(
         TENANT, DEPLOYMENT_ID, expected_version=1, ended_at=NOW
     )
-    assert client.transaction()[3]["Update"]["ConditionExpression"] == "attribute_not_exists(PK)"
+    assert client.transaction()[3]["Update"] == deployment_marker_advance_request(
+        TABLE, TENANT, COMPONENT_ID, observed_seq=None, ended_at=NOW
+    )
 
 
 @pytest.mark.asyncio

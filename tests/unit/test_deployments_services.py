@@ -221,6 +221,10 @@ def test_start_command_rejects_naive_site_and_malformed_ids() -> None:
         start_request(asset_id="pond_1")
     with pytest.raises(ValidationError):
         DeploymentEndCommand(expected_version=0, ended_at=NOW)
+    with pytest.raises(ValidationError, match="out of range"):
+        start_request(started_at="0001-01-01T00:00:00+01:00")
+    with pytest.raises(ValidationError, match="ISO 8601"):
+        DeploymentEndCommand(expected_version=1, ended_at=1756119600)
 
 
 def test_offset_timestamps_are_normalized_to_utc() -> None:
