@@ -2926,3 +2926,28 @@ def test_deadline_passing_during_the_receipt_read_writes_no_receipt() -> None:
     assert result.result == "deadline_exceeded"
     assert [name for name, _ in client.calls if name == "update_item"] == []
     assert client.items[receipt_key] == before
+
+
+# Emulator portability ---------------------------------------------------------------------------
+
+
+def test_conditions_use_only_portable_functions() -> None:
+    """Every condition sticks to attribute_exists/attribute_not_exists, which every DynamoDB
+    emulator parses (Floci rejects attribute_type); key conditions use begins_with only."""
+    client = moved_after_migration()  # covers puts, fences, link updates, drift and receipt
+    client.calls.clear()
+
+    run(client, apply=True)
+    run(client, apply=True)
+
+    expressions: list[str] = []
+    for name, request in client.calls:
+        actions = request.get("TransactItems") or [{name: request}]
+        for action in actions:
+            ((_, body),) = action.items()
+            if "ConditionExpression" in body:
+                expressions.append(body["ConditionExpression"])
+    assert any("#migration = :migration" in e for e in expressions)  # the receipt is covered
+    for expression in expressions:
+        functions = set(re.findall(r"([a-z_]+)\(", expression))
+        assert functions <= {"attribute_exists", "attribute_not_exists"}, expression

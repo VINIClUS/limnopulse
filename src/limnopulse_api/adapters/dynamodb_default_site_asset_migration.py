@@ -369,17 +369,20 @@ class DynamoDefaultSiteAssetMigrationStore(DynamoV2RepositoryBase):
     ) -> None:
         """Upsert the per-tenant marker; it only records runs and is never used to skip work.
 
-        Conditioned on the key being free or already holding this tenant's M1 receipt with a
-        numeric (or absent) `run_count`, so a foreign or malformed row at the key is never
-        overwritten (`DynamoConditionalConflict`).
+        Conditioned on the key being free or already holding this tenant's M1 receipt, so a
+        foreign row at the key is never overwritten (`DynamoConditionalConflict`). A
+        non-numeric `run_count` is rejected before this call by the consistent read, and a
+        `ValidationException` here is mapped to the same conflict by the migrator.
         """
         self.update_item_sync(
             self.update_request(
                 self.keys.migration_receipt(tenant_id),
+                # Ownership only. `run_count` is validated by the consistent read in
+                # `migration_receipt_run_count_valid`; `attribute_type()` is avoided because
+                # some DynamoDB emulators (Floci) cannot parse it.
                 condition=(
                     "attribute_not_exists(PK) OR (#entity_type = :entity_type "
-                    "AND #tenant_id = :tenant_id AND #migration = :migration "
-                    "AND (attribute_not_exists(#run_count) OR attribute_type(#run_count, :n)))"
+                    "AND #tenant_id = :tenant_id AND #migration = :migration)"
                 ),
                 update_expression=(
                     "SET #entity_type = :entity_type, #tenant_id = :tenant_id, "
@@ -405,7 +408,6 @@ class DynamoDefaultSiteAssetMigrationStore(DynamoV2RepositoryBase):
                     ":completed_at": canonical_timestamp_key(completed_at),
                     ":zero": 0,
                     ":one": 1,
-                    ":n": "N",
                     ":last_run": dict(counts),
                 },
             )
