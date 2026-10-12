@@ -338,26 +338,36 @@ class DynamoV1PondDeviceProjection(DynamoV2RepositoryBase):
                     raise _ProjectionRace("pond projection is inconsistent")
                 asset = asset_from_item(asset_item)
                 site_id = asset.site_id
-                plan.add(
-                    "asset_update",
-                    self.keys.asset(tenant_id, asset_id),
-                    {
-                        "Update": self._fenced_set(
-                            self.keys.asset(tenant_id, asset_id),
-                            {
-                                **({"name": name} if name is not None else {}),
-                                "updated_at": canonical_timestamp_key(
-                                    max(now, asset.updated_at)
-                                ),
-                                "version": asset.version + 1,
-                            },
-                            expected_version=asset.version,
-                            tenant_id=tenant_id,
-                        )
-                    },
-                )
-                if description is not None:
-                    profile = pond_profile_from_item(profile_item)
+                # Reconcile against the post-update legacy Pond, so edits made while the
+                # projection was off converge; equal values are never rewritten.
+                asset_changes: dict[str, Any] = {}
+                if asset.name != updated.name:
+                    asset_changes["name"] = updated.name
+                target_status = asset_status_from_legacy(updated.status)
+                if asset.status is not target_status and target_status is AssetStatus.ARCHIVED:
+                    # Archiving is the only Asset transition; an archived Asset never revives.
+                    asset_changes["status"] = target_status.value
+                if asset_changes:
+                    plan.add(
+                        "asset_update",
+                        self.keys.asset(tenant_id, asset_id),
+                        {
+                            "Update": self._fenced_set(
+                                self.keys.asset(tenant_id, asset_id),
+                                {
+                                    **asset_changes,
+                                    "updated_at": canonical_timestamp_key(
+                                        max(now, asset.updated_at)
+                                    ),
+                                    "version": asset.version + 1,
+                                },
+                                expected_version=asset.version,
+                                tenant_id=tenant_id,
+                            )
+                        },
+                    )
+                profile = pond_profile_from_item(profile_item)
+                if updated.description is not None and profile.description != updated.description:
                     plan.add(
                         "profile_update",
                         self.keys.pond_profile(asset_id),
@@ -365,7 +375,7 @@ class DynamoV1PondDeviceProjection(DynamoV2RepositoryBase):
                             "Update": self._fenced_set(
                                 self.keys.pond_profile(asset_id),
                                 {
-                                    "description": description,
+                                    "description": updated.description,
                                     "updated_at": canonical_timestamp_key(
                                         max(now, profile.updated_at)
                                     ),

@@ -217,17 +217,8 @@ class DynamoDomainRepository:
         return self._tenant_from_item(item)
 
     async def list_ponds(self, tenant_id: str) -> list[Pond]:
-        response = self.client.query(
-            TableName=self.table_name,
-            KeyConditionExpression="PK = :pk AND begins_with(SK, :sk_prefix)",
-            ExpressionAttributeValues=self._serialize_values(
-                {
-                    ":pk": f"TENANT#{tenant_id}",
-                    ":sk_prefix": "POND#",
-                }
-            ),
-        )
-        return [self._pond_from_item(item) for item in self._response_items(response)]
+        items = self._query_tenant_prefix(tenant_id, "POND#")
+        return [self._pond_from_item(item) for item in items]
 
     async def get_pond(self, tenant_id: str, pond_id: str) -> Pond | None:
         response = self.client.get_item(
@@ -290,22 +281,9 @@ class DynamoDomainRepository:
         return self._pond_from_item(item)
 
     async def list_devices(self, tenant_id: str) -> list[Device]:
-        response = self.client.query(
-            TableName=self.table_name,
-            KeyConditionExpression="PK = :pk AND begins_with(SK, :sk_prefix)",
-            ExpressionAttributeValues=self._serialize_values(
-                {
-                    ":pk": f"TENANT#{tenant_id}",
-                    ":sk_prefix": "DEVICE#",
-                }
-            ),
-        )
+        items = self._query_tenant_prefix(tenant_id, "DEVICE#")
         # Native v2 Device rows share this prefix; `/v1` never lists them.
-        return [
-            self._device_from_item(item)
-            for item in self._response_items(response)
-            if is_legacy_device_item(item)
-        ]
+        return [self._device_from_item(item) for item in items if is_legacy_device_item(item)]
 
     async def get_device(self, tenant_id: str, device_id: str) -> Device | None:
         response = self.client.get_item(
@@ -426,6 +404,27 @@ class DynamoDomainRepository:
             "version": next_version,
         }
         return self._device_from_item(merged_item)
+
+    def _query_tenant_prefix(self, tenant_id: str, sk_prefix: str) -> list[dict[str, Any]]:
+        """Every page of a tenant-partition prefix Query, in key order."""
+        items: list[dict[str, Any]] = []
+        request: dict[str, Any] = {
+            "TableName": self.table_name,
+            "KeyConditionExpression": "PK = :pk AND begins_with(SK, :sk_prefix)",
+            "ExpressionAttributeValues": self._serialize_values(
+                {
+                    ":pk": f"TENANT#{tenant_id}",
+                    ":sk_prefix": sk_prefix,
+                }
+            ),
+        }
+        while True:
+            response = self.client.query(**request)
+            items.extend(self._response_items(response))
+            last_evaluated_key = response.get("LastEvaluatedKey")
+            if not last_evaluated_key:
+                return items
+            request["ExclusiveStartKey"] = last_evaluated_key
 
     def _conditioned_put(self, item: dict[str, Any]) -> dict[str, Any]:
         return {

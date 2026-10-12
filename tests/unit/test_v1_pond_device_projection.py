@@ -741,7 +741,9 @@ async def test_empty_pond_patch_still_bumps_version_and_skips_the_profile() -> N
 
     assert (pond.version, pond.name) == (2, "West")
     assert client.item(KEYS.pond_profile(asset_id))["version"] == 1
-    assert len(client.transactions[0]) == 2
+    # Everything already agrees: only the legacy Pond is written.
+    assert len(client.transactions[0]) == 1
+    assert client.item(KEYS.asset(TENANT, asset_id))["version"] == 1
     await assert_pond_projection_matches(client, "pond_west")
 
 
@@ -1477,3 +1479,91 @@ async def test_internal_value_errors_are_not_mapped_to_conflicts(monkeypatch) ->
     monkeypatch.setattr(projection_module._Plan, "add", broken_add)
     with pytest.raises(ValueError, match="duplicate transaction key"):
         await projection(store()).create_pond(TENANT, "pond_west", "West", None)
+
+
+# PR review follow-ups ------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_pond_edits_made_while_off_are_reconciled_on_the_next_projected_update() -> None:
+    client = store()
+    asset_id = seed_migrated_pond(client, "pond_west")
+    legacy = DynamoDomainRepository(TABLE, client)
+    repo = projection(client)
+
+    await legacy.update_pond(TENANT, "pond_west", 1, "Renamed off", None)
+    pond = await repo.update_pond(TENANT, "pond_west", 2, None, "Deep")
+    assert (pond.name, pond.description) == ("Renamed off", "Deep")
+    assert client.item(KEYS.asset(TENANT, asset_id))["name"] == "Renamed off"
+    assert client.item(KEYS.pond_profile(asset_id))["description"] == "Deep"
+    await assert_pond_projection_matches(client, "pond_west")
+
+    await legacy.update_pond(TENANT, "pond_west", 3, None, "Shallow off")
+    await repo.update_pond(TENANT, "pond_west", 4, "North", None)
+    assert client.item(KEYS.pond_profile(asset_id))["description"] == "Shallow off"
+    assert client.item(KEYS.asset(TENANT, asset_id))["name"] == "North"
+    await assert_pond_projection_matches(client, "pond_west")
+
+    await legacy.update_pond(TENANT, "pond_west", 5, "Again off", "Murky off")
+    await repo.update_pond(TENANT, "pond_west", 6, None, None)
+    assert client.item(KEYS.asset(TENANT, asset_id))["name"] == "Again off"
+    assert client.item(KEYS.pond_profile(asset_id))["description"] == "Murky off"
+    await assert_pond_projection_matches(client, "pond_west")
+
+    asset_version = client.item(KEYS.asset(TENANT, asset_id))["version"]
+    profile_version = client.item(KEYS.pond_profile(asset_id))["version"]
+    await repo.update_pond(TENANT, "pond_west", 7, "Again off", "Murky off")
+    assert len(client.transactions[-1]) == 1
+    assert client.item(KEYS.asset(TENANT, asset_id))["version"] == asset_version
+    assert client.item(KEYS.pond_profile(asset_id))["version"] == profile_version
+
+
+class PagedQueryClient:
+    """Serves a fixed sequence of Query pages and records every request."""
+
+    def __init__(self, pages: list[list[dict]]) -> None:
+        self.serializer = TypeSerializer()
+        self.pages = pages
+        self.requests: list[dict] = []
+
+    def query(self, **kwargs):
+        index = len(self.requests)
+        self.requests.append(kwargs)
+        response = {
+            "Items": [
+                {k: self.serializer.serialize(v) for k, v in item.items()}
+                for item in self.pages[index]
+            ]
+        }
+        if index + 1 < len(self.pages):
+            last = self.pages[index][-1]
+            response["LastEvaluatedKey"] = {
+                "PK": {"S": last["PK"]},
+                "SK": {"S": last["SK"]},
+            }
+        return response
+
+
+@pytest.mark.asyncio
+async def test_legacy_lists_read_every_page() -> None:
+    native = [device_v2_to_item(native_device("dev_" + f"{i:x}" * 32)) for i in range(3)]
+    devices = [legacy_device_rows(f"local-{i}", "pond_west")[0] for i in range(3)]
+    client = PagedQueryClient([[*native, devices[0]], devices[1:]])
+
+    listed = await DynamoDomainRepository(TABLE, client).list_devices(TENANT)
+
+    assert [d.device_id for d in listed] == ["local-0", "local-1", "local-2"]
+    assert "ExclusiveStartKey" not in client.requests[0]
+    assert client.requests[1]["ExclusiveStartKey"] == {
+        "PK": {"S": f"TENANT#{TENANT}"},
+        "SK": {"S": "DEVICE#local-0"},
+    }
+    for request in client.requests:
+        assert set(request["ExpressionAttributeValues"]) == {":pk", ":sk_prefix"}
+        assert "Limit" not in request
+
+    ponds = [legacy_pond_item(f"pond_{i}") for i in range(3)]
+    client = PagedQueryClient([ponds[:1], ponds[1:2], ponds[2:]])
+    listed_ponds = await DynamoDomainRepository(TABLE, client).list_ponds(TENANT)
+    assert [p.pond_id for p in listed_ponds] == ["pond_0", "pond_1", "pond_2"]
+    assert len(client.requests) == 3
