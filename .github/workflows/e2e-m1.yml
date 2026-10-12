@@ -1,0 +1,152 @@
+name: e2e-m1
+
+on:
+  workflow_dispatch:
+    inputs:
+      allow_v2_unavailable:
+        description: "Accept ok=null verdicts (reason v2-unavailable) while /v2 is not deployed"
+        type: boolean
+        default: false
+  schedule:
+    - cron: "17 6 * * 1"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: e2e-m1-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  AWS_EC2_METADATA_DISABLED: "true"
+  APP_ENV: local
+  AUTH_MODE: dev
+  # Scheduled runs have no inputs; the repository variable can relax them
+  # until the /v2 API lands on main.
+  ALLOW_V2_UNAVAILABLE: ${{ (inputs.allow_v2_unavailable || vars.M1_E2E_ALLOW_V2_UNAVAILABLE == '1') && '1' || '0' }}
+  MQTTX_CLI_VERSION: "1.13.1"
+  NODE_RED_VERSION: "5.0.8"
+
+jobs:
+  stack:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+      - uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6
+        with:
+          python-version: "3.12"
+      - uses: astral-sh/setup-uv@d0cc045d04ccac9d8b7881df0226f9e82c39688e # v6.8.0
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
+        with:
+          node-version: 22
+      - name: Install Python dependencies
+        run: uv sync --locked --extra dev
+      - name: Install MQTTX CLI and Node-RED
+        run: npm install --global --no-audit --no-fund "mqttx-cli@${MQTTX_CLI_VERSION}" "node-red@${NODE_RED_VERSION}"
+      - name: Start compose dependencies, seed, migrate and start the API
+        run: bash ops/e2e/ci_stack.sh up
+      - name: Run M1 e2e (static + stack)
+        env:
+          RUN_M1_E2E: "1"
+        run: uv run --locked --no-sync python -m pytest -q tests/e2e
+      - name: Diagnostics
+        if: failure()
+        run: |
+          tail -n 100 .e2e-out/ci/uvicorn.log || true
+          tail -n 100 .e2e-out/m1-e2e/node-red.log || true
+          docker compose logs --no-color --tail 100 mqtt-broker telegraf || true
+      - name: Stop stack
+        if: always()
+        run: bash ops/e2e/ci_stack.sh down
+
+  wokwi-gate:
+    # Decides whether the optional Wokwi job runs. Only the boolean result of
+    # the comparison reaches the step; the secret value is never exposed here.
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    outputs:
+      has_token: ${{ steps.token.outputs.has_token }}
+    steps:
+      - name: Check for a Wokwi token
+        id: token
+        env:
+          HAS_TOKEN: ${{ secrets.WOKWI_CLI_TOKEN != '' }}
+        run: |
+          echo "has_token=${HAS_TOKEN}" >> "$GITHUB_OUTPUT"
+          if [ "${HAS_TOKEN}" != "true" ]; then
+            echo "::notice::WOKWI_CLI_TOKEN is not configured; skipping the Wokwi simulation job."
+          fi
+
+  wokwi:
+    needs: wokwi-gate
+    if: needs.wokwi-gate.outputs.has_token == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 40
+    env:
+      ARDUINO_CLI_VERSION: "1.3.1"
+      ARDUINO_CLI_SHA256: "376428d7d45be640c00812a71612e1742edc2f5f9ee3742a2d6da7870e079588"
+      WOKWI_CLI_VERSION: "0.28.1"
+      WOKWI_CLI_SHA256: "869f194ee473257c6112ed58d786376527769020056320b0a49a37d9e7d3bdd7"
+      ESP32_CORE: "esp32:esp32@3.0.7"
+      ESP32_INDEX: "https://espressif.github.io/arduino-esp32/package_esp32_index.json"
+    steps:
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+      - uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6
+        with:
+          python-version: "3.12"
+      - uses: astral-sh/setup-uv@d0cc045d04ccac9d8b7881df0226f9e82c39688e # v6.8.0
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
+        with:
+          node-version: 22
+      - name: Install arduino-cli, ESP32 core and libraries
+        run: |
+          mkdir -p "$RUNNER_TEMP/bin"
+          curl -fsSL -o "$RUNNER_TEMP/arduino-cli.tgz" \
+            "https://github.com/arduino/arduino-cli/releases/download/v${ARDUINO_CLI_VERSION}/arduino-cli_${ARDUINO_CLI_VERSION}_Linux_64bit.tar.gz"
+          echo "${ARDUINO_CLI_SHA256}  $RUNNER_TEMP/arduino-cli.tgz" | sha256sum -c -
+          tar -xzf "$RUNNER_TEMP/arduino-cli.tgz" -C "$RUNNER_TEMP/bin" arduino-cli
+          echo "$RUNNER_TEMP/bin" >> "$GITHUB_PATH"
+          # esptool in the ESP32 core needs pyserial on the python3 in PATH.
+          python -m pip install --disable-pip-version-check pyserial==3.5
+          "$RUNNER_TEMP/bin/arduino-cli" core update-index --additional-urls "$ESP32_INDEX"
+          "$RUNNER_TEMP/bin/arduino-cli" core install "$ESP32_CORE" --additional-urls "$ESP32_INDEX"
+          "$RUNNER_TEMP/bin/arduino-cli" lib install PubSubClient@2.8 ArduinoJson@7.2.1 OneWire@2.3.8 DallasTemperature@4.0.6
+      - name: Compile the probe sketch
+        run: |
+          arduino-cli compile --fqbn esp32:esp32:esp32 --warnings default \
+            --output-dir ops/e2e/wokwi/build ops/e2e/wokwi/sketch/limnopulse_probe
+      - name: Install wokwi-cli
+        run: |
+          curl -fsSL -o "$RUNNER_TEMP/bin/wokwi-cli" \
+            "https://github.com/wokwi/wokwi-cli/releases/download/v${WOKWI_CLI_VERSION}/wokwi-cli-linuxstatic-x64"
+          echo "${WOKWI_CLI_SHA256}  $RUNNER_TEMP/bin/wokwi-cli" | sha256sum -c -
+          chmod +x "$RUNNER_TEMP/bin/wokwi-cli"
+      - name: Simulate and capture serial output
+        # The only step that sees the token.
+        env:
+          WOKWI_CLI_TOKEN: ${{ secrets.WOKWI_CLI_TOKEN }}
+        run: |
+          wokwi-cli lint --warnings-as-errors ops/e2e/wokwi
+          wokwi-cli ops/e2e/wokwi --scenario scenario.yaml \
+            --serial-log-file ops/e2e/wokwi/serial.log --timeout 120000
+          grep -c '^READING {' ops/e2e/wokwi/serial.log
+      - name: Install Python dependencies, MQTTX CLI and Node-RED
+        run: |
+          uv sync --locked --extra dev
+          npm install --global --no-audit --no-fund "mqttx-cli@${MQTTX_CLI_VERSION}" "node-red@${NODE_RED_VERSION}"
+      - name: Start compose dependencies, seed, migrate and start the API
+        run: bash ops/e2e/ci_stack.sh up
+      - name: Replay captured readings through the M1 e2e harness
+        env:
+          RUN_M1_E2E: "1"
+          WOKWI_SERIAL_LOG: ops/e2e/wokwi/serial.log
+        run: uv run --locked --no-sync python -m pytest -q tests/e2e/test_m1_e2e_stack.py
+      - name: Diagnostics
+        if: failure()
+        run: |
+          cat ops/e2e/wokwi/serial.log || true
+          tail -n 100 .e2e-out/ci/uvicorn.log || true
+      - name: Stop stack
+        if: always()
+        run: bash ops/e2e/ci_stack.sh down

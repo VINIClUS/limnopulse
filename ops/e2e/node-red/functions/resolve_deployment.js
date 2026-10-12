@@ -1,0 +1,143 @@
+// Output 1: GET /v2 asset request. Output 2: verdict.
+// Output 3: GET /v2 deployments for the next component (native devices only).
+// Resolves the deployment whose half-open interval [started_at, ended_at)
+// contains the reading ts (ended_at null = still open).
+const ctx = msg.e2e;
+
+function verdict(ok, reason) {
+    msg.payload = {
+        device_id: ctx.device_id,
+        seq: ctx.seq,
+        ts: ctx.ts,
+        v1_pond_id: ctx.v1_pond_id,
+        resolved_asset_id: ctx.resolved_asset_id,
+        expected_asset_id: ctx.expected_asset_id,
+        ok: ok,
+        reason: reason,
+    };
+    return [null, msg, null];
+}
+
+// HTTP nodes return text; undefined = body is not JSON.
+function parseBody(raw) {
+    if (raw !== null && typeof raw === "object" && !Buffer.isBuffer(raw)) return raw;
+    if (raw === undefined || raw === null) return undefined;
+    try {
+        return JSON.parse(Buffer.isBuffer(raw) ? raw.toString("utf8") : String(raw));
+    } catch (e) {
+        return undefined;
+    }
+}
+
+// /v2 is "unavailable" only when it is not mounted: a 501, or a 404 whose
+// body is exactly Starlette's unmounted-route {"detail":"Not Found"}. Any
+// other non-200 (including 503) is a real failure, also in allow mode.
+function v2Unavailable(status, body) {
+    if (status === 501) return true;
+    if (status !== 404 || !body || typeof body !== "object" || Array.isArray(body)) return false;
+    const keys = Object.keys(body);
+    return keys.length === 1 && keys[0] === "detail" && body.detail === "Not Found";
+}
+
+// The /v2 list contract is {"items": [...]}; anything else is a regression.
+function items(body) {
+    if (body && typeof body === "object" && Array.isArray(body.items)) return body.items;
+    return null;
+}
+
+function headers() {
+    return {
+        "Accept": "application/json",
+        "X-Dev-User-Sub": String(env.get("LIMNOPULSE_DEV_USER_SUB") || "local-user-001"),
+        "X-Dev-User-Email": String(env.get("LIMNOPULSE_DEV_USER_EMAIL") || "local@example.test"),
+    };
+}
+
+const prefix = ctx.native ? "v2-native-" : "";
+const body = parseBody(msg.payload);
+if (v2Unavailable(msg.statusCode, body)) {
+    return verdict(null, "v2-unavailable");
+}
+if (msg.statusCode !== 200) {
+    return verdict(false, "v2-deployments-error-" + String(msg.statusCode));
+}
+const deployments = items(body);
+if (deployments === null) {
+    return verdict(false, "v2-deployments-bad-body");
+}
+
+// Date.parse truncates to milliseconds, but deployment boundaries (e.g. a
+// relocation's transition instant) carry microseconds. Parse whole seconds
+// with Date.parse and the fraction separately: integer microseconds since the
+// epoch stay below 2^53, so the comparison is exact. Number.NaN when unparseable.
+function epochMicros(value) {
+    if (typeof value !== "string") return Number.NaN;
+    const m = /^(\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2})(?:\.(\d+))?(Z|[+-]\d{2}:\d{2})$/.exec(value);
+    if (!m) return Number.NaN;
+    const seconds = Date.parse(m[1] + m[3]);
+    if (!Number.isFinite(seconds)) return Number.NaN;
+    const fraction = Number.parseInt(((m[2] || "") + "000000").slice(0, 6), 10);
+    return seconds * 1000 + fraction;
+}
+
+const tsUs = epochMicros(ctx.ts);
+const matches = deployments.filter(function (d) {
+    if (!d || d.component_id !== ctx.component_id) return false;
+    const start = epochMicros(d.started_at);
+    if (!Number.isFinite(start)) return false;
+    const end = d.ended_at === null || d.ended_at === undefined ? Infinity : epochMicros(d.ended_at);
+    return start <= tsUs && tsUs < end;
+});
+
+if (matches.length > 1) {
+    return verdict(false, prefix + "overlapping-deployments");
+}
+
+let match = matches[0];
+if (ctx.native) {
+    if (match) {
+        ctx.native_matches.push({
+            component_id: ctx.component_id,
+            deployment_id: match.deployment_id || null,
+            asset_id: match.asset_id || null,
+            ended: match.ended_at !== null && match.ended_at !== undefined,
+        });
+    }
+    if (ctx.pending_component_ids.length > 0) {
+        ctx.component_id = ctx.pending_component_ids.shift();
+        msg.method = "GET";
+        msg.url = ctx.base + "/v2/tenants/" + encodeURIComponent(ctx.tenant) +
+            "/deployments?component_id=" + encodeURIComponent(ctx.component_id);
+        msg.headers = headers();
+        msg.payload = undefined;
+        return [null, null, msg];
+    }
+    const assets = ctx.native_matches
+        .map(function (m) { return m.asset_id; })
+        .filter(function (a, i, all) { return all.indexOf(a) === i; });
+    if (assets.length === 0) {
+        return verdict(false, "v2-native-no-deployment-for-ts");
+    }
+    if (assets.length > 1) {
+        return verdict(false, "v2-native-ambiguous-assets");
+    }
+    match = ctx.native_matches[0];
+    ctx.component_id = match.component_id;
+} else if (!match) {
+    return verdict(false, "no-deployment-for-ts");
+}
+
+ctx.resolved_asset_id = match.asset_id || null;
+ctx.deployment_id = match.deployment_id || null;
+ctx.deployment_ended = ctx.native ? match.ended :
+    match.ended_at !== null && match.ended_at !== undefined;
+if (!ctx.resolved_asset_id) {
+    return verdict(false, prefix + "deployment-without-asset");
+}
+
+msg.method = "GET";
+msg.url = ctx.base + "/v2/tenants/" + encodeURIComponent(ctx.tenant) + "/assets/" +
+    encodeURIComponent(ctx.resolved_asset_id);
+msg.headers = headers();
+msg.payload = undefined;
+return [msg, null, null];

@@ -1,0 +1,9 @@
+# Wokwi project for the LimnoPulse simulated probe.
+# Build first (paths are relative to this file):
+#   arduino-cli compile --fqbn esp32:esp32:esp32 \
+#     --output-dir ops/e2e/wokwi/build ops/e2e/wokwi/sketch/limnopulse_probe
+# Then: wokwi-cli ops/e2e/wokwi --scenario scenario.yaml --serial-log-file serial.log
+[wokwi]
+version = 1
+firmware = "build/limnopulse_probe.ino.merged.bin"
+elf = "build/limnopulse_probe.ino.elf"
