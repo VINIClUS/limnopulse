@@ -9,13 +9,16 @@ import asyncio
 import importlib.util
 import inspect
 import json
+from collections.abc import Callable
 from datetime import UTC, datetime
+from decimal import Decimal
 from pathlib import Path
 from typing import Any
 
 import pytest
 from fastapi.testclient import TestClient
 
+from limnopulse_api.adapters.dynamodb import DynamoDomainRepository
 from limnopulse_api.adapters.dynamodb_deployments import deployment_marker_key
 from limnopulse_api.adapters.dynamodb_integrations import integration_account_to_item
 from limnopulse_api.adapters.dynamodb_v1_pond_device_projection import (
@@ -28,9 +31,20 @@ from limnopulse_api.api.v2.schemas.integrations import (
     IntegrationAccountCreate,
 )
 from limnopulse_api.core.config import Settings
-from limnopulse_api.core.errors import ConflictError
+from limnopulse_api.core.errors import ConflictError, NotFoundError
 from limnopulse_api.domain.deployments import DeploymentStatus
-from limnopulse_api.domain.devices_v2 import ComponentKind, DeviceV2
+from limnopulse_api.domain.devices_v2 import (
+    CapabilityAvailability,
+    CapabilityDeclaration,
+    CapabilityOperation,
+    CapabilityProvenance,
+    CapabilitySupport,
+    ComponentKind,
+    ComponentStatus,
+    DeviceComponent,
+    DeviceV2,
+    ProbeProfile,
+)
 from limnopulse_api.domain.entities import Device, Membership
 from limnopulse_api.domain.ids import (
     asset_id_for_legacy_pond,
@@ -502,6 +516,128 @@ def test_external_identity_claims_are_global_on_both_backends() -> None:
     assert outcomes["in_memory"] == outcomes["dynamo"] == ["external identity already claimed"] * 2
 
 
+def _capability(component_id: str, index: int, **schemas: Any) -> CapabilityDeclaration:
+    return CapabilityDeclaration(
+        tenant_id=TENANT,
+        component_id=component_id,
+        capability_id=f"cap_{index:032x}",
+        capability_key="water.temperature",
+        operation=CapabilityOperation.READ,
+        support=CapabilitySupport.SUPPORTED,
+        availability=CapabilityAvailability.AVAILABLE,
+        provenance=CapabilityProvenance.MODEL_PROFILE,
+        created_at=NOW,
+        updated_at=NOW,
+        version=1,
+        **schemas,
+    )
+
+
+def _component_backends() -> list[tuple[str, Any, Callable[[], Any]]]:
+    in_memory = InMemoryM1Repositories(clock=Clock(NOW))
+    client = ConditionalDynamoClient()
+    dynamo = DynamoM1Repositories.over(client, clock=lambda: NOW)
+
+    def in_memory_state() -> Any:
+        return (dict(in_memory.capabilities), dict(in_memory.receipts))
+
+    return [
+        ("in_memory", in_memory, in_memory_state),
+        ("dynamo", dynamo.device_component_repository, client.snapshot),
+    ]
+
+
+def _seed_component(repository: Any, index: int) -> DeviceComponent:
+    device = DeviceV2(
+        tenant_id=TENANT,
+        device_id=f"dev_{index:032x}",
+        name="Gateway",
+        created_at=NOW,
+        updated_at=NOW,
+        version=1,
+    )
+    component = DeviceComponent(
+        tenant_id=TENANT,
+        component_id=f"cmp_{index:032x}",
+        device_id=device.device_id,
+        kind=ComponentKind.PROBE,
+        name="Probe",
+        probe_profile=ProbeProfile(probe_profile_id=f"prb_{index:032x}"),
+        created_at=NOW,
+        updated_at=NOW,
+        version=1,
+    )
+    asyncio.run(repository.create_device(device, _receipt(TENANT, "device-create", index)))
+    asyncio.run(repository.create_component(component, _receipt(TENANT, "component-create", index)))
+    return component
+
+
+@pytest.mark.parametrize(
+    "terminal", [None, ComponentStatus.REPLACED, ComponentStatus.DECOMMISSIONED]
+)
+def test_capability_parent_checks_agree_on_both_backends(
+    terminal: ComponentStatus | None,
+) -> None:
+    outcomes = {}
+    for name, repository, state in _component_backends():
+        if terminal is None:
+            component_id = "cmp_" + "f" * 32
+        else:
+            component = _seed_component(repository, 1)
+            asyncio.run(
+                repository.update_component(
+                    TENANT, component.component_id, 1, name=None, status=terminal
+                )
+            )
+            component_id = component.component_id
+        before = state()
+        with pytest.raises((NotFoundError, ConflictError)) as raised:
+            asyncio.run(
+                repository.create_capability(
+                    _capability(component_id, 9), _receipt(TENANT, "capability-create", 9)
+                )
+            )
+        assert state() == before, name
+        outcomes[name] = (type(raised.value), str(raised.value))
+
+    expected = (
+        (NotFoundError, "component not found")
+        if terminal is None
+        else (ConflictError, f"component is {terminal}")
+    )
+    assert outcomes["in_memory"] == outcomes["dynamo"] == expected
+
+
+def test_non_integral_numbers_round_trip_through_the_dynamo_fake() -> None:
+    client = ConditionalDynamoClient()
+    repositories = DynamoM1Repositories.over(client, clock=lambda: NOW)
+    repository = repositories.device_component_repository
+    component = _seed_component(repository, 2)
+    schemas = {
+        "parameter_schema": {"type": "number", "minimum": 0.5, "nested": {"steps": [0.25, 1.5]}},
+        "result_schema": {"type": "number", "multipleOf": 0.1},
+    }
+
+    # Production stores capability schemas as canonical JSON strings.
+    asyncio.run(
+        repository.create_capability(
+            _capability(component.component_id, 3, **schemas),
+            _receipt(TENANT, "capability-create", 3),
+        )
+    )
+    (stored,) = asyncio.run(repository.list_capabilities(TENANT, component.component_id))
+    assert (stored.parameter_schema, stored.result_schema) == (
+        schemas["parameter_schema"],
+        schemas["result_schema"],
+    )
+    # Generic numeric attributes take the adapter base's float -> Decimal path.
+    key = {"PK": "TEST#numbers", "SK": "META"}
+    item = {**key, "ratio": 0.5, "nested": {"values": [0.25, 2, 1.5]}}
+    client.put_item(**repository.put_request(item))
+    assert asyncio.run(repository.get_item(key, consistent=True)) == item
+    assert client.item("TEST#numbers", "META")["ratio"] == Decimal("0.5")
+
+
 # 2) West -> East relocation keeps the old event-time assignment ------------------------------------
 
 
@@ -663,13 +799,16 @@ MIGRATION_RECEIPT_KEY = (f"TENANT#{TENANT}", "MIGRATION#M1#DEFAULT_SITE_ASSET_DE
 
 
 def assert_second_apply_only_bumped_the_receipt(
-    after_first: dict[tuple[str, str], dict], after_second: dict[tuple[str, str], dict]
+    after_first: dict[tuple[str, str], dict],
+    after_second: dict[tuple[str, str], dict],
+    *,
+    first_run_count: int = 1,
 ) -> None:
     """Idempotency over the full key union: nothing added, removed or changed except the
     receipt, which exists after both applies and records exactly one more run."""
     assert MIGRATION_RECEIPT_KEY in after_first and MIGRATION_RECEIPT_KEY in after_second
-    assert after_first[MIGRATION_RECEIPT_KEY]["run_count"] == 1
-    assert after_second[MIGRATION_RECEIPT_KEY]["run_count"] == 2
+    assert after_first[MIGRATION_RECEIPT_KEY]["run_count"] == first_run_count
+    assert after_second[MIGRATION_RECEIPT_KEY]["run_count"] == first_run_count + 1
     assert set(after_first) == set(after_second)
     without_receipt = [
         {key: item for key, item in snapshot.items() if key != MIGRATION_RECEIPT_KEY}
@@ -741,6 +880,76 @@ def test_migration_dry_run_then_apply_twice_duplicates_nothing() -> None:
         if key[0] == f"COMPONENT#{component_id}" and key[1] != "DEPLOYMENT#CURRENT"
     }
     assert len([key for key in deployment_rows if "MARKER" not in key[1]]) == 1
+    assert client.scan_calls == 0
+
+
+NEW_LEGACY_DEVICE = "dev_" + "4" * 32
+
+
+@pytest.mark.parametrize("window", ["enable", "rollback"])
+def test_apply_after_a_mixed_flag_window_converges(window: str) -> None:
+    """A rolling restart leaves flag-off instances accepting legacy-only `/v1` writes after the
+    final pre-cutover apply (enable), or flag-on and flag-off writes interleaved (rollback). One
+    more dry-run + `--apply` repairs moves and backfills creates; the next apply is a no-op."""
+    client = migrated_store()
+    legacy = DynamoDomainRepository(TABLE, client)
+    if window == "rollback":
+        # An old flag-on instance moves the Device East, then a flag-off one moves it back West.
+        projection = v1_projection(client, Clock(dt("2026-08-25T11:00:00Z")))
+        device = asyncio.run(projection.get_device(TENANT, LEGACY_DEVICE))
+        asyncio.run(
+            projection.update_device(
+                TENANT,
+                LEGACY_DEVICE,
+                device.version,
+                name=None,
+                pond_id=EAST_POND,
+                firmware_version=None,
+            )
+        )
+        target_pond = WEST_POND
+    else:
+        target_pond = EAST_POND
+    device = asyncio.run(legacy.get_device(TENANT, LEGACY_DEVICE))
+    asyncio.run(
+        legacy.update_device(
+            TENANT,
+            LEGACY_DEVICE,
+            device.version,
+            name=None,
+            pond_id=target_pond,
+            firmware_version=None,
+        )
+    )
+    asyncio.run(legacy.create_device(TENANT, EAST_POND, NEW_LEGACY_DEVICE, "Late", None))
+    repositories = DynamoM1Repositories.over(client, clock=lambda: NOW)
+
+    def current_asset(device_id: str) -> str | None:
+        component_id = default_component_id_for_legacy_device(TENANT, device_id)
+        current = asyncio.run(
+            repositories.deployment_repository.get_current_deployment(TENANT, component_id)
+        )
+        return None if current is None else current.asset_id
+
+    # Drift left by the window, before the repairing apply.
+    assert current_asset(LEGACY_DEVICE) != asset_id_for_legacy_pond(TENANT, target_pond)
+    assert current_asset(NEW_LEGACY_DEVICE) is None
+
+    dry_run = migrate(client, apply=False)
+    repair = migrate(client, apply=True)
+    after_repair = client.snapshot()
+    third = migrate(client, apply=True)
+
+    assert dry_run.result == repair.result == third.result == "success"
+    assert (repair.components_created, repair.deployments_created) == (1, 2)
+    assert current_asset(LEGACY_DEVICE) == asset_id_for_legacy_pond(TENANT, target_pond)
+    assert current_asset(NEW_LEGACY_DEVICE) == asset_id_for_legacy_pond(TENANT, EAST_POND)
+    new_component = default_component_id_for_legacy_device(TENANT, NEW_LEGACY_DEVICE)
+    assert client.item(f"COMPONENT#{new_component}", "META") is not None
+    assert {f: v for f, v in third.model_dump().items() if "_created" in f} == {
+        f: 0 for f in third.model_dump() if "_created" in f
+    }
+    assert_second_apply_only_bumped_the_receipt(after_repair, client.snapshot(), first_run_count=2)
     assert client.scan_calls == 0
 
 

@@ -11,7 +11,7 @@ The two flags are independent and both default to `false`:
 
 | Flag | Effect when `true` |
 |---|---|
-| `API_V2_ENABLED` | Mounts the M1 `/v2` groups: 13 paths and 25 operations (Sites, Assets, Devices, Components, Capabilities, Integration accounts, Device integrations, Deployments). |
+| `API_V2_ENABLED` | Mounts the M1 `/v2` groups: 13 paths and 25 operations (Sites, Assets, Devices, Components, Capabilities, Integration accounts, Device integrations, Deployments) for every tenant of the deployment; there is no tenant allowlist. |
 | `V1_POND_DEVICE_PROJECTION_ENABLED` | `/v1` Pond/Device routes read and write through the v2 projection. When any of the four M1 repositories is missing from app state, they return `503` and never fall back to the legacy repository. |
 
 ## Release gate
@@ -87,7 +87,11 @@ conditional transactions and ignores the 1 MB Query page, so its results do not 
    (enable, rollback, re-enable) therefore takes effect only after a restart or redeploy of
    **every** API instance; changing the environment alone does nothing. After each restart,
    [verify the flags took effect](#verify-the-flags-took-effect).
-6. **Pilot `API_V2_ENABLED=true`.** Enable it for the pilot. Smoke each M1 group: list and
+6. **Pilot `API_V2_ENABLED=true`.** `API_V2_ENABLED` mounts `/v2` for the whole application;
+   there is no tenant allowlist. Enabling it is **environment-wide**: every tenant served by
+   that deployment gets the M1 endpoints (still gated by tenant membership). A tenant-limited
+   pilot therefore needs an isolated environment or deployment serving only the pilot tenants;
+   otherwise accept and record that the pilot is environment-wide. Smoke each M1 group: list and
    create Sites, Assets, Devices, Components, Capabilities, Integration accounts, Device
    integrations, and start and end Deployments. Every `/v2` create needs an `Idempotency-Key`
    of 8–128 characters. Restart every API instance and verify the flags took effect.
@@ -95,10 +99,24 @@ conditional transactions and ignores the 1 MB Query page, so its results do not 
    `tests/contracts/test_v1_openapi_contract.py`, `tests/unit/test_tenant_mapping_conformance.py`
    and `tests/unit/test_no_scan_guard.py` against the deployed revision, or just run the release
    gate above.
-8. **Re-run the dry-run and `--apply` immediately before enabling the projection.** The flag
-   was off, so `/v1` moves made since step 3 may have left drift; this pass repairs it (see
-   [Drift repair](#drift-repair)). Then set `V1_POND_DEVICE_PROJECTION_ENABLED=true` for the
-   rollout environment, restart every API instance and verify the flags took effect.
+8. **Enable the projection with a closed cutover window.**
+   1. Re-run the dry-run and `--apply` immediately before the cutover. The flag was off, so
+      `/v1` moves made since step 3 may have left drift; this pass repairs it (see
+      [Drift repair](#drift-repair)).
+   2. Set `V1_POND_DEVICE_PROJECTION_ENABLED=true` and cut over **atomically** where the
+      platform allows it: blue/green, or scale the flag-off instances to zero before any
+      flag-on instance serves traffic. If only a rolling restart is possible, **quiesce `/v1`
+      Pond/Device writes** (POST/PATCH ponds and devices) from the final dry-run until every
+      instance runs flag-on. During a rolling restart, a flag-off instance still accepts
+      legacy-only writes: a Device moved there leaves `DEPLOYMENT#CURRENT` on the old Asset, and
+      a Device created there has no Component or Deployment until it is migrated.
+   3. Verify the flags took effect on **every** instance.
+   4. **Mandatory, in either case:** once every instance is confirmed flag-on, run the dry-run
+      and `--apply` **again**. It repairs window moves through drift repair and backfills
+      window-created Devices. Running it while flag-on `/v1` writes continue is safe; the M1-05
+      writes and the M1-06 migration converge. The gate proves this sequence
+      (`test_apply_after_a_mixed_flag_window_converges`): after this apply, CURRENT is on the new
+      Asset, the late Device has its Component and Deployment, and the next apply is a no-op.
 9. **Run the full gate.** Run the release gate. Then watch the `/v1` and `/v2` `409` and `503`
    rates. Diagnose a sustained `503` on `/v1` Pond/Device routes with
    [Diagnosing 503 on /v1 Ponds and Devices](#diagnosing-503-on-v1-ponds-and-devices) before
@@ -108,15 +126,19 @@ conditional transactions and ignores the 1 MB Query page, so its results do not 
 
 Roll back by changing flags only: set `V1_POND_DEVICE_PROJECTION_ENABLED=false` and
 `API_V2_ENABLED=false`, then restart or redeploy **every** API instance (the flags are read
-only at startup) and [verify the flags took effect](#verify-the-flags-took-effect). With the
+only at startup) and [verify the flags took effect](#verify-the-flags-took-effect). A rolling
+rollback mixes flag-on writes (which keep the v2 rows in sync) with flag-off legacy-only writes
+(which leave drift). That is safe: the legacy rows remain the `/v1` source of truth (D1), and the
+re-enable sequence below repairs the drift; the gate covers this interleaving too. With the
 projection off, `/v1` reads come from the legacy `POND#` and
 `DEVICE#` rows (under D1 they do with either flag value). Native v2 Devices never appear in `/v1`.
 
 - **Never delete rows.** Additive v2 rows, the `v2_*` link attributes on legacy rows,
   Deployment history, Deployment markers and migration receipts all stay in place.
-- **Before re-enabling after a rollback,** run the dry-run and then `--apply` again so the v2
-  rows catch up with `/v1` edits made while the flag was off. After that, follow the rollout
-  from step 8.
+- **Re-enabling after a rollback** is the full step 8: dry-run and `--apply` so the v2 rows
+  catch up with `/v1` edits made while the flag was off, an atomic cutover or quiesced `/v1`
+  Pond/Device writes, a restart of every instance with verification, and then the mandatory
+  post-cutover dry-run and `--apply`.
 
 ### Verify the flags took effect
 

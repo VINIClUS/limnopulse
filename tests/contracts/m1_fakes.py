@@ -181,8 +181,12 @@ def _split_top_level(expression: str, separator: str) -> list[str]:
 
 
 def _normalize(value: Any) -> Any:
+    """Integral numbers become `int`; non-integral ones stay `Decimal`, which is what DynamoDB
+    returns and what `TypeSerializer` accepts again (it rejects `float`)."""
     if isinstance(value, Decimal):
-        return int(value) if value == value.to_integral_value() else float(value)
+        return int(value) if value == value.to_integral_value() else value
+    if isinstance(value, float):
+        return Decimal(str(value))
     if isinstance(value, dict):
         return {key: _normalize(item) for key, item in value.items()}
     if isinstance(value, list):
@@ -222,7 +226,7 @@ class ConditionalDynamoClient:
     # Test helpers ---------------------------------------------------------------------------
 
     def seed(self, item: dict[str, Any]) -> None:
-        normalized = self._plain(self._encode(item))
+        normalized = self._plain(self._encode(_normalize(item)))
         self.items[(normalized["PK"], normalized["SK"])] = normalized
 
     def item(self, pk: str, sk: str) -> dict[str, Any] | None:
@@ -637,6 +641,13 @@ class InMemoryM1Repositories:
     async def create_capability(
         self, declaration: CapabilityDeclaration, receipt: IdempotencyReceipt
     ) -> CapabilityDeclaration:
+        """Mirrors the Dynamo adapter: the Component's ownership and status are checked before
+        anything (including the receipt) is written."""
+        component = self.components.get((declaration.tenant_id, declaration.component_id))
+        if component is None:
+            raise NotFoundError("component not found")
+        if component.status in {ComponentStatus.REPLACED, ComponentStatus.DECOMMISSIONED}:
+            raise ConflictError(f"component is {component.status}")
         key = (declaration.tenant_id, declaration.component_id, declaration.capability_id)
         if key in self.capabilities:
             raise ConflictError("capability already exists")
