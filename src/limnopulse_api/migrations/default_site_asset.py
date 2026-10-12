@@ -18,6 +18,9 @@ ownership conflict receives no writes; other tenants continue. Planned writes ar
 
 Legacy state is mirrored; v2 start/move rules apply only to new writes. A Device in an archived
 Pond therefore gets an ACTIVE Deployment on the ARCHIVED Asset, exactly as the legacy rows say.
+A drift repair (below) is such a new write: like the `/v1` projection it never moves a Deployment
+into an ARCHIVED Asset; that Device counts as already migrated (links may still be set), and the
+repair transaction is fenced on the target Asset being ACTIVE.
 
 The default Component's `DEPLOYMENT#CURRENT` is authoritative history whoever wrote it (this
 migration, the flag-on `/v1` projection, which also starts non-deterministic intervals, or
@@ -54,8 +57,10 @@ migrated, divergent content is a schema conflict. Known keys of one transaction 
 siblings-first and the primary row last (Deployment CURRENT/history/marker before its mirror), so
 a present primary proves the group. Any mixed state that a concurrent commit or a `/v1` move can
 explain (a lookup that disagrees with the queried Device row, a Device whose Pond is unknown, a
-partial Deployment group) re-reads the record, bounded by `MAX_RECORD_ATTEMPTS`, before it is
-reported as a conflict; a Pond created during the run is read and planned before its Device.
+partial Deployment group) re-reads the record after a small jittered backoff, bounded by
+`MAX_RECORD_ATTEMPTS`. A state observed identically on every re-read is stable and divergent and
+becomes a schema conflict; one that kept changing fails the tenant (rerun to converge). A Pond
+created during the run is read and planned before its Device.
 Exhausted retries mark only that tenant failed (result `failed`, exit 1); other tenants continue.
 The run is idempotent, so rerunning it converges any tenant left incomplete.
 
@@ -68,6 +73,7 @@ Device whose deterministic Deployment exists but is no longer CURRENT (it has si
 already migrated. The receipt records each completed run and is never used to skip validation.
 """
 
+import json
 import logging
 import random
 import time
@@ -111,12 +117,14 @@ from limnopulse_api.adapters.dynamodb_sites_assets import (
     site_to_item,
 )
 from limnopulse_api.adapters.dynamodb_v2 import DynamoConditionalConflict, utc_now
+from limnopulse_api.domain.assets import AssetStatus
 from limnopulse_api.domain.deployments import Deployment, DeploymentStatus
 from limnopulse_api.domain.devices_v2 import ComponentStatus
 from limnopulse_api.domain.entities import Device, Pond, Tenant
 from limnopulse_api.domain.ids import asset_id_for_legacy_pond, new_deployment_id
 from limnopulse_api.domain.legacy_projection import (
     asset_and_profile_for_legacy_pond,
+    asset_status_from_legacy,
     component_for_legacy_device,
     default_site_for_tenant,
     deployment_for_legacy_device,
@@ -245,10 +253,12 @@ class _DeadlineExceeded(Exception):
 class _Unstable(Exception):
     """A mixed state that a concurrent commit can explain; re-read and re-plan the record."""
 
-    def __init__(self, kind: str, key: Mapping[str, str]) -> None:
+    def __init__(self, kind: str, key: Mapping[str, str], observed: Any = None) -> None:
         super().__init__(kind)
         self.kind = kind
         self.key = dict(key)
+        # The rows whose mix was inconsistent: identical on every re-read means a stable state.
+        self.observed = observed
 
 
 class _RetryExhausted(Exception):
@@ -434,6 +444,10 @@ class DefaultSiteAssetMigrator:
         except _SchemaConflict as conflict:
             state.add_conflicts(tenant_id, [conflict])
             return
+        except _RetryExhausted as exc:
+            _LOGGER.error("tenant %s not planned: retries exhausted on %s", tenant_id, exc)
+            state.tenants_failed += 1
+            return
         if plan.conflicts:
             state.add_conflicts(tenant_id, plan.conflicts)
             return
@@ -517,11 +531,17 @@ class DefaultSiteAssetMigrator:
         plan: _TenantPlan,
         on_new_pond: Callable[[_RecordPlan], None],
     ) -> _RecordPlan:
-        """Plan one record; a mixed state re-reads the source row and re-plans, bounded."""
+        """Plan one record; a mixed state re-reads the source row and re-plans, bounded.
+
+        When re-reads run out, a state observed identically every time is stable and divergent
+        (a schema conflict); one that kept changing is a failure of this run (rerun to converge).
+        """
         source_key = _source_key(item)
+        observations: list[str] = []
         unstable: _Unstable | None = None
         for attempt in range(MAX_RECORD_ATTEMPTS):
             if attempt:
+                self._backoff(attempt - 1)
                 fresh = self.store.get_known_item(source_key)
                 if fresh is None:
                     raise _SchemaConflict(f"{kind}_missing", source_key)
@@ -530,8 +550,13 @@ class DefaultSiteAssetMigrator:
                 return self._plan_from_item(kind, item, plan, on_new_pond)
             except _Unstable as exc:
                 unstable = exc
+                observations.append(
+                    json.dumps([item, exc.kind, exc.key, exc.observed], sort_keys=True, default=str)
+                )
         assert unstable is not None
-        raise _SchemaConflict(unstable.kind, unstable.key)
+        if len(set(observations)) == 1:
+            raise _SchemaConflict(unstable.kind, unstable.key)
+        raise _RetryExhausted(f"{kind} {unstable.kind}")
 
     def _plan_from_item(
         self,
@@ -549,7 +574,7 @@ class DefaultSiteAssetMigrator:
             raise _SchemaConflict("device_invalid", _source_key(item))
         device = self._parse_device(tenant_id, item)
         self._ensure_pond(device, item, plan, on_new_pond)
-        return self._plan_device(device, item, plan.site_id)
+        return self._plan_device(device, item, plan.site_id, plan.ponds[device.pond_id])
 
     def _ensure_pond(
         self,
@@ -643,7 +668,9 @@ class DefaultSiteAssetMigrator:
             link_updated=link_updated,
         )
 
-    def _plan_device(self, device: Device, item: Mapping[str, Any], site_id: str) -> _RecordPlan:
+    def _plan_device(
+        self, device: Device, item: Mapping[str, Any], site_id: str, pond: Pond
+    ) -> _RecordPlan:
         source_key = _source_key(item)
         tenant_id = device.tenant_id
         asset_id = asset_id_for_legacy_pond(tenant_id, device.pond_id)
@@ -663,7 +690,7 @@ class DefaultSiteAssetMigrator:
         ):
             # The Device row came from an earlier Query page; a /v1 move since then shows up
             # as a lookup mismatch, so re-read the row before calling it a conflict.
-            raise _Unstable("device_lookup", lookup_key)
+            raise _Unstable("device_lookup", lookup_key, lookup)
 
         # Mirror, then canonical; both commit together and absent rows are conditional puts.
         mirror_put = self._plan_put(
@@ -689,6 +716,7 @@ class DefaultSiteAssetMigrator:
         deployment_actions = self._plan_deployment(
             device,
             deployment,
+            pond,
             active=active,
             component_planned=canonical_put is not None,
         )
@@ -726,6 +754,7 @@ class DefaultSiteAssetMigrator:
         self,
         device: Device,
         deployment: Deployment,
+        pond: Pond,
         *,
         active: bool,
         component_planned: bool,
@@ -747,6 +776,9 @@ class DefaultSiteAssetMigrator:
             marker = self._require_marker(tenant_id, deployment.component_id)
             if current.asset_id == deployment.asset_id or not active:
                 return []
+            if not self._asset_active(tenant_id, deployment.asset_id, pond):
+                # Like the `/v1` projection, never reconcile into an archived Asset.
+                return []
             return self._drift_repair_actions(
                 device, current, marker, deployment, component_planned=component_planned
             )
@@ -767,20 +799,20 @@ class DefaultSiteAssetMigrator:
             if mirror.get("status") == DeploymentStatus.ACTIVE.value:
                 # Active but not CURRENT: CURRENT was absent when read, so this is a commit
                 # landing between the reads.
-                raise _Unstable("deployment_current", current_key)
+                raise _Unstable("deployment_current", current_key, mirror)
             if history is None:
-                raise _Unstable("deployment_history", history_key)
+                raise _Unstable("deployment_history", history_key, [mirror, marker])
             if marker is None:
-                raise _Unstable("deployment_marker", marker_key)
+                raise _Unstable("deployment_marker", marker_key, [mirror, history])
             # Ended with nothing CURRENT: already migrated. The migration never restarts an
             # ended interval, because that would invent history.
             return []
         if not active:
             return []
         if history is not None:
-            raise _Unstable("deployment_history", history_key)
+            raise _Unstable("deployment_history", history_key, [history, marker])
         if marker is not None:
-            raise _Unstable("deployment_marker", marker_key)
+            raise _Unstable("deployment_marker", marker_key, marker)
         return [
             *(
                 {"Put": self.store.put_new_request(target)}
@@ -797,6 +829,13 @@ class DefaultSiteAssetMigrator:
                 )
             },
         ]
+
+    def _asset_active(self, tenant_id: str, asset_id: str, pond: Pond) -> bool:
+        """Status of the Pond's Asset; one not written yet will mirror the Pond's status."""
+        asset = self.store.get_known_item(self.keys.asset(tenant_id, asset_id))
+        if asset is None:
+            return asset_status_from_legacy(pond.status) is AssetStatus.ACTIVE
+        return asset.get("status") == AssetStatus.ACTIVE.value
 
     def _current_deployment(
         self, current_item: Mapping[str, Any], expected: Deployment, current_key: Mapping[str, str]
@@ -828,7 +867,7 @@ class DefaultSiteAssetMigrator:
                 row.get(name) != named.get(name)
                 for name in (*_CURRENT_FIELDS, "site_id", "status", "version")
             ):
-                raise _Unstable("deployment_current", current_key)
+                raise _Unstable("deployment_current", current_key, [current_item, row])
         return current
 
     def _require_marker(self, tenant_id: str, component_id: str) -> Mapping[str, Any]:
@@ -909,7 +948,7 @@ class DefaultSiteAssetMigrator:
                 )
             },
             {
-                "ConditionCheck": self.store.asset_exists_check_request(
+                "ConditionCheck": self.store.asset_active_check_request(
                     current.tenant_id, target.asset_id
                 )
             },

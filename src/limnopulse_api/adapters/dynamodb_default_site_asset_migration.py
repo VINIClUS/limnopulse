@@ -212,6 +212,14 @@ class DynamoDefaultSiteAssetMigrationStore(DynamoV2RepositoryBase):
             values={":tenant_id": tenant_id},
         )
 
+    def asset_active_check_request(self, tenant_id: str, asset_id: str) -> dict[str, Any]:
+        return self.condition_check_request(
+            self.keys.asset(tenant_id, asset_id),
+            condition="attribute_exists(PK) AND #status = :active AND #tenant_id = :tenant_id",
+            names={"#status": "status", "#tenant_id": "tenant_id"},
+            values={":active": "active", ":tenant_id": tenant_id},
+        )
+
     def component_active_check_request(self, tenant_id: str, component_id: str) -> dict[str, Any]:
         return self.condition_check_request(
             self.keys.component(component_id),

@@ -440,7 +440,10 @@ def device_model(device_id: str, pond_id: str, *, status: str = "active") -> Dev
 def run(client: FakeMigrationDynamo, *, apply: bool, clock=fixed_clock, **kwargs: Any):
     options = {"page_size": 25, "deadline_seconds": 300, **kwargs}
     tenants = options.pop("tenants", ["tnt_1"])
-    return DefaultSiteAssetMigrator(client, clock=clock).run(tenants, apply=apply, **options)
+    sleep = options.pop("sleep", lambda _delay: None)
+    return DefaultSiteAssetMigrator(client, clock=clock, sleep=sleep).run(
+        tenants, apply=apply, **options
+    )
 
 
 def normalized(item: dict[str, Any]) -> dict[str, Any]:
@@ -1216,9 +1219,11 @@ def test_persistent_lookup_mismatch_is_a_conflict_after_bounded_rereads() -> Non
         devices=[legacy_device("probe-1", "pond_1")],
     )
     client.items[("DEVICE#probe-1", "META")]["pond_id"] = "pond_2"
+    sleeps: list[float] = []
 
-    result = run(client, apply=True)
+    result = run(client, apply=True, sleep=sleeps.append)
 
+    assert len(sleeps) == 2  # jittered backoff before each re-read
     assert result.result == "schema_conflict"
     assert [(c.kind, c.key) for c in result.conflicts] == [("device_lookup", "DEVICE#probe-1/META")]
     device_reads = [
@@ -1643,3 +1648,134 @@ def test_concurrent_identical_runs_converge_on_drift(scenario: str, interleave: 
     assert _current(client)["asset_id"] == asset_id_for_legacy_pond("tnt_1", final_pond)
     assert len(_history_rows(client)) == history_rows
     assert sum(row["status"] == "active" for row in _history_rows(client)) == 1
+
+
+# Final audit: archived drift targets, query shape, unstable-state exhaustion --------------------
+
+
+def test_move_into_archived_pond_after_migration_is_not_repaired() -> None:
+    client = migrated_store()
+    client.put_raw({**legacy_pond("pond_2"), "status": "archived"})
+    _move_device_at(client, "pond_2", MOVED_AT)
+    before = dict(_current(client))
+
+    dry = run(client, apply=False)
+    result = run(client, apply=True)
+
+    assert (dry.would_create_deployments, dry.would_project_devices) == (0, 0)
+    assert result.result == "success"
+    assert exit_code_for(result.result) == 0
+    assert (result.deployments_created, result.devices_projected) == (0, 0)
+    assert result.assets_created == 1  # the archived Pond still gets its (ARCHIVED) Asset
+    assert result.already_migrated == 2  # pond_1 and the Device
+    assert _current(client) == before
+    archived = client.get_raw(
+        *KEYS.asset("tnt_1", asset_id_for_legacy_pond("tnt_1", "pond_2")).values()
+    )
+    assert archived["status"] == "archived"
+
+
+def test_asset_archived_between_plan_and_repair_is_fenced_and_already_migrated() -> None:
+    client = moved_after_migration()
+    run(client, apply=True)  # pond_2 Asset now exists; the drift was repaired
+    client.put_raw(legacy_pond("pond_3"))
+    run(client, apply=True)  # pond_3 Asset exists, nothing drifts yet
+    _move_device_at(client, "pond_3", MOVED_AT + timedelta(days=1))
+    pond_3_asset = KEYS.asset("tnt_1", asset_id_for_legacy_pond("tnt_1", "pond_3"))
+    before = dict(_current(client))
+
+    def archive_target(fake: FakeMigrationDynamo, actions: list[dict]) -> None:
+        if "DEPLOYMENT#CURRENT" not in str(actions):
+            fake.before_transact = archive_target
+            return
+        fake.items[(pond_3_asset["PK"], pond_3_asset["SK"])]["status"] = "archived"
+
+    client.before_transact = archive_target
+    client.calls.clear()
+
+    result = run(client, apply=True)
+
+    assert result.result == "success"
+    assert result.deployments_created == 0
+    assert result.already_migrated == 4
+    assert _current(client) == before
+    repairs = [tx for tx in client.transactions if "DEPLOYMENT#CURRENT" in str(tx)]
+    assert len(repairs) == 1  # fenced, then re-planned as already migrated without a retry
+    repair = repairs[0]
+    checks = [action["ConditionCheck"] for action in repair if "ConditionCheck" in action]
+    assert any("#status = :active" in check["ConditionExpression"] for check in checks)
+
+
+def test_every_query_is_a_tenant_partition_prefix_query() -> None:
+    client = moved_after_migration()
+    client.add_legacy_tenant("tnt_2", ponds=[legacy_pond("pond_x", tenant_id="tnt_2")], devices=[])
+    client.calls.clear()
+
+    run(client, apply=False, page_size=1, tenants=["tnt_1", "tnt_2"])
+    run(client, apply=True, page_size=1, tenants=["tnt_1", "tnt_2"])
+    run(client, apply=True, page_size=1, tenants=["tnt_1", "tnt_2"])
+
+    assert client.scan_calls == []
+    assert {name for name, _ in client.calls} <= {
+        "get_item",
+        "query",
+        "put_item",
+        "update_item",
+        "transact_write_items",
+    }
+    assert client.query_calls
+    for request in client.query_calls:
+        assert request["KeyConditionExpression"] == "PK = :pk AND begins_with(SK, :sk_prefix)"
+        assert "BETWEEN" not in str(request)
+        values = client.deserialize(request["ExpressionAttributeValues"])
+        assert values[":pk"] in {"TENANT#tnt_1", "TENANT#tnt_2"}
+        assert values[":sk_prefix"] in {"POND#", "DEVICE#"}
+        assert request["Limit"] == 1
+
+
+def test_unstable_state_that_keeps_changing_fails_the_tenant_not_a_conflict() -> None:
+    client = FakeMigrationDynamo.with_legacy_tenant(
+        tenant_id="tnt_1",
+        ponds=[legacy_pond("pond_1")],
+        devices=[legacy_device("probe-1", "pond_1")],
+    )
+    client.add_legacy_tenant("tnt_2", ponds=[legacy_pond("pond_2", tenant_id="tnt_2")], devices=[])
+    flips = {"count": 0}
+
+    def churn_lookup(fake: FakeMigrationDynamo, key: tuple[str, str]) -> None:
+        if key == ("DEVICE#probe-1", "META"):
+            flips["count"] += 1
+            fake.items[key]["pond_id"] = f"pond_churn_{flips['count']}"
+
+    client.before_get_item = churn_lookup
+    sleeps: list[float] = []
+
+    result = run(client, apply=True, sleep=sleeps.append, tenants=["tnt_1", "tnt_2"])
+
+    assert result.result == "failed"
+    assert exit_code_for(result.result) == 1
+    assert result.conflicts == []
+    assert result.schema_conflicts == 0
+    assert result.tenants_completed == 1  # tnt_2 still migrated
+    assert result.scope_completed is False
+    assert len(sleeps) == 2
+    assert all(0 <= delay <= 0.1 for delay in sleeps)
+    assert all("tnt_1" not in str(request) for _, request in client.write_calls)
+
+
+def test_stable_partial_deployment_group_stays_a_schema_conflict() -> None:
+    client = FakeMigrationDynamo.with_legacy_tenant(
+        tenant_id="tnt_1",
+        ponds=[legacy_pond("pond_1")],
+        devices=[legacy_device("probe-1", "pond_1")],
+    )
+    client.put_raw(deployment_marker_item("tnt_1", COMPONENT_ID, seq=3, last_ended_at=LATER))
+    sleeps: list[float] = []
+
+    result = run(client, apply=True, sleep=sleeps.append)
+
+    assert result.result == "schema_conflict"
+    assert [(c.kind, c.key) for c in result.conflicts] == [
+        ("deployment_marker", f"COMPONENT#{COMPONENT_ID}/DEPLOYMENT#MARKER")
+    ]
+    assert len(sleeps) == 2
