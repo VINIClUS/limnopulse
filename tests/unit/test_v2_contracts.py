@@ -235,7 +235,8 @@ def test_compatibility_id_vectors_are_pinned() -> None:
 
 
 def test_compatibility_ids_are_stable_and_tenant_scoped() -> None:
-    assert default_site_id("tnt_a") == default_site_id("tnt_a")
+    first, second = default_site_id("tnt_a"), default_site_id("tnt_a")
+    assert first == second
     assert default_site_id("tnt_a") != default_site_id("tnt_b")
     assert asset_id_for_legacy_pond("tnt_a", "p") != asset_id_for_legacy_pond("tnt_b", "p")
     for builder, prefix in (

@@ -84,7 +84,9 @@ def test_default_site_uses_tenant_identity_name_and_window() -> None:
 
 
 def test_default_site_is_deterministic() -> None:
-    assert default_site_for_tenant(legacy_tenant()) == default_site_for_tenant(legacy_tenant())
+    first = default_site_for_tenant(legacy_tenant())
+    second = default_site_for_tenant(legacy_tenant())
+    assert first == second
 
 
 def test_asset_and_profile_copy_legacy_pond() -> None:
