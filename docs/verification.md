@@ -74,6 +74,14 @@ in the table, so use a disposable one (`DYNAMODB_DOMAIN_TABLE`).
 `ALLOW_V2_UNAVAILABLE=1` accepts `ok=null` verdicts while `/v2` is off; the
 default is strict.
 
+The harness runs from the repository root and keeps its run files (Node-RED
+user directory, MQTTX capture, verdicts, CI logs) in the ignored `.e2e-out/`
+directory. Its Python tools only read and write files inside the working
+directory, so `E2E_WORK_DIR` and `WOKWI_SERIAL_LOG` must point inside the
+repository. Each published reading is identified by its device, `seq` and
+`ts`, and must get exactly one verdict; duplicates from QoS-1 redelivery are
+accepted only when they agree.
+
 Telegraf limitation: Telegraf enriches readings from the static registry in
 `infra/telegraf/device_registry.star`, which only knows `local-device-001`.
 Readings of the devices the harness creates reach the verdict flow but are not

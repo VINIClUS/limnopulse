@@ -3,17 +3,24 @@ const EXPECTED_KEYS = [
     "battery_v", "do_mg_l", "ph", "rssi", "salinity_ppt",
     "seq", "temp_c", "ts", "turbidity_ntu",
 ];
-const base = String(env.get("LIMNOPULSE_API_URL") || "http://127.0.0.1:8000").replace(/\/+$/, "");
+// Strip trailing slashes without a regex (linear, no backtracking).
+let base = String(env.get("LIMNOPULSE_API_URL") || "http://127.0.0.1:8000");
+while (base.endsWith("/")) {
+    base = base.slice(0, -1);
+}
 const tenant = String(env.get("LIMNOPULSE_TENANT") || "tnt_local_001");
 const parts = String(msg.topic || "").split("/");
-const reading = msg.payload;
+// The switch node only lets objects through; never trust that here.
+const reading = msg.payload !== null && typeof msg.payload === "object" && !Array.isArray(msg.payload)
+    ? msg.payload
+    : {};
 
 const ctx = {
     base: base,
     tenant: tenant,
     device_id: parts.length === 5 && parts[4] === "readings" ? parts[3] : null,
-    seq: reading && reading.seq !== undefined ? reading.seq : null,
-    ts: reading && typeof reading.ts === "string" ? reading.ts : null,
+    seq: Object.hasOwn(reading, "seq") ? reading.seq : null,
+    ts: typeof reading.ts === "string" ? reading.ts : null,
     v1_pond_id: null,
     component_id: null,
     native: false,
@@ -39,7 +46,13 @@ function verdict(ok, reason) {
 if (!ctx.device_id) {
     return verdict(false, "bad-topic");
 }
-const keys = Object.keys(reading || {}).sort();
+// Code-point order, the same order as EXPECTED_KEYS (all keys are ASCII).
+function byCodePoint(a, b) {
+    if (a < b) return -1;
+    if (a > b) return 1;
+    return 0;
+}
+const keys = Object.keys(reading).sort(byCodePoint);
 if (keys.join(",") !== EXPECTED_KEYS.join(",")) {
     return verdict(false, "payload-keys-mismatch");
 }

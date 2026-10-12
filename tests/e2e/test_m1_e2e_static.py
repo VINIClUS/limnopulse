@@ -608,8 +608,9 @@ def test_scenario_and_harness_avoid_moving_the_registry_device() -> None:
 
 
 def test_summarize_filters_several_devices_and_counts_reasons(
-    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, capsys: pytest.CaptureFixture[str]
 ) -> None:
+    monkeypatch.chdir(tmp_path)
     summarize = _load("m1_e2e_summarize", E2E / "summarize_verdicts.py")
     keys = dict.fromkeys(summarize.VERDICT_KEYS)
     raw = tmp_path / "verdicts.raw"
@@ -627,7 +628,7 @@ def test_summarize_filters_several_devices_and_counts_reasons(
     out = capsys.readouterr().out
     assert code == 0
     assert "REASONS true:match=1 true:v2-native=1" in out
-    assert "verdicts=2 expected=2 ok_true=2 ok_false=0 ok_null=0 failures=0" in out
+    assert "verdicts=2 duplicates=0 expected=2 missing=0 ok_true=2 ok_false=0 ok_null=0" in out
 
 
 def test_ci_stack_runs_the_real_migration_and_enables_both_m1_flags() -> None:
@@ -774,8 +775,9 @@ def test_node_function_compares_deployment_bounds_at_microsecond_precision(
 
 
 def test_summarize_counts_failed_scenarios_as_failures(
-    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, capsys: pytest.CaptureFixture[str]
 ) -> None:
+    monkeypatch.chdir(tmp_path)
     summarize = _load("m1_e2e_summarize", E2E / "summarize_verdicts.py")
     keys = dict.fromkeys(summarize.VERDICT_KEYS)
     raw = tmp_path / "verdicts.raw"
@@ -798,7 +800,8 @@ def test_failed_scenarios_still_report_their_devices(
         raise scenarios.ScenarioError("seq=1: resolved mismatch")
 
     monkeypatch.setattr(scenarios.Harness, "relocation", failing_relocation)
-    code = scenarios.main(["relocation", "--raw", str(tmp_path / "raw")])
+    monkeypatch.chdir(tmp_path)
+    code = scenarios.main(["relocation", "--raw", "raw"])
 
     assert code == 1
     assert capsys.readouterr().out.splitlines() == ["SCENARIO_DEVICE dev_" + "a" * 32 + " 1"]
@@ -810,3 +813,340 @@ def test_run_script_fails_fast_without_replayed_line_and_reports_scenarios_faile
     assert 'expected="${expected:-0}"' in runner
     assert "replay.py reported no REPLAYED line" in runner
     assert '--scenarios-failed "$scenarios_failed"' in runner
+
+
+# --- Sonar: path containment, validated mqttx argv, JS fixes ---
+
+
+def _verdict_rows(summarize: ModuleType, *rows: dict) -> str:
+    keys = dict.fromkeys(summarize.VERDICT_KEYS)
+    return "".join(json.dumps({"payload": json.dumps({**keys, **row})}) for row in rows)
+
+
+def test_summarize_rejects_paths_outside_the_working_directory(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    summarize = _load("m1_e2e_summarize", E2E / "summarize_verdicts.py")
+    inside = tmp_path / "repo"
+    inside.mkdir()
+    outside = tmp_path / "outside.raw"
+    outside.write_text("{}")
+    monkeypatch.chdir(inside)
+
+    assert summarize.main(["--raw", str(outside)]) == 2
+    assert summarize.main(["--raw", "../outside.raw"]) == 2
+    assert summarize.main(["--raw", "x.raw", "--jsonl-out", "../out.jsonl"]) == 2
+    assert "inside the working directory" in capsys.readouterr().err
+    (inside / "dir.raw").mkdir()
+    assert summarize.main(["--raw", "dir.raw"]) == 2
+
+
+def test_replay_rejects_serial_logs_outside_the_working_directory(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    replay = _load("m1_e2e_replay", E2E / "wokwi/replay.py")
+    inside = tmp_path / "repo"
+    inside.mkdir()
+    (tmp_path / "outside.log").write_text(FIXTURE.read_text(encoding="utf-8"))
+    (inside / "big.log").write_bytes(b"x" * (replay.MAX_SERIAL_LOG_BYTES + 1))
+    (inside / "ok.log").write_text(FIXTURE.read_text(encoding="utf-8"))
+    monkeypatch.chdir(inside)
+    monkeypatch.delenv("WOKWI_SERIAL_LOG", raising=False)
+
+    for bad in (str(tmp_path / "outside.log"), "../outside.log", "missing.log", "big.log", "."):
+        with pytest.raises(replay.ReplayError):
+            replay.resolve_source(bad)
+    assert replay.resolve_source("ok.log") == (inside / "ok.log").resolve()
+    monkeypatch.setenv("WOKWI_SERIAL_LOG", "../outside.log")
+    with pytest.raises(replay.ReplayError):
+        replay.resolve_source(None)
+
+
+def _fake_mqttx(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> Path:
+    tool = tmp_path / "bin" / "mqttx"
+    tool.parent.mkdir()
+    tool.write_text("#!/bin/sh\nexit 0\n")
+    tool.chmod(0o755)
+    monkeypatch.setenv("PATH", str(tool.parent))
+    return tool
+
+
+def test_replay_publish_argv_uses_only_validated_values(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    replay = _load("m1_e2e_replay", E2E / "wokwi/replay.py")
+    tool = _fake_mqttx(monkeypatch, tmp_path)
+    reading = _fixture_payloads()[0]
+
+    argv = replay.publish_argv("127.0.0.1", "1883", "local-device-001", 1, reading)
+
+    assert argv[0] == str(tool.resolve())
+    assert argv[1:-1] == [
+        "pub",
+        "--hostname",
+        "127.0.0.1",
+        "--port",
+        "1883",
+        "--topic",
+        "limnopulse/v1/devices/local-device-001/readings",
+        "--qos",
+        "1",
+        "--message",
+    ]
+    assert json.loads(argv[-1]) == reading
+    assert replay.publish_argv("mqtt-broker.local", 1883, "dev_" + "a" * 32, 0, reading)[3] == (
+        "mqtt-broker.local"
+    )
+
+    bad_calls = [
+        ("127.0.0.1;rm -rf /", 1883, "local-device-001", 1, reading),
+        ("-h", 1883, "local-device-001", 1, reading),
+        ("a..b", 1883, "local-device-001", 1, reading),
+        ("127.0.0.1", 0, "local-device-001", 1, reading),
+        ("127.0.0.1", 65536, "local-device-001", 1, reading),
+        ("127.0.0.1", "18x", "local-device-001", 1, reading),
+        ("127.0.0.1", 1883, "a/b", 1, reading),
+        ("127.0.0.1", 1883, "-t", 1, reading),
+        ("127.0.0.1", 1883, "+", 1, reading),
+        ("127.0.0.1", 1883, "local-device-001", 3, reading),
+        ("127.0.0.1", 1883, "local-device-001", 1, {**reading, "tenant" + "_id": "x"}),
+        ("127.0.0.1", 1883, "local-device-001", 1, {**reading, "seq": {"$ne": 1}}),
+    ]
+    for args in bad_calls:
+        with pytest.raises(replay.ReplayError):
+            replay.publish_argv(*args)
+
+    monkeypatch.setenv("PATH", str(tmp_path / "empty"))
+    with pytest.raises(replay.ReplayError):
+        replay.publish_argv("127.0.0.1", 1883, "local-device-001", 1, reading)
+
+
+def test_scenarios_publish_through_the_validated_replay_path() -> None:
+    text = (E2E / "scenarios.py").read_text(encoding="utf-8")
+
+    assert "subprocess" not in text
+    assert "self.replay.publish(" in text
+    assert "--mqttx" not in text
+    assert "--mqttx" not in (E2E / "run_m1_e2e.sh").read_text(encoding="utf-8")
+
+
+# --- Codex review: identity-based verdict counting ---
+
+
+@pytest.mark.parametrize(
+    ("rows", "expect", "code", "fragment"),
+    [
+        # Two verdicts for seq 1 must not stand in for the missing seq 3.
+        (
+            [
+                {"device_id": "a", "seq": 1, "ts": "t1", "ok": True, "reason": "match"},
+                {"device_id": "a", "seq": 1, "ts": "t1", "ok": True, "reason": "match"},
+                {"device_id": "a", "seq": 2, "ts": "t2", "ok": True, "reason": "match"},
+            ],
+            ["a,1,t1", "a,2,t2", "a,3,t3"],
+            3,
+            "verdicts=2 duplicates=1 expected=3 missing=1",
+        ),
+        # Agreeing duplicates (QoS-1 redelivery) are tolerated.
+        (
+            [
+                {"device_id": "a", "seq": 1, "ts": "t1", "ok": True, "reason": "match"},
+                {"device_id": "a", "seq": 1, "ts": "t1", "ok": True, "reason": "match"},
+            ],
+            ["a,1,t1"],
+            0,
+            "verdicts=1 duplicates=1 expected=1 missing=0 ok_true=1 ok_false=0 ok_null=0 failures=0",
+        ),
+        # Duplicates that disagree on the outcome or the deployment fail.
+        (
+            [
+                {"device_id": "a", "seq": 1, "ts": "t1", "ok": True, "reason": "match"},
+                {"device_id": "a", "seq": 1, "ts": "t1", "ok": False, "reason": "asset-mismatch"},
+            ],
+            ["a,1,t1"],
+            1,
+            "FAIL: conflicting duplicate verdicts for ('a', '1', 't1')",
+        ),
+        (
+            [
+                {"device_id": "a", "seq": 1, "ts": "t1", "ok": True, "resolved_asset_id": "x"},
+                {"device_id": "a", "seq": 1, "ts": "t1", "ok": True, "resolved_asset_id": "y"},
+            ],
+            ["a,1,t1"],
+            1,
+            "conflicting duplicate verdicts",
+        ),
+        # A verdict for a reading that was never published fails.
+        (
+            [
+                {"device_id": "a", "seq": 1, "ts": "t1", "ok": True, "reason": "match"},
+                {"device_id": "a", "seq": 9, "ts": "t9", "ok": True, "reason": "match"},
+            ],
+            ["a,1,t1"],
+            1,
+            "FAIL: unexpected verdict for ('a', '9', 't9')",
+        ),
+    ],
+)
+def test_summarize_counts_distinct_published_readings(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+    rows: list[dict],
+    expect: list[str],
+    code: int,
+    fragment: str,
+) -> None:
+    monkeypatch.chdir(tmp_path)
+    summarize = _load("m1_e2e_summarize", E2E / "summarize_verdicts.py")
+    (tmp_path / "v.raw").write_text(_verdict_rows(summarize, *rows))
+    args = ["--raw", "v.raw"]
+    for item in expect:
+        args += ["--expect-reading", item]
+
+    assert summarize.main(args) == code
+    assert fragment in capsys.readouterr().out
+    assert summarize.main([*args, "--count-only"]) == 0
+    assert capsys.readouterr().out.strip() == str(
+        len({tuple(e.split(",")) for e in expect} & {("a", str(r["seq"]), r["ts"]) for r in rows})
+    )
+
+
+def test_run_script_expects_every_published_reading() -> None:
+    runner = (E2E / "run_m1_e2e.sh").read_text(encoding="utf-8")
+
+    assert "grep '^PUBLISHED '" in runner
+    assert '"${replay_expect[@]}" --count-only' in runner
+    assert '"${all_expect[@]}" --jsonl-out' in runner
+    assert '--expect "$' not in runner
+    assert 'WORK="$(realpath -m -- "${E2E_WORK_DIR:-$ROOT/.e2e-out/m1-e2e}")"' in runner
+    assert 'cd "$ROOT"' in runner
+
+
+# --- Codex review: relocation must keep the West history ---
+
+WEST = {
+    "deployment_id": "dep_" + "1" * 32,
+    "component_id": "cmp_" + "c" * 32,
+    "site_id": "site_" + "s" * 32,
+    "asset_id": "ast_west",
+    "started_at": "2026-10-12T12:00:00Z",
+    "ended_at": None,
+    "status": "active",
+}
+BOUNDARY = "2026-10-12T12:00:05.000400Z"
+
+
+def _history(**overrides: dict) -> list[dict]:
+    ended = {**WEST, "ended_at": BOUNDARY, "status": "ended", **overrides.get("ended", {})}
+    east = {
+        **WEST,
+        "deployment_id": "dep_" + "2" * 32,
+        "asset_id": "ast_east",
+        "started_at": BOUNDARY,
+        **overrides.get("east", {}),
+    }
+    return [ended, east]
+
+
+def test_relocation_history_accepts_an_ended_west_and_active_east_interval() -> None:
+    scenarios = _load("m1_e2e_scenarios", E2E / "scenarios.py")
+
+    boundary = scenarios.check_relocation_history(_history(), WEST, "ast_east")
+
+    assert boundary == scenarios.parse_ts(BOUNDARY)
+    assert scenarios.ceil_second(boundary) == scenarios.parse_ts("2026-10-12T12:00:06Z")
+
+
+@pytest.mark.parametrize(
+    "after",
+    [
+        # CURRENT mutated West->East in place, history gone.
+        [{**WEST, "asset_id": "ast_east"}],
+        # West interval deleted.
+        _history()[1:],
+        # West not ended.
+        _history(ended={"status": "active"}),
+        # West reassigned to another asset/site.
+        _history(ended={"asset_id": "ast_other"}),
+        _history(ended={"site_id": "site_" + "x" * 32}),
+        # West start rewritten.
+        _history(ended={"started_at": "2026-10-12T12:00:01Z"}),
+        # Gap or overlap at the boundary (microsecond precision).
+        _history(ended={"ended_at": "2026-10-12T12:00:05.000399Z"}),
+        _history(east={"started_at": "2026-10-12T12:00:05.000401Z"}),
+        # East interval not active or not East.
+        _history(east={"status": "ended", "ended_at": None}),
+        _history(east={"asset_id": "ast_west"}),
+        # Transition not after the West start.
+        _history(
+            ended={"ended_at": "2026-10-12T12:00:00Z"}, east={"started_at": "2026-10-12T12:00:00Z"}
+        ),
+    ],
+)
+def test_relocation_history_rejects_lost_or_rewritten_history(after: list[dict]) -> None:
+    scenarios = _load("m1_e2e_scenarios", E2E / "scenarios.py")
+
+    with pytest.raises(scenarios.ScenarioError):
+        scenarios.check_relocation_history(after, WEST, "ast_east")
+
+
+# --- Codex review: /v2 unavailable means the same as in the flow ---
+
+
+@pytest.mark.parametrize(
+    ("status", "payload", "unavailable"),
+    [
+        (501, None, True),
+        (501, "Not Implemented", True),
+        (404, {"detail": "Not Found"}, True),
+        (404, {"detail": "not found"}, False),
+        (404, {"detail": "Not Found", "x": 1}, False),
+        (503, {"detail": "service unavailable"}, False),
+    ],
+)
+def test_scenario_api_maps_v2_unavailable_like_the_flow(
+    monkeypatch: pytest.MonkeyPatch, status: int, payload: object, unavailable: bool
+) -> None:
+    scenarios = _load("m1_e2e_scenarios", E2E / "scenarios.py")
+    api = scenarios.Api("http://api.test", "tnt_local_001", "sub", "e@x.test")
+    monkeypatch.setattr(api, "call", lambda *args, **kwargs: (status, payload))
+
+    expected = scenarios.V2Unavailable if unavailable else scenarios.SetupError
+    with pytest.raises(expected):
+        api.expect(200, "GET", "/v2/tenants/tnt_local_001/sites")
+    with pytest.raises(scenarios.SetupError):
+        api.expect(200, "GET", "/v1/tenants/tnt_local_001/ponds")
+
+
+# --- Sonar: prepare_v1_request.js ---
+
+
+def test_node_function_prepare_strips_slashes_sorts_keys_and_reads_seq() -> None:
+    reading = dict(_fixture_payloads()[0])
+    reversed_reading = dict(reversed(list(reading.items())))
+    msg = {"topic": "limnopulse/v1/devices/local-device-001/readings", "payload": reversed_reading}
+
+    out = _run_function("prepare_v1_request.js", msg, {"LIMNOPULSE_API_URL": "http://api.test///"})
+
+    assert out[1] is None
+    assert out[0]["url"] == "http://api.test/v1/tenants/tnt_local_001/devices/local-device-001"
+    assert out[0]["e2e"]["seq"] == reading["seq"]
+
+    without_seq = {k: v for k, v in reading.items() if k != "seq"}
+    out = _run_function("prepare_v1_request.js", {**msg, "payload": without_seq})
+    assert out[1]["payload"]["seq"] is None
+    assert out[1]["payload"]["reason"] == "payload-keys-mismatch"
+
+    out = _run_function("prepare_v1_request.js", {**msg, "payload": ["not", "an", "object"]})
+    assert out[1]["payload"]["reason"] == "payload-keys-mismatch"
+
+
+def test_node_functions_avoid_flagged_constructs() -> None:
+    prepare = (FUNCTIONS / "prepare_v1_request.js").read_text(encoding="utf-8")
+    sha = (FUNCTIONS / "after_v1_device.js").read_text(encoding="utf-8")
+    resolve = (FUNCTIONS / "resolve_deployment.js").read_text(encoding="utf-8")
+
+    assert ".sort()" not in prepare and "/+$/" not in prepare
+    assert re.search(r"\) \| 0;", sha) is None
+    assert re.search(r"(?<![.\w])(NaN|parseInt)\b", resolve) is None

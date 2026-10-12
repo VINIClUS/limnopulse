@@ -70,14 +70,14 @@ if (deployments === null) {
 // Date.parse truncates to milliseconds, but deployment boundaries (e.g. a
 // relocation's transition instant) carry microseconds. Parse whole seconds
 // with Date.parse and the fraction separately: integer microseconds since the
-// epoch stay below 2^53, so the comparison is exact. NaN when unparseable.
+// epoch stay below 2^53, so the comparison is exact. Number.NaN when unparseable.
 function epochMicros(value) {
-    if (typeof value !== "string") return NaN;
+    if (typeof value !== "string") return Number.NaN;
     const m = /^(\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2})(?:\.(\d+))?(Z|[+-]\d{2}:\d{2})$/.exec(value);
-    if (!m) return NaN;
+    if (!m) return Number.NaN;
     const seconds = Date.parse(m[1] + m[3]);
-    if (!Number.isFinite(seconds)) return NaN;
-    const fraction = parseInt(((m[2] || "") + "000000").slice(0, 6), 10);
+    if (!Number.isFinite(seconds)) return Number.NaN;
+    const fraction = Number.parseInt(((m[2] || "") + "000000").slice(0, 6), 10);
     return seconds * 1000 + fraction;
 }
 

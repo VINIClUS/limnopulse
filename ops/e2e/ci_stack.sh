@@ -15,7 +15,7 @@
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
-STATE="${E2E_CI_STATE_DIR:-${RUNNER_TEMP:-${TMPDIR:-/tmp}}/limnopulse-m1-ci}"
+STATE="${E2E_CI_STATE_DIR:-$ROOT/.e2e-out/ci}"
 API_PORT="${API_PORT:-8000}"
 TENANT="${LIMNOPULSE_TENANT:-tnt_local_001}"
 SERVICES=(redis dynamodb-local influxdb mqtt-broker telegraf elasticmq)

@@ -32,7 +32,6 @@ import importlib.util
 import json
 import math
 import os
-import subprocess
 import sys
 import time
 import urllib.error
@@ -60,14 +59,26 @@ class V2Unavailable(Exception):
     pass
 
 
-def _load_summarizer() -> ModuleType:
-    spec = importlib.util.spec_from_file_location(
-        "m1_e2e_summarize", HERE / "summarize_verdicts.py"
-    )
+def _load(name: str, path: Path) -> ModuleType:
+    spec = importlib.util.spec_from_file_location(name, path)
     assert spec is not None and spec.loader is not None
     module = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(module)
     return module
+
+
+def _load_summarizer() -> ModuleType:
+    return _load("m1_e2e_summarize", HERE / "summarize_verdicts.py")
+
+
+def _load_replay() -> ModuleType:
+    # The one validated `mqttx pub` path (host, port, device id, payload, executable).
+    return _load("m1_e2e_replay", HERE / "wokwi" / "replay.py")
+
+
+def v2_unavailable(status: int, payload: object) -> bool:
+    """Same rule as the Node-RED flow: a 501, or the unmounted-route 404 body."""
+    return status == 501 or (status == 404 and payload == {"detail": "Not Found"})
 
 
 def legacy_asset_id(tenant: str, pond_id: str) -> str:
@@ -92,6 +103,38 @@ def parse_ts(value: str) -> datetime:
 def ceil_second(value: datetime) -> datetime:
     whole = value.replace(microsecond=0)
     return whole if whole == value else whole + timedelta(seconds=1)
+
+
+def check_relocation_history(after: list[dict], west: dict, east_asset: str) -> datetime:
+    """The move must END the West interval (history kept) and START an East one at the
+    same boundary; M1-05 sets it to max(clock, west.started_at + 1us). Returns it."""
+    ended = [d for d in after if d.get("deployment_id") == west.get("deployment_id")]
+    active = [d for d in after if d.get("ended_at") is None]
+    problems = []
+    if len(after) != 2 or len(ended) != 1 or len(active) != 1:
+        raise ScenarioError(f"expected the ended West and the active East interval: {after!r}")
+    old, new = ended[0], active[0]
+    for key in ("asset_id", "site_id", "component_id"):
+        if old.get(key) != west.get(key):
+            problems.append(f"West interval {key} changed: {old.get(key)} != {west.get(key)}")
+    if old.get("status") != "ended" or old.get("ended_at") is None:
+        problems.append(f"West interval not ended: status={old.get('status')}")
+    if old.get("started_at") is None or parse_ts(old["started_at"]) != parse_ts(west["started_at"]):
+        problems.append(f"West started_at changed: {old.get('started_at')} != {west['started_at']}")
+    if new.get("asset_id") != east_asset or new.get("status") != "active":
+        problems.append(f"active interval is not East: {new!r}")
+    if new.get("deployment_id") == west.get("deployment_id"):
+        problems.append("the West deployment was reassigned in place instead of ended")
+    if problems:
+        raise ScenarioError("; ".join(problems))
+    boundary = parse_ts(new["started_at"])
+    if parse_ts(old["ended_at"]) != boundary:
+        raise ScenarioError(
+            f"West ended_at {old['ended_at']} != East started_at {new['started_at']}"
+        )
+    if boundary <= parse_ts(west["started_at"]):
+        raise ScenarioError(f"transition {new['started_at']} is not after the West start")
+    return boundary
 
 
 class Api:
@@ -135,8 +178,8 @@ class Api:
     ) -> dict:
         got, payload = self.call(method, path, body, **kwargs)
         if got != status or not isinstance(payload, dict):
-            if got == 404 and payload == {"detail": "Not Found"} and path.startswith("/v2/"):
-                raise V2Unavailable(f"{method} {path}: route not mounted")
+            if path.startswith("/v2/") and v2_unavailable(got, payload):
+                raise V2Unavailable(f"{method} {path}: /v2 not mounted ({got})")
             raise SetupError(f"{method} {path} -> {got} {payload!r} (expected {status})")
         return payload
 
@@ -150,6 +193,7 @@ class Harness:
         self.args = args
         self.api = Api(args.api_url, args.tenant, args.dev_user_sub, args.dev_user_email)
         self.summarizer = _load_summarizer()
+        self.replay = _load_replay()
         self.template = json.loads(EXAMPLE.read_text(encoding="utf-8"))
         self.run_id = datetime.now(UTC).strftime("%Y%m%dT%H%M%S")
 
@@ -158,32 +202,46 @@ class Harness:
 
     def publish(self, device_id: str, seq: int, ts: datetime) -> dict:
         reading = {**self.template, "seq": seq, "ts": format_ts(ts)}
-        topic = TOPIC_TEMPLATE.format(device_id=device_id)
-        body = json.dumps(reading, separators=(",", ":"))
-        command = [self.args.mqttx, "pub", "-h", self.args.host, "-p", str(self.args.port)]
-        command += ["-t", topic, "-q", "1", "-m", body]
-        result = subprocess.run(command, check=False, capture_output=True, text=True, timeout=30)
-        if result.returncode != 0:
-            raise SetupError(f"mqttx pub failed ({result.returncode}): {result.stderr.strip()}")
+        try:
+            self.replay.publish(self.args.host, self.args.port, device_id, 1, reading)
+        except self.replay.ReplayError as exc:
+            raise SetupError(str(exc)) from exc
         self.published[device_id] = self.published.get(device_id, 0) + 1
+        print(f"PUBLISHED {device_id} {seq} {reading['ts']}", flush=True)
         self.log(f"published {device_id} seq={seq} ts={reading['ts']}")
         return reading
 
-    def wait_verdict(self, device_id: str, seq: int) -> dict:
+    def wait_verdict(self, device_id: str, seq: int, ts: str) -> dict:
         deadline = time.monotonic() + self.args.timeout
         while True:
-            text = (
-                self.args.raw.read_text(encoding="utf-8", errors="replace")
-                if (self.args.raw.exists())
-                else ""
-            )
+            try:
+                text = self.summarizer.read_raw(self.args.raw)
+            except self.summarizer.SummaryError as exc:
+                raise SetupError(str(exc)) from exc
             for verdict in self.summarizer.parse_stream(text):
-                if verdict.get("device_id") == device_id and verdict.get("seq") == seq:
+                if self.summarizer.identity(verdict) == (device_id, str(seq), ts):
                     print(json.dumps(verdict, sort_keys=True))
                     return verdict
             if time.monotonic() >= deadline:
-                raise ScenarioError(f"no verdict for {device_id} seq={seq}")
+                raise ScenarioError(f"no verdict for {device_id} seq={seq} ts={ts}")
             time.sleep(0.25)
+
+    def deployments(self, component_id: str) -> list[dict] | None:
+        """The component's deployment history, or None when /v2 is off and that is allowed."""
+        try:
+            listing = self.api.expect(
+                200,
+                "GET",
+                self.api.tenant_path("v2", f"deployments?component_id={component_id}"),
+            )
+        except V2Unavailable:
+            if not self.args.allow_v2_unavailable:
+                raise
+            return None
+        items = listing.get("items")
+        if not isinstance(items, list):
+            raise ScenarioError(f"deployments listing without items: {listing!r}")
+        return items
 
     def check(self, verdict: dict, *, reason: str, resolved: str, v1_pond_id: str | None) -> None:
         if verdict.get("ok") is None and self.args.allow_v2_unavailable:
@@ -231,6 +289,17 @@ class Harness:
             v1_pond_id=west,
         )
 
+        component_id = legacy_component_id(tenant, device_id)
+        before = self.deployments(component_id)
+        west_interval = None
+        if before is not None:
+            active = [d for d in before if d.get("ended_at") is None]
+            if len(before) != 1 or len(active) != 1 or active[0].get("asset_id") != west_asset:
+                raise ScenarioError(
+                    f"expected one active West deployment before the move: {before!r}"
+                )
+            west_interval = active[0]
+
         moved = api.expect(
             200,
             "PATCH",
@@ -242,20 +311,9 @@ class Harness:
         # t1: at or after the transition instant (microsecond precision), rounded up to
         # the second the reading carries.
         transition = datetime.now(UTC)
-        try:
-            listing = api.expect(
-                200,
-                "GET",
-                api.tenant_path(
-                    "v2", f"deployments?component_id={legacy_component_id(tenant, device_id)}"
-                ),
-            )
-            active = [d for d in listing.get("items", []) if d.get("ended_at") is None]
-            if len(active) == 1:
-                transition = parse_ts(active[0]["started_at"])
-        except V2Unavailable:
-            if not self.args.allow_v2_unavailable:
-                raise
+        after = self.deployments(component_id)
+        if after is not None and west_interval is not None:
+            transition = check_relocation_history(after, west_interval, east_asset)
         t1 = max(ceil_second(transition), ceil_second(datetime.now(UTC)))
         wait = (t1 - datetime.now(UTC)).total_seconds()
         if wait > 0:
@@ -331,8 +389,8 @@ class Harness:
         return device_id, 1
 
     def _publish_and_wait(self, device_id: str, seq: int, ts: datetime) -> dict:
-        self.publish(device_id, seq, ts)
-        return self.wait_verdict(device_id, seq)
+        reading = self.publish(device_id, seq, ts)
+        return self.wait_verdict(device_id, seq, reading["ts"])
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -340,7 +398,9 @@ def main(argv: list[str] | None = None) -> int:
         description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter
     )
     parser.add_argument("scenario", choices=("relocation", "v2-native"))
-    parser.add_argument("--raw", required=True, type=Path, help="mqttx sub clean-mode capture")
+    parser.add_argument(
+        "--raw", required=True, help="mqttx sub clean-mode capture, inside the working directory"
+    )
     parser.add_argument(
         "--api-url", default=os.environ.get("LIMNOPULSE_API_URL", "http://127.0.0.1:8000")
     )
@@ -357,7 +417,6 @@ def main(argv: list[str] | None = None) -> int:
     )
     parser.add_argument("--host", default=os.environ.get("MQTT_HOST", "127.0.0.1"))
     parser.add_argument("--port", type=int, default=int(os.environ.get("MQTT_PORT", "1883")))
-    parser.add_argument("--mqttx", default=os.environ.get("MQTTX_BIN", "mqttx"))
     parser.add_argument("--timeout", type=float, default=float(os.environ.get("E2E_TIMEOUT", "45")))
     parser.add_argument("--allow-v2-unavailable", action="store_true")
     args = parser.parse_args(argv)

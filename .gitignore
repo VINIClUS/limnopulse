@@ -6,6 +6,8 @@ __pycache__/
 .Codex/
 .worktrees/
 .pytest_cache/
+# ops/e2e harness runs (Node-RED user dir, MQTTX capture, verdicts)
+.e2e-out/
 .terraform/
 *.tfstate
 *.tfstate.*

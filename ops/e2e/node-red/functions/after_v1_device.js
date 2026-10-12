@@ -21,6 +21,9 @@ function verdict(ok, reason) {
     return [null, msg];
 }
 
+// SHA-1 needs 32-bit wrap-around arithmetic: `>>> 0` reduces each sum modulo
+// 2^32 (as an unsigned value). The bitwise operators then work on the same 32
+// bits, so the digest is identical to the signed `| 0` form.
 function sha1(bytes) {
     const ml = bytes.length;
     const withPad = ((ml + 9 + 63) >> 6) << 6;
@@ -37,7 +40,7 @@ function sha1(bytes) {
     for (let off = 0; off < withPad; off += 64) {
         for (let i = 0; i < 16; i++) {
             const j = off + i * 4;
-            w[i] = ((buf[j] << 24) | (buf[j + 1] << 16) | (buf[j + 2] << 8) | buf[j + 3]) | 0;
+            w[i] = ((buf[j] << 24) | (buf[j + 1] << 16) | (buf[j + 2] << 8) | buf[j + 3]) >>> 0;
         }
         for (let i = 16; i < 80; i++) {
             const x = w[i - 3] ^ w[i - 8] ^ w[i - 14] ^ w[i - 16];
@@ -50,10 +53,10 @@ function sha1(bytes) {
             else if (i < 40) { f = b ^ c ^ d; k = 0x6ed9eba1; }
             else if (i < 60) { f = (b & c) | (b & d) | (c & d); k = 0x8f1bbcdc; }
             else { f = b ^ c ^ d; k = 0xca62c1d6; }
-            const t = (((a << 5) | (a >>> 27)) + f + e + k + w[i]) | 0;
+            const t = (((a << 5) | (a >>> 27)) + f + e + k + w[i]) >>> 0;
             e = d; d = c; c = (b << 30) | (b >>> 2); b = a; a = t;
         }
-        h0 = (h0 + a) | 0; h1 = (h1 + b) | 0; h2 = (h2 + c) | 0; h3 = (h3 + d) | 0; h4 = (h4 + e) | 0;
+        h0 = (h0 + a) >>> 0; h1 = (h1 + b) >>> 0; h2 = (h2 + c) >>> 0; h3 = (h3 + d) >>> 0; h4 = (h4 + e) >>> 0;
     }
     const out = new Uint8Array(20);
     [h0, h1, h2, h3, h4].forEach(function (h, i) {

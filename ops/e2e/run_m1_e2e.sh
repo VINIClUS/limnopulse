@@ -15,17 +15,24 @@
 # Environment (defaults):
 #   LIMNOPULSE_API_URL=http://127.0.0.1:8000  LIMNOPULSE_TENANT=tnt_local_001
 #   MQTT_HOST=127.0.0.1  MQTT_PORT=1883       E2E_DEVICE_ID=local-device-001
-#   NODE_RED_PORT=18800  E2E_TIMEOUT=45        E2E_WORK_DIR=$TMPDIR/limnopulse-m1-e2e
+#   NODE_RED_PORT=18800  E2E_TIMEOUT=45
+#   E2E_WORK_DIR=<repo>/.e2e-out/m1-e2e  (must stay inside the repository: the
+#                          Python tools only read and write files under the
+#                          working directory, which is the repository root)
 #   WOKWI_SERIAL_LOG=<path> (else ops/e2e/wokwi/serial.log, else the fixture)
 #   E2E_TS_MODE=now        (keep = publish the logged ts unchanged)
 #   ALLOW_V2_UNAVAILABLE=0  (1 accepts ok=null / reason v2-unavailable)
 #   E2E_SCENARIOS="relocation v2-native"  (ops/e2e/scenarios.py; "" = replay only)
 #   E2E_WEST_POND_ID=pond_local_001  LIMNOPULSE_DEV_USER_SUB/EMAIL (dev auth headers)
-#   PYTHON=python3  NODE_RED_BIN=node-red  MQTTX_BIN=mqttx
+#   PYTHON=python3  NODE_RED_BIN=node-red
+#   MQTTX_BIN=mqttx (its directory is put first on PATH; the Python tools run
+#                    the `mqttx` found there)
 set -euo pipefail
 
-ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
+ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd -P)"
 E2E_DIR="$ROOT/ops/e2e"
+# The Python tools confine their file arguments to the working directory.
+cd "$ROOT"
 
 export LIMNOPULSE_API_URL="${LIMNOPULSE_API_URL:-http://127.0.0.1:8000}"
 export LIMNOPULSE_TENANT="${LIMNOPULSE_TENANT:-tnt_local_001}"
@@ -39,7 +46,14 @@ E2E_SCENARIOS="${E2E_SCENARIOS-relocation v2-native}"
 PYTHON="${PYTHON:-python3}"
 NODE_RED_BIN="${NODE_RED_BIN:-node-red}"
 MQTTX_BIN="${MQTTX_BIN:-mqttx}"
-WORK="${E2E_WORK_DIR:-${TMPDIR:-/tmp}/limnopulse-m1-e2e}"
+WORK="$(realpath -m -- "${E2E_WORK_DIR:-$ROOT/.e2e-out/m1-e2e}")"
+case "$WORK" in
+  "$ROOT"/?*) ;;
+  *)
+    printf '[m1-e2e] E2E_WORK_DIR must be inside the repository (%s): %s\n' "$ROOT" "$WORK" >&2
+    exit 2
+    ;;
+esac
 PIDFILE="$WORK.pids"
 VERDICT_TOPIC="limnopulse/e2e/verdicts"
 
@@ -94,6 +108,13 @@ require "$PYTHON"
 require "$NODE_RED_BIN"
 require "$MQTTX_BIN"
 require curl
+# replay.py and scenarios.py run `mqttx` from PATH (a fixed command name).
+mqttx_path="$(command -v "$MQTTX_BIN")"
+if [[ "$(basename "$mqttx_path")" != "mqttx" ]]; then
+  log "MQTTX_BIN must point at an executable named mqttx: $mqttx_path"
+  exit 2
+fi
+export PATH="$(dirname "$mqttx_path"):$PATH"
 
 # Idempotency: stop anything a previous (interrupted) run left behind.
 stop_pids
@@ -153,7 +174,7 @@ echo $! >>"$PIDFILE"
 # both subscriptions a moment before publishing (QoS1, non-retained).
 sleep "${E2E_SUBSCRIBE_SETTLE:-2}"
 
-replay_args=(--device-id "$E2E_DEVICE_ID" --host "$MQTT_HOST" --port "$MQTT_PORT" --ts-mode "${E2E_TS_MODE:-now}" --mqttx "$MQTTX_BIN")
+replay_args=(--device-id "$E2E_DEVICE_ID" --host "$MQTT_HOST" --port "$MQTT_PORT" --ts-mode "${E2E_TS_MODE:-now}")
 if [[ -n "${WOKWI_SERIAL_LOG:-}" ]]; then
   replay_args+=(--serial-log "$WOKWI_SERIAL_LOG")
 fi
@@ -171,14 +192,28 @@ if [[ ! "$expected" =~ ^[0-9]+$ || "$expected" -eq 0 ]]; then
 fi
 log "replayed ${expected} reading(s) for ${E2E_DEVICE_ID}"
 
+# Every published reading is identified by (device_id, seq, ts); the summary
+# needs exactly one (agreeing) verdict per reading and none for anything else.
+published_args() {  # published_args <tool output>
+  local _tag device seq ts
+  while read -r _tag device seq ts; do
+    printf '%s\n' "--expect-reading" "${device},${seq},${ts}"
+  done < <(printf '%s\n' "$1" | grep '^PUBLISHED ' || true)
+}
+mapfile -t replay_expect < <(published_args "$replay_out")
+if [[ ${#replay_expect[@]} -ne $((expected * 2)) ]]; then
+  log "replay.py printed ${#replay_expect[@]} PUBLISHED argument(s) for ${expected} reading(s)"
+  exit 1
+fi
+
 count_verdicts() {
   "$PYTHON" "$E2E_DIR/summarize_verdicts.py" --raw "$WORK/verdicts.raw" \
-    --device-id "$E2E_DEVICE_ID" --count-only
+    --device-id "$E2E_DEVICE_ID" "${replay_expect[@]}" --count-only
 }
 enough_verdicts() { [[ "$(count_verdicts)" -ge "$expected" ]]; }
 wait_for "$E2E_TIMEOUT" enough_verdicts || log "timed out waiting for ${expected} verdict(s)"
 
-summary_args=(--raw "$WORK/verdicts.raw" --device-id "$E2E_DEVICE_ID" --expect "$expected" --jsonl-out "$WORK/verdicts.replay.jsonl")
+summary_args=(--raw "$WORK/verdicts.raw" --device-id "$E2E_DEVICE_ID" "${replay_expect[@]}" --jsonl-out "$WORK/verdicts.replay.jsonl")
 scenario_args=()
 if [[ "$ALLOW_V2_UNAVAILABLE" == "1" ]]; then
   summary_args+=(--allow-v2-unavailable)
@@ -193,31 +228,32 @@ set -e
 # API-driven scenarios (ops/e2e/scenarios.py): West->East relocation of a NEW
 # /v1 device and a native /v2 device. local-device-001 is never moved.
 devices=(--device-id "$E2E_DEVICE_ID")
-total="$expected"
+all_expect=("${replay_expect[@]}")
 scenarios_failed=0
 for scenario in $E2E_SCENARIOS; do
   log "scenario ${scenario}"
   set +e
   scenario_out="$("$PYTHON" "$E2E_DIR/scenarios.py" "$scenario" --raw "$WORK/verdicts.raw" \
-    --timeout "$E2E_TIMEOUT" --mqttx "$MQTTX_BIN" "${scenario_args[@]}")"
+    --timeout "$E2E_TIMEOUT" "${scenario_args[@]}")"
   scenario_rc=$?
   set -e
-  printf '%s\n' "$scenario_out" | grep -v '^SCENARIO_DEVICE ' || true
+  printf '%s\n' "$scenario_out" | grep -Ev '^(SCENARIO_DEVICE|PUBLISHED) ' || true
   if [[ $scenario_rc -ne 0 ]]; then
     log "scenario ${scenario} failed (exit ${scenario_rc})"
     scenarios_failed=$((scenarios_failed + 1))
     result=1
   fi
-  while read -r _ device count; do
+  while read -r _ device _count; do
     devices+=(--device-id "$device")
-    total=$((total + count))
   done < <(printf '%s\n' "$scenario_out" | grep '^SCENARIO_DEVICE ' || true)
+  mapfile -t scenario_expect < <(published_args "$scenario_out")
+  all_expect+=("${scenario_expect[@]}")
 done
 
 # Failed scenarios still report their devices (SCENARIO_DEVICE), and each one
 # counts as a failure, so the final SUMMARY shows failures>0 whenever a
 # scenario made this script fail.
-final_args=(--raw "$WORK/verdicts.raw" "${devices[@]}" --expect "$total" --jsonl-out "$WORK/verdicts.jsonl" --scenarios-failed "$scenarios_failed")
+final_args=(--raw "$WORK/verdicts.raw" "${devices[@]}" "${all_expect[@]}" --jsonl-out "$WORK/verdicts.jsonl" --scenarios-failed "$scenarios_failed")
 if [[ "$ALLOW_V2_UNAVAILABLE" == "1" ]]; then
   final_args+=(--allow-v2-unavailable)
 fi

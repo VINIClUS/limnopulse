@@ -53,8 +53,8 @@ jobs:
       - name: Diagnostics
         if: failure()
         run: |
-          tail -n 100 "${RUNNER_TEMP}/limnopulse-m1-ci/uvicorn.log" || true
-          tail -n 100 "${TMPDIR:-/tmp}/limnopulse-m1-e2e/node-red.log" || true
+          tail -n 100 .e2e-out/ci/uvicorn.log || true
+          tail -n 100 .e2e-out/m1-e2e/node-red.log || true
           docker compose logs --no-color --tail 100 mqtt-broker telegraf || true
       - name: Stop stack
         if: always()
@@ -146,7 +146,7 @@ jobs:
         if: failure()
         run: |
           cat ops/e2e/wokwi/serial.log || true
-          tail -n 100 "${RUNNER_TEMP}/limnopulse-m1-ci/uvicorn.log" || true
+          tail -n 100 .e2e-out/ci/uvicorn.log || true
       - name: Stop stack
         if: always()
         run: bash ops/e2e/ci_stack.sh down
