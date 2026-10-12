@@ -5,6 +5,10 @@
 #                                  # (dry-run, apply, apply), API with both M1 flags
 #   bash ops/e2e/ci_stack.sh down  # stop API, remove compose deps and volumes
 #
+# `down` deletes the compose volumes (local DynamoDB, Influx, broker data), so
+# it refuses to run unless CI=true or GITHUB_ACTIONS=true, or `down --force`
+# is given explicitly.
+#
 # Local development normally uses the stack you already run; this script is
 # for disposable CI runners. The API starts with API_V2_ENABLED=true and
 # V1_POND_DEVICE_PROJECTION_ENABLED=true on 127.0.0.1:${API_PORT:-8000}.
@@ -70,31 +74,68 @@ up() {
   done
 
   log "starting API on 127.0.0.1:${API_PORT}"
+  # Run the venv's uvicorn directly (nohup execs it), so the recorded PID is
+  # the server itself and not a `uv run` wrapper.
+  local uvicorn_bin
+  uvicorn_bin="$("$UV" run --locked --no-sync python -c 'import shutil; print(shutil.which("uvicorn") or "")')"
+  if [[ -z "$uvicorn_bin" ]]; then
+    log "uvicorn not found in the project environment"
+    return 1
+  fi
   API_V2_ENABLED=true V1_POND_DEVICE_PROJECTION_ENABLED=true APP_ENV=local AUTH_MODE=dev \
-    nohup "$UV" run --locked --no-sync uvicorn limnopulse_api.main:app \
+    nohup "$uvicorn_bin" limnopulse_api.main:app \
     --host 127.0.0.1 --port "$API_PORT" >"$STATE/uvicorn.log" 2>&1 &
   echo $! >"$STATE/uvicorn.pid"
   if ! wait_http "http://127.0.0.1:${API_PORT}/readyz" 90; then
     tail -n 80 "$STATE/uvicorn.log" >&2 || true
     return 1
   fi
-  log "stack ready"
+  log "stack ready (uvicorn pid $(cat "$STATE/uvicorn.pid"))"
+}
+
+stop_api() {
+  local pids=()
+  if [[ -f "$STATE/uvicorn.pid" ]]; then
+    pids+=("$(cat "$STATE/uvicorn.pid")")
+  fi
+  # Also stop by command line/port, in case the pidfile is stale or missing.
+  local pid
+  while read -r pid; do
+    [[ -n "$pid" ]] && pids+=("$pid")
+  done < <(pgrep -f "uvicorn limnopulse_api.main:app --host 127.0.0.1 --port ${API_PORT}" || true)
+  for pid in "${pids[@]}"; do
+    kill "$pid" 2>/dev/null || true
+  done
+  for pid in "${pids[@]}"; do
+    for _ in $(seq 1 20); do
+      kill -0 "$pid" 2>/dev/null || break
+      sleep 0.25
+    done
+    kill -9 "$pid" 2>/dev/null || true
+  done
+  rm -f "$STATE/uvicorn.pid"
+  if curl -fsS --max-time 2 "http://127.0.0.1:${API_PORT}/healthz" >/dev/null 2>&1; then
+    log "an API still answers on 127.0.0.1:${API_PORT}"
+    return 1
+  fi
 }
 
 down() {
-  cd "$ROOT"
-  if [[ -f "$STATE/uvicorn.pid" ]]; then
-    kill "$(cat "$STATE/uvicorn.pid")" 2>/dev/null || true
-    rm -f "$STATE/uvicorn.pid"
+  if [[ "${1:-}" != "--force" && "${CI:-}" != "true" && "${GITHUB_ACTIONS:-}" != "true" ]]; then
+    log "refusing to run 'down' outside CI: it removes the compose services AND volumes"
+    log "set CI=true / GITHUB_ACTIONS=true (disposable runner) or pass: $0 down --force"
+    return 2
   fi
+  cd "$ROOT"
+  stop_api
   docker compose down -v --remove-orphans || true
 }
 
 case "${1:-}" in
   up) up ;;
-  down) down ;;
+  down) down "${2:-}" ;;
   *)
-    echo "usage: $0 up|down" >&2
+    echo "usage: $0 up|down [--force]" >&2
     exit 2
     ;;
 esac

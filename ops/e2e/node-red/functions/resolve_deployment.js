@@ -29,12 +29,14 @@ function parseBody(raw) {
     }
 }
 
+// /v2 is "unavailable" only when it is not mounted: a 501, or a 404 whose
+// body is exactly Starlette's unmounted-route {"detail":"Not Found"}. Any
+// other non-200 (including 503) is a real failure, also in allow mode.
 function v2Unavailable(status, body) {
-    if (status === 501 || status === 503) return true;
-    if (status !== 404) return false;
-    const detail = body && typeof body === "object" ? body.detail : body;
-    if (detail === "Not Found") return true;
-    return typeof detail === "string" && /v2|disabled/i.test(detail);
+    if (status === 501) return true;
+    if (status !== 404 || !body || typeof body !== "object" || Array.isArray(body)) return false;
+    const keys = Object.keys(body);
+    return keys.length === 1 && keys[0] === "detail" && body.detail === "Not Found";
 }
 
 function items(body, key) {
@@ -65,13 +67,27 @@ if (deployments === null) {
     return verdict(false, "v2-deployments-bad-body");
 }
 
-const tsMs = Date.parse(ctx.ts);
+// Date.parse truncates to milliseconds, but deployment boundaries (e.g. a
+// relocation's transition instant) carry microseconds. Parse whole seconds
+// with Date.parse and the fraction separately: integer microseconds since the
+// epoch stay below 2^53, so the comparison is exact. NaN when unparseable.
+function epochMicros(value) {
+    if (typeof value !== "string") return NaN;
+    const m = /^(\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2})(?:\.(\d+))?(Z|[+-]\d{2}:\d{2})$/.exec(value);
+    if (!m) return NaN;
+    const seconds = Date.parse(m[1] + m[3]);
+    if (!Number.isFinite(seconds)) return NaN;
+    const fraction = parseInt(((m[2] || "") + "000000").slice(0, 6), 10);
+    return seconds * 1000 + fraction;
+}
+
+const tsUs = epochMicros(ctx.ts);
 const matches = deployments.filter(function (d) {
     if (!d || d.component_id !== ctx.component_id) return false;
-    const start = Date.parse(d.started_at);
+    const start = epochMicros(d.started_at);
     if (!Number.isFinite(start)) return false;
-    const end = d.ended_at === null || d.ended_at === undefined ? Infinity : Date.parse(d.ended_at);
-    return start <= tsMs && tsMs < end;
+    const end = d.ended_at === null || d.ended_at === undefined ? Infinity : epochMicros(d.ended_at);
+    return start <= tsUs && tsUs < end;
 });
 
 if (matches.length > 1) {

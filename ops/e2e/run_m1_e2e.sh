@@ -163,6 +163,12 @@ replay_out="$("$PYTHON" "$E2E_DIR/wokwi/replay.py" "${replay_args[@]}" 2>"$WORK/
 }
 cat "$WORK/replay.log" >&2
 expected="$(printf '%s\n' "$replay_out" | awk '/^REPLAYED /{print $2}')"
+expected="${expected:-0}"
+if [[ ! "$expected" =~ ^[0-9]+$ || "$expected" -eq 0 ]]; then
+  log "replay.py reported no REPLAYED line (or 0 readings); output was:"
+  printf '%s\n' "$replay_out" >&2
+  exit 1
+fi
 log "replayed ${expected} reading(s) for ${E2E_DEVICE_ID}"
 
 count_verdicts() {
@@ -188,6 +194,7 @@ set -e
 # /v1 device and a native /v2 device. local-device-001 is never moved.
 devices=(--device-id "$E2E_DEVICE_ID")
 total="$expected"
+scenarios_failed=0
 for scenario in $E2E_SCENARIOS; do
   log "scenario ${scenario}"
   set +e
@@ -198,6 +205,7 @@ for scenario in $E2E_SCENARIOS; do
   printf '%s\n' "$scenario_out" | grep -v '^SCENARIO_DEVICE ' || true
   if [[ $scenario_rc -ne 0 ]]; then
     log "scenario ${scenario} failed (exit ${scenario_rc})"
+    scenarios_failed=$((scenarios_failed + 1))
     result=1
   fi
   while read -r _ device count; do
@@ -206,7 +214,10 @@ for scenario in $E2E_SCENARIOS; do
   done < <(printf '%s\n' "$scenario_out" | grep '^SCENARIO_DEVICE ' || true)
 done
 
-final_args=(--raw "$WORK/verdicts.raw" "${devices[@]}" --expect "$total" --jsonl-out "$WORK/verdicts.jsonl")
+# Failed scenarios still report their devices (SCENARIO_DEVICE), and each one
+# counts as a failure, so the final SUMMARY shows failures>0 whenever a
+# scenario made this script fail.
+final_args=(--raw "$WORK/verdicts.raw" "${devices[@]}" --expect "$total" --jsonl-out "$WORK/verdicts.jsonl" --scenarios-failed "$scenarios_failed")
 if [[ "$ALLOW_V2_UNAVAILABLE" == "1" ]]; then
   final_args+=(--allow-v2-unavailable)
 fi

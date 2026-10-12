@@ -5,7 +5,7 @@ Accepts either the clean-mode stream (concatenated JSON packet objects whose
 ``payload`` is the verdict JSON string) or plain JSON lines of verdicts.
 
 Exit codes: 0 pass, 1 a verdict failed (ok=false, or ok=null without
---allow-v2-unavailable), 3 fewer verdicts than --expect.
+--allow-v2-unavailable) or --scenarios-failed > 0, 3 fewer verdicts than --expect.
 """
 
 from __future__ import annotations
@@ -68,6 +68,12 @@ def main(argv: list[str] | None = None) -> int:
     )
     parser.add_argument("--expect", type=int, default=0)
     parser.add_argument("--allow-v2-unavailable", action="store_true")
+    parser.add_argument(
+        "--scenarios-failed",
+        type=int,
+        default=0,
+        help="failed API-driven scenarios; each one counts as a failure",
+    )
     parser.add_argument("--count-only", action="store_true")
     parser.add_argument("--jsonl-out", type=Path)
     args = parser.parse_args(argv)
@@ -107,6 +113,7 @@ def main(argv: list[str] | None = None) -> int:
             print(f"       verdict missing keys: {missing}")
             failures += 1
 
+    failures += max(args.scenarios_failed, 0)
     passed = sum(1 for v in verdicts if v.get("ok") is True)
     ok_false = sum(1 for v in verdicts if v.get("ok") is False)
     reasons = Counter(f"{json.dumps(v.get('ok'))}:{v.get('reason')}" for v in verdicts)
@@ -114,7 +121,8 @@ def main(argv: list[str] | None = None) -> int:
     print(
         f"SUMMARY verdicts={len(verdicts)} expected={args.expect} ok_true={passed} "
         f"ok_false={ok_false} ok_null={unavailable} failures={failures} "
-        f"allow_v2_unavailable={int(args.allow_v2_unavailable)}"
+        f"allow_v2_unavailable={int(args.allow_v2_unavailable)} "
+        f"scenarios_failed={args.scenarios_failed}"
     )
     if failures:
         return 1

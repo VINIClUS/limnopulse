@@ -18,7 +18,9 @@
 
 Each scenario waits for its own verdicts on the capture written by
 ``mqttx sub --output-mode clean`` (``--raw``) and checks the resolved assets.
-Prints ``SCENARIO_DEVICE <device_id> <verdict count>`` for the final summary.
+Prints ``SCENARIO_DEVICE <device_id> <published readings>`` for every device it
+published for, also when the scenario fails, so the final summary counts (and
+fails on) its verdicts.
 Exit codes: 0 pass (or skipped with --allow-v2-unavailable while /v2 is
 not mounted), 1 a check failed, 2 setup failed. Standard library only.
 """
@@ -144,6 +146,7 @@ class Api:
 
 class Harness:
     def __init__(self, args: argparse.Namespace) -> None:
+        self.published: dict[str, int] = {}
         self.args = args
         self.api = Api(args.api_url, args.tenant, args.dev_user_sub, args.dev_user_email)
         self.summarizer = _load_summarizer()
@@ -162,6 +165,7 @@ class Harness:
         result = subprocess.run(command, check=False, capture_output=True, text=True, timeout=30)
         if result.returncode != 0:
             raise SetupError(f"mqttx pub failed ({result.returncode}): {result.stderr.strip()}")
+        self.published[device_id] = self.published.get(device_id, 0) + 1
         self.log(f"published {device_id} seq={seq} ts={reading['ts']}")
         return reading
 
@@ -360,22 +364,24 @@ def main(argv: list[str] | None = None) -> int:
 
     harness = Harness(args)
     run = harness.relocation if args.scenario == "relocation" else harness.v2_native
+    code = 0
     try:
-        device_id, count = run()
+        run()
     except V2Unavailable as exc:
         if args.allow_v2_unavailable:
             harness.log(f"skipped: /v2 unavailable ({exc})")
-            return 0
-        harness.log(f"FAIL: /v2 unavailable ({exc})")
-        return 1
+        else:
+            harness.log(f"FAIL: /v2 unavailable ({exc})")
+            code = 1
     except SetupError as exc:
         harness.log(f"setup failed: {exc}")
-        return 2
+        code = 2
     except ScenarioError as exc:
         harness.log(f"FAIL: {exc}")
-        return 1
-    print(f"SCENARIO_DEVICE {device_id} {count}")
-    return 0
+        code = 1
+    for device_id, count in harness.published.items():
+        print(f"SCENARIO_DEVICE {device_id} {count}")
+    return code
 
 
 if __name__ == "__main__":

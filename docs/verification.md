@@ -87,4 +87,11 @@ apply, apply again) and starts the API with both M1 flags. The run is strict
 unless the dispatch input `allow_v2_unavailable` or the repository variable
 `M1_E2E_ALLOW_V2_UNAVAILABLE=1` is set. The optional `wokwi` job compiles and
 simulates the probe sketch and replays its serial output, and it runs only
-when the `WOKWI_CLI_TOKEN` secret is configured.
+when the `WOKWI_CLI_TOKEN` secret is configured; a separate gate job checks
+for the secret, and only the simulation step receives it.
+
+`ops/e2e/ci_stack.sh down` stops the API and runs `docker compose down -v`,
+which deletes the local compose volumes (DynamoDB, Influx and broker data). It
+therefore refuses to run unless `CI=true` or `GITHUB_ACTIONS=true` is set, as
+on a disposable runner; on a workstation it needs an explicit
+`bash ops/e2e/ci_stack.sh down --force`.

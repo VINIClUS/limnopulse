@@ -29,15 +29,14 @@ function parseBody(raw) {
     }
 }
 
-// /v2 is "unavailable" when the route is not mounted (Starlette's default
-// 404 body), the flag rejects it (501/503), or the API answers 404 with an
-// explicit disabled marker. Any other non-200 is a real failure.
+// /v2 is "unavailable" only when it is not mounted: a 501, or a 404 whose
+// body is exactly Starlette's unmounted-route {"detail":"Not Found"}. Any
+// other non-200 (including 503) is a real failure, also in allow mode.
 function v2Unavailable(status, body) {
-    if (status === 501 || status === 503) return true;
-    if (status !== 404) return false;
-    const detail = body && typeof body === "object" ? body.detail : body;
-    if (detail === "Not Found") return true;
-    return typeof detail === "string" && /v2|disabled/i.test(detail);
+    if (status === 501) return true;
+    if (status !== 404 || !body || typeof body !== "object" || Array.isArray(body)) return false;
+    const keys = Object.keys(body);
+    return keys.length === 1 && keys[0] === "detail" && body.detail === "Not Found";
 }
 
 function items(body, key) {

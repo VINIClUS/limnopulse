@@ -644,4 +644,169 @@ def test_ci_stack_runs_the_real_migration_and_enables_both_m1_flags() -> None:
     )
     triggers = workflow[True]  # PyYAML reads the bare `on:` key as True
     assert set(triggers) == {"workflow_dispatch", "schedule"}
-    assert workflow["jobs"]["wokwi"]["env"]["WOKWI_CLI_TOKEN"] == "${{ secrets.WOKWI_CLI_TOKEN }}"
+    # The token reaches only the step that runs wokwi-cli; the job is gated on
+    # a boolean computed by a separate job.
+    gate = workflow["jobs"]["wokwi-gate"]
+    assert gate["steps"][0]["env"] == {"HAS_TOKEN": "${{ secrets.WOKWI_CLI_TOKEN != '' }}"}
+    wokwi = workflow["jobs"]["wokwi"]
+    assert wokwi["needs"] == "wokwi-gate"
+    assert wokwi["if"] == "needs.wokwi-gate.outputs.has_token == 'true'"
+    assert "WOKWI_CLI_TOKEN" not in wokwi.get("env", {})
+    with_token = [step for step in wokwi["steps"] if "WOKWI_CLI_TOKEN" in step.get("env", {})]
+    assert [step["name"] for step in with_token] == ["Simulate and capture serial output"]
+    assert "wokwi-cli ops/e2e/wokwi" in with_token[0]["run"]
+    raw = (ROOT / ".github/workflows/e2e-m1.yml").read_text(encoding="utf-8")
+    assert raw.count("secrets.WOKWI_CLI_TOKEN") == 2
+
+
+def test_ci_stack_down_is_guarded_and_stops_the_real_server() -> None:
+    script = (E2E / "ci_stack.sh").read_text(encoding="utf-8")
+
+    assert '"${1:-}" != "--force" && "${CI:-}" != "true" && "${GITHUB_ACTIONS:-}" != "true"' in (
+        script
+    )
+    assert 'down) down "${2:-}" ;;' in script
+    assert 'nohup "$uvicorn_bin" limnopulse_api.main:app' in script
+    assert 'nohup "$UV" run' not in script
+    assert (
+        'pgrep -f "uvicorn limnopulse_api.main:app --host 127.0.0.1 --port ${API_PORT}"' in script
+    )
+
+
+def test_ci_stack_down_refuses_outside_ci(tmp_path: Path) -> None:
+    env = {"PATH": "/usr/bin:/bin", "E2E_CI_STATE_DIR": str(tmp_path)}
+    result = subprocess.run(
+        ["bash", str(E2E / "ci_stack.sh"), "down"],
+        check=False,
+        capture_output=True,
+        text=True,
+        env=env,
+        timeout=30,
+    )
+
+    assert result.returncode == 2
+    assert "refusing to run 'down' outside CI" in result.stderr
+
+
+@pytest.mark.parametrize(
+    ("script", "status", "body", "ok", "reason"),
+    [
+        ("after_v2_components.js", 404, {"detail": "Not Found"}, None, "v2-unavailable"),
+        ("after_v2_components.js", 501, "Not Implemented", None, "v2-unavailable"),
+        (
+            "after_v2_components.js",
+            503,
+            '{"detail":"service unavailable"}',
+            False,
+            "v2-components-error-503",
+        ),
+        ("after_v2_components.js", 503, "Service Unavailable", False, "v2-components-error-503"),
+        (
+            "after_v2_components.js",
+            404,
+            '{"detail":"v2 disabled"}',
+            False,
+            "v2-components-error-404",
+        ),
+        (
+            "after_v2_components.js",
+            404,
+            '{"detail":"Not Found","x":1}',
+            False,
+            "v2-components-error-404",
+        ),
+        ("after_v2_components.js", 404, "Not Found", False, "v2-components-error-404"),
+        ("resolve_deployment.js", 404, '{"detail":"Not Found"}', None, "v2-unavailable"),
+        ("resolve_deployment.js", 501, "", None, "v2-unavailable"),
+        (
+            "resolve_deployment.js",
+            503,
+            '{"detail":"service unavailable"}',
+            False,
+            "v2-deployments-error-503",
+        ),
+        ("resolve_deployment.js", 404, '{"detail":"not found"}', False, "v2-deployments-error-404"),
+    ],
+)
+def test_node_function_v2_unavailable_is_only_an_unmounted_route(
+    script: str, status: int, body: object, ok: bool | None, reason: str
+) -> None:
+    out = _run_function(
+        script,
+        {"e2e": _ctx(component_id="cmp_x"), "statusCode": status, "payload": body},
+    )
+
+    assert out[0] is None
+    assert (out[1]["payload"]["ok"], out[1]["payload"]["reason"]) == (ok, reason)
+
+
+@pytest.mark.parametrize(
+    ("ts", "expected"),
+    [
+        # Transition at .000400: inside the first millisecond, which Date.parse
+        # would truncate to .000 and so wrongly attribute to the new interval.
+        ("2026-10-12T12:00:05Z", "ast_old"),
+        ("2026-10-12T12:00:05.000399Z", "ast_old"),
+        ("2026-10-12T12:00:05.0004Z", "ast_new"),
+        ("2026-10-12T12:00:05.000400+00:00", "ast_new"),
+        ("2026-10-12T12:00:05.001Z", "ast_new"),
+    ],
+)
+def test_node_function_compares_deployment_bounds_at_microsecond_precision(
+    ts: str, expected: str
+) -> None:
+    boundary = "2026-10-12T12:00:05.000400Z"
+    deployments = [
+        _deployment("cmp_x", "ast_old", "2026-10-12T11:00:00.123456Z", boundary),
+        _deployment("cmp_x", "ast_new", boundary),
+    ]
+    out = _run_function(
+        "resolve_deployment.js",
+        {
+            "e2e": _ctx(component_id="cmp_x", ts=ts),
+            "statusCode": 200,
+            "payload": json.dumps({"items": deployments}),
+        },
+    )
+
+    assert out[1] is None
+    assert out[0]["e2e"]["resolved_asset_id"] == expected
+
+
+def test_summarize_counts_failed_scenarios_as_failures(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    summarize = _load("m1_e2e_summarize", E2E / "summarize_verdicts.py")
+    keys = dict.fromkeys(summarize.VERDICT_KEYS)
+    raw = tmp_path / "verdicts.raw"
+    raw.write_text(json.dumps({**keys, "device_id": "a", "seq": 1, "ok": True, "reason": "match"}))
+
+    code = summarize.main(["--raw", str(raw), "--expect", "1", "--scenarios-failed", "1"])
+
+    out = capsys.readouterr().out
+    assert code == 1
+    assert "failures=1 allow_v2_unavailable=0 scenarios_failed=1" in out
+
+
+def test_failed_scenarios_still_report_their_devices(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    scenarios = _load("m1_e2e_scenarios", E2E / "scenarios.py")
+
+    def failing_relocation(self: object) -> None:
+        self.published["dev_" + "a" * 32] = 1  # type: ignore[attr-defined]
+        raise scenarios.ScenarioError("seq=1: resolved mismatch")
+
+    monkeypatch.setattr(scenarios.Harness, "relocation", failing_relocation)
+    code = scenarios.main(["relocation", "--raw", str(tmp_path / "raw")])
+
+    assert code == 1
+    assert capsys.readouterr().out.splitlines() == ["SCENARIO_DEVICE dev_" + "a" * 32 + " 1"]
+
+
+def test_run_script_fails_fast_without_replayed_line_and_reports_scenarios_failed() -> None:
+    runner = (E2E / "run_m1_e2e.sh").read_text(encoding="utf-8")
+
+    assert 'expected="${expected:-0}"' in runner
+    assert "replay.py reported no REPLAYED line" in runner
+    assert '--scenarios-failed "$scenarios_failed"' in runner
