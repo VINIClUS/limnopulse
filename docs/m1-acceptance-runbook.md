@@ -77,8 +77,19 @@ conditional transactions and ignores the 1 MB Query page, so its results do not 
    nothing.
 3. **Apply.** Run the same command with `--apply`. Expect `"result": "success"` and `*_created`
    counts equal to the dry-run's `would_*` counts.
-4. **Run a second apply to prove idempotency.** Run `--apply` again. Every `*_created` count
-   must be `0`, `legacy_links_updated` must be `0` and `already_migrated` must be nonzero.
+4. **Run a second apply to prove idempotency.** Run `--apply` again. Expect `"result":
+   "success"`, `"schema_conflicts": 0`, every `*_created` count `0` and `legacy_links_updated`
+   `0`. `already_migrated` must equal the tenant's number of legacy records (its `POND#` rows
+   plus its legacy `DEVICE#` rows; native v2 Devices and the default Site are not counted), so
+   it is `0` for a tenant with no legacy Ponds or Devices. Such an empty tenant only gets its
+   default Site, on the first apply. The gate pins this
+   (`test_empty_tenant_migrates_with_nothing_to_count`); its three summaries are:
+
+   ```json
+   {"apply": false, ..., "would_create_default_sites": 1, "would_create_assets": 0, "would_project_devices": 0, "already_migrated": 0, "schema_conflicts": 0, "conflicts": [], "scope_completed": true, "result": "success"}
+   {"apply": true, ..., "default_sites_created": 1, "assets_created": 0, "devices_projected": 0, "components_created": 0, "deployments_created": 0, "legacy_links_updated": 0, "already_migrated": 0, "schema_conflicts": 0, "result": "success"}
+   {"apply": true, ..., "default_sites_created": 0, "assets_created": 0, "devices_projected": 0, "components_created": 0, "deployments_created": 0, "legacy_links_updated": 0, "already_migrated": 0, "schema_conflicts": 0, "result": "success"}
+   ```
 5. **Deploy with both flags false.** Set `API_V2_ENABLED=false` and
    `V1_POND_DEVICE_PROJECTION_ENABLED=false`. `/v1` behaves exactly as before.
 
@@ -234,8 +245,8 @@ commit it.
 | `kind` | Cause | Remedy |
 |---|---|---|
 | `device_missing_pond` | A legacy Device's `pond_id` names no Pond (D5). The whole tenant is blocked. | First check the Device id is v2-compatible (see [Missing pond and an unsafe Device id](#missing-pond-and-an-unsafe-device-id); the dry-run does **not** report that while the pond is missing). If it is, patch the Device through `/v1` to an **existing** `pond_id`, then re-run the dry-run and `--apply`. This works with either flag value: with the flag off the next `--apply` repairs the Deployment ([Drift repair](#drift-repair)); with the flag on the `/v1` write reconciles it. With the flag on, a `/v1` create or patch to a **nonexistent** `pond_id` returns `409 "pond not found"`. Delete the Device only under the strict conditions in [Removing a legacy Device](#removing-a-legacy-device). |
-| `tenant_missing` | `TENANT#<id>/META` does not exist. | Check the tenant ID (it is case- and whitespace-sensitive) and remove it from the scope. |
-| `tenant_invalid` | Tenant META does not parse as a legacy Tenant, or its ID is not v2-safe. | Repair the Tenant row from backup, or exclude the tenant until it is fixed. |
+| `tenant_missing` | `TENANT#<id>/META` does not exist. | A typo or stale inventory entry: fix the list and re-run. If the ID came from an **active membership**, removing it from the scope does not stop it being served: see [Unmigratable tenants that are still served](#unmigratable-tenants-that-are-still-served). |
+| `tenant_invalid` | Tenant META does not parse as a legacy Tenant, or its ID is not v2-safe. | Repair the Tenant row from backup and migrate it, or handle it as in [Unmigratable tenants that are still served](#unmigratable-tenants-that-are-still-served). |
 | `site` | A row at the deterministic default Site key has different ownership, or the default Site is not ACTIVE when a new Asset or initial Deployment needs it. | Inspect `TENANT#<id>/SITE#<default_site_id>`. The default Site cannot be archived (D6); restore its ownership and `active` status from backup. |
 | `asset` | A row at `ASSET#<asset_id_for_legacy_pond>` belongs to a different Site or Pond, or cannot be rebuilt. | Inspect the Asset and its PondProfile. Restore the deterministic Asset from backup; never hand-edit IDs. |
 | `pond_profile` | The PondProfile's `legacy_pond_id` or owner disagrees with the Pond or Asset. | Restore `ASSET#<id>/PROFILE#POND` from backup so it points at the legacy Pond. |
@@ -243,9 +254,28 @@ commit it.
 | `deployment`, `deployment_current`, `deployment_history`, `deployment_marker` | A Deployment group (mirror, history row, `DEPLOYMENT#CURRENT`, marker) is inconsistent, malformed, or shows a stray history row or marker where no deterministic Deployment exists. | Do not delete history. Compare the group with backup or PITR, restore the missing or divergent row, and re-run. Escalate to the M1-04/M1-06 owner if the history itself is wrong. |
 | `device_lookup` | `DEVICE#<id>/META` disagrees with the tenant `DEVICE#` row the same way on every re-read. | Restore the lookup from the tenant Device row; every field except `PK`, `SK` and `entity_type` must match. |
 | `device_invalid` | A legacy Device row does not parse, or has an identifier that is not v2-compatible ([unsafe identifiers](#unsafe-legacy-identifiers)). | A malformed row: fix it from backup, then re-run. An unsafe identifier cannot be fixed in place (it is the Device's identity, and the M1 projection never renames it); such a Device can never have been projected, so retire it with [Removing a legacy Device](#removing-a-legacy-device) and, if still needed, re-register the hardware under a v2-compatible id. Native v2 rows (`schema_version == 2`) are skipped, never reported. |
-| `pond_invalid` | A legacy Pond row does not parse, or its ID is not v2-safe. | Fix the Pond row from backup. With the flag on, `/v1` returns `409` for such ids. |
+| `pond_invalid` | A legacy Pond row does not parse, or its ID is not v2-safe ([unsafe identifiers](#unsafe-legacy-identifiers)). | A malformed row: fix it from backup. An unsafe Pond id survives any restore, so follow [Retiring an unsafe legacy Pond](#retiring-an-unsafe-legacy-pond), or isolate the tenant from the v2-enabled deployment. With the flag on, `/v1` writes to such a Pond return `409`. |
 | `pond_missing`, `device_missing` | A source row vanished while the run was planning it, and stayed gone. | Re-run; if it persists, check for concurrent deletes. |
 | `migration_receipt` | `MIGRATION#M1#DEFAULT_SITE_ASSET_DEVICE` exists but is not this tenant's M1 receipt (wrong owner or malformed `run_count`). | Inspect the row. Restore it from backup, or remove it only after confirming with the M1-06 owner. The receipt is an audit trail and is never used to skip validation. |
+
+### Unmigratable tenants that are still served
+
+`require_tenant_access` only checks the caller's membership; it never reads
+`TENANT#<id>/META`. A tenant whose META is missing or invalid but whose memberships are active
+is therefore still served by every deployment, including a v2-enabled one, with an unmigrated
+domain. Before continuing the rollout, do **one** of:
+
+1. **Restore the Tenant row** from backup (PITR) and migrate the tenant like any other.
+2. **Deactivate its memberships and invalidate their cache.** There is no admin API for this.
+   For each member `<sub>`, in one transaction, set `status` to `"inactive"` on both
+   `USER#<sub>/TENANT#<id>` (the row access checks read) and `TENANT#<id>/MEMBER#<sub>`, each
+   conditioned on its observed `version` (`#version = :version`) and bumping `version` and
+   `updated_at`. Find the members by querying `PK = TENANT#<id>` with
+   `begins_with(SK, "MEMBER#")`. Access is cached per user in Redis under
+   `user:<sub>:memberships` for `MEMBERSHIP_CACHE_TTL_SECONDS` (default `120`, range 60–300):
+   delete those keys, or wait at least that TTL, before treating the tenant as unserved.
+3. **Isolate the tenant** from the v2-enabled deployment (it keeps being served only by a
+   deployment with both flags off).
 
 ### Missing pond and an unsafe Device id
 
@@ -271,6 +301,46 @@ exactly `dev_<32 lower-hex>`) before choosing the remedy:
   [Removing a legacy Device](#removing-a-legacy-device) with either flag value.
 
 The gate pins all three outcomes (`test_missing_pond_and_unsafe_device_id_remedies`).
+
+### Retiring an unsafe legacy Pond
+
+A Pond whose id is not v2-compatible blocks its tenant with `pond_invalid`; a restore keeps
+the id, `/v1` has no Pond delete or archive route, and the Pond can never have been projected
+(no `v2_site_id`, `v2_asset_id` or `v2_projection_version`). Repair it with the projection
+flag **off** (a flag-off deployment, before step 8, after a rollback, or a maintenance window
+with a restart), or isolate the tenant instead:
+
+1. Quiesce `/v1` writes for the tenant and do not run the migration until step 5.
+2. Create a replacement Pond with a v2-compatible id: `POST /v1/tenants/<tenant>/ponds`. (With
+   the flag on this also works and provisions its Asset, but step 3 does not.)
+3. Move every Device off the unsafe Pond: `PATCH /v1/tenants/<tenant>/devices/<device>` with
+   the new `pond_id`. With the flag **on**, this returns `409` ("pond is not compatible with the
+   v2 projection"), because the move reads the unsafe source Pond; it needs the flag off.
+   Confirm no legacy Device still references the Pond: Query `PK = TENANT#<tenant>` with
+   `begins_with(SK, "DEVICE#")` and check that no item has `pond_id = <pond>`.
+4. Take a backup, then delete the Pond row with a fenced transaction (cancelled if the Pond
+   changed or was ever linked to v2). Replace the placeholders and run
+   `aws dynamodb transact-write-items --transact-items file://delete-legacy-pond.json` with:
+
+   ```json
+   [
+     {
+       "Delete": {
+         "TableName": "<DYNAMODB_DOMAIN_TABLE>",
+         "Key": {"PK": {"S": "TENANT#<tenant>"}, "SK": {"S": "POND#<pond>"}},
+         "ConditionExpression": "#version = :version AND #tenant_id = :tenant_id AND attribute_not_exists(#asset_link) AND attribute_not_exists(#projection_version)",
+         "ExpressionAttributeNames": {"#version": "version", "#tenant_id": "tenant_id", "#asset_link": "v2_asset_id", "#projection_version": "v2_projection_version"},
+         "ExpressionAttributeValues": {":version": {"N": "<observed-version>"}, ":tenant_id": {"S": "<tenant>"}}
+       }
+     }
+   ]
+   ```
+
+   Then repeat the Device query from step 3; if a Device references the Pond again, restore
+   the Pond from the backup, move that Device, and retry.
+5. Run the dry-run and `--apply`, then lift the quiesce.
+
+The gate runs this sequence and this exact JSON (`test_unsafe_pond_retirement_sequence`).
 
 ### Removing a legacy Device
 

@@ -1725,24 +1725,108 @@ def test_apply_after_a_mixed_flag_window_converges(window: str) -> None:
 RUNBOOK = ROOT / "docs/m1-acceptance-runbook.md"
 
 
-def runbook_fenced_delete(tenant_id: str, device_id: str, version: int) -> list[dict]:
-    """The runbook's `delete-legacy-device.json`, with its placeholders filled in."""
+def runbook_json(heading: str, **placeholders: str) -> list[dict]:
+    """The first JSON block under a runbook heading, with its `<placeholders>` filled in."""
     text = RUNBOOK.read_text(encoding="utf-8")
-    section = text[text.index("### Removing a legacy Device") :]
-    block = section[
-        section.index("```json") + len("```json") : section.index(
-            "```", section.index("```json") + 7
-        )
-    ]
-    for placeholder, value in {
-        "<DYNAMODB_DOMAIN_TABLE>": TABLE,
-        "<tenant>": tenant_id,
-        "<device>": device_id,
-        "<observed-version>": str(version),
-    }.items():
-        block = block.replace(placeholder, value)
+    section = text[text.index(heading) :]
+    opening = section.index("```json") + len("```json")
+    block = section[opening : section.index("```", opening)]
+    for name, value in {"DYNAMODB_DOMAIN_TABLE": TABLE, **placeholders}.items():
+        block = block.replace(f"<{name}>", value)
     assert "<" not in block, block
     return json.loads(block)
+
+
+def runbook_fenced_delete(tenant_id: str, device_id: str, version: int) -> list[dict]:
+    """The runbook's `delete-legacy-device.json`, with its placeholders filled in."""
+    return runbook_json(
+        "### Removing a legacy Device",
+        tenant=tenant_id,
+        device=device_id,
+        **{"observed-version": str(version)},
+    )
+
+
+def runbook_fenced_pond_delete(tenant_id: str, pond_id: str, version: int) -> list[dict]:
+    """The runbook's `delete-legacy-pond.json`, with its placeholders filled in."""
+    return runbook_json(
+        "### Retiring an unsafe legacy Pond",
+        tenant=tenant_id,
+        pond=pond_id,
+        **{"observed-version": str(version)},
+    )
+
+
+def test_empty_tenant_migrates_with_nothing_to_count() -> None:
+    client = ConditionalDynamoClient()
+    client.seed(legacy_tenant_item())
+
+    dry_run, first, second = (migrate(client, apply=apply) for apply in (False, True, True))
+
+    assert dry_run.would_create_default_sites == 1
+    assert (first.default_sites_created, second.default_sites_created) == (1, 0)
+    for summary in (dry_run, first, second):
+        counts = summary.model_dump()
+        assert summary.result == "success" and summary.schema_conflicts == 0
+        assert summary.already_migrated == 0 and summary.legacy_links_updated == 0
+        assert all(
+            counts[name] == 0
+            for name in counts
+            if name.endswith("_created") and name != "default_sites_created"
+        )
+
+
+UNSAFE_POND = "pond west"
+
+
+def test_unsafe_pond_retirement_sequence() -> None:
+    client = ConditionalDynamoClient()
+    client.seed(legacy_tenant_item())
+    client.seed(legacy_pond_item(UNSAFE_POND))
+    for item in legacy_device_items(LEGACY_DEVICE, UNSAFE_POND):
+        client.seed(item)
+    legacy = DynamoDomainRepository(TABLE, client)
+    projection = v1_projection(client, Clock(NOW))
+
+    def conflicts() -> list[tuple[str, str]]:
+        return [(c.kind, c.key) for c in migrate(client, apply=False).conflicts]
+
+    assert conflicts() == [("pond_invalid", f"TENANT#{TENANT}/POND#{UNSAFE_POND}")]
+    # Step 2: the replacement Pond (flag off here; flag on would also work).
+    asyncio.run(legacy.create_pond(TENANT, WEST_POND, "West", None))
+    # Step 3: the flag-on move reads the unsafe source Pond and is refused; flag off works.
+    with pytest.raises(ConflictError, match="pond is not compatible"):
+        asyncio.run(
+            projection.update_device(
+                TENANT, LEGACY_DEVICE, 1, name=None, pond_id=WEST_POND, firmware_version=None
+            )
+        )
+    asyncio.run(
+        legacy.update_device(
+            TENANT, LEGACY_DEVICE, 1, name=None, pond_id=WEST_POND, firmware_version=None
+        )
+    )
+    assert conflicts() == [("pond_invalid", f"TENANT#{TENANT}/POND#{UNSAFE_POND}")]
+    # Step 4: a stale observed version cancels the fenced delete; the observed one succeeds.
+    with pytest.raises(ClientError):
+        client.transact_write_items(
+            TransactItems=runbook_fenced_pond_delete(TENANT, UNSAFE_POND, 7)
+        )
+    client.transact_write_items(TransactItems=runbook_fenced_pond_delete(TENANT, UNSAFE_POND, 1))
+    assert client.item(f"TENANT#{TENANT}", f"POND#{UNSAFE_POND}") is None
+    # Step 5: the tenant converges.
+    assert conflicts() == []
+    applied = migrate(client, apply=True)
+    assert applied.result == "success"
+    assert (applied.assets_created, applied.devices_projected) == (1, 1)
+
+
+def test_runbook_fenced_pond_delete_refuses_a_linked_pond() -> None:
+    client = migrated_store()
+    before = client.snapshot()
+    with pytest.raises(ClientError):
+        client.transact_write_items(TransactItems=runbook_fenced_pond_delete(TENANT, WEST_POND, 1))
+    assert client.snapshot() == before
 
 
 def _legacy_device_rows(client: ConditionalDynamoClient, device_id: str) -> list:
