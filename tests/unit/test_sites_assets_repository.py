@@ -584,6 +584,31 @@ async def test_linked_asset_name_patch_mirrors_only_changed_fields() -> None:
 
 
 @pytest.mark.asyncio
+async def test_linked_asset_patch_losing_legacy_pond_race_conflicts() -> None:
+    client = FakeDynamoClient.with_asset_and_profile(asset_version=4, legacy_pond_id="pond_legacy")
+    client.seed(legacy_pond_item(version=7))
+    client.transaction_error = client_error(
+        "TransactionCanceledException", ["None", "None", "ConditionalCheckFailed"]
+    )
+
+    with pytest.raises(ConflictError):
+        await build(client).update_asset(
+            TENANT,
+            ASSET_ID,
+            4,
+            name="West",
+            status=None,
+            pond_description="covered",
+            pond_profile_expected_version=1,
+        )
+
+    assert transaction_expected_versions(client) == [4, 1, 7]
+    pond = update_of(client, "pond")
+    assert plain(pond["ExpressionAttributeValues"])[":expected_version"] == 7
+    assert pond["ConditionExpression"] == "attribute_exists(PK) AND #version = :expected_version"
+
+
+@pytest.mark.asyncio
 async def test_linked_asset_patch_with_missing_legacy_pond_conflicts() -> None:
     client = FakeDynamoClient.with_asset_and_profile(legacy_pond_id="pond_legacy")
 

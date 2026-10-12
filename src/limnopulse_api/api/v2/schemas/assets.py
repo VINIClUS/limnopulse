@@ -64,7 +64,7 @@ class PondProfileResponse(BaseModel):
 
 
 class AssetResponse(V2VersionedResponse):
-    model_config = ConfigDict(extra="forbid", validate_by_name=True, validate_by_alias=True)
+    model_config = ConfigDict(extra="forbid", populate_by_name=True)
 
     asset_id: str
     site_id: str
