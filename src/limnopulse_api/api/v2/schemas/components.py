@@ -1,8 +1,20 @@
-from pydantic import BaseModel
+from typing import Annotated
+
+from fastapi import Path
+from pydantic import AfterValidator, BaseModel
 
 from limnopulse_api.api.v2.schemas.common import V2VersionedResponse
 from limnopulse_api.domain.devices_v2 import ComponentKind, ComponentStatus, DeviceComponent
+from limnopulse_api.domain.ids import require_canonical_id
 from limnopulse_api.services.components import ComponentCreateCommand, ComponentUpdateCommand
+
+
+def _require_component_id(value: str) -> str:
+    return require_canonical_id(value, "cmp")
+
+
+# Malformed IDs are 422; unknown well-formed IDs are 404.
+V2ComponentPathId = Annotated[str, Path(), AfterValidator(_require_component_id)]
 
 
 class V2ComponentCreateRequest(ComponentCreateCommand):

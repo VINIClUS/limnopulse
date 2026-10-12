@@ -6,6 +6,7 @@ through an explicit allowlist and updates only SET mutable attributes, so `/v1` 
 """
 
 import json
+import logging
 from collections.abc import Mapping
 from datetime import datetime
 from typing import Any
@@ -40,6 +41,7 @@ COMPONENT_MIRROR_ENTITY_TYPE = "component_mirror"
 CAPABILITY_ENTITY_TYPE = "capability_declaration"
 _TERMINAL_COMPONENT_STATUSES = frozenset({ComponentStatus.REPLACED, ComponentStatus.DECOMMISSIONED})
 _KEYS = DynamoV2KeyBuilder()
+_LOGGER = logging.getLogger(__name__)
 
 
 def _without_none(item: Mapping[str, Any]) -> dict[str, Any]:
@@ -281,7 +283,18 @@ class DynamoDeviceComponentRepository(DynamoV2RepositoryBase):
         items = await self.query_prefix(
             self.keys.tenant_partition(tenant_id), DynamoV2KeyBuilder.DEVICE_PREFIX
         )
-        return [device_v2_from_item(item) for item in items if item.get("tenant_id") == tenant_id]
+        devices = []
+        for item in items:
+            if item.get("tenant_id") != tenant_id:
+                continue
+            try:
+                devices.append(device_v2_from_item(item))
+            except (KeyError, TypeError, ValueError):
+                # One malformed historical row must not hide the rest; log only the key.
+                _LOGGER.warning(
+                    "skipping unmappable device row PK=%s SK=%s", item.get("PK"), item.get("SK")
+                )
+        return devices
 
     async def create_device(self, device: DeviceV2, receipt: IdempotencyReceipt) -> DeviceV2:
         await self.transact_write(

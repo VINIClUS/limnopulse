@@ -743,3 +743,17 @@ async def test_updates_never_move_updated_at_backwards() -> None:
     updated_component = await repo.update_component(TENANT_A, COMPONENT_1, 1, name="x", status=None)
     assert updated_device.updated_at == LATER
     assert updated_component.updated_at == LATER
+
+
+@pytest.mark.asyncio
+async def test_list_devices_skips_unmappable_rows_and_logs_only_the_key(caplog) -> None:
+    client = FakeDynamoClient()
+    row, _ = legacy_device_items()
+    bad_row, _ = legacy_device_items(device_id="dev_legacy01")
+    client.seed(row)
+    client.seed(bad_row)
+    with caplog.at_level("WARNING"):
+        devices = await repository(client).list_devices(TENANT_A)
+    assert [device.device_id for device in devices] == ["local-device-001"]
+    assert "SK=DEVICE#dev_legacy01" in caplog.text
+    assert "Legacy Probe" not in caplog.text

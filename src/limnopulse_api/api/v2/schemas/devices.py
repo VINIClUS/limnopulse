@@ -1,8 +1,15 @@
-from pydantic import BaseModel
+from typing import Annotated
+
+from fastapi import Path
+from pydantic import AfterValidator, BaseModel
 
 from limnopulse_api.api.v2.schemas.common import V2VersionedResponse
 from limnopulse_api.domain.devices_v2 import CompatibilityLevel, DeviceStatus, DeviceV2
+from limnopulse_api.domain.ids import require_device_id
 from limnopulse_api.services.devices_v2 import DeviceV2CreateCommand, DeviceV2UpdateCommand
+
+# Malformed IDs are 422; historical IDs such as `local-device-001` stay valid.
+V2DevicePathId = Annotated[str, Path(), AfterValidator(require_device_id)]
 
 
 class V2DeviceCreateRequest(DeviceV2CreateCommand):

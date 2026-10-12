@@ -1,3 +1,4 @@
+import json
 import re
 from datetime import UTC, datetime
 
@@ -419,7 +420,6 @@ def test_cross_tenant_and_unknown_devices_are_not_found() -> None:
     for path in (
         f"/tenants/{TENANT}/devices/dev_{'f' * 32}",
         f"/tenants/{TENANT}/devices/dev_{'0' * 32}",
-        f"/tenants/{TENANT}/devices/dev_short",
     ):
         assert client.get(path, headers=HEADERS).status_code == 404
     assert (
@@ -688,3 +688,92 @@ def test_routers_are_not_mounted_and_v1_is_unchanged() -> None:
     assert "/v1/tenants/{tenant_id}/devices" in paths
     schemas = document["components"]["schemas"]
     assert not any(name.startswith("V2") for name in schemas)
+
+
+# Audit round 1 ----------------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    "method,path",
+    [
+        ("GET", "/devices/dev_short"),
+        ("GET", "/devices/bad%23id"),
+        ("PATCH", "/devices/dev_short"),
+        ("GET", "/devices/dev_short/components"),
+        ("POST", "/devices/dev_short/components"),
+        ("GET", "/components/cmp_short"),
+        ("GET", "/components/local-component"),
+        ("PATCH", "/components/cmp_short"),
+        ("GET", "/components/cmp_short/capabilities"),
+        ("POST", "/components/cmp_short/capabilities"),
+    ],
+)
+def test_malformed_path_ids_are_422(method: str, path: str) -> None:
+    client = http(app_with_device_component_repository(TenantRole.OWNER))
+    body = {
+        "PATCH": {"expected_version": 1},
+        "POST": capability_body() if "capabilities" in path else probe_body(),
+    }.get(method)
+    response = client.request(
+        method,
+        f"/tenants/{TENANT}{path}",
+        json=body,
+        headers={**HEADERS, "Idempotency-Key": "idem-key-0001"},
+    )
+    assert response.status_code == 422
+
+
+def test_well_formed_unknown_ids_stay_404_and_historical_ids_are_valid() -> None:
+    client = http(app_with_device_component_repository(TenantRole.OWNER))
+    for path in (
+        "/devices/local-device-404",
+        f"/devices/dev_{'0' * 32}",
+        f"/components/cmp_{'0' * 32}",
+        f"/components/cmp_{'0' * 32}/capabilities",
+        f"/devices/dev_{'0' * 32}/components",
+    ):
+        assert client.get(f"/tenants/{TENANT}{path}", headers=HEADERS).status_code == 404
+
+
+def test_unmappable_legacy_row_does_not_break_device_list(caplog) -> None:
+    fake = FakeDynamoClient()
+    seed_legacy_device(fake)
+    seed_legacy_device(fake, device_id="dev_legacy01")
+    client = http(app_with_device_component_repository(client=fake))
+    with caplog.at_level("WARNING"):
+        listed = client.get(f"/tenants/{TENANT}/devices", headers=HEADERS)
+    assert listed.status_code == 200
+    assert [item["device_id"] for item in listed.json()["items"]] == ["local-device-001"]
+    assert "DEVICE#dev_legacy01" in caplog.text
+    assert "Legacy Probe" not in caplog.text
+
+
+@pytest.mark.parametrize("field", ["parameter_schema", "result_schema"])
+@pytest.mark.parametrize("bad", ["NaN", "Infinity", "-Infinity"])
+def test_non_finite_capability_schema_is_422(field: str, bad: str) -> None:
+    client = http(app_with_device_component_repository())
+    device_id = create_device(client)["device_id"]
+    component_id = create_probe(client, device_id, "Probe A", "probe-key-01")["component_id"]
+    body = json.dumps(capability_body()).replace(f'"{field}": {{', f'"{field}": {{"x": {bad}, ', 1)
+    response = client.post(
+        f"/tenants/{TENANT}/components/{component_id}/capabilities",
+        content=body,
+        headers={**HEADERS, "Idempotency-Key": "cap-key-0001", "Content-Type": "application/json"},
+    )
+    assert response.status_code == 422
+
+
+def test_oversized_capability_schema_and_metric_keys_are_422() -> None:
+    client = http(app_with_device_component_repository())
+    device_id = create_device(client)["device_id"]
+    component_id = create_probe(client, device_id, "Probe A", "probe-key-01")["component_id"]
+    huge = {"type": "object", "description": "x" * (32 * 1024)}
+    path = f"/tenants/{TENANT}/components/{component_id}/capabilities"
+    assert post(client, path, capability_body(parameter_schema=huge)).status_code == 422
+    assert post(client, path, capability_body(result_schema=huge)).status_code == 422
+
+    components = f"/tenants/{TENANT}/devices/{device_id}/components"
+    too_many = {**probe_body(), "probe_profile": {"measurement_metric_keys": ["k"] * 65}}
+    too_long = {**probe_body(), "probe_profile": {"measurement_metric_keys": ["k" * 129]}}
+    assert post(client, components, too_many, "probe-key-02").status_code == 422
+    assert post(client, components, too_long, "probe-key-03").status_code == 422

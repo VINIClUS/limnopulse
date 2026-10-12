@@ -1,6 +1,12 @@
 """Unmounted `/v2` Device router; M1-07 mounts it under `/v2`."""
 
-from fastapi import APIRouter, Depends, HTTPException, Response, status
+import math
+from collections.abc import Callable, Coroutine
+from typing import Any
+
+from fastapi import APIRouter, Depends, HTTPException, Request, Response, status
+from fastapi.exceptions import RequestValidationError
+from fastapi.routing import APIRoute
 
 from limnopulse_api.api.dependencies import require_tenant_role
 from limnopulse_api.api.v1.schemas.common import ErrorResponse
@@ -9,6 +15,7 @@ from limnopulse_api.api.v2.schemas.common import V2_ERROR_RESPONSES, Idempotency
 from limnopulse_api.api.v2.schemas.devices import (
     V2DeviceCreateRequest,
     V2DeviceListResponse,
+    V2DevicePathId,
     V2DeviceResponse,
     V2DeviceUpdateRequest,
 )
@@ -17,7 +24,35 @@ from limnopulse_api.domain.entities import TenantAccess
 from limnopulse_api.domain.roles import READ_ROLES, WRITE_ROLES
 from limnopulse_api.services.devices_v2 import DeviceV2Service
 
-router = APIRouter(prefix="/tenants/{tenant_id}/devices", tags=["v2-devices"])
+
+def _json_safe(value: Any) -> Any:
+    if isinstance(value, float) and not math.isfinite(value):
+        return repr(value)
+    if isinstance(value, dict):
+        return {key: _json_safe(item) for key, item in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [_json_safe(item) for item in value]
+    return value
+
+
+class V2JsonSafeRoute(APIRoute):
+    """Keeps 422 bodies serializable: a NaN/Infinity echoed as `input` would otherwise 500."""
+
+    def get_route_handler(self) -> Callable[[Request], Coroutine[Any, Any, Response]]:
+        handler = super().get_route_handler()
+
+        async def route_handler(request: Request) -> Response:
+            try:
+                return await handler(request)
+            except RequestValidationError as exc:
+                raise RequestValidationError(_json_safe(list(exc.errors()))) from None
+
+        return route_handler
+
+
+router = APIRouter(
+    prefix="/tenants/{tenant_id}/devices", tags=["v2-devices"], route_class=V2JsonSafeRoute
+)
 
 _RESPONSES: dict[int | str, dict[str, object]] = {
     403: {"model": ErrorResponse},
@@ -64,7 +99,7 @@ async def create_device(
 @router.get("/{device_id}", response_model=V2DeviceResponse, responses=_RESPONSES)
 async def get_device(
     tenant_id: str,
-    device_id: str,
+    device_id: V2DevicePathId,
     repository: DeviceComponentRepositoryDep,
     _access: TenantAccess = Depends(require_tenant_role(*READ_ROLES)),
 ) -> V2DeviceResponse:
@@ -77,7 +112,7 @@ async def get_device(
 @router.patch("/{device_id}", response_model=V2DeviceResponse, responses=_RESPONSES)
 async def update_device(
     tenant_id: str,
-    device_id: str,
+    device_id: V2DevicePathId,
     payload: V2DeviceUpdateRequest,
     repository: DeviceComponentRepositoryDep,
     _access: TenantAccess = Depends(require_tenant_role(*WRITE_ROLES)),

@@ -8,6 +8,7 @@ from fastapi import APIRouter, Depends, HTTPException, Response, status
 from limnopulse_api.api.dependencies import require_tenant_role
 from limnopulse_api.api.v1.schemas.common import ErrorResponse
 from limnopulse_api.api.v2.dependencies import DeviceComponentRepositoryDep
+from limnopulse_api.api.v2.routers.devices import V2JsonSafeRoute
 from limnopulse_api.api.v2.schemas.capabilities import (
     V2CapabilityCreateRequest,
     V2CapabilityListResponse,
@@ -17,16 +18,20 @@ from limnopulse_api.api.v2.schemas.common import V2_ERROR_RESPONSES, Idempotency
 from limnopulse_api.api.v2.schemas.components import (
     V2ComponentCreateRequest,
     V2ComponentListResponse,
+    V2ComponentPathId,
     V2ComponentResponse,
     V2ComponentUpdateRequest,
 )
+from limnopulse_api.api.v2.schemas.devices import V2DevicePathId
 from limnopulse_api.core.errors import ConflictError, NotFoundError
 from limnopulse_api.domain.entities import TenantAccess
 from limnopulse_api.domain.roles import READ_ROLES, WRITE_ROLES
 from limnopulse_api.services.capabilities import CapabilityService
 from limnopulse_api.services.components import ComponentService
 
-router = APIRouter(prefix="/tenants/{tenant_id}", tags=["v2-components"])
+router = APIRouter(
+    prefix="/tenants/{tenant_id}", tags=["v2-components"], route_class=V2JsonSafeRoute
+)
 
 _RESPONSES: dict[int | str, dict[str, object]] = {
     403: {"model": ErrorResponse},
@@ -55,7 +60,7 @@ def _created(snapshot_json: str) -> Response:
 )
 async def list_device_components(
     tenant_id: str,
-    device_id: str,
+    device_id: V2DevicePathId,
     repository: DeviceComponentRepositoryDep,
     _access: TenantAccess = Depends(require_tenant_role(*READ_ROLES)),
 ) -> V2ComponentListResponse:
@@ -76,7 +81,7 @@ async def list_device_components(
 )
 async def create_device_component(
     tenant_id: str,
-    device_id: str,
+    device_id: V2DevicePathId,
     payload: V2ComponentCreateRequest,
     idempotency_key: IdempotencyKeyHeader,
     repository: DeviceComponentRepositoryDep,
@@ -98,7 +103,7 @@ async def create_device_component(
 )
 async def get_component(
     tenant_id: str,
-    component_id: str,
+    component_id: V2ComponentPathId,
     repository: DeviceComponentRepositoryDep,
     _access: TenantAccess = Depends(require_tenant_role(*READ_ROLES)),
 ) -> V2ComponentResponse:
@@ -115,7 +120,7 @@ async def get_component(
 )
 async def update_component(
     tenant_id: str,
-    component_id: str,
+    component_id: V2ComponentPathId,
     payload: V2ComponentUpdateRequest,
     repository: DeviceComponentRepositoryDep,
     _access: TenantAccess = Depends(require_tenant_role(*WRITE_ROLES)),
@@ -134,7 +139,7 @@ async def update_component(
 )
 async def list_component_capabilities(
     tenant_id: str,
-    component_id: str,
+    component_id: V2ComponentPathId,
     repository: DeviceComponentRepositoryDep,
     _access: TenantAccess = Depends(require_tenant_role(*READ_ROLES)),
 ) -> V2CapabilityListResponse:
@@ -155,7 +160,7 @@ async def list_component_capabilities(
 )
 async def create_component_capability(
     tenant_id: str,
-    component_id: str,
+    component_id: V2ComponentPathId,
     payload: V2CapabilityCreateRequest,
     idempotency_key: IdempotencyKeyHeader,
     repository: DeviceComponentRepositoryDep,

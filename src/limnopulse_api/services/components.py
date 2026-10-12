@@ -1,5 +1,6 @@
 from collections.abc import Callable
 from datetime import datetime
+from typing import Annotated
 
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
@@ -31,6 +32,8 @@ from limnopulse_api.services.devices_v2 import (
 )
 
 COMPONENT_CREATE_SCOPE = "component-create"
+MAX_MEASUREMENT_METRIC_KEYS = 64
+METRIC_KEY_MAX_LENGTH = 128
 
 
 def is_valid_component_id(component_id: str) -> bool:
@@ -47,7 +50,9 @@ class ProbeProfileCommand(BaseModel):
     model_config = ConfigDict(extra="forbid", frozen=True)
 
     serial_number: str | None = Field(default=None, min_length=1, max_length=TEXT_MAX_LENGTH)
-    measurement_metric_keys: tuple[str, ...] = ()
+    measurement_metric_keys: tuple[
+        Annotated[str, Field(min_length=1, max_length=METRIC_KEY_MAX_LENGTH)], ...
+    ] = Field(default=(), max_length=MAX_MEASUREMENT_METRIC_KEYS)
 
 
 class ActuatorProfileCommand(BaseModel):

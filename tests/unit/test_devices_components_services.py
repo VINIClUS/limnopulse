@@ -412,6 +412,10 @@ async def test_component_terminal_lifecycle_is_rejected() -> None:
         {"provider_implementation_key": "arn:aws:iot:us-east-1:123:thing/x"},
         {"tenant_id": TENANT_A},
         {"aws_thing_name": "thing"},
+        {"parameter_schema": {"x": float("nan")}},
+        {"result_schema": {"x": float("inf")}},
+        {"parameter_schema": {"x": {1, 2}}},
+        {"parameter_schema": {"d": "x" * (32 * 1024)}},
     ],
 )
 def test_capability_command_validation(overrides) -> None:
@@ -479,3 +483,24 @@ def test_entity_snapshot_uses_fixed_width_utc_and_round_trips() -> None:
     assert snapshot["updated_at"] == "2026-08-25T00:00:00.000000Z"
     assert snapshot["status"] == "active"
     assert DeviceV2.model_validate(snapshot) == device
+
+
+def test_capability_schema_at_size_limit_is_accepted() -> None:
+    padding = 32 * 1024 - len('{"d":""}')
+    assert command_capability(parameter_schema={"d": "x" * padding}).parameter_schema
+
+
+@pytest.mark.parametrize(
+    "profile",
+    [
+        {"measurement_metric_keys": ["k"] * 65},
+        {"measurement_metric_keys": ["k" * 129]},
+        {"measurement_metric_keys": [""]},
+    ],
+)
+def test_probe_profile_metric_keys_are_bounded(profile: dict) -> None:
+    with pytest.raises(ValidationError):
+        ComponentCreateCommand(kind="probe", name="P", probe_profile=profile)
+    assert ComponentCreateCommand(
+        kind="probe", name="P", probe_profile={"measurement_metric_keys": ["k" * 128] * 64}
+    )

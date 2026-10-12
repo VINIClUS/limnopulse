@@ -1,3 +1,4 @@
+import json
 from collections.abc import Callable
 from datetime import datetime
 
@@ -26,11 +27,16 @@ from limnopulse_api.services.devices_v2 import (
 )
 
 CAPABILITY_CREATE_SCOPE = "capability-create"
+SCHEMA_MAX_BYTES = 32 * 1024
 _TERMINAL_COMPONENT_STATUSES = frozenset({ComponentStatus.REPLACED, ComponentStatus.DECOMMISSIONED})
 
 
 class CapabilityCreateCommand(BaseModel):
-    """Append-only declaration; `provider_implementation_key` is opaque provider-neutral text."""
+    """Append-only declaration; `provider_implementation_key` is opaque provider-neutral text.
+
+    The idempotency request hash is computed over the JSON form of the body, so schemas that
+    differ only in number spelling (`1` vs `1.0`) are different requests.
+    """
 
     model_config = ConfigDict(extra="forbid", frozen=True)
 
@@ -46,6 +52,19 @@ class CapabilityCreateCommand(BaseModel):
     )
     risk_class: CommandRiskClass | None = None
     verified_at: datetime | None = None
+
+    @field_validator("parameter_schema", "result_schema", mode="after")
+    @classmethod
+    def require_bounded_json_object(cls, value: dict[str, object] | None) -> dict | None:
+        if value is None:
+            return None
+        try:
+            encoded = json.dumps(value, allow_nan=False, separators=(",", ":"))
+        except (TypeError, ValueError) as exc:
+            raise ValueError("schema must be a finite JSON object") from exc
+        if len(encoded.encode()) > SCHEMA_MAX_BYTES:
+            raise ValueError(f"schema must not exceed {SCHEMA_MAX_BYTES} bytes as JSON")
+        return value
 
     @field_validator("provider_implementation_key", mode="after")
     @classmethod
