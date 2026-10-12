@@ -1,6 +1,7 @@
 from datetime import UTC, datetime, timedelta
 
 import jwt
+import pytest
 from botocore.exceptions import EndpointConnectionError
 from cryptography.hazmat.primitives.asymmetric import rsa
 from fastapi import Request
@@ -8,6 +9,10 @@ from fastapi.testclient import TestClient
 
 from limnopulse_api.adapters.alert_rules import DynamoAlertRuleRepository
 from limnopulse_api.adapters.dynamodb import DynamoDomainRepository
+from limnopulse_api.adapters.dynamodb_deployments import DynamoDeploymentRepository
+from limnopulse_api.adapters.dynamodb_devices_v2 import DynamoDeviceComponentRepository
+from limnopulse_api.adapters.dynamodb_integrations import DynamoIntegrationRepository
+from limnopulse_api.adapters.dynamodb_sites_assets import DynamoSiteAssetRepository
 from limnopulse_api.adapters.notification_preferences import (
     DynamoNotificationPreferenceRepository,
 )
@@ -25,6 +30,12 @@ from limnopulse_api.services.telegram_webhook_secret import (
 )
 
 TEST_ISSUER = "https://cognito-idp.us-east-1.amazonaws.com/pool_1"
+M1_REPOSITORY_TYPES = {
+    "site_asset_repository": DynamoSiteAssetRepository,
+    "device_component_repository": DynamoDeviceComponentRepository,
+    "integration_repository": DynamoIntegrationRepository,
+    "deployment_repository": DynamoDeploymentRepository,
+}
 
 
 class FakeRedisClient:
@@ -150,6 +161,8 @@ def test_app_lifespan_wires_runtime_dependencies(monkeypatch) -> None:
     assert not hasattr(app.state, "membership_service")
     assert not hasattr(app.state, "auth_provider")
     assert not hasattr(app.state, "telemetry_repository")
+    for name in M1_REPOSITORY_TYPES:
+        assert not hasattr(app.state, name)
 
     with TestClient(app):
         assert dynamo_calls == [
@@ -189,6 +202,11 @@ def test_app_lifespan_wires_runtime_dependencies(monkeypatch) -> None:
             DynamoTelegramBindingRepository,
         )
         assert app.state.telegram_binding_repository.client is fake_dynamo
+        for name, repository_type in M1_REPOSITORY_TYPES.items():
+            repository = getattr(app.state, name)
+            assert isinstance(repository, repository_type)
+            assert repository.client is fake_dynamo
+            assert repository.table_name == "LimnopulseDomain"
         assert isinstance(app.state.telegram_binding_service, TelegramBindingService)
         assert app.state.telegram_binding_service.repository is (
             app.state.telegram_binding_repository
@@ -331,6 +349,54 @@ def test_app_lifespan_uses_dev_identity_verifier_without_cognito_client(monkeypa
             }
         ]
         assert isinstance(app.state.cognito_identity_verifier, DevIdentityVerifier)
+
+
+@pytest.mark.parametrize("api_v2_enabled", [False, True])
+def test_lifespan_wires_m1_repositories_to_the_one_dynamo_client(
+    monkeypatch, api_v2_enabled: bool
+) -> None:
+    boto_calls: list[str] = []
+    fake_dynamo = object()
+    fake_redis = FakeRedisClient()
+
+    def fake_boto3_client(service_name: str, **kwargs):
+        boto_calls.append(service_name)
+        return fake_dynamo
+
+    monkeypatch.setattr("limnopulse_api.main.boto3.client", fake_boto3_client)
+    monkeypatch.setattr("limnopulse_api.main.redis.from_url", lambda url: fake_redis)
+
+    app = create_app(
+        Settings(
+            app_env="test",
+            auth_mode="dev",
+            dynamodb_domain_table="DomainUnderTest",
+            api_v2_enabled=api_v2_enabled,
+        )
+    )
+
+    with TestClient(app):
+        assert boto_calls == ["dynamodb"]
+        repositories = [getattr(app.state, name) for name in M1_REPOSITORY_TYPES]
+        assert {id(repository.client) for repository in repositories} == {id(fake_dynamo)}
+        assert {repository.table_name for repository in repositories} == {"DomainUnderTest"}
+
+
+@pytest.mark.parametrize("prewired_name", list(M1_REPOSITORY_TYPES))
+def test_prewired_m1_repository_skips_runtime_wiring(monkeypatch, prewired_name: str) -> None:
+    def fail(*args, **kwargs):
+        raise AssertionError("prewired test apps must not create runtime clients")
+
+    monkeypatch.setattr("limnopulse_api.main.boto3.client", fail)
+    monkeypatch.setattr("limnopulse_api.main.redis.from_url", fail)
+    monkeypatch.setattr("limnopulse_api.main.InfluxDBClient", fail)
+    app = create_app(Settings(app_env="test", auth_mode="dev", api_v2_enabled=True))
+    prewired = object()
+    setattr(app.state, prewired_name, prewired)
+
+    with TestClient(app):
+        assert getattr(app.state, prewired_name) is prewired
+        assert not hasattr(app.state, "domain_repository")
 
 
 def test_me_reuses_app_scoped_auth_provider(monkeypatch) -> None:

@@ -45,6 +45,8 @@ class Settings(BaseSettings):
     )
     telegram_webhook_secret_arn: str | None = None
     telegram_webhook_secret_cache_ttl_seconds: int = Field(default=60, ge=5, le=300)
+    api_v2_enabled: bool = False
+    v1_pond_device_projection_enabled: bool = False
 
     @model_validator(mode="after")
     def validate_auth_mode_for_environment(self) -> "Settings":

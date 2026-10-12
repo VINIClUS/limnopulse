@@ -161,6 +161,33 @@ contain no chat ID or rendered message, and Telegram jobs never enter the email
 queue. See [Phase 3C-B Telegram operations](docs/notifications-phase-3c-b.md)
 for secrets, backfill, rollout, rollback, retry semantics and DLQ handling.
 
+## M1 v2 Domain API (disabled by default)
+
+Two independent rollout flags, both `false` by default (see `.env.example`):
+
+- `API_V2_ENABLED` mounts the M1 `/v2` domain API.
+- `V1_POND_DEVICE_PROJECTION_ENABLED` serves `/v1` Pond/Device reads from v2 records.
+
+With `API_V2_ENABLED=true` only the M1 route groups are mounted:
+
+```text
+GET/POST  /v2/tenants/{tenant_id}/sites
+GET/PATCH /v2/tenants/{tenant_id}/sites/{site_id}
+GET/POST  /v2/tenants/{tenant_id}/assets
+GET/PATCH /v2/tenants/{tenant_id}/assets/{asset_id}
+GET/POST  /v2/tenants/{tenant_id}/devices
+GET/PATCH /v2/tenants/{tenant_id}/devices/{device_id}
+GET/POST  /v2/tenants/{tenant_id}/devices/{device_id}/components
+GET/POST  /v2/tenants/{tenant_id}/devices/{device_id}/integrations
+GET/PATCH /v2/tenants/{tenant_id}/components/{component_id}
+GET/POST  /v2/tenants/{tenant_id}/components/{component_id}/capabilities
+GET/POST  /v2/tenants/{tenant_id}/integration-accounts
+GET/POST  /v2/tenants/{tenant_id}/deployments
+POST      /v2/tenants/{tenant_id}/deployments/{deployment_id}/end
+```
+
+There are no `/v2` telemetry, observation, health, calibration, billing, AWS IoT, notification-destination or command routes. `/v1` is unchanged with either flag. Rollout follows the M1-08 runbook (to be added). A local `.env` with `API_V2_ENABLED=true` changes the default route count that the tenant-mapping conformance tests expect, so keep it `false` when running the test suite.
+
 ## Local Telemetry Ingestion
 
 Phase 2B adds a local MQTT-to-InfluxDB scaffold:
