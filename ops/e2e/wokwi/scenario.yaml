@@ -1,0 +1,13 @@
+# wokwi-cli automation scenario: passes once the probe has printed a
+# capture line. Requires WOKWI_CLI_TOKEN.
+#   wokwi-cli ops/e2e/wokwi --scenario scenario.yaml \
+#     --serial-log-file serial.log --timeout 90000
+name: LimnoPulse probe prints legacy readings
+version: 1
+author: LimnoPulse
+
+steps:
+  - wait-serial: "LimnoPulse probe local-device-001 booting"
+  - wait-serial: "READING {"
+  - delay: 6000ms
+  - wait-serial: "READING {"

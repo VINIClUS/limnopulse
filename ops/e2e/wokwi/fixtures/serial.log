@@ -1,0 +1,16 @@
+ets Jul 29 2019 12:21:46
+
+rst:0x1 (POWERON_RESET),boot:0x13 (SPI_FAST_FLASH_BOOT)
+configsip: 0, SPIWP:0xee
+mode:DIO, clock div:2
+load:0x3fff0030,len:4832
+entry 0x400805cc
+LimnoPulse probe local-device-001 booting topic=limnopulse/v1/devices/local-device-001/readings
+WIFI connected ip=10.13.37.2
+NTP unavailable; using fallback epoch
+MQTT connect host.wokwi.internal:1883 failed rc=-2
+READING {"ts":"2026-07-09T12:00:10Z","seq":1,"temp_c":25.1,"ph":7.2,"do_mg_l":6.39,"turbidity_ntu":3.13,"salinity_ppt":11.81,"battery_v":3.82,"rssi":-67}
+MQTT connect host.wokwi.internal:1883 failed rc=-2
+READING {"ts":"2026-07-09T12:00:15Z","seq":2,"temp_c":25.1,"ph":7.2,"do_mg_l":6.39,"turbidity_ntu":3.13,"salinity_ppt":11.81,"battery_v":3.82,"rssi":-67}
+MQTT connect host.wokwi.internal:1883 failed rc=-2
+READING {"ts":"2026-07-09T12:00:20Z","seq":3,"temp_c":25.1,"ph":7.2,"do_mg_l":6.39,"turbidity_ntu":3.13,"salinity_ppt":11.81,"battery_v":3.82,"rssi":-67}

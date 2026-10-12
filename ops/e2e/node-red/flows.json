@@ -1,0 +1,406 @@
+[
+    {
+        "id": "m1e2e_tab",
+        "type": "tab",
+        "label": "LimnoPulse M1 e2e verdicts",
+        "disabled": false,
+        "info": "Subscribes to legacy readings, asks the API which deployment owned the device at the reading ts and publishes a verdict to limnopulse/e2e/verdicts. Canonical dev_ ids unknown to /v1 resolve through /v2 only (reason v2-native). Env: LIMNOPULSE_API_URL, LIMNOPULSE_TENANT, MQTT_HOST, MQTT_PORT.",
+        "env": []
+    },
+    {
+        "id": "m1e2e_broker",
+        "type": "mqtt-broker",
+        "name": "limnopulse local broker",
+        "broker": "${MQTT_HOST}",
+        "port": "${MQTT_PORT}",
+        "clientid": "",
+        "autoConnect": true,
+        "usetls": false,
+        "protocolVersion": "4",
+        "keepalive": "60",
+        "cleansession": true,
+        "autoUnsubscribe": true,
+        "birthTopic": "",
+        "birthQos": "0",
+        "birthPayload": "",
+        "birthMsg": {},
+        "closeTopic": "",
+        "closeQos": "0",
+        "closePayload": "",
+        "closeMsg": {},
+        "willTopic": "",
+        "willQos": "0",
+        "willPayload": "",
+        "willMsg": {},
+        "userProps": "",
+        "sessionExpiry": ""
+    },
+    {
+        "id": "m1e2e_in_readings",
+        "type": "mqtt in",
+        "z": "m1e2e_tab",
+        "name": "legacy readings",
+        "topic": "limnopulse/v1/devices/+/readings",
+        "qos": "1",
+        "datatype": "auto-detect",
+        "broker": "m1e2e_broker",
+        "nl": false,
+        "rap": true,
+        "rh": 0,
+        "inputs": 0,
+        "x": 130,
+        "y": 100,
+        "wires": [
+            [
+                "m1e2e_is_object"
+            ]
+        ]
+    },
+    {
+        "id": "m1e2e_is_object",
+        "type": "switch",
+        "z": "m1e2e_tab",
+        "name": "payload is object?",
+        "property": "payload",
+        "propertyType": "msg",
+        "rules": [
+            {
+                "t": "istype",
+                "v": "object",
+                "vt": "object"
+            },
+            {
+                "t": "else"
+            }
+        ],
+        "checkall": "false",
+        "repair": false,
+        "outputs": 2,
+        "x": 330,
+        "y": 100,
+        "wires": [
+            [
+                "m1e2e_prepare"
+            ],
+            [
+                "m1e2e_reject"
+            ]
+        ]
+    },
+    {
+        "id": "m1e2e_prepare",
+        "type": "function",
+        "z": "m1e2e_tab",
+        "name": "prepare v1 device GET",
+        "func": "// Output 1: GET /v1 device request. Output 2: verdict (reading rejected).\nconst EXPECTED_KEYS = [\n    \"battery_v\", \"do_mg_l\", \"ph\", \"rssi\", \"salinity_ppt\",\n    \"seq\", \"temp_c\", \"ts\", \"turbidity_ntu\",\n];\nconst base = String(env.get(\"LIMNOPULSE_API_URL\") || \"http://127.0.0.1:8000\").replace(/\\/+$/, \"\");\nconst tenant = String(env.get(\"LIMNOPULSE_TENANT\") || \"tnt_local_001\");\nconst parts = String(msg.topic || \"\").split(\"/\");\nconst reading = msg.payload;\n\nconst ctx = {\n    base: base,\n    tenant: tenant,\n    device_id: parts.length === 5 && parts[4] === \"readings\" ? parts[3] : null,\n    seq: reading && reading.seq !== undefined ? reading.seq : null,\n    ts: reading && typeof reading.ts === \"string\" ? reading.ts : null,\n    v1_pond_id: null,\n    component_id: null,\n    native: false,\n    resolved_asset_id: null,\n    expected_asset_id: null,\n};\nmsg.e2e = ctx;\n\nfunction verdict(ok, reason) {\n    msg.payload = {\n        device_id: ctx.device_id,\n        seq: ctx.seq,\n        ts: ctx.ts,\n        v1_pond_id: ctx.v1_pond_id,\n        resolved_asset_id: ctx.resolved_asset_id,\n        expected_asset_id: ctx.expected_asset_id,\n        ok: ok,\n        reason: reason,\n    };\n    return [null, msg];\n}\n\nif (!ctx.device_id) {\n    return verdict(false, \"bad-topic\");\n}\nconst keys = Object.keys(reading || {}).sort();\nif (keys.join(\",\") !== EXPECTED_KEYS.join(\",\")) {\n    return verdict(false, \"payload-keys-mismatch\");\n}\nif (!ctx.ts || !Number.isFinite(Date.parse(ctx.ts))) {\n    return verdict(false, \"bad-ts\");\n}\n\nmsg.method = \"GET\";\nmsg.url = base + \"/v1/tenants/\" + encodeURIComponent(tenant) + \"/devices/\" + encodeURIComponent(ctx.device_id);\nmsg.headers = {\n    \"Accept\": \"application/json\",\n    \"X-Dev-User-Sub\": String(env.get(\"LIMNOPULSE_DEV_USER_SUB\") || \"local-user-001\"),\n    \"X-Dev-User-Email\": String(env.get(\"LIMNOPULSE_DEV_USER_EMAIL\") || \"local@example.test\"),\n};\nmsg.payload = undefined;\nreturn [msg, null];\n",
+        "outputs": 2,
+        "timeout": 0,
+        "noerr": 0,
+        "initialize": "",
+        "finalize": "",
+        "libs": [],
+        "x": 550,
+        "y": 100,
+        "wires": [
+            [
+                "m1e2e_http_v1"
+            ],
+            [
+                "m1e2e_verdict_topic"
+            ]
+        ]
+    },
+    {
+        "id": "m1e2e_reject",
+        "type": "function",
+        "z": "m1e2e_tab",
+        "name": "reject non-JSON payload",
+        "func": "// Single output: verdict for a reading whose payload is not a JSON object.\nconst parts = String(msg.topic || \"\").split(\"/\");\nmsg.payload = {\n    device_id: parts.length === 5 ? parts[3] : null,\n    seq: null,\n    ts: null,\n    v1_pond_id: null,\n    resolved_asset_id: null,\n    expected_asset_id: null,\n    ok: false,\n    reason: \"payload-not-json-object\",\n};\nreturn msg;\n",
+        "outputs": 1,
+        "timeout": 0,
+        "noerr": 0,
+        "initialize": "",
+        "finalize": "",
+        "libs": [],
+        "x": 550,
+        "y": 160,
+        "wires": [
+            [
+                "m1e2e_verdict_topic"
+            ]
+        ]
+    },
+    {
+        "id": "m1e2e_http_v1",
+        "type": "http request",
+        "z": "m1e2e_tab",
+        "name": "GET /v1 device",
+        "method": "use",
+        "ret": "txt",
+        "paytoqs": "ignore",
+        "url": "",
+        "tls": "",
+        "persist": false,
+        "proxy": "",
+        "insecureHTTPParser": false,
+        "authType": "",
+        "senderr": false,
+        "headers": [],
+        "x": 780,
+        "y": 100,
+        "wires": [
+            [
+                "m1e2e_after_v1"
+            ]
+        ]
+    },
+    {
+        "id": "m1e2e_after_v1",
+        "type": "function",
+        "z": "m1e2e_tab",
+        "name": "default component + expected asset",
+        "func": "// Output 1: GET /v2 device components request. Output 2: verdict.\n// Legacy devices: /v1 pond -> deterministic default component + expected asset.\n// Native v2 devices (canonical dev_<32hex>, /v1 404): ctx.native = true.\n// Deterministic IDs mirror the Python helpers:\n//   asset_id_for_legacy_pond(t, p) = \"ast_\" + uuid5(NAMESPACE_URL, \"limnopulse/v4/legacy-pond/{t}/{p}\").hex\n//   default_component_id_for_legacy_device(t, d) =\n//       \"cmp_\" + uuid5(NAMESPACE_URL, \"limnopulse/v4/legacy-device-component/{t}/{d}\").hex\nconst ctx = msg.e2e;\n\nfunction verdict(ok, reason) {\n    msg.payload = {\n        device_id: ctx.device_id,\n        seq: ctx.seq,\n        ts: ctx.ts,\n        v1_pond_id: ctx.v1_pond_id,\n        resolved_asset_id: ctx.resolved_asset_id,\n        expected_asset_id: ctx.expected_asset_id,\n        ok: ok,\n        reason: reason,\n    };\n    return [null, msg];\n}\n\nfunction sha1(bytes) {\n    const ml = bytes.length;\n    const withPad = ((ml + 9 + 63) >> 6) << 6;\n    const buf = new Uint8Array(withPad);\n    buf.set(bytes);\n    buf[ml] = 0x80;\n    const bitLen = ml * 8;\n    buf[withPad - 4] = (bitLen >>> 24) & 0xff;\n    buf[withPad - 3] = (bitLen >>> 16) & 0xff;\n    buf[withPad - 2] = (bitLen >>> 8) & 0xff;\n    buf[withPad - 1] = bitLen & 0xff;\n    let h0 = 0x67452301, h1 = 0xefcdab89, h2 = 0x98badcfe, h3 = 0x10325476, h4 = 0xc3d2e1f0;\n    const w = new Array(80);\n    for (let off = 0; off < withPad; off += 64) {\n        for (let i = 0; i < 16; i++) {\n            const j = off + i * 4;\n            w[i] = ((buf[j] << 24) | (buf[j + 1] << 16) | (buf[j + 2] << 8) | buf[j + 3]) | 0;\n        }\n        for (let i = 16; i < 80; i++) {\n            const x = w[i - 3] ^ w[i - 8] ^ w[i - 14] ^ w[i - 16];\n            w[i] = (x << 1) | (x >>> 31);\n        }\n        let a = h0, b = h1, c = h2, d = h3, e = h4;\n        for (let i = 0; i < 80; i++) {\n            let f, k;\n            if (i < 20) { f = (b & c) | (~b & d); k = 0x5a827999; }\n            else if (i < 40) { f = b ^ c ^ d; k = 0x6ed9eba1; }\n            else if (i < 60) { f = (b & c) | (b & d) | (c & d); k = 0x8f1bbcdc; }\n            else { f = b ^ c ^ d; k = 0xca62c1d6; }\n            const t = (((a << 5) | (a >>> 27)) + f + e + k + w[i]) | 0;\n            e = d; d = c; c = (b << 30) | (b >>> 2); b = a; a = t;\n        }\n        h0 = (h0 + a) | 0; h1 = (h1 + b) | 0; h2 = (h2 + c) | 0; h3 = (h3 + d) | 0; h4 = (h4 + e) | 0;\n    }\n    const out = new Uint8Array(20);\n    [h0, h1, h2, h3, h4].forEach(function (h, i) {\n        out[i * 4] = (h >>> 24) & 0xff;\n        out[i * 4 + 1] = (h >>> 16) & 0xff;\n        out[i * 4 + 2] = (h >>> 8) & 0xff;\n        out[i * 4 + 3] = h & 0xff;\n    });\n    return out;\n}\n\nfunction uuid5Hex(name) {\n    // RFC 4122 NAMESPACE_URL 6ba7b811-9dad-11d1-80b4-00c04fd430c8\n    const ns = Buffer.from(\"6ba7b8119dad11d180b400c04fd430c8\", \"hex\");\n    const digest = sha1(Buffer.concat([ns, Buffer.from(name, \"utf8\")]));\n    const b = Array.from(digest.slice(0, 16));\n    b[6] = (b[6] & 0x0f) | 0x50;\n    b[8] = (b[8] & 0x3f) | 0x80;\n    return b.map(function (x) { return (x < 16 ? \"0\" : \"\") + x.toString(16); }).join(\"\");\n}\n\n// HTTP nodes return text (ret \"txt\") so a non-JSON body (e.g. a text/plain\n// 500) never triggers Node-RED's JSON parse warning; parse it here instead.\n// undefined = not JSON.\nfunction parseBody(raw) {\n    if (raw !== null && typeof raw === \"object\" && !Buffer.isBuffer(raw)) return raw;\n    if (raw === undefined || raw === null) return undefined;\n    try {\n        return JSON.parse(Buffer.isBuffer(raw) ? raw.toString(\"utf8\") : String(raw));\n    } catch (e) {\n        return undefined;\n    }\n}\n\nfunction v2Request(path) {\n    msg.method = \"GET\";\n    msg.url = ctx.base + \"/v2/tenants/\" + encodeURIComponent(ctx.tenant) + path;\n    msg.headers = {\n        \"Accept\": \"application/json\",\n        \"X-Dev-User-Sub\": String(env.get(\"LIMNOPULSE_DEV_USER_SUB\") || \"local-user-001\"),\n        \"X-Dev-User-Email\": String(env.get(\"LIMNOPULSE_DEV_USER_EMAIL\") || \"local@example.test\"),\n    };\n    msg.payload = undefined;\n    return [msg, null];\n}\n\n// Canonical v2 device ids; native v2 devices have no /v1 row (404 after M1-05).\nconst CANONICAL_DEVICE_ID = /^dev_[0-9a-f]{32}$/;\nconst body = parseBody(msg.payload);\n\nif (msg.statusCode === 404 && CANONICAL_DEVICE_ID.test(ctx.device_id)) {\n    // Native v2 device: resolve through all of its components instead of the\n    // legacy default component; there is no /v1 pond to cross-check.\n    ctx.native = true;\n    return v2Request(\"/devices/\" + encodeURIComponent(ctx.device_id) + \"/components\");\n}\nif (msg.statusCode === 404) {\n    return verdict(false, \"v1-device-not-found\");\n}\nif (msg.statusCode !== 200 || !body || typeof body !== \"object\" || Array.isArray(body)) {\n    return verdict(false, \"v1-error-\" + String(msg.statusCode));\n}\nif (!body.pond_id) {\n    return verdict(false, \"v1-device-without-pond\");\n}\n\nctx.native = false;\nctx.v1_pond_id = body.pond_id;\nctx.expected_asset_id = \"ast_\" + uuid5Hex(\"limnopulse/v4/legacy-pond/\" + ctx.tenant + \"/\" + ctx.v1_pond_id);\nctx.component_id = \"cmp_\" + uuid5Hex(\"limnopulse/v4/legacy-device-component/\" + ctx.tenant + \"/\" + ctx.device_id);\n\nreturn v2Request(\"/devices/\" + encodeURIComponent(ctx.device_id) + \"/components\");\n",
+        "outputs": 2,
+        "timeout": 0,
+        "noerr": 0,
+        "initialize": "",
+        "finalize": "",
+        "libs": [],
+        "x": 1010,
+        "y": 100,
+        "wires": [
+            [
+                "m1e2e_http_components"
+            ],
+            [
+                "m1e2e_verdict_topic"
+            ]
+        ]
+    },
+    {
+        "id": "m1e2e_http_components",
+        "type": "http request",
+        "z": "m1e2e_tab",
+        "name": "GET /v2 device components",
+        "method": "use",
+        "ret": "txt",
+        "paytoqs": "ignore",
+        "url": "",
+        "tls": "",
+        "persist": false,
+        "proxy": "",
+        "insecureHTTPParser": false,
+        "authType": "",
+        "senderr": false,
+        "headers": [],
+        "x": 200,
+        "y": 260,
+        "wires": [
+            [
+                "m1e2e_after_components"
+            ]
+        ]
+    },
+    {
+        "id": "m1e2e_after_components",
+        "type": "function",
+        "z": "m1e2e_tab",
+        "name": "check default component",
+        "func": "// Output 1: GET /v2 deployments request. Output 2: verdict.\n// Legacy devices: the deterministic default component must be listed.\n// Native v2 devices (ctx.native): every component is a candidate; their\n// deployments are walked one by one by resolve_deployment.js.\nconst ctx = msg.e2e;\n\nfunction verdict(ok, reason) {\n    msg.payload = {\n        device_id: ctx.device_id,\n        seq: ctx.seq,\n        ts: ctx.ts,\n        v1_pond_id: ctx.v1_pond_id,\n        resolved_asset_id: ctx.resolved_asset_id,\n        expected_asset_id: ctx.expected_asset_id,\n        ok: ok,\n        reason: reason,\n    };\n    return [null, msg];\n}\n\n// HTTP nodes return text; undefined = body is not JSON.\nfunction parseBody(raw) {\n    if (raw !== null && typeof raw === \"object\" && !Buffer.isBuffer(raw)) return raw;\n    if (raw === undefined || raw === null) return undefined;\n    try {\n        return JSON.parse(Buffer.isBuffer(raw) ? raw.toString(\"utf8\") : String(raw));\n    } catch (e) {\n        return undefined;\n    }\n}\n\n// /v2 is \"unavailable\" when the route is not mounted (Starlette's default\n// 404 body), the flag rejects it (501/503), or the API answers 404 with an\n// explicit disabled marker. Any other non-200 is a real failure.\nfunction v2Unavailable(status, body) {\n    if (status === 501 || status === 503) return true;\n    if (status !== 404) return false;\n    const detail = body && typeof body === \"object\" ? body.detail : body;\n    if (detail === \"Not Found\") return true;\n    return typeof detail === \"string\" && /v2|disabled/i.test(detail);\n}\n\nfunction items(body, key) {\n    if (Array.isArray(body)) return body;\n    if (body && Array.isArray(body.items)) return body.items;\n    if (body && Array.isArray(body[key])) return body[key];\n    return null;\n}\n\nconst body = parseBody(msg.payload);\nif (v2Unavailable(msg.statusCode, body)) {\n    return verdict(null, \"v2-unavailable\");\n}\nif (ctx.native && msg.statusCode === 404) {\n    return verdict(false, \"v2-native-device-not-found\");\n}\nif (msg.statusCode !== 200) {\n    return verdict(false, \"v2-components-error-\" + String(msg.statusCode));\n}\nconst components = items(body, \"components\");\nif (components === null) {\n    return verdict(false, \"v2-components-bad-body\");\n}\nconst ids = components\n    .map(function (c) { return c && (c.component_id || c.id); })\n    .filter(function (id) { return typeof id === \"string\" && id.length > 0; });\n\nif (ctx.native) {\n    if (ids.length === 0) {\n        return verdict(false, \"v2-native-no-components\");\n    }\n    ctx.component_id = ids[0];\n    ctx.pending_component_ids = ids.slice(1);\n    ctx.native_matches = [];\n} else if (ids.indexOf(ctx.component_id) === -1) {\n    return verdict(false, \"default-component-missing\");\n}\n\nmsg.method = \"GET\";\nmsg.url = ctx.base + \"/v2/tenants/\" + encodeURIComponent(ctx.tenant) +\n    \"/deployments?component_id=\" + encodeURIComponent(ctx.component_id);\nmsg.headers = {\n    \"Accept\": \"application/json\",\n    \"X-Dev-User-Sub\": String(env.get(\"LIMNOPULSE_DEV_USER_SUB\") || \"local-user-001\"),\n    \"X-Dev-User-Email\": String(env.get(\"LIMNOPULSE_DEV_USER_EMAIL\") || \"local@example.test\"),\n};\nmsg.payload = undefined;\nreturn [msg, null];\n",
+        "outputs": 2,
+        "timeout": 0,
+        "noerr": 0,
+        "initialize": "",
+        "finalize": "",
+        "libs": [],
+        "x": 450,
+        "y": 260,
+        "wires": [
+            [
+                "m1e2e_http_deployments"
+            ],
+            [
+                "m1e2e_verdict_topic"
+            ]
+        ]
+    },
+    {
+        "id": "m1e2e_http_deployments",
+        "type": "http request",
+        "z": "m1e2e_tab",
+        "name": "GET /v2 deployments",
+        "method": "use",
+        "ret": "txt",
+        "paytoqs": "ignore",
+        "url": "",
+        "tls": "",
+        "persist": false,
+        "proxy": "",
+        "insecureHTTPParser": false,
+        "authType": "",
+        "senderr": false,
+        "headers": [],
+        "x": 690,
+        "y": 260,
+        "wires": [
+            [
+                "m1e2e_resolve"
+            ]
+        ]
+    },
+    {
+        "id": "m1e2e_resolve",
+        "type": "function",
+        "z": "m1e2e_tab",
+        "name": "resolve [started_at, ended_at)",
+        "func": "// Output 1: GET /v2 asset request. Output 2: verdict.\n// Output 3: GET /v2 deployments for the next component (native devices only).\n// Resolves the deployment whose half-open interval [started_at, ended_at)\n// contains the reading ts (ended_at null = still open).\nconst ctx = msg.e2e;\n\nfunction verdict(ok, reason) {\n    msg.payload = {\n        device_id: ctx.device_id,\n        seq: ctx.seq,\n        ts: ctx.ts,\n        v1_pond_id: ctx.v1_pond_id,\n        resolved_asset_id: ctx.resolved_asset_id,\n        expected_asset_id: ctx.expected_asset_id,\n        ok: ok,\n        reason: reason,\n    };\n    return [null, msg, null];\n}\n\n// HTTP nodes return text; undefined = body is not JSON.\nfunction parseBody(raw) {\n    if (raw !== null && typeof raw === \"object\" && !Buffer.isBuffer(raw)) return raw;\n    if (raw === undefined || raw === null) return undefined;\n    try {\n        return JSON.parse(Buffer.isBuffer(raw) ? raw.toString(\"utf8\") : String(raw));\n    } catch (e) {\n        return undefined;\n    }\n}\n\nfunction v2Unavailable(status, body) {\n    if (status === 501 || status === 503) return true;\n    if (status !== 404) return false;\n    const detail = body && typeof body === \"object\" ? body.detail : body;\n    if (detail === \"Not Found\") return true;\n    return typeof detail === \"string\" && /v2|disabled/i.test(detail);\n}\n\nfunction items(body, key) {\n    if (Array.isArray(body)) return body;\n    if (body && Array.isArray(body.items)) return body.items;\n    if (body && Array.isArray(body[key])) return body[key];\n    return null;\n}\n\nfunction headers() {\n    return {\n        \"Accept\": \"application/json\",\n        \"X-Dev-User-Sub\": String(env.get(\"LIMNOPULSE_DEV_USER_SUB\") || \"local-user-001\"),\n        \"X-Dev-User-Email\": String(env.get(\"LIMNOPULSE_DEV_USER_EMAIL\") || \"local@example.test\"),\n    };\n}\n\nconst prefix = ctx.native ? \"v2-native-\" : \"\";\nconst body = parseBody(msg.payload);\nif (v2Unavailable(msg.statusCode, body)) {\n    return verdict(null, \"v2-unavailable\");\n}\nif (msg.statusCode !== 200) {\n    return verdict(false, \"v2-deployments-error-\" + String(msg.statusCode));\n}\nconst deployments = items(body, \"deployments\");\nif (deployments === null) {\n    return verdict(false, \"v2-deployments-bad-body\");\n}\n\nconst tsMs = Date.parse(ctx.ts);\nconst matches = deployments.filter(function (d) {\n    if (!d || d.component_id !== ctx.component_id) return false;\n    const start = Date.parse(d.started_at);\n    if (!Number.isFinite(start)) return false;\n    const end = d.ended_at === null || d.ended_at === undefined ? Infinity : Date.parse(d.ended_at);\n    return start <= tsMs && tsMs < end;\n});\n\nif (matches.length > 1) {\n    return verdict(false, prefix + \"overlapping-deployments\");\n}\n\nlet match = matches[0];\nif (ctx.native) {\n    if (match) {\n        ctx.native_matches.push({\n            component_id: ctx.component_id,\n            deployment_id: match.deployment_id || null,\n            asset_id: match.asset_id || null,\n            ended: match.ended_at !== null && match.ended_at !== undefined,\n        });\n    }\n    if (ctx.pending_component_ids.length > 0) {\n        ctx.component_id = ctx.pending_component_ids.shift();\n        msg.method = \"GET\";\n        msg.url = ctx.base + \"/v2/tenants/\" + encodeURIComponent(ctx.tenant) +\n            \"/deployments?component_id=\" + encodeURIComponent(ctx.component_id);\n        msg.headers = headers();\n        msg.payload = undefined;\n        return [null, null, msg];\n    }\n    const assets = ctx.native_matches\n        .map(function (m) { return m.asset_id; })\n        .filter(function (a, i, all) { return all.indexOf(a) === i; });\n    if (assets.length === 0) {\n        return verdict(false, \"v2-native-no-deployment-for-ts\");\n    }\n    if (assets.length > 1) {\n        return verdict(false, \"v2-native-ambiguous-assets\");\n    }\n    match = ctx.native_matches[0];\n    ctx.component_id = match.component_id;\n} else if (!match) {\n    return verdict(false, \"no-deployment-for-ts\");\n}\n\nctx.resolved_asset_id = match.asset_id || null;\nctx.deployment_id = match.deployment_id || null;\nctx.deployment_ended = ctx.native ? match.ended :\n    match.ended_at !== null && match.ended_at !== undefined;\nif (!ctx.resolved_asset_id) {\n    return verdict(false, prefix + \"deployment-without-asset\");\n}\n\nmsg.method = \"GET\";\nmsg.url = ctx.base + \"/v2/tenants/\" + encodeURIComponent(ctx.tenant) + \"/assets/\" +\n    encodeURIComponent(ctx.resolved_asset_id);\nmsg.headers = headers();\nmsg.payload = undefined;\nreturn [msg, null, null];\n",
+        "outputs": 3,
+        "timeout": 0,
+        "noerr": 0,
+        "initialize": "",
+        "finalize": "",
+        "libs": [],
+        "x": 920,
+        "y": 260,
+        "wires": [
+            [
+                "m1e2e_http_asset"
+            ],
+            [
+                "m1e2e_verdict_topic"
+            ],
+            [
+                "m1e2e_http_deployments"
+            ]
+        ]
+    },
+    {
+        "id": "m1e2e_http_asset",
+        "type": "http request",
+        "z": "m1e2e_tab",
+        "name": "GET /v2 asset",
+        "method": "use",
+        "ret": "txt",
+        "paytoqs": "ignore",
+        "url": "",
+        "tls": "",
+        "persist": false,
+        "proxy": "",
+        "insecureHTTPParser": false,
+        "authType": "",
+        "senderr": false,
+        "headers": [],
+        "x": 200,
+        "y": 380,
+        "wires": [
+            [
+                "m1e2e_final"
+            ]
+        ]
+    },
+    {
+        "id": "m1e2e_final",
+        "type": "function",
+        "z": "m1e2e_tab",
+        "name": "final verdict",
+        "func": "// Single output: verdict. Legacy devices: cross-checks the resolved asset\n// against the deterministic legacy-pond asset id and the pond profile's\n// legacy_pond_id. Native v2 devices: the resolved asset must exist; there is\n// no /v1 pond to compare with, so expected_asset_id and v1_pond_id stay null.\nconst ctx = msg.e2e;\n\nfunction verdict(ok, reason) {\n    msg.payload = {\n        device_id: ctx.device_id,\n        seq: ctx.seq,\n        ts: ctx.ts,\n        v1_pond_id: ctx.v1_pond_id,\n        resolved_asset_id: ctx.resolved_asset_id,\n        expected_asset_id: ctx.expected_asset_id,\n        ok: ok,\n        reason: reason,\n    };\n    return msg;\n}\n\n// HTTP nodes return text; undefined = body is not JSON.\nfunction parseBody(raw) {\n    if (raw !== null && typeof raw === \"object\" && !Buffer.isBuffer(raw)) return raw;\n    if (raw === undefined || raw === null) return undefined;\n    try {\n        return JSON.parse(Buffer.isBuffer(raw) ? raw.toString(\"utf8\") : String(raw));\n    } catch (e) {\n        return undefined;\n    }\n}\n\nfunction legacyPondId(asset) {\n    if (!asset || typeof asset !== \"object\") return undefined;\n    if (asset.legacy_pond_id !== undefined) return asset.legacy_pond_id;\n    const candidates = [asset.profile, asset.pond_profile, asset.pond, asset.profiles && asset.profiles.pond];\n    for (let i = 0; i < candidates.length; i++) {\n        const p = candidates[i];\n        if (p && typeof p === \"object\" && p.legacy_pond_id !== undefined) return p.legacy_pond_id;\n    }\n    return undefined;\n}\n\nconst body = parseBody(msg.payload);\nif (ctx.native) {\n    if (msg.statusCode !== 200 || !body || typeof body !== \"object\") {\n        return verdict(false, \"v2-native-asset-lookup-error-\" + String(msg.statusCode));\n    }\n    const assetId = body.asset_id || (body.asset && body.asset.asset_id);\n    if (assetId !== ctx.resolved_asset_id) {\n        return verdict(false, \"v2-native-asset-mismatch\");\n    }\n    return verdict(true, \"v2-native\");\n}\n\nif (msg.statusCode !== 200) {\n    return verdict(false, \"asset-lookup-error-\" + String(msg.statusCode));\n}\nif (ctx.resolved_asset_id !== ctx.expected_asset_id) {\n    // An ended deployment means the reading predates a relocation: the\n    // expected asset (from the device's current /v1 pond) no longer applies.\n    return verdict(false, ctx.deployment_ended ? \"asset-mismatch-ended-deployment\" : \"asset-mismatch\");\n}\nconst legacy = legacyPondId(body);\nif (legacy === undefined) {\n    return verdict(false, \"asset-without-legacy-pond-id\");\n}\nif (legacy !== ctx.v1_pond_id) {\n    return verdict(false, \"legacy-pond-mismatch\");\n}\nreturn verdict(true, \"match\");\n",
+        "outputs": 1,
+        "timeout": 0,
+        "noerr": 0,
+        "initialize": "",
+        "finalize": "",
+        "libs": [],
+        "x": 400,
+        "y": 380,
+        "wires": [
+            [
+                "m1e2e_verdict_topic"
+            ]
+        ]
+    },
+    {
+        "id": "m1e2e_verdict_topic",
+        "type": "change",
+        "z": "m1e2e_tab",
+        "name": "verdict topic",
+        "rules": [
+            {
+                "t": "set",
+                "p": "topic",
+                "pt": "msg",
+                "to": "limnopulse/e2e/verdicts",
+                "tot": "str"
+            },
+            {
+                "t": "delete",
+                "p": "e2e",
+                "pt": "msg"
+            },
+            {
+                "t": "delete",
+                "p": "headers",
+                "pt": "msg"
+            },
+            {
+                "t": "delete",
+                "p": "url",
+                "pt": "msg"
+            },
+            {
+                "t": "delete",
+                "p": "method",
+                "pt": "msg"
+            },
+            {
+                "t": "delete",
+                "p": "statusCode",
+                "pt": "msg"
+            },
+            {
+                "t": "delete",
+                "p": "responseUrl",
+                "pt": "msg"
+            },
+            {
+                "t": "delete",
+                "p": "redirectList",
+                "pt": "msg"
+            },
+            {
+                "t": "delete",
+                "p": "retain",
+                "pt": "msg"
+            }
+        ],
+        "action": "",
+        "property": "",
+        "from": "",
+        "to": "",
+        "reg": false,
+        "x": 640,
+        "y": 380,
+        "wires": [
+            [
+                "m1e2e_out_verdicts"
+            ]
+        ]
+    },
+    {
+        "id": "m1e2e_out_verdicts",
+        "type": "mqtt out",
+        "z": "m1e2e_tab",
+        "name": "verdicts",
+        "topic": "",
+        "qos": "1",
+        "retain": "false",
+        "respTopic": "",
+        "contentType": "",
+        "userProps": "",
+        "correl": "",
+        "expiry": "",
+        "broker": "m1e2e_broker",
+        "x": 840,
+        "y": 380,
+        "wires": []
+    }
+]

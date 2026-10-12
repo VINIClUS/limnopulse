@@ -40,3 +40,51 @@ credential-free does not mean offline.
 Passing these checks does not establish AWS sandbox or production readiness.
 Cloud deployment, remote-state configuration, environment smoke tests, and
 operational readiness remain a later gate.
+
+## Optional M1 end-to-end harness
+
+`ops/e2e/` holds an opt-in end-to-end check for the M1 Site/Asset/Deployment
+model. It is not part of `make verify` and it does not start services by
+itself. Readings are published with MQTTX (directly, or replayed from a Wokwi
+serial log by `ops/e2e/wokwi/replay.py`), a headless Node-RED flow
+(`ops/e2e/node-red/flows.json`, generated from `functions/*.js` by
+`build_flows.py`) asks the API which deployment owned the device at the
+reading's `ts`, and every reading yields one verdict on
+`limnopulse/e2e/verdicts`. Legacy devices resolve through `/v1` and the
+deterministic default component (reason `match`); canonical `dev_` devices
+unknown to `/v1` resolve through `/v2` only (reason `v2-native`).
+
+To run it locally, start the compose dependencies, initialize and seed
+DynamoDB, run the M1 backfill
+(`python -m scripts.migrations.m1_backfill_default_site_assets --tenant
+tnt_local_001`, then again with `--apply`), and start the API with
+`API_V2_ENABLED=true` and `V1_POND_DEVICE_PROJECTION_ENABLED=true`. With
+`node-red`, `mqttx` and `curl` on `PATH`, run:
+
+```
+LIMNOPULSE_API_URL=http://127.0.0.1:8000 bash ops/e2e/run_m1_e2e.sh
+RUN_M1_E2E=1 uv run --locked --extra dev pytest -q tests/e2e/test_m1_e2e_stack.py
+```
+
+Besides the replayed readings for `local-device-001`, the harness creates a
+pond and a new device through `/v1`, moves that device West to East and
+expects its readings before and after the move to resolve to each pond's
+asset, and creates a native `/v2` device with a deployment. These writes stay
+in the table, so use a disposable one (`DYNAMODB_DOMAIN_TABLE`).
+`ALLOW_V2_UNAVAILABLE=1` accepts `ok=null` verdicts while `/v2` is off; the
+default is strict.
+
+Telegraf limitation: Telegraf enriches readings from the static registry in
+`infra/telegraf/device_registry.star`, which only knows `local-device-001`.
+Readings of the devices the harness creates reach the verdict flow but are not
+ingested into Influx, and `local-device-001` is never moved. Registry-driven
+or `/v2`-driven enrichment is P2/P3 work and out of scope for M1.
+
+The `e2e-m1` workflow (`.github/workflows/e2e-m1.yml`) runs on manual dispatch
+and on a weekly schedule only. `ops/e2e/ci_stack.sh up` starts the compose
+dependencies on the disposable runner, seeds, runs the M1 backfill (dry-run,
+apply, apply again) and starts the API with both M1 flags. The run is strict
+unless the dispatch input `allow_v2_unavailable` or the repository variable
+`M1_E2E_ALLOW_V2_UNAVAILABLE=1` is set. The optional `wokwi` job compiles and
+simulates the probe sketch and replays its serial output, and it runs only
+when the `WOKWI_CLI_TOKEN` secret is configured.
