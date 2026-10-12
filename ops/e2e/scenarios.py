@@ -244,7 +244,11 @@ class Harness:
         return items
 
     def check(self, verdict: dict, *, reason: str, resolved: str, v1_pond_id: str | None) -> None:
-        if verdict.get("ok") is None and self.args.allow_v2_unavailable:
+        if (
+            verdict.get("ok") is None
+            and verdict.get("reason") == "v2-unavailable"
+            and self.args.allow_v2_unavailable
+        ):
             self.log(f"seq={verdict.get('seq')} ok=null accepted (--allow-v2-unavailable)")
             return
         problems = []

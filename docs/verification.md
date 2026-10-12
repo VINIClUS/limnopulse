@@ -76,9 +76,9 @@ default is strict.
 
 The harness runs from the repository root and keeps its run files (Node-RED
 user directory, MQTTX capture, verdicts, CI logs) in the ignored `.e2e-out/`
-directory. Its Python tools only read and write files inside the working
-directory, so `E2E_WORK_DIR` and `WOKWI_SERIAL_LOG` must point inside the
-repository. Each published reading is identified by its device, `seq` and
+directory. `E2E_WORK_DIR` is deleted and recreated on every run, so it must be
+a subdirectory of `.e2e-out/`; the Python tools only read files inside the
+working directory, so `WOKWI_SERIAL_LOG` must point inside the repository. Each published reading is identified by its device, `seq` and
 `ts`, and must get exactly one verdict; duplicates from QoS-1 redelivery are
 accepted only when they agree.
 

@@ -1021,6 +1021,7 @@ def test_run_script_expects_every_published_reading() -> None:
     assert "--jsonl-out" not in runner
     assert '--expect "$' not in runner
     assert 'WORK="$(realpath -m -- "${E2E_WORK_DIR:-$ROOT/.e2e-out/m1-e2e}")"' in runner
+    assert '"$ROOT"/.e2e-out/?*) ;;' in runner
     assert 'cd "$ROOT"' in runner
 
 
@@ -1168,3 +1169,77 @@ def test_summarize_jsonl_prints_selected_verdicts_without_writing_files(
     lines = capsys.readouterr().out.splitlines()
     assert [json.loads(line)["device_id"] for line in lines] == ["a"]
     assert sorted(p.name for p in tmp_path.iterdir()) == ["v.raw"]
+
+
+@pytest.mark.parametrize(
+    ("body", "ok", "reason"),
+    [
+        (
+            '{"asset_id":"ast_other","pond_profile":{"legacy_pond_id":"pond_a"}}',
+            False,
+            "asset-response-mismatch",
+        ),
+        ('{"pond_profile":{"legacy_pond_id":"pond_a"}}', False, "asset-response-mismatch"),
+        ("not json", False, "asset-lookup-error-200"),
+        ('{"asset_id":"ast_1","pond_profile":{"legacy_pond_id":"pond_a"}}', True, "match"),
+    ],
+)
+def test_node_function_legacy_final_verdict_checks_the_returned_asset(
+    body: str, ok: bool, reason: str
+) -> None:
+    ctx = _ctx(v1_pond_id="pond_a", resolved_asset_id="ast_1", expected_asset_id="ast_1")
+    out = _run_function("final_verdict.js", {"e2e": ctx, "statusCode": 200, "payload": body})
+
+    assert (out[0]["payload"]["ok"], out[0]["payload"]["reason"]) == (ok, reason)
+
+
+@pytest.mark.parametrize(("reason", "code"), [("v2-unavailable", 0), ("something-else", 1)])
+def test_summarize_allow_mode_only_excuses_v2_unavailable(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, reason: str, code: int
+) -> None:
+    monkeypatch.chdir(tmp_path)
+    summarize = _load("m1_e2e_summarize_allow", E2E / "summarize_verdicts.py")
+    keys = dict.fromkeys(summarize.VERDICT_KEYS)
+    (tmp_path / "v.raw").write_text(
+        json.dumps({**keys, "device_id": "a", "seq": 1, "ts": "t", "ok": None, "reason": reason})
+    )
+
+    assert summarize.main(["--raw", "v.raw", "--allow-v2-unavailable"]) == code
+
+
+@pytest.mark.parametrize(("reason", "accepted"), [("v2-unavailable", True), ("other", False)])
+def test_scenario_check_allow_mode_only_excuses_v2_unavailable(reason: str, accepted: bool) -> None:
+    from types import SimpleNamespace
+
+    scenarios = _load("m1_e2e_scenarios_allow", E2E / "scenarios.py")
+    harness = SimpleNamespace(
+        args=SimpleNamespace(allow_v2_unavailable=True), log=lambda message: None
+    )
+    verdict = {"seq": 1, "ok": None, "reason": reason}
+
+    def run() -> None:
+        scenarios.Harness.check(harness, verdict, reason="match", resolved="ast_1", v1_pond_id="p")
+
+    if accepted:
+        run()
+    else:
+        with pytest.raises(scenarios.ScenarioError):
+            run()
+
+
+@pytest.mark.parametrize("work", ["ops/e2e", "src", ".git", ".e2e-out", "../elsewhere"])
+def test_run_script_refuses_work_dirs_outside_e2e_out(work: str) -> None:
+    root = E2E.parents[1]
+    result = subprocess.run(
+        ["bash", str(E2E / "run_m1_e2e.sh")],
+        cwd=root,
+        env={"PATH": "/usr/bin:/bin", "E2E_WORK_DIR": str(root / work)},
+        capture_output=True,
+        text=True,
+        timeout=30,
+        check=False,
+    )
+
+    assert result.returncode == 2
+    assert "must be a subdirectory of" in result.stderr
+    assert (root / "ops" / "e2e").is_dir() and (root / "src").is_dir()

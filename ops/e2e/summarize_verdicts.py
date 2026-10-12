@@ -71,6 +71,7 @@ def parse_stream(text: str) -> list[dict]:
 
 
 MAX_RAW_BYTES = 16 * 1024 * 1024
+V2_UNAVAILABLE = "v2-unavailable"
 # A verdict "agrees" with a duplicate (QoS-1 redelivery) when these match.
 AGREEMENT_KEYS = ("ok", "reason", "resolved_asset_id", "expected_asset_id", "v1_pond_id")
 
@@ -182,7 +183,8 @@ def main(argv: list[str] | None = None) -> int:
         ok = v.get("ok")
         if ok is None:
             unavailable += 1
-            if not args.allow_v2_unavailable:
+            # --allow-v2-unavailable only excuses the flow's v2-unavailable verdict.
+            if not (args.allow_v2_unavailable and v.get("reason") == V2_UNAVAILABLE):
                 failures += 1
         elif ok is not True:
             failures += 1

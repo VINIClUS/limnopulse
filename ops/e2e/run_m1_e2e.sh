@@ -16,9 +16,10 @@
 #   LIMNOPULSE_API_URL=http://127.0.0.1:8000  LIMNOPULSE_TENANT=tnt_local_001
 #   MQTT_HOST=127.0.0.1  MQTT_PORT=1883       E2E_DEVICE_ID=local-device-001
 #   NODE_RED_PORT=18800  E2E_TIMEOUT=45
-#   E2E_WORK_DIR=<repo>/.e2e-out/m1-e2e  (must stay inside the repository: the
-#                          Python tools only read and write files under the
-#                          working directory, which is the repository root)
+#   E2E_WORK_DIR=<repo>/.e2e-out/m1-e2e  (must be a subdirectory of
+#                          <repo>/.e2e-out: it is deleted and recreated on
+#                          every run, and the Python tools only read files
+#                          under the repository root)
 #   WOKWI_SERIAL_LOG=<path> (else ops/e2e/wokwi/serial.log, else the fixture)
 #   E2E_TS_MODE=now        (keep = publish the logged ts unchanged)
 #   ALLOW_V2_UNAVAILABLE=0  (1 accepts ok=null / reason v2-unavailable)
@@ -47,10 +48,12 @@ PYTHON="${PYTHON:-python3}"
 NODE_RED_BIN="${NODE_RED_BIN:-node-red}"
 MQTTX_BIN="${MQTTX_BIN:-mqttx}"
 WORK="$(realpath -m -- "${E2E_WORK_DIR:-$ROOT/.e2e-out/m1-e2e}")"
+# The run deletes $WORK recursively, so it may only live in the ignored
+# .e2e-out/ tree, never in source or repository metadata.
 case "$WORK" in
-  "$ROOT"/?*) ;;
+  "$ROOT"/.e2e-out/?*) ;;
   *)
-    printf '[m1-e2e] E2E_WORK_DIR must be inside the repository (%s): %s\n' "$ROOT" "$WORK" >&2
+    printf '[m1-e2e] E2E_WORK_DIR must be a subdirectory of %s/.e2e-out: %s\n' "$ROOT" "$WORK" >&2
     exit 2
     ;;
 esac

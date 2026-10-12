@@ -52,8 +52,12 @@ if (ctx.native) {
     return verdict(true, "v2-native");
 }
 
-if (msg.statusCode !== 200) {
+if (msg.statusCode !== 200 || !body || typeof body !== "object") {
     return verdict(false, "asset-lookup-error-" + String(msg.statusCode));
+}
+const legacyAssetId = body.asset_id || (body.asset && body.asset.asset_id);
+if (legacyAssetId !== ctx.resolved_asset_id) {
+    return verdict(false, "asset-response-mismatch");
 }
 if (ctx.resolved_asset_id !== ctx.expected_asset_id) {
     // An ended deployment means the reading predates a relocation: the
