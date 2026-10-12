@@ -15,7 +15,12 @@ from limnopulse_api.adapters.dynamodb_v2 import (
     parse_canonical_timestamp,
 )
 from limnopulse_api.core.errors import ConflictError
-from limnopulse_api.domain.integrations import DeviceIntegration, IntegrationAccount
+from limnopulse_api.domain.devices_v2 import DeviceStatus
+from limnopulse_api.domain.integrations import (
+    DeviceIntegration,
+    IntegrationAccount,
+    IntegrationAccountStatus,
+)
 from limnopulse_api.domain.v2_common import IdempotencyReceipt
 
 INTEGRATION_ACCOUNT_ENTITY_TYPE = "integration_account"
@@ -26,6 +31,8 @@ _ACCOUNT_RECEIPT_INDEX = 1
 _INTEGRATION_ROW_INDEX = 0
 _LOOKUP_INDEX = 1
 _INTEGRATION_RECEIPT_INDEX = 2
+_ACCOUNT_CHECK_INDEX = 3
+_DEVICE_CHECK_INDEX = 4
 
 _IDEMPOTENCY_CONFLICT = "idempotency key already used"
 
@@ -137,7 +144,9 @@ class DynamoIntegrationRepository(DynamoV2RepositoryBase):
 
     async def list_integration_accounts(self, tenant_id: str) -> list[IntegrationAccount]:
         items = await self.query_prefix(
-            self.keys.tenant_partition(tenant_id), self.keys.INTEGRATION_ACCOUNT_PREFIX
+            self.keys.tenant_partition(tenant_id),
+            self.keys.INTEGRATION_ACCOUNT_PREFIX,
+            consistent=True,
         )
         return [
             integration_account_from_item(item)
@@ -164,7 +173,9 @@ class DynamoIntegrationRepository(DynamoV2RepositoryBase):
         self, tenant_id: str, device_id: str
     ) -> list[DeviceIntegration]:
         items = await self.query_prefix(
-            self.keys.tenant_partition(tenant_id), self.keys.DEVICE_INTEGRATION_PREFIX
+            self.keys.tenant_partition(tenant_id),
+            self.keys.DEVICE_INTEGRATION_PREFIX,
+            consistent=True,
         )
         return [
             device_integration_from_item(item)
@@ -180,6 +191,29 @@ class DynamoIntegrationRepository(DynamoV2RepositoryBase):
             {"Put": self.put_new_request(device_integration_to_item(integration, self.keys))},
             {"Put": self.put_new_request(external_identity_lookup_to_item(integration, self.keys))},
             {"Put": self.receipt_put_request(receipt)},
+            # Parent status is fenced at commit time, not only by the service's earlier reads.
+            {
+                "ConditionCheck": self.condition_check_request(
+                    self.keys.integration_account(
+                        integration.tenant_id, integration.integration_account_id
+                    ),
+                    condition="attribute_exists(PK) AND #status IN (:pending, :active)",
+                    names={"#status": "status"},
+                    values={
+                        ":pending": IntegrationAccountStatus.PENDING.value,
+                        ":active": IntegrationAccountStatus.ACTIVE.value,
+                    },
+                )
+            },
+            {
+                # Legacy Device rows share this key and carry status "active".
+                "ConditionCheck": self.condition_check_request(
+                    self.keys.device(integration.tenant_id, integration.device_id),
+                    condition="attribute_exists(PK) AND #status <> :decommissioned",
+                    names={"#status": "status"},
+                    values={":decommissioned": DeviceStatus.DECOMMISSIONED.value},
+                )
+            },
         ]
         try:
             await self.transact_write(actions)
@@ -188,6 +222,10 @@ class DynamoIntegrationRepository(DynamoV2RepositoryBase):
             # the receipt wins so the service can reread it and replay the stored snapshot.
             if _INTEGRATION_RECEIPT_INDEX in exc.failed_indexes:
                 raise ConflictError(_IDEMPOTENCY_CONFLICT) from exc
+            if _ACCOUNT_CHECK_INDEX in exc.failed_indexes:
+                raise ConflictError("integration account is not provisionable") from exc
+            if _DEVICE_CHECK_INDEX in exc.failed_indexes:
+                raise ConflictError("device is decommissioned") from exc
             if _LOOKUP_INDEX in exc.failed_indexes:
                 raise ConflictError("external identity already claimed") from exc
             raise ConflictError("device integration already exists") from exc

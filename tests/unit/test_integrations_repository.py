@@ -137,7 +137,7 @@ def transaction_item_keys(client: FakeDynamoClient) -> list[tuple[str, str]]:
     deserializer = TypeDeserializer()
     keys = []
     for action in client.transaction():
-        item = action["Put"]["Item"]
+        item = action["Put"]["Item"] if "Put" in action else action["ConditionCheck"]["Key"]
         keys.append((deserializer.deserialize(item["PK"]), deserializer.deserialize(item["SK"])))
     return keys
 
@@ -147,6 +147,7 @@ def transaction_items(client: FakeDynamoClient) -> list[dict]:
     return [
         {key: deserializer.deserialize(value) for key, value in action["Put"]["Item"].items()}
         for action in client.transaction()
+        if "Put" in action
     ]
 
 
@@ -168,11 +169,27 @@ async def test_device_integration_claims_external_identity_once() -> None:
         (f"TENANT#{TENANT}", f"DEVICE_INTEGRATION#{INTEGRATION_ID}"),
         (f"EXTERNAL_ID#vendor.cloud#{IDENTITY_HASH}", "META"),
         (f"TENANT#{TENANT}", f"IDEMPOTENCY#device-integration-create#{KEY_HASH}"),
+        (f"TENANT#{TENANT}", f"INTEGRATION_ACCOUNT#{ACCOUNT_ID}"),
+        (f"TENANT#{TENANT}", f"DEVICE#{DEVICE_ID}"),
     ]
     actions = client.transaction()
     assert actions[0]["Put"]["ConditionExpression"] == "attribute_not_exists(PK)"
     assert actions[1]["Put"]["ConditionExpression"] == "attribute_not_exists(PK)"
     assert "expires_at" in actions[2]["Put"]["ConditionExpression"]
+    account_check = actions[3]["ConditionCheck"]
+    assert account_check["ConditionExpression"] == (
+        "attribute_exists(PK) AND #status IN (:pending, :active)"
+    )
+    assert account_check["ExpressionAttributeNames"] == {"#status": "status"}
+    assert account_check["ExpressionAttributeValues"] == {
+        ":pending": {"S": "pending"},
+        ":active": {"S": "active"},
+    }
+    device_check = actions[4]["ConditionCheck"]
+    assert device_check["ConditionExpression"] == (
+        "attribute_exists(PK) AND #status <> :decommissioned"
+    )
+    assert device_check["ExpressionAttributeValues"] == {":decommissioned": {"S": "decommissioned"}}
     assert "external_identity" not in flatten_transaction(client).replace(
         "external_identity_hash", ""
     )
@@ -184,6 +201,7 @@ async def test_external_identity_lookup_holds_only_routing_metadata() -> None:
     await repository(client).create_device_integration(device_integration(), receipt())
 
     tenant_row, lookup, receipt_row = transaction_items(client)
+    assert len(client.transaction()) == 5
     assert lookup == {
         "PK": f"EXTERNAL_ID#vendor.cloud#{IDENTITY_HASH}",
         "SK": "META",
@@ -214,7 +232,7 @@ async def test_no_raw_identity_in_any_serialized_transaction_item() -> None:
 
 @pytest.mark.asyncio
 async def test_external_identity_collision_maps_to_conflict() -> None:
-    client = FakeDynamoClient.rejecting("None", "ConditionalCheckFailed", "None")
+    client = FakeDynamoClient.rejecting("None", "ConditionalCheckFailed", "None", "None", "None")
     with pytest.raises(ConflictError, match="external identity already claimed") as caught:
         await repository(client).create_device_integration(device_integration(), receipt())
     assert RAW_IDENTITY not in str(caught.value)
@@ -223,21 +241,50 @@ async def test_external_identity_collision_maps_to_conflict() -> None:
 
 @pytest.mark.asyncio
 async def test_receipt_collision_is_reported_as_idempotency_conflict() -> None:
-    client = FakeDynamoClient.rejecting("None", "ConditionalCheckFailed", "ConditionalCheckFailed")
+    client = FakeDynamoClient.rejecting(
+        "None", "ConditionalCheckFailed", "ConditionalCheckFailed", "None", "None"
+    )
+    with pytest.raises(ConflictError, match="idempotency key already used"):
+        await repository(client).create_device_integration(device_integration(), receipt())
+
+
+@pytest.mark.asyncio
+async def test_account_no_longer_provisionable_at_commit_is_conflict() -> None:
+    client = FakeDynamoClient.rejecting("None", "None", "None", "ConditionalCheckFailed", "None")
+    with pytest.raises(ConflictError, match="integration account is not provisionable"):
+        await repository(client).create_device_integration(device_integration(), receipt())
+
+
+@pytest.mark.asyncio
+async def test_device_decommissioned_at_commit_is_conflict() -> None:
+    client = FakeDynamoClient.rejecting("None", "None", "None", "None", "ConditionalCheckFailed")
+    with pytest.raises(ConflictError, match="device is decommissioned"):
+        await repository(client).create_device_integration(device_integration(), receipt())
+
+
+@pytest.mark.asyncio
+async def test_receipt_failure_is_classified_before_parent_checks() -> None:
+    client = FakeDynamoClient.rejecting(
+        "None",
+        "ConditionalCheckFailed",
+        "ConditionalCheckFailed",
+        "ConditionalCheckFailed",
+        "ConditionalCheckFailed",
+    )
     with pytest.raises(ConflictError, match="idempotency key already used"):
         await repository(client).create_device_integration(device_integration(), receipt())
 
 
 @pytest.mark.asyncio
 async def test_device_integration_row_collision_is_conflict() -> None:
-    client = FakeDynamoClient.rejecting("ConditionalCheckFailed", "None", "None")
+    client = FakeDynamoClient.rejecting("ConditionalCheckFailed", "None", "None", "None", "None")
     with pytest.raises(ConflictError, match="device integration already exists"):
         await repository(client).create_device_integration(device_integration(), receipt())
 
 
 @pytest.mark.asyncio
 async def test_non_conditional_transaction_failure_is_not_swallowed() -> None:
-    client = FakeDynamoClient.rejecting("None", "TransactionConflict", "None")
+    client = FakeDynamoClient.rejecting("None", "TransactionConflict", "None", "None", "None")
     with pytest.raises(ClientError):
         await repository(client).create_device_integration(device_integration(), receipt())
 
@@ -324,6 +371,7 @@ async def test_list_integration_accounts_queries_tenant_prefix_with_pagination()
     assert [item.integration_account_id for item in accounts] == [ACCOUNT_ID, "ia_" + "4" * 32]
     queries = [kwargs for name, kwargs in client.calls if name == "query"]
     assert len(queries) == 2
+    assert all(query["ConsistentRead"] is True for query in queries)
     assert queries[0]["ExpressionAttributeValues"] == {
         ":pk": {"S": f"TENANT#{TENANT}"},
         ":sk_prefix": {"S": "INTEGRATION_ACCOUNT#"},
@@ -356,6 +404,7 @@ async def test_list_device_integrations_filters_by_device_across_pages() -> None
     assert integrations == [device_integration()]
     queries = [kwargs for name, kwargs in client.calls if name == "query"]
     assert len(queries) == 2
+    assert all(query["ConsistentRead"] is True for query in queries)
     assert queries[0]["ExpressionAttributeValues"][":sk_prefix"] == {"S": "DEVICE_INTEGRATION#"}
 
 

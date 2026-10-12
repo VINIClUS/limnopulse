@@ -24,7 +24,11 @@ from limnopulse_api.core.errors import ConflictError, NotFoundError
 from limnopulse_api.domain.entities import TenantAccess
 from limnopulse_api.domain.ids import require_device_id
 from limnopulse_api.domain.roles import READ_ROLES, WRITE_ROLES
-from limnopulse_api.services.integrations import IdempotentCreateResult, IntegrationService
+from limnopulse_api.services.integrations import (
+    IdempotentCreateResult,
+    IntegrationInputError,
+    IntegrationService,
+)
 
 
 class _RedactedValidationRoute(APIRoute):
@@ -55,8 +59,7 @@ router = APIRouter(
 DevicePathId = Annotated[str, Path(), AfterValidator(require_device_id)]
 TenantReaderDep = Annotated[TenantAccess, Depends(require_tenant_role(*tuple(READ_ROLES)))]
 TenantWriterDep = Annotated[TenantAccess, Depends(require_tenant_role(*tuple(WRITE_ROLES)))]
-_READ_RESPONSES = {403: {"model": ErrorResponse}, **V2_ERROR_RESPONSES}
-_WRITE_RESPONSES = {403: {"model": ErrorResponse}, **V2_ERROR_RESPONSES}
+_RESPONSES = {403: {"model": ErrorResponse}, **V2_ERROR_RESPONSES}
 
 
 def _created(result: IdempotentCreateResult) -> Response:
@@ -74,14 +77,14 @@ async def _run_create(create: Coroutine[Any, Any, IdempotentCreateResult]) -> Re
         raise HTTPException(status_code=404, detail="not found") from exc
     except ConflictError as exc:
         raise HTTPException(status_code=409, detail=str(exc) or "conflict") from exc
-    except ValueError as exc:
+    except IntegrationInputError as exc:
         raise HTTPException(status_code=422, detail="invalid request") from exc
 
 
 @router.get(
     "/integration-accounts",
     response_model=IntegrationAccountListResponse,
-    responses=_READ_RESPONSES,
+    responses=_RESPONSES,
 )
 async def list_integration_accounts(
     tenant_id: str,
@@ -98,7 +101,7 @@ async def list_integration_accounts(
     "/integration-accounts",
     response_model=IntegrationAccountResponse,
     status_code=status.HTTP_201_CREATED,
-    responses=_WRITE_RESPONSES,
+    responses=_RESPONSES,
 )
 async def create_integration_account(
     tenant_id: str,
@@ -116,7 +119,7 @@ async def create_integration_account(
 @router.get(
     "/devices/{device_id}/integrations",
     response_model=DeviceIntegrationListResponse,
-    responses=_READ_RESPONSES,
+    responses=_RESPONSES,
 )
 async def list_device_integrations(
     tenant_id: str,
@@ -139,7 +142,7 @@ async def list_device_integrations(
     "/devices/{device_id}/integrations",
     response_model=DeviceIntegrationResponse,
     status_code=status.HTTP_201_CREATED,
-    responses=_WRITE_RESPONSES,
+    responses=_RESPONSES,
 )
 async def create_device_integration(
     tenant_id: str,

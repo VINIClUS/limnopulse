@@ -16,6 +16,9 @@ from limnopulse_api.domain.v2_common import PROVIDER_KEY_PATTERN
 
 PROVIDER_KEY_MAX_LENGTH = 128
 EXTERNAL_IDENTITY_MAX_LENGTH = 512
+# Identities are hashed byte-exact, so surrounding whitespace and control characters are refused
+# rather than normalized: "X" and "X " must not become two distinct claims.
+EXTERNAL_IDENTITY_PATTERN = r"^[^\s\x00-\x1f\x7f](?:[^\x00-\x1f\x7f]*[^\s\x00-\x1f\x7f])?$"
 
 
 def _require_integration_account_id(value: str) -> str:
@@ -49,6 +52,7 @@ class DeviceIntegrationCreate(BaseModel):
     external_identity: str = Field(
         min_length=1,
         max_length=EXTERNAL_IDENTITY_MAX_LENGTH,
+        pattern=EXTERNAL_IDENTITY_PATTERN,
         description="Write-only provider identity; stored and returned only as a SHA-256 digest.",
     )
 

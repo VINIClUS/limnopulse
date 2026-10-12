@@ -460,6 +460,8 @@ def test_dynamo_backed_identity_collision_returns_409() -> None:
                 {"Code": "None"},
                 {"Code": "ConditionalCheckFailed"},
                 {"Code": "None"},
+                {"Code": "None"},
+                {"Code": "None"},
             ],
         },
         "TransactWriteItems",
@@ -503,3 +505,63 @@ def test_dynamo_backed_identity_collision_returns_409() -> None:
     assert response.status_code == 409
     assert response.json() == {"detail": "external identity already claimed"}
     assert RAW_IDENTITY not in json.dumps(dynamo.transactions)
+
+
+class CorruptAccountClient:
+    """Returns an IntegrationAccount row whose stored status is not a valid enum value."""
+
+    def __init__(self) -> None:
+        self.transactions: list[dict] = []
+
+    def get_item(self, **kwargs):
+        if not kwargs["Key"]["SK"]["S"].startswith("INTEGRATION_ACCOUNT#"):
+            return {}
+        item = {
+            "PK": f"TENANT#{TENANT}",
+            "SK": f"INTEGRATION_ACCOUNT#{ACCOUNT_ID}",
+            "entity_type": "integration_account",
+            "tenant_id": TENANT,
+            "integration_account_id": ACCOUNT_ID,
+            "provider_key": "vendor.cloud",
+            "display_name": "Vendor",
+            "status": "corrupted",
+            "created_at": "2026-08-25T12:00:00.000000Z",
+            "updated_at": "2026-08-25T12:00:00.000000Z",
+            "version": 1,
+            "schema_version": 2,
+        }
+        return {
+            "Item": {k: {"N" if k.endswith("version") else "S": str(v)} for k, v in item.items()}
+        }
+
+    def transact_write_items(self, **kwargs):
+        self.transactions.append(kwargs)
+        return {}
+
+
+def test_corrupt_stored_account_is_a_server_error_not_422() -> None:
+    dynamo = CorruptAccountClient()
+    repository = DynamoIntegrationRepository("LimnopulseDomain", dynamo)
+    app = app_with_integration_repository(repository=repository)
+    client = TestClient(app, headers=AUTH, raise_server_exceptions=False)
+
+    response = post_integration(client)
+
+    assert response.status_code == 500
+    assert RAW_IDENTITY not in response.text
+    assert dynamo.transactions == []
+
+
+@pytest.mark.parametrize(
+    "identity",
+    [" serial-raw", "serial-raw ", "serial-raw\n", "serial\x00raw", "\tserial", "serial\x7f"],
+)
+def test_external_identity_with_padding_or_control_characters_is_422(identity: str) -> None:
+    repository = FakeIntegrationRepository(account())
+    client = client_for(app_with_integration_repository(repository=repository))
+
+    response = post_integration(client, external_identity=identity)
+
+    assert response.status_code == 422
+    assert repository.integrations == []
+    assert "serial" not in response.text

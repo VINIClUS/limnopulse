@@ -24,6 +24,7 @@ from limnopulse_api.domain.v2_common import IdempotencyReceipt
 from limnopulse_api.services.integrations import (
     DEVICE_INTEGRATION_CREATE_SCOPE,
     INTEGRATION_ACCOUNT_CREATE_SCOPE,
+    IntegrationInputError,
     IntegrationService,
 )
 
@@ -209,6 +210,46 @@ def test_device_integration_requires_canonical_account_id(value: str) -> None:
 def test_device_integration_requires_non_empty_identity() -> None:
     with pytest.raises(ValidationError):
         integration_payload(external_identity="")
+
+
+@pytest.mark.parametrize(
+    "identity",
+    ["X ", " X", "X\n", "\tX", "X\r", "a\x00b", "a\x1fb", "a\x7fb", " ", "\u00a0X"],
+)
+def test_external_identity_rejects_padding_and_control_characters(identity: str) -> None:
+    with pytest.raises(ValidationError):
+        integration_payload(external_identity=identity)
+
+
+@pytest.mark.parametrize("identity", ["X", "serial number 42", "vendor/SN:42-é", "x" * 512])
+def test_external_identity_accepts_inner_spaces_and_unicode(identity: str) -> None:
+    assert integration_payload(external_identity=identity).external_identity == identity
+
+
+@pytest.mark.asyncio
+async def test_identity_hashing_failure_is_input_error_without_raw_value() -> None:
+    repository = FakeIntegrationRepository(account())
+    payload = DeviceIntegrationCreate.model_construct(
+        integration_account_id=ACCOUNT_ID, external_identity=""
+    )
+    with pytest.raises(IntegrationInputError, match="invalid external identity"):
+        await service(repository).create_device_integration(
+            TENANT, DEVICE_ID, payload, IDEMPOTENCY_KEY
+        )
+    assert repository.created == []
+
+
+@pytest.mark.asyncio
+async def test_corrupt_parent_data_is_not_an_input_error() -> None:
+    class CorruptRepository(FakeIntegrationRepository):
+        async def get_integration_account(self, tenant_id, integration_account_id):
+            return IntegrationAccount(**{**account().model_dump(), "status": "corrupted"})
+
+    with pytest.raises(ValidationError) as caught:
+        await service(CorruptRepository()).create_device_integration(
+            TENANT, DEVICE_ID, integration_payload(), IDEMPOTENCY_KEY
+        )
+    assert not isinstance(caught.value, IntegrationInputError)
 
 
 # IntegrationAccount ---------------------------------------------------------------------------

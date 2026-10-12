@@ -9,6 +9,10 @@ The external-identity lookup is global across tenants so one provider identity c
 by exactly one DeviceIntegration. Consequently a create that collides with another tenant's
 claim returns 409 "external identity already claimed": an accepted existence oracle, limited to
 authenticated tenant writers who already know the raw provider identity.
+
+Parent status is checked twice: the service reads the Device and IntegrationAccount for precise
+404/409 answers, and the repository fences both statuses at commit time with ConditionChecks in
+the same transaction, so a parent decommissioned or revoked in between still yields 409.
 """
 
 from collections.abc import Callable
@@ -28,7 +32,7 @@ from limnopulse_api.api.v2.schemas.integrations import (
     IntegrationAccountCreate,
     IntegrationAccountResponse,
 )
-from limnopulse_api.core.errors import ConflictError, NotFoundError
+from limnopulse_api.core.errors import ConflictError, LimnopulseError, NotFoundError
 from limnopulse_api.domain.devices_v2 import DeviceStatus, DeviceV2
 from limnopulse_api.domain.ids import new_device_integration_id, new_integration_account_id
 from limnopulse_api.domain.integrations import (
@@ -46,6 +50,24 @@ DEVICE_INTEGRATION_CREATE_SCOPE = "device-integration-create"
 PROVISIONABLE_ACCOUNT_STATUSES = frozenset(
     {IntegrationAccountStatus.PENDING, IntegrationAccountStatus.ACTIVE}
 )
+
+
+class IntegrationInputError(LimnopulseError):
+    """Client input rejected by hashing; the message never contains the rejected value."""
+
+
+def _key_hash(idempotency_key: str) -> str:
+    try:
+        return idempotency_key_hash(idempotency_key)
+    except ValueError as exc:
+        raise IntegrationInputError("invalid Idempotency-Key") from exc
+
+
+def _identity_hash(provider_key: str, external_identity: str) -> str:
+    try:
+        return external_identity_hash(provider_key, external_identity)
+    except ValueError as exc:
+        raise IntegrationInputError("invalid external identity") from exc
 
 
 @dataclass(frozen=True)
@@ -81,7 +103,7 @@ class IntegrationService:
         self, tenant_id: str, payload: IntegrationAccountCreate, idempotency_key: str
     ) -> IdempotentCreateResult:
         scope = INTEGRATION_ACCOUNT_CREATE_SCOPE
-        key_hash = idempotency_key_hash(idempotency_key)
+        key_hash = _key_hash(idempotency_key)
         request_hash = canonical_request_hash(
             {
                 "scope": scope,
@@ -142,7 +164,7 @@ class IntegrationService:
         idempotency_key: str,
     ) -> IdempotentCreateResult:
         scope = DEVICE_INTEGRATION_CREATE_SCOPE
-        key_hash = idempotency_key_hash(idempotency_key)
+        key_hash = _key_hash(idempotency_key)
         # The body includes the raw identity; only its digest is ever persisted.
         request_hash = canonical_request_hash(
             {
@@ -169,7 +191,7 @@ class IntegrationService:
             raise ConflictError(f"integration account is {account.status.value}")
 
         # The provider comes from the tenant's account; the client cannot choose it.
-        identity_hash = external_identity_hash(account.provider_key, payload.external_identity)
+        identity_hash = _identity_hash(account.provider_key, payload.external_identity)
         now = self.clock()
         integration = DeviceIntegration(
             tenant_id=tenant_id,
