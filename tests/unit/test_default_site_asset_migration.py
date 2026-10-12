@@ -325,6 +325,13 @@ class FakeMigrationDynamo:
                 if present == bool(exists.group(1)):
                     return False
                 continue
+            typed = re.fullmatch(r"attribute_type\((\S+),\s*(\S+)\)", clause)
+            if typed:
+                value = None if item is None else item.get(names.get(typed.group(1)))
+                numeric = isinstance(value, (int, Decimal)) and not isinstance(value, bool)
+                if values[typed.group(2)] != "N" or not numeric:
+                    return False
+                continue
             left, right = (part.strip() for part in clause.split("="))
             if item is None or item.get(names.get(left, left)) != values[right]:
                 return False
@@ -351,7 +358,13 @@ class FakeMigrationDynamo:
     def _value(self, expression: str, item: dict, names: dict, values: dict) -> Any:
         terms = _split_top_level(expression, "+")
         if len(terms) > 1:
-            return sum(self._value(term, item, names, values) for term in terms)
+            operands = [self._value(term, item, names, values) for term in terms]
+            if any(isinstance(o, bool) or not isinstance(o, (int, Decimal)) for o in operands):
+                raise ClientError(
+                    {"Error": {"Code": "ValidationException", "Message": "operand type"}},
+                    "UpdateItem",
+                )
+            return sum(operands)
         default = re.fullmatch(r"if_not_exists\((\S+),\s*(\S+)\)", expression)
         if default:
             name = names[default.group(1)]
@@ -2607,3 +2620,73 @@ def test_existing_rows_must_parse_through_their_codecs(
 
     assert result.result == "schema_conflict"
     assert (kind, f"{key[0]}/{key[1]}") in [(c.kind, c.key) for c in result.conflicts]
+
+
+# Codex round 5: stored ints before every codec, receipt run_count ------------------------------
+
+
+@pytest.mark.parametrize("form", ["mirror", "history"])
+@pytest.mark.parametrize("version", [True, "1"])
+def test_active_current_sibling_version_must_be_a_stored_integer(form: str, version: Any) -> None:
+    client = migrated_store()
+    key = _item_key(deployment_to_item(_deterministic_deployment(), form=form))
+    client.items[key]["version"] = version
+    client.calls.clear()
+
+    result = run(client, apply=True)
+
+    kind = "deployment_current" if form == "mirror" else "deployment_history"
+    assert result.result == "schema_conflict"
+    assert [(c.kind, c.key) for c in result.conflicts] == [(kind, f"{key[0]}/{key[1]}")]
+    assert client.transactions == []
+
+
+def test_ended_group_history_version_must_be_a_stored_integer() -> None:
+    client = _ended_group_store()
+    history_key = _item_key(deployment_to_item(_deterministic_deployment(), form="history"))
+    client.items[history_key]["version"] = "2"
+
+    result = run(client, apply=True)
+
+    assert [c.kind for c in result.conflicts] == ["deployment_history"]
+
+
+@pytest.mark.parametrize("run_count", ["3", True])
+def test_own_receipt_with_a_non_numeric_run_count_is_a_conflict(run_count: Any) -> None:
+    client = migrated_store()
+    receipt_key = _item_key(KEYS.migration_receipt("tnt_1"))
+    client.items[receipt_key]["run_count"] = run_count
+    before = dict(client.items[receipt_key])
+    client.add_legacy_tenant("tnt_2", ponds=[], devices=[])
+
+    result = run(client, apply=True, tenants=["tnt_1", "tnt_2"])
+
+    assert result.result == "schema_conflict"
+    assert [(c.tenant_id, c.kind) for c in result.conflicts] == [("tnt_1", "migration_receipt")]
+    assert client.items[receipt_key] == before
+    assert result.tenants_completed == 1
+
+
+def test_receipt_validation_exception_maps_to_a_receipt_conflict() -> None:
+    client = migrated_store()
+    client.fail_once["update_item"] = ClientError(
+        {"Error": {"Code": "ValidationException", "Message": "operand type"}}, "UpdateItem"
+    )
+
+    result = run(client, apply=True)
+
+    assert result.result == "schema_conflict"
+    assert [c.kind for c in result.conflicts] == ["migration_receipt"]
+    assert exit_code_for(result.result) == 2
+
+
+@pytest.mark.parametrize("version", ["4", True])
+def test_existing_site_version_must_be_a_stored_integer(version: Any) -> None:
+    client = migrated_store()
+    site_key = _item_key(KEYS.site("tnt_1", default_site_id("tnt_1")))
+    client.items[site_key]["version"] = version
+
+    result = run(client, apply=False)
+
+    assert result.result == "schema_conflict"
+    assert [(c.kind, c.key) for c in result.conflicts] == [("site", f"{site_key[0]}/{site_key[1]}")]

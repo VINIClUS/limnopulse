@@ -315,6 +315,10 @@ class _RetryExhausted(Exception):
     pass
 
 
+class _ReceiptRejected(Exception):
+    """The receipt key holds a row this migration must not update."""
+
+
 def _is_transaction_conflict(exc: ClientError) -> bool:
     """A write lost only to concurrent transactions (no conditional failure): retryable."""
     code = exc.response.get("Error", {}).get("Code")
@@ -452,10 +456,15 @@ def _stored_int(row: Mapping[str, Any], name: str, kind: str, key: Mapping[str, 
 def _decoded[T](
     parser: Callable[[Mapping[str, Any]], T], row: Mapping[str, Any] | None
 ) -> T | None:
-    """The row through its public codec, or `None` when it is absent or does not parse."""
+    """The row through its public codec, or `None` when it is absent or does not parse.
+
+    Its `version` must be a stored integer first: codecs coerce with `int()`, which would
+    accept a bool or a numeric string that a later version condition can never match.
+    """
     if row is None:
         return None
     try:
+        stored_int(row.get("version"))
         return parser(row)
     except (KeyError, TypeError, ValueError):
         return None
@@ -566,21 +575,33 @@ class DefaultSiteAssetMigrator:
             state.counts.update(tenant_counts)
         self._check_deadline(deadline)
         try:
-            self.store.record_migration_receipt(
+            self._record_receipt(
                 tenant_id,
                 completed_at=self._clock(),
                 counts={
                     name: tenant_counts[name] for name in (*_CREATED_TO_WOULD, "already_migrated")
                 },
             )
-        except DynamoConditionalConflict:
-            # A foreign row occupies the receipt key: never overwrite it.
+        except (DynamoConditionalConflict, _ReceiptRejected):
+            # A foreign or malformed row occupies the receipt key: never overwrite it.
             state.add_conflicts(
                 tenant_id,
                 [_SchemaConflict("migration_receipt", self.keys.migration_receipt(tenant_id))],
             )
             return
         state.tenants_completed += 1
+
+    def _record_receipt(
+        self, tenant_id: str, *, completed_at: datetime, counts: Mapping[str, int]
+    ) -> None:
+        try:
+            self.store.record_migration_receipt(tenant_id, completed_at=completed_at, counts=counts)
+        except ClientError as exc:
+            # DynamoDB rejects the `run_count + 1` arithmetic on a non-numeric stored value
+            # with a ValidationException; that is a malformed receipt, not a fatal error.
+            if exc.response.get("Error", {}).get("Code") == "ValidationException":
+                raise _ReceiptRejected from exc
+            raise
 
     def _reload_tenant(self, tenant_id: str) -> Tenant:
         meta_key = self.store.tenant_meta_key(tenant_id)
@@ -1138,7 +1159,7 @@ class DefaultSiteAssetMigrator:
             key = deployment_item_key(current, form)
             row = self.store.get_known_item(key)
             sibling = _decoded(deployment_from_item, row)
-            if sibling != current or row is None or not isinstance(row.get("version"), int):
+            if sibling is None or sibling != current:
                 raise _Unstable(kind, key, [current_item, row])
         return current
 
