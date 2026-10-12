@@ -42,13 +42,15 @@ from limnopulse_api.domain.devices_v2 import (
     DeviceComponent,
     DeviceStatus,
     DeviceV2,
+    ensure_component_transition,
+    ensure_device_transition,
 )
 from limnopulse_api.domain.integrations import (
     DeviceIntegration,
     IntegrationAccount,
     IntegrationAccountStatus,
 )
-from limnopulse_api.domain.v2_common import IdempotencyReceipt
+from limnopulse_api.domain.v2_common import IDEMPOTENCY_RECEIPT_TTL, IdempotencyReceipt
 from limnopulse_api.services.assets import AssetService
 from limnopulse_api.services.components import (
     ComponentCreateCommand,
@@ -433,35 +435,45 @@ class DynamoM1Repositories:
 # Asynchronous in-memory implementation of the four M1 protocols ---------------------------------
 
 
-def _bumped[EntityT: Any](entity: EntityT, now: datetime, **changes: Any) -> EntityT:
-    values = {key: value for key, value in changes.items() if value is not None}
-    return entity.model_copy(
-        update={
-            **values,
-            "version": entity.version + 1,
-            "updated_at": max(now, entity.updated_at),
-        }
-    )
+CONDITIONAL_CONFLICT = "conditional write conflict"
+DEPLOYMENT_IDEMPOTENCY_CONFLICT = "idempotency key reused with a different request"
+_TERMINAL_COMPONENT_STATUSES = frozenset({ComponentStatus.REPLACED, ComponentStatus.DECOMMISSIONED})
+_PROVISIONABLE_ACCOUNT_STATUSES = frozenset(
+    {IntegrationAccountStatus.PENDING, IntegrationAccountStatus.ACTIVE}
+)
+
+
+def _without_none(changes: dict[str, Any]) -> dict[str, Any]:
+    return {key: value for key, value in changes.items() if value is not None}
 
 
 @dataclass
 class InMemoryM1Repositories:
     """Implements `SiteAssetRepository`, `DeviceComponentRepository`, `IntegrationRepository`
-    and `DeploymentRepository`. Each Component keeps an ordered list of half-open intervals; a
-    second current interval or an overlapping start is rejected like the Dynamo marker fence."""
+    and `DeploymentRepository` with the same observable behavior as the four Dynamo adapters.
+
+    Every write mirrors its adapter step by step: the same global keys (Device lookup,
+    Component canonical row, Asset PondProfile, external identity), the same ownership, parent
+    and lifecycle checks in the same order, the same version fences, all-or-nothing commits,
+    and the same exception types and messages, including the raw "conditional write conflict"
+    an adapter surfaces for an unclassified conditional failure. Lifecycle transitions are
+    validated where the adapters validate them (Devices, Components, Deployments); Site and
+    Asset transitions are validated by `SiteService`/`AssetService` on top of either backend.
+    `test_m1_acceptance_gate.py` proves the parity scenario by scenario.
+    """
 
     clock: Callable[[], datetime] = field(default=lambda: datetime.now(UTC))
     sites: dict[tuple[str, str], Site] = field(default_factory=dict)
     assets: dict[tuple[str, str], AssetWithPondProfile] = field(default_factory=dict)
     devices: dict[tuple[str, str], DeviceV2] = field(default_factory=dict)
-    components: dict[tuple[str, str], DeviceComponent] = field(default_factory=dict)
+    components: dict[str, DeviceComponent] = field(default_factory=dict)
     capabilities: dict[tuple[str, str, str], CapabilityDeclaration] = field(default_factory=dict)
     integration_accounts: dict[tuple[str, str], IntegrationAccount] = field(default_factory=dict)
     device_integrations: dict[tuple[str, str], DeviceIntegration] = field(default_factory=dict)
-    # Global, cross-tenant claims, like the production `EXTERNAL_ID#<provider>#<sha256>` row.
-    external_identities: dict[tuple[str, str], str] = field(default_factory=dict)
     deployments: dict[str, list[Deployment]] = field(default_factory=dict)
     receipts: dict[tuple[str, str, str], IdempotencyReceipt] = field(default_factory=dict)
+    # Global, cross-tenant claims, like the production `EXTERNAL_ID#<provider>#<sha256>` row.
+    external_identities: dict[tuple[str, str], str] = field(default_factory=dict)
 
     # Idempotency ------------------------------------------------------------------------------
 
@@ -469,20 +481,30 @@ class InMemoryM1Repositories:
         self, tenant_id: str, scope: str, key_hash: str, request_hash: str
     ) -> str | None:
         receipt = self.receipts.get((tenant_id, scope, key_hash))
-        if receipt is None or receipt.expires_at <= self.clock():
+        if receipt is None or self.clock() >= receipt.created_at + IDEMPOTENCY_RECEIPT_TTL:
             return None
         if receipt.request_hash != request_hash:
             raise ConflictError("idempotency key reused with a different request")
         return receipt.response_snapshot_json
 
     def _receipt_taken(self, receipt: IdempotencyReceipt) -> bool:
+        """The adapters' receipt Put condition: `attribute_not_exists(PK) OR expires_at <= now`
+        on whole epoch seconds."""
         existing = self.receipts.get((receipt.tenant_id, receipt.scope, receipt.key_hash))
-        return existing is not None and existing.expires_at > self.clock()
+        return existing is not None and int(existing.expires_at.timestamp()) > int(
+            self.clock().timestamp()
+        )
 
-    def _claim(self, receipt: IdempotencyReceipt) -> None:
-        if self._receipt_taken(receipt):
-            raise ConflictError("idempotency key already used")
+    def _store_receipt(self, receipt: IdempotencyReceipt) -> None:
         self.receipts[(receipt.tenant_id, receipt.scope, receipt.key_hash)] = receipt
+
+    async def _replay_after_conflict(self, receipt: IdempotencyReceipt) -> str:
+        snapshot = await self.get_idempotency_replay(
+            receipt.tenant_id, receipt.scope, receipt.key_hash, receipt.request_hash
+        )
+        if snapshot is None:
+            raise ConflictError("idempotency key is being used by a concurrent request")
+        return snapshot
 
     # Sites and Assets -------------------------------------------------------------------------
 
@@ -493,9 +515,11 @@ class InMemoryM1Repositories:
         return [site for (tenant, _), site in sorted(self.sites.items()) if tenant == tenant_id]
 
     async def create_site(self, site: Site, receipt: IdempotencyReceipt) -> Site:
+        if self._receipt_taken(receipt):
+            return Site.model_validate_json(await self._replay_after_conflict(receipt))
         if (site.tenant_id, site.site_id) in self.sites:
             raise ConflictError("site already exists")
-        self._claim(receipt)
+        self._store_receipt(receipt)
         self.sites[(site.tenant_id, site.site_id)] = site
         return site
 
@@ -508,8 +532,17 @@ class InMemoryM1Repositories:
         name: str | None,
         status: SiteStatus | None,
     ) -> Site:
-        current = self._versioned(self.sites, (tenant_id, site_id), expected_version, "site")
-        updated = _bumped(current, self.clock(), name=name, status=status)
+        current = self.sites.get((tenant_id, site_id))
+        if current is None or current.version != expected_version:
+            raise ConflictError(CONDITIONAL_CONFLICT)
+        updated = Site.model_validate(
+            {
+                **current.model_dump(),
+                **_without_none({"name": name, "status": status}),
+                "updated_at": self.clock(),
+                "version": expected_version + 1,
+            }
+        )
         self.sites[(tenant_id, site_id)] = updated
         return updated
 
@@ -522,15 +555,20 @@ class InMemoryM1Repositories:
     async def create_asset(
         self, asset: Asset, profile: PondProfile, receipt: IdempotencyReceipt
     ) -> AssetWithPondProfile:
+        created = AssetWithPondProfile(asset=asset, pond_profile=profile)
+        if self._receipt_taken(receipt):
+            snapshot = await self._replay_after_conflict(receipt)
+            return AssetWithPondProfile.model_validate_json(snapshot)
         site = self.sites.get((asset.tenant_id, asset.site_id))
         if site is None or site.status is not SiteStatus.ACTIVE:
             raise ConflictError("site is not active")
-        if (asset.tenant_id, asset.asset_id) in self.assets:
+        # The PondProfile row `ASSET#<id>/PROFILE#POND` is global, so an Asset id is unique
+        # across tenants.
+        if any(asset_id == asset.asset_id for _, asset_id in self.assets):
             raise ConflictError("asset already exists")
-        self._claim(receipt)
-        combined = AssetWithPondProfile(asset=asset, pond_profile=profile)
-        self.assets[(asset.tenant_id, asset.asset_id)] = combined
-        return combined
+        self._store_receipt(receipt)
+        self.assets[(asset.tenant_id, asset.asset_id)] = created
+        return created
 
     async def update_asset(
         self,
@@ -543,20 +581,40 @@ class InMemoryM1Repositories:
         pond_description: str | None,
         pond_profile_expected_version: int | None,
     ) -> AssetWithPondProfile:
+        if (pond_description is None) != (pond_profile_expected_version is None):
+            raise ValueError(
+                "pond_description and pond_profile_expected_version must be sent together"
+            )
         current = self.assets.get((tenant_id, asset_id))
         if current is None:
             raise NotFoundError("asset not found")
-        if current.asset.version != expected_version:
-            raise ConflictError("asset version conflict")
+        if current.pond_profile.legacy_pond_id is not None:
+            raise NotImplementedError("legacy Pond mirroring is only modelled by the Dynamo fake")
+        asset, profile = current.asset, current.pond_profile
         now = self.clock()
-        profile = current.pond_profile
-        if pond_description is not None:
-            if profile.version != pond_profile_expected_version:
-                raise ConflictError("pond profile version conflict")
-            profile = _bumped(profile, now, description=pond_description)
-        updated = AssetWithPondProfile(
-            asset=_bumped(current.asset, now, name=name, status=status), pond_profile=profile
+        if asset.version != expected_version:
+            raise ConflictError(CONDITIONAL_CONFLICT)
+        if pond_description is not None and profile.version != pond_profile_expected_version:
+            raise ConflictError(CONDITIONAL_CONFLICT)
+        updated_asset = Asset.model_validate(
+            {
+                **asset.model_dump(),
+                **_without_none({"name": name, "status": status}),
+                "updated_at": now,
+                "version": expected_version + 1,
+            }
         )
+        updated_profile = profile
+        if pond_description is not None and pond_profile_expected_version is not None:
+            updated_profile = PondProfile.model_validate(
+                {
+                    **profile.model_dump(),
+                    "description": pond_description,
+                    "updated_at": now,
+                    "version": pond_profile_expected_version + 1,
+                }
+            )
+        updated = AssetWithPondProfile(asset=updated_asset, pond_profile=updated_profile)
         self.assets[(tenant_id, asset_id)] = updated
         return updated
 
@@ -569,9 +627,13 @@ class InMemoryM1Repositories:
         return [value for (tenant, _), value in sorted(self.devices.items()) if tenant == tenant_id]
 
     async def create_device(self, device: DeviceV2, receipt: IdempotencyReceipt) -> DeviceV2:
-        if any(device_id == device.device_id for _, device_id in self.devices):
-            raise ConflictError("device already exists")
-        self._claim(receipt)
+        # Tenant row, global `DEVICE#<id>/META` lookup and receipt commit together; the adapter
+        # does not classify which of them failed.
+        if any(
+            device_id == device.device_id for _, device_id in self.devices
+        ) or self._receipt_taken(receipt):
+            raise ConflictError(CONDITIONAL_CONFLICT)
+        self._store_receipt(receipt)
         self.devices[(device.tenant_id, device.device_id)] = device
         return device
 
@@ -585,33 +647,51 @@ class InMemoryM1Repositories:
         firmware_version: str | None,
         status: DeviceStatus | None,
     ) -> DeviceV2:
-        current = self._versioned(self.devices, (tenant_id, device_id), expected_version, "device")
-        updated = _bumped(
-            current, self.clock(), name=name, firmware_version=firmware_version, status=status
+        current = self.devices.get((tenant_id, device_id))
+        if current is None:
+            raise NotFoundError("device not found")
+        if current.version != expected_version:
+            raise ConflictError("device version conflict")
+        if status is not None:
+            ensure_device_transition(current.status, status)
+        updated = DeviceV2.model_validate(
+            {
+                **current.model_dump(),
+                **_without_none(
+                    {"name": name, "firmware_version": firmware_version, "status": status}
+                ),
+                "updated_at": max(self.clock(), current.updated_at),
+                "version": expected_version + 1,
+            }
         )
         self.devices[(tenant_id, device_id)] = updated
         return updated
 
     async def get_component(self, tenant_id: str, component_id: str) -> DeviceComponent | None:
-        return self.components.get((tenant_id, component_id))
+        component = self.components.get(component_id)
+        return component if component is not None and component.tenant_id == tenant_id else None
 
     async def list_components(self, tenant_id: str, device_id: str) -> list[DeviceComponent]:
         return [
             component
-            for (tenant, _), component in sorted(self.components.items())
-            if tenant == tenant_id and component.device_id == device_id
+            for _, component in sorted(self.components.items())
+            if component.tenant_id == tenant_id and component.device_id == device_id
         ]
 
     async def create_component(
         self, component: DeviceComponent, receipt: IdempotencyReceipt
     ) -> DeviceComponent:
         device = self.devices.get((component.tenant_id, component.device_id))
-        if device is None or device.status is DeviceStatus.DECOMMISSIONED:
-            raise ConflictError("device is not available")
-        if (component.tenant_id, component.component_id) in self.components:
-            raise ConflictError("component already exists")
-        self._claim(receipt)
-        self.components[(component.tenant_id, component.component_id)] = component
+        if device is None:
+            raise NotFoundError("device not found")
+        if device.status is DeviceStatus.DECOMMISSIONED:
+            raise ConflictError("device is decommissioned")
+        # Tenant mirror, global `COMPONENT#<id>/META`, Device version fence and receipt commit
+        # together; the adapter does not classify which of them failed.
+        if component.component_id in self.components or self._receipt_taken(receipt):
+            raise ConflictError(CONDITIONAL_CONFLICT)
+        self._store_receipt(receipt)
+        self.components[component.component_id] = component
         return component
 
     async def update_component(
@@ -623,15 +703,29 @@ class InMemoryM1Repositories:
         name: str | None,
         status: ComponentStatus | None,
     ) -> DeviceComponent:
-        key = (tenant_id, component_id)
-        current = self._versioned(self.components, key, expected_version, "component")
-        updated = _bumped(current, self.clock(), name=name, status=status)
-        self.components[key] = updated
+        current = await self.get_component(tenant_id, component_id)
+        if current is None:
+            raise NotFoundError("component not found")
+        if current.version != expected_version:
+            raise ConflictError("component version conflict")
+        if status is not None:
+            ensure_component_transition(current.status, status)
+        updated = DeviceComponent.model_validate(
+            {
+                **current.model_dump(),
+                **_without_none({"name": name, "status": status}),
+                "updated_at": max(self.clock(), current.updated_at),
+                "version": expected_version + 1,
+            }
+        )
+        self.components[component_id] = updated
         return updated
 
     async def list_capabilities(
         self, tenant_id: str, component_id: str
     ) -> list[CapabilityDeclaration]:
+        if await self.get_component(tenant_id, component_id) is None:
+            return []
         return [
             value
             for (tenant, component, _), value in sorted(self.capabilities.items())
@@ -641,17 +735,16 @@ class InMemoryM1Repositories:
     async def create_capability(
         self, declaration: CapabilityDeclaration, receipt: IdempotencyReceipt
     ) -> CapabilityDeclaration:
-        """Mirrors the Dynamo adapter: the Component's ownership and status are checked before
-        anything (including the receipt) is written."""
-        component = self.components.get((declaration.tenant_id, declaration.component_id))
+        """The Component's ownership and status are checked before anything is written."""
+        component = await self.get_component(declaration.tenant_id, declaration.component_id)
         if component is None:
             raise NotFoundError("component not found")
-        if component.status in {ComponentStatus.REPLACED, ComponentStatus.DECOMMISSIONED}:
+        if component.status in _TERMINAL_COMPONENT_STATUSES:
             raise ConflictError(f"component is {component.status}")
         key = (declaration.tenant_id, declaration.component_id, declaration.capability_id)
-        if key in self.capabilities:
-            raise ConflictError("capability already exists")
-        self._claim(receipt)
+        if key in self.capabilities or self._receipt_taken(receipt):
+            raise ConflictError(CONDITIONAL_CONFLICT)
+        self._store_receipt(receipt)
         self.capabilities[key] = declaration
         return declaration
 
@@ -672,10 +765,12 @@ class InMemoryM1Repositories:
     async def create_integration_account(
         self, account: IntegrationAccount, receipt: IdempotencyReceipt
     ) -> IntegrationAccount:
+        if self._receipt_taken(receipt):
+            raise ConflictError("idempotency key already used")
         key = (account.tenant_id, account.integration_account_id)
         if key in self.integration_accounts:
             raise ConflictError("integration account already exists")
-        self._claim(receipt)
+        self._store_receipt(receipt)
         self.integration_accounts[key] = account
         return account
 
@@ -691,8 +786,8 @@ class InMemoryM1Repositories:
     async def create_device_integration(
         self, integration: DeviceIntegration, receipt: IdempotencyReceipt
     ) -> DeviceIntegration:
-        """All-or-nothing, classified in the production adapter's order: receipt, account,
-        device, then the global external identity claim."""
+        """All-or-nothing, classified in the adapter's order: receipt, account, device, then
+        the global external identity claim."""
         key = (integration.tenant_id, integration.device_integration_id)
         identity = (integration.provider_key, integration.external_identity_hash)
         account = self.integration_accounts.get(
@@ -701,10 +796,7 @@ class InMemoryM1Repositories:
         device = self.devices.get((integration.tenant_id, integration.device_id))
         if self._receipt_taken(receipt):
             raise ConflictError("idempotency key already used")
-        if account is None or account.status not in {
-            IntegrationAccountStatus.PENDING,
-            IntegrationAccountStatus.ACTIVE,
-        }:
+        if account is None or account.status not in _PROVISIONABLE_ACCOUNT_STATUSES:
             raise ConflictError("integration account is not provisionable")
         if device is None or device.status is DeviceStatus.DECOMMISSIONED:
             raise ConflictError("device is decommissioned")
@@ -712,7 +804,7 @@ class InMemoryM1Repositories:
             raise ConflictError("external identity already claimed")
         if key in self.device_integrations:
             raise ConflictError("device integration already exists")
-        self._claim(receipt)
+        self._store_receipt(receipt)
         self.external_identities[identity] = integration.tenant_id
         self.device_integrations[key] = integration
         return integration
@@ -754,23 +846,38 @@ class InMemoryM1Repositories:
     ) -> Deployment:
         if deployment.status is not DeploymentStatus.ACTIVE:
             raise ValueError("only an active deployment can be started")
-        history = self.deployments.setdefault(deployment.component_id, [])
-        if any(item.status is DeploymentStatus.ACTIVE for item in history):
-            raise ConflictError("component already has an active deployment")
-        if history and deployment.started_at < max(item.ended_at for item in history):
+        history = self.deployments.get(deployment.component_id, [])
+        # Pre-checks the adapter makes from the marker and the latest history row.
+        ended = [item.ended_at for item in history if item.ended_at is not None]
+        if ended and deployment.started_at < max(ended):
             raise ConflictError("deployment overlaps the previous interval")
-        component = self.components.get((deployment.tenant_id, deployment.component_id))
+        if history:
+            latest = max(history, key=lambda item: item.started_at)
+            if latest.ended_at is None:
+                raise ConflictError("component already has an active deployment")
+            if deployment.started_at < latest.ended_at:
+                raise ConflictError("deployment overlaps the previous interval")
+        # The transaction, classified in the adapter's order.
+        component = self.components.get(deployment.component_id)
         asset = self.assets.get((deployment.tenant_id, deployment.asset_id))
         site = self.sites.get((deployment.tenant_id, deployment.site_id))
-        if component is None or component.status is not ComponentStatus.ACTIVE:
+        if self._receipt_taken(receipt):
+            raise ConflictError(DEPLOYMENT_IDEMPOTENCY_CONFLICT)
+        if (
+            component is None
+            or component.tenant_id != deployment.tenant_id
+            or component.status is not ComponentStatus.ACTIVE
+        ):
             raise ConflictError("component is not active")
         if asset is None or asset.asset.status is not AssetStatus.ACTIVE:
             raise ConflictError("asset is not active")
         if site is None or site.status is not SiteStatus.ACTIVE:
             raise ConflictError("site is not active")
-        self._claim(receipt)
-        history.append(deployment)
-        history.sort(key=lambda item: item.started_at)
+        if await self.get_deployment(deployment.tenant_id, deployment.deployment_id) is not None:
+            raise ConflictError("deployment already exists")
+        self._store_receipt(receipt)
+        self.deployments.setdefault(deployment.component_id, []).append(deployment)
+        self.deployments[deployment.component_id].sort(key=lambda item: item.started_at)
         return deployment
 
     async def end_deployment(
@@ -800,17 +907,6 @@ class InMemoryM1Repositories:
         history = self.deployments[current.component_id]
         history[history.index(current)] = ended
         return ended
-
-    # Internals -------------------------------------------------------------------------------
-
-    @staticmethod
-    def _versioned(store: dict, key: tuple[str, str], expected_version: int, entity: str) -> Any:
-        current = store.get(key)
-        if current is None:
-            raise NotFoundError(f"{entity} not found")
-        if current.version != expected_version:
-            raise ConflictError(f"{entity} version conflict")
-        return current
 
 
 # Synchronous scenario facade over the real M1 services --------------------------------------------

@@ -16,7 +16,9 @@ from pathlib import Path
 from typing import Any
 
 import pytest
+from botocore.exceptions import ClientError
 from fastapi.testclient import TestClient
+from pydantic import BaseModel
 
 from limnopulse_api.adapters.dynamodb import DynamoDomainRepository
 from limnopulse_api.adapters.dynamodb_deployments import deployment_marker_key
@@ -32,7 +34,15 @@ from limnopulse_api.api.v2.schemas.integrations import (
 )
 from limnopulse_api.core.config import Settings
 from limnopulse_api.core.errors import ConflictError, NotFoundError
-from limnopulse_api.domain.deployments import DeploymentStatus
+from limnopulse_api.domain.assets import (
+    Asset,
+    AssetStatus,
+    AssetType,
+    PondProfile,
+    Site,
+    SiteStatus,
+)
+from limnopulse_api.domain.deployments import Deployment, DeploymentStatus
 from limnopulse_api.domain.devices_v2 import (
     CapabilityAvailability,
     CapabilityDeclaration,
@@ -42,6 +52,7 @@ from limnopulse_api.domain.devices_v2 import (
     ComponentKind,
     ComponentStatus,
     DeviceComponent,
+    DeviceStatus,
     DeviceV2,
     ProbeProfile,
 )
@@ -67,8 +78,10 @@ from limnopulse_api.repositories.v2_contracts import (
     IntegrationRepository,
     SiteAssetRepository,
 )
+from limnopulse_api.services.assets import AssetService
 from limnopulse_api.services.devices_v2 import DeviceV2CreateCommand, DeviceV2Service
 from limnopulse_api.services.integrations import IntegrationService
+from limnopulse_api.services.sites import SiteService
 from tests.contracts.m1_fakes import (
     TABLE,
     ConditionalDynamoClient,
@@ -638,6 +651,653 @@ def test_non_integral_numbers_round_trip_through_the_dynamo_fake() -> None:
     assert client.item("TEST#numbers", "META")["ratio"] == Decimal("0.5")
 
 
+# Parity sweep: InMemoryM1Repositories vs the four real Dynamo adapters ---------------------------
+
+
+class ParityBundle:
+    """The four protocol implementations of one backend, fresh for each scenario."""
+
+    def __init__(self, backend: str) -> None:
+        if backend == "in_memory":
+            repositories = InMemoryM1Repositories(clock=Clock(NOW))
+            self.sites = self.devices = self.integrations = self.deployments = repositories
+        else:
+            dynamo = DynamoM1Repositories.over(ConditionalDynamoClient(), clock=lambda: NOW)
+            self.sites = dynamo.site_asset_repository
+            self.devices = dynamo.device_component_repository
+            self.integrations = dynamo.integration_repository
+            self.deployments = dynamo.deployment_repository
+
+
+TENANT_A, TENANT_B = "tnt_a", "tnt_b"
+P_SITE, P_ASSET, P_DEVICE = "site_" + "1" * 32, "ast_" + "2" * 32, "dev_" + "3" * 32
+P_COMPONENT, P_ACCOUNT, P_DEPLOYMENT = "cmp_" + "4" * 32, "ia_" + "5" * 32, "dep_" + "6" * 32
+T10, T11, T1130 = dt("2026-08-25T10:00:00Z"), dt("2026-08-25T11:00:00Z"), dt("2026-08-25T11:30:00Z")
+
+
+def p_receipt(tenant_id: str, scope: str, index: int, *, request: str = "b", snapshot="{}"):
+    return new_idempotency_receipt(
+        tenant_id=tenant_id,
+        scope=scope,
+        key_hash=f"{index:064x}",
+        request_hash=request * 64,
+        response_snapshot_json=snapshot,
+        created_at=NOW,
+    )
+
+
+def p_site(tenant_id: str = TENANT_A, site_id: str = P_SITE, name: str = "Fazenda") -> Site:
+    return Site(
+        tenant_id=tenant_id, site_id=site_id, name=name, created_at=NOW, updated_at=NOW, version=1
+    )
+
+
+def p_asset(tenant_id: str = TENANT_A, asset_id: str = P_ASSET, site_id: str = P_SITE):
+    asset = Asset(
+        tenant_id=tenant_id,
+        asset_id=asset_id,
+        site_id=site_id,
+        asset_type=AssetType.POND,
+        name="West",
+        created_at=NOW,
+        updated_at=NOW,
+        version=1,
+    )
+    profile = PondProfile(
+        tenant_id=tenant_id, asset_id=asset_id, created_at=NOW, updated_at=NOW, version=1
+    )
+    return asset, profile
+
+
+def p_device(tenant_id: str = TENANT_A, device_id: str = P_DEVICE) -> DeviceV2:
+    return DeviceV2(
+        tenant_id=tenant_id,
+        device_id=device_id,
+        name="Gateway",
+        created_at=NOW,
+        updated_at=NOW,
+        version=1,
+    )
+
+
+def p_component(
+    tenant_id: str = TENANT_A, component_id: str = P_COMPONENT, device_id: str = P_DEVICE
+) -> DeviceComponent:
+    return DeviceComponent(
+        tenant_id=tenant_id,
+        component_id=component_id,
+        device_id=device_id,
+        kind=ComponentKind.PROBE,
+        name="Probe",
+        probe_profile=ProbeProfile(probe_profile_id="prb_" + "7" * 32),
+        created_at=NOW,
+        updated_at=NOW,
+        version=1,
+    )
+
+
+def p_account(status: IntegrationAccountStatus = IntegrationAccountStatus.PENDING):
+    return IntegrationAccount(
+        tenant_id=TENANT_A,
+        integration_account_id=P_ACCOUNT,
+        provider_key="vendor.cloud",
+        display_name="Vendor",
+        status=status,
+        created_at=NOW,
+        updated_at=NOW,
+        version=1,
+    )
+
+
+def p_integration(device_id: str = P_DEVICE, index: int = 1) -> DeviceIntegration:
+    return DeviceIntegration(
+        tenant_id=TENANT_A,
+        device_integration_id=f"di_{index:032x}",
+        device_id=device_id,
+        integration_account_id=P_ACCOUNT,
+        provider_key="vendor.cloud",
+        external_identity_hash=f"{index:064x}",
+        created_at=NOW,
+        updated_at=NOW,
+        version=1,
+    )
+
+
+def p_deployment(
+    deployment_id: str = P_DEPLOYMENT, started_at: datetime = T10, **overrides: Any
+) -> Deployment:
+    values = {
+        "tenant_id": TENANT_A,
+        "deployment_id": deployment_id,
+        "component_id": P_COMPONENT,
+        "site_id": P_SITE,
+        "asset_id": P_ASSET,
+        "started_at": started_at,
+        "created_at": NOW,
+        "updated_at": NOW,
+        "version": 1,
+        **overrides,
+    }
+    return Deployment(**values)
+
+
+def p_capability() -> CapabilityDeclaration:
+    return _capability(P_COMPONENT, 1).model_copy(update={"tenant_id": TENANT_A})
+
+
+async def p_world(r: ParityBundle) -> None:
+    """tnt_a: an active Site, Asset, Device, probe Component and pending IntegrationAccount."""
+    await r.sites.create_site(p_site(), p_receipt(TENANT_A, "site-create", 1))
+    await r.sites.create_asset(*p_asset(), p_receipt(TENANT_A, "asset-create", 1))
+    await r.devices.create_device(p_device(), p_receipt(TENANT_A, "device-create", 1))
+    await r.devices.create_component(p_component(), p_receipt(TENANT_A, "component-create", 1))
+    await r.integrations.create_integration_account(
+        p_account(), p_receipt(TENANT_A, "integration-account-create", 1)
+    )
+
+
+async def p_start(r: ParityBundle, deployment: Deployment, index: int) -> Deployment:
+    return await r.deployments.start_deployment(
+        deployment, p_receipt(TENANT_A, "deployment-create", index)
+    )
+
+
+def _scenario(steps):
+    async def run(r: ParityBundle) -> Any:
+        await p_world(r)
+        return await steps(r)
+
+    return run
+
+
+PARITY_SCENARIOS: dict[str, Any] = {
+    # SiteAssetRepository ------------------------------------------------------------------
+    "site.create.duplicate_same_tenant": _scenario(
+        lambda r: r.sites.create_site(p_site(), p_receipt(TENANT_A, "site-create", 2))
+    ),
+    "site.create.same_id_other_tenant": _scenario(
+        lambda r: r.sites.create_site(p_site(TENANT_B), p_receipt(TENANT_B, "site-create", 1))
+    ),
+    "site.create.replay_same_request": _scenario(
+        lambda r: r.sites.create_site(
+            p_site(site_id="site_" + "9" * 32, name="Other"),
+            p_receipt(TENANT_A, "site-create", 7, snapshot=p_site().model_dump_json()),
+        )
+    ),
+    "site.create.key_reused_for_different_request": _scenario(
+        lambda r: r.sites.create_site(
+            p_site(site_id="site_" + "9" * 32), p_receipt(TENANT_A, "site-create", 1, request="c")
+        )
+    ),
+    "site.update.ok": _scenario(
+        lambda r: r.sites.update_site(TENANT_A, P_SITE, 1, name="Renamed", status=None)
+    ),
+    "site.update.stale_version": _scenario(
+        lambda r: r.sites.update_site(TENANT_A, P_SITE, 7, name="Renamed", status=None)
+    ),
+    "site.update.missing": _scenario(
+        lambda r: r.sites.update_site(TENANT_B, P_SITE, 1, name="Renamed", status=None)
+    ),
+    "site.get.other_tenant": _scenario(lambda r: r.sites.get_site(TENANT_B, P_SITE)),
+    "site.list": _scenario(lambda r: r.sites.list_sites(TENANT_A)),
+    "asset.create.on_archived_site": _scenario(
+        lambda r: _then(
+            r.sites.update_site(TENANT_A, P_SITE, 1, name=None, status=SiteStatus.ARCHIVED),
+            lambda: r.sites.create_asset(
+                *p_asset(asset_id="ast_" + "9" * 32), p_receipt(TENANT_A, "asset-create", 2)
+            ),
+        )
+    ),
+    "asset.create.missing_site": _scenario(
+        lambda r: r.sites.create_asset(
+            *p_asset(asset_id="ast_" + "9" * 32, site_id="site_" + "9" * 32),
+            p_receipt(TENANT_A, "asset-create", 2),
+        )
+    ),
+    "asset.create.same_id_other_tenant": _scenario(
+        lambda r: _then(
+            r.sites.create_site(p_site(TENANT_B), p_receipt(TENANT_B, "site-create", 1)),
+            lambda: r.sites.create_asset(
+                *p_asset(TENANT_B), p_receipt(TENANT_B, "asset-create", 1)
+            ),
+        )
+    ),
+    "asset.update.missing": _scenario(
+        lambda r: r.sites.update_asset(
+            TENANT_B,
+            P_ASSET,
+            1,
+            name="X",
+            status=None,
+            pond_description=None,
+            pond_profile_expected_version=None,
+        )
+    ),
+    "asset.update.stale_version": _scenario(
+        lambda r: r.sites.update_asset(
+            TENANT_A,
+            P_ASSET,
+            5,
+            name="X",
+            status=None,
+            pond_description=None,
+            pond_profile_expected_version=None,
+        )
+    ),
+    "asset.update.stale_profile_version": _scenario(
+        lambda r: r.sites.update_asset(
+            TENANT_A,
+            P_ASSET,
+            1,
+            name=None,
+            status=None,
+            pond_description="d",
+            pond_profile_expected_version=5,
+        )
+    ),
+    "asset.update.description_without_profile_version": _scenario(
+        lambda r: r.sites.update_asset(
+            TENANT_A,
+            P_ASSET,
+            1,
+            name=None,
+            status=None,
+            pond_description="d",
+            pond_profile_expected_version=None,
+        )
+    ),
+    "asset.update.archive_with_description": _scenario(
+        lambda r: r.sites.update_asset(
+            TENANT_A,
+            P_ASSET,
+            1,
+            name="East",
+            status=AssetStatus.ARCHIVED,
+            pond_description="d",
+            pond_profile_expected_version=1,
+        )
+    ),
+    "site.service.reactivate_archived": _scenario(
+        lambda r: _then(
+            r.sites.update_site(TENANT_A, P_SITE, 1, name=None, status=SiteStatus.ARCHIVED),
+            lambda: SiteService(r.sites, clock=lambda: NOW).update(
+                tenant_id=TENANT_A,
+                site_id=P_SITE,
+                expected_version=2,
+                name=None,
+                status="active",
+            ),
+        )
+    ),
+    "asset.service.reactivate_archived": _scenario(
+        lambda r: _then(
+            r.sites.update_asset(
+                TENANT_A,
+                P_ASSET,
+                1,
+                name=None,
+                status=AssetStatus.ARCHIVED,
+                pond_description=None,
+                pond_profile_expected_version=None,
+            ),
+            lambda: AssetService(r.sites, clock=lambda: NOW).update(
+                tenant_id=TENANT_A,
+                asset_id=P_ASSET,
+                expected_version=2,
+                name=None,
+                status="active",
+                pond_description=None,
+                pond_profile_expected_version=None,
+            ),
+        )
+    ),
+    # DeviceComponentRepository ------------------------------------------------------------
+    "device.create.same_id_other_tenant": _scenario(
+        lambda r: r.devices.create_device(
+            p_device(TENANT_B), p_receipt(TENANT_B, "device-create", 1)
+        )
+    ),
+    "device.create.receipt_already_used": _scenario(
+        lambda r: r.devices.create_device(
+            p_device(device_id="dev_" + "9" * 32), p_receipt(TENANT_A, "device-create", 1)
+        )
+    ),
+    "device.update.missing": _scenario(
+        lambda r: r.devices.update_device(
+            TENANT_B, P_DEVICE, 1, name="X", firmware_version=None, status=None
+        )
+    ),
+    "device.update.stale_version": _scenario(
+        lambda r: r.devices.update_device(
+            TENANT_A, P_DEVICE, 3, name="X", firmware_version=None, status=None
+        )
+    ),
+    "device.update.decommissioned_to_active": _scenario(
+        lambda r: _then(
+            r.devices.update_device(
+                TENANT_A,
+                P_DEVICE,
+                1,
+                name=None,
+                firmware_version=None,
+                status=DeviceStatus.DECOMMISSIONED,
+            ),
+            lambda: r.devices.update_device(
+                TENANT_A,
+                P_DEVICE,
+                2,
+                name=None,
+                firmware_version=None,
+                status=DeviceStatus.ACTIVE,
+            ),
+        )
+    ),
+    "device.update.suspend": _scenario(
+        lambda r: r.devices.update_device(
+            TENANT_A,
+            P_DEVICE,
+            1,
+            name="X",
+            firmware_version="2.0",
+            status=DeviceStatus.SUSPENDED,
+        )
+    ),
+    "device.get.other_tenant": _scenario(lambda r: r.devices.get_device(TENANT_B, P_DEVICE)),
+    "component.create.missing_device": _scenario(
+        lambda r: r.devices.create_component(
+            p_component(component_id="cmp_" + "9" * 32, device_id="dev_" + "9" * 32),
+            p_receipt(TENANT_A, "component-create", 2),
+        )
+    ),
+    "component.create.decommissioned_device": _scenario(
+        lambda r: _then(
+            r.devices.update_device(
+                TENANT_A,
+                P_DEVICE,
+                1,
+                name=None,
+                firmware_version=None,
+                status=DeviceStatus.DECOMMISSIONED,
+            ),
+            lambda: r.devices.create_component(
+                p_component(component_id="cmp_" + "9" * 32),
+                p_receipt(TENANT_A, "component-create", 2),
+            ),
+        )
+    ),
+    "component.create.same_id_other_tenant": _scenario(
+        lambda r: _then(
+            r.devices.create_device(
+                p_device(TENANT_B, "dev_" + "8" * 32), p_receipt(TENANT_B, "device-create", 1)
+            ),
+            lambda: r.devices.create_component(
+                p_component(TENANT_B, device_id="dev_" + "8" * 32),
+                p_receipt(TENANT_B, "component-create", 1),
+            ),
+        )
+    ),
+    "component.create.receipt_already_used": _scenario(
+        lambda r: r.devices.create_component(
+            p_component(component_id="cmp_" + "9" * 32),
+            p_receipt(TENANT_A, "component-create", 1),
+        )
+    ),
+    "component.update.other_tenant": _scenario(
+        lambda r: r.devices.update_component(TENANT_B, P_COMPONENT, 1, name="X", status=None)
+    ),
+    "component.update.stale_version": _scenario(
+        lambda r: r.devices.update_component(TENANT_A, P_COMPONENT, 4, name="X", status=None)
+    ),
+    "component.update.replaced_to_active": _scenario(
+        lambda r: _then(
+            r.devices.update_component(
+                TENANT_A, P_COMPONENT, 1, name=None, status=ComponentStatus.REPLACED
+            ),
+            lambda: r.devices.update_component(
+                TENANT_A, P_COMPONENT, 2, name=None, status=ComponentStatus.ACTIVE
+            ),
+        )
+    ),
+    "component.update.rename": _scenario(
+        lambda r: r.devices.update_component(TENANT_A, P_COMPONENT, 1, name="X", status=None)
+    ),
+    "component.get.other_tenant": _scenario(
+        lambda r: r.devices.get_component(TENANT_B, P_COMPONENT)
+    ),
+    "component.list": _scenario(lambda r: r.devices.list_components(TENANT_A, P_DEVICE)),
+    "capability.create.duplicate": _scenario(
+        lambda r: _then(
+            r.devices.create_capability(
+                p_capability(), p_receipt(TENANT_A, "capability-create", 1)
+            ),
+            lambda: r.devices.create_capability(
+                p_capability(), p_receipt(TENANT_A, "capability-create", 2)
+            ),
+        )
+    ),
+    "capability.list.missing_component": _scenario(
+        lambda r: r.devices.list_capabilities(TENANT_A, "cmp_" + "9" * 32)
+    ),
+    "capability.create_then_list": _scenario(
+        lambda r: _then(
+            r.devices.create_capability(
+                p_capability(), p_receipt(TENANT_A, "capability-create", 1)
+            ),
+            lambda: r.devices.list_capabilities(TENANT_A, P_COMPONENT),
+        )
+    ),
+    # IntegrationRepository ----------------------------------------------------------------
+    "account.create.duplicate": _scenario(
+        lambda r: r.integrations.create_integration_account(
+            p_account(), p_receipt(TENANT_A, "integration-account-create", 2)
+        )
+    ),
+    "account.create.receipt_already_used": _scenario(
+        lambda r: r.integrations.create_integration_account(
+            p_account().model_copy(update={"integration_account_id": "ia_" + "9" * 32}),
+            p_receipt(TENANT_A, "integration-account-create", 1),
+        )
+    ),
+    "integration.create.missing_device": _scenario(
+        lambda r: r.integrations.create_device_integration(
+            p_integration(device_id="dev_" + "9" * 32),
+            p_receipt(TENANT_A, "device-integration-create", 1),
+        )
+    ),
+    "integration.create.decommissioned_device": _scenario(
+        lambda r: _then(
+            r.devices.update_device(
+                TENANT_A,
+                P_DEVICE,
+                1,
+                name=None,
+                firmware_version=None,
+                status=DeviceStatus.DECOMMISSIONED,
+            ),
+            lambda: r.integrations.create_device_integration(
+                p_integration(), p_receipt(TENANT_A, "device-integration-create", 1)
+            ),
+        )
+    ),
+    "integration.create.receipt_already_used": _scenario(
+        lambda r: _then(
+            r.integrations.create_device_integration(
+                p_integration(), p_receipt(TENANT_A, "device-integration-create", 1)
+            ),
+            lambda: r.integrations.create_device_integration(
+                p_integration(index=2), p_receipt(TENANT_A, "device-integration-create", 1)
+            ),
+        )
+    ),
+    "integration.create_then_list": _scenario(
+        lambda r: _then(
+            r.integrations.create_device_integration(
+                p_integration(), p_receipt(TENANT_A, "device-integration-create", 1)
+            ),
+            lambda: r.integrations.list_device_integrations(TENANT_A, P_DEVICE),
+        )
+    ),
+    # DeploymentRepository -----------------------------------------------------------------
+    "deployment.start_then_current": _scenario(
+        lambda r: _then(
+            p_start(r, p_deployment(), 1),
+            lambda: r.deployments.get_current_deployment(TENANT_A, P_COMPONENT),
+        )
+    ),
+    "deployment.start.second_active": _scenario(
+        lambda r: _then(
+            p_start(r, p_deployment(), 1),
+            lambda: p_start(r, p_deployment("dep_" + "9" * 32, T11), 2),
+        )
+    ),
+    "deployment.start.overlaps_previous": _scenario(
+        lambda r: _then(
+            p_start(r, p_deployment(), 1),
+            lambda: r.deployments.end_deployment(
+                TENANT_A, P_DEPLOYMENT, expected_version=1, ended_at=T11
+            ),
+            lambda: p_start(r, p_deployment("dep_" + "9" * 32, T10), 2),
+        )
+    ),
+    "deployment.start.reused_deployment_id": _scenario(
+        lambda r: _then(
+            p_start(r, p_deployment(), 1),
+            lambda: r.deployments.end_deployment(
+                TENANT_A, P_DEPLOYMENT, expected_version=1, ended_at=T11
+            ),
+            lambda: p_start(r, p_deployment(started_at=T1130), 2),
+        )
+    ),
+    "deployment.start.component_decommissioned": _scenario(
+        lambda r: _then(
+            r.devices.update_component(
+                TENANT_A, P_COMPONENT, 1, name=None, status=ComponentStatus.DECOMMISSIONED
+            ),
+            lambda: p_start(r, p_deployment(), 1),
+        )
+    ),
+    "deployment.start.asset_archived": _scenario(
+        lambda r: _then(
+            r.sites.update_asset(
+                TENANT_A,
+                P_ASSET,
+                1,
+                name=None,
+                status=AssetStatus.ARCHIVED,
+                pond_description=None,
+                pond_profile_expected_version=None,
+            ),
+            lambda: p_start(r, p_deployment(), 1),
+        )
+    ),
+    "deployment.start.site_archived": _scenario(
+        lambda r: _then(
+            r.sites.update_site(TENANT_A, P_SITE, 1, name=None, status=SiteStatus.ARCHIVED),
+            lambda: p_start(r, p_deployment(), 1),
+        )
+    ),
+    "deployment.start.receipt_already_used": _scenario(
+        lambda r: _then(
+            p_start(r, p_deployment(), 1),
+            lambda: r.deployments.end_deployment(
+                TENANT_A, P_DEPLOYMENT, expected_version=1, ended_at=T11
+            ),
+            lambda: p_start(r, p_deployment("dep_" + "9" * 32, T11), 1),
+        )
+    ),
+    "deployment.start.not_active": _scenario(
+        lambda r: p_start(r, p_deployment(ended_at=T11, status=DeploymentStatus.ENDED), 1)
+    ),
+    "deployment.end.missing": _scenario(
+        lambda r: r.deployments.end_deployment(
+            TENANT_A, P_DEPLOYMENT, expected_version=1, ended_at=T11
+        )
+    ),
+    "deployment.end.stale_version": _scenario(
+        lambda r: _then(
+            p_start(r, p_deployment(), 1),
+            lambda: r.deployments.end_deployment(
+                TENANT_A, P_DEPLOYMENT, expected_version=3, ended_at=T11
+            ),
+        )
+    ),
+    "deployment.end.twice": _scenario(
+        lambda r: _then(
+            p_start(r, p_deployment(), 1),
+            lambda: r.deployments.end_deployment(
+                TENANT_A, P_DEPLOYMENT, expected_version=1, ended_at=T11
+            ),
+            lambda: r.deployments.end_deployment(
+                TENANT_A, P_DEPLOYMENT, expected_version=2, ended_at=T1130
+            ),
+        )
+    ),
+    "deployment.end.before_start": _scenario(
+        lambda r: _then(
+            p_start(r, p_deployment(started_at=T11), 1),
+            lambda: r.deployments.end_deployment(
+                TENANT_A, P_DEPLOYMENT, expected_version=1, ended_at=T10
+            ),
+        )
+    ),
+    "deployment.end_then_history_and_lookup": _scenario(
+        lambda r: _then(
+            p_start(r, p_deployment(), 1),
+            lambda: r.deployments.end_deployment(
+                TENANT_A, P_DEPLOYMENT, expected_version=1, ended_at=T11
+            ),
+            lambda: _gather(
+                r.deployments.list_component_deployments(TENANT_A, P_COMPONENT),
+                r.deployments.get_deployment_at(TENANT_A, P_COMPONENT, T10),
+                r.deployments.get_deployment_at(TENANT_A, P_COMPONENT, T11),
+                r.deployments.get_deployment(TENANT_B, P_DEPLOYMENT),
+            ),
+        )
+    ),
+}
+
+
+async def _then(first, *rest):
+    """Await `first`, then each zero-argument factory in turn; return the last result."""
+    result = await first
+    for step in rest:
+        result = await step()
+    return result
+
+
+async def _gather(*awaitables):
+    return [await awaitable for awaitable in awaitables]
+
+
+def _observable(value: Any) -> Any:
+    if isinstance(value, BaseModel):
+        return value.model_dump(mode="json")
+    if isinstance(value, list):
+        return [_observable(item) for item in value]
+    return value
+
+
+def parity_outcome(backend: str, scenario: Any) -> tuple:
+    try:
+        value = asyncio.run(scenario(ParityBundle(backend)))
+    except (NotFoundError, ConflictError, ValueError) as exc:
+        kind = next(k for k in (NotFoundError, ConflictError, ValueError) if isinstance(exc, k))
+        return ("raises", kind.__name__, str(exc).splitlines()[0])
+    return ("returns", _observable(value))
+
+
+@pytest.mark.parametrize("name", sorted(PARITY_SCENARIOS))
+def test_in_memory_repositories_match_the_dynamo_adapters(name: str) -> None:
+    in_memory = parity_outcome("in_memory", PARITY_SCENARIOS[name])
+    dynamo = parity_outcome("dynamo", PARITY_SCENARIOS[name])
+    assert in_memory == dynamo
+
+
+def test_parity_scenarios_exercise_both_outcomes() -> None:
+    kinds = {parity_outcome("dynamo", scenario)[0] for scenario in PARITY_SCENARIOS.values()}
+    assert kinds == {"raises", "returns"}
+
+
 # 2) West -> East relocation keeps the old event-time assignment ------------------------------------
 
 
@@ -951,6 +1611,65 @@ def test_apply_after_a_mixed_flag_window_converges(window: str) -> None:
     }
     assert_second_apply_only_bumped_the_receipt(after_repair, client.snapshot(), first_run_count=2)
     assert client.scan_calls == 0
+
+
+RUNBOOK = ROOT / "docs/m1-acceptance-runbook.md"
+
+
+def runbook_fenced_delete(tenant_id: str, device_id: str, version: int) -> list[dict]:
+    """The runbook's `delete-legacy-device.json`, with its placeholders filled in."""
+    text = RUNBOOK.read_text(encoding="utf-8")
+    section = text[text.index("### Removing a legacy Device") :]
+    block = section[
+        section.index("```json") + len("```json") : section.index(
+            "```", section.index("```json") + 7
+        )
+    ]
+    for placeholder, value in {
+        "<DYNAMODB_DOMAIN_TABLE>": TABLE,
+        "<tenant>": tenant_id,
+        "<device>": device_id,
+        "<observed-version>": str(version),
+    }.items():
+        block = block.replace(placeholder, value)
+    assert "<" not in block, block
+    return json.loads(block)
+
+
+def _legacy_device_rows(client: ConditionalDynamoClient, device_id: str) -> list:
+    return [
+        client.item(f"TENANT#{TENANT}", f"DEVICE#{device_id}"),
+        client.item(f"DEVICE#{device_id}", "META"),
+    ]
+
+
+@pytest.mark.parametrize("state", ["never_projected", "projected", "changed"])
+def test_runbook_fenced_device_delete_refuses_projected_devices(state: str) -> None:
+    client = legacy_store()
+    observed_version = 1
+    if state == "projected":
+        assert migrate(client, apply=True).result == "success"
+    elif state == "changed":
+        # A concurrent `/v1` write bumps the version after the operator's preflight read.
+        legacy = DynamoDomainRepository(TABLE, client)
+        asyncio.run(
+            legacy.update_device(
+                TENANT, LEGACY_DEVICE, 1, name="Renamed", pond_id=None, firmware_version=None
+            )
+        )
+    request = runbook_fenced_delete(TENANT, LEGACY_DEVICE, observed_version)
+    before = client.snapshot()
+
+    if state == "never_projected":
+        client.transact_write_items(TransactItems=request)
+        assert _legacy_device_rows(client, LEGACY_DEVICE) == [None, None]
+        component_id = default_component_id_for_legacy_device(TENANT, LEGACY_DEVICE)
+        assert client.item(f"COMPONENT#{component_id}", "META") is None
+        return
+    with pytest.raises(ClientError) as cancelled:
+        client.transact_write_items(TransactItems=request)
+    assert cancelled.value.response["Error"]["Code"] == "TransactionCanceledException"
+    assert client.snapshot() == before
 
 
 # 7) Projection flag with incomplete repository state returns 503 -----------------------------------

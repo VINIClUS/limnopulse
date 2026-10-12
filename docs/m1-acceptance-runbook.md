@@ -11,7 +11,7 @@ The two flags are independent and both default to `false`:
 
 | Flag | Effect when `true` |
 |---|---|
-| `API_V2_ENABLED` | Mounts the M1 `/v2` groups: 13 paths and 25 operations (Sites, Assets, Devices, Components, Capabilities, Integration accounts, Device integrations, Deployments) for every tenant of the deployment; there is no tenant allowlist. |
+| `API_V2_ENABLED` | Mounts the M1 `/v2` groups: 13 paths and 25 operations (Sites, Assets, Devices, Components, Capabilities, Integration accounts, Device integrations, Deployments) for every tenant of the deployment; there is no tenant allowlist, so every served tenant must be migrated first (rollout step 6). |
 | `V1_POND_DEVICE_PROJECTION_ENABLED` | `/v1` Pond/Device routes read and write through the v2 projection. When any of the four M1 repositories is missing from app state, they return `503` and never fall back to the legacy repository. |
 
 ## Release gate
@@ -87,20 +87,37 @@ conditional transactions and ignores the 1 MB Query page, so its results do not 
    (enable, rollback, re-enable) therefore takes effect only after a restart or redeploy of
    **every** API instance; changing the environment alone does nothing. After each restart,
    [verify the flags took effect](#verify-the-flags-took-effect).
-6. **Pilot `API_V2_ENABLED=true`.** `API_V2_ENABLED` mounts `/v2` for the whole application;
-   there is no tenant allowlist. Enabling it is **environment-wide**: every tenant served by
-   that deployment gets the M1 endpoints (still gated by tenant membership). A tenant-limited
-   pilot therefore needs an isolated environment or deployment serving only the pilot tenants;
-   otherwise accept and record that the pilot is environment-wide. Smoke each M1 group: list and
-   create Sites, Assets, Devices, Components, Capabilities, Integration accounts, Device
-   integrations, and start and end Deployments. Every `/v2` create needs an `Idempotency-Key`
-   of 8–128 characters. Restart every API instance and verify the flags took effect.
+6. **Enable `API_V2_ENABLED=true`.** `API_V2_ENABLED` mounts `/v2` for the whole application;
+   there is no tenant allowlist, so enabling it is **environment-wide**: every tenant served by
+   that deployment gets the M1 endpoints (still gated by tenant membership). `/v2` on an
+   unmigrated tenant shows an incomplete domain (no Site, Assets, Components or Deployments for
+   its legacy Ponds and Devices). Before enabling, therefore, **one** of these must hold:
+   - the deployment is isolated and serves only the pilot tenant(s), which steps 2–4 migrated;
+     or
+   - steps 2–4 (dry-run, `--apply`, idempotency `--apply`) ran for **every** tenant served by
+     the deployment, with exit `0` and no conflicts. Use `--tenant-file` with one tenant ID per
+     line, kept inside the repository working directory and not committed (see
+     [Migration exit codes](#migration-exit-codes)). The code has **no tenant registry and
+     never Scans**, so build the list from the operator's tenant inventory (onboarding or
+     provisioning records). The only Scan-free read the code offers is per user: Query
+     `PK = USER#<cognito_sub>` with `begins_with(SK, "TENANT#")` for each known Cognito user
+     (e.g. from Cognito `ListUsers`) and take the union. Any typo or stale entry then shows up
+     as `tenant_missing` in the dry-run.
+
+   Then, in this order:
+   1. Set `API_V2_ENABLED=true`.
+   2. Restart or redeploy **every** API instance.
+   3. [Verify the flags took effect](#verify-the-flags-took-effect).
+   4. Smoke each M1 group: list and create Sites, Assets, Devices, Components, Capabilities,
+      Integration accounts, Device integrations, and start and end Deployments. Every `/v2`
+      create needs an `Idempotency-Key` of 8–128 characters.
 7. **Check the `/v1` golden and tenant conformance.** Run
    `tests/contracts/test_v1_openapi_contract.py`, `tests/unit/test_tenant_mapping_conformance.py`
    and `tests/unit/test_no_scan_guard.py` against the deployed revision, or just run the release
    gate above.
 8. **Enable the projection with a closed cutover window.**
-   1. Re-run the dry-run and `--apply` immediately before the cutover. The flag was off, so
+   1. Re-run the dry-run and `--apply` immediately before the cutover, for **every** tenant
+      served by the deployment (the same tenant list and rule as step 6). The flag was off, so
       `/v1` moves made since step 3 may have left drift; this pass repairs it (see
       [Drift repair](#drift-repair)).
    2. Set `V1_POND_DEVICE_PROJECTION_ENABLED=true` and cut over **atomically** where the
@@ -112,7 +129,7 @@ conditional transactions and ignores the 1 MB Query page, so its results do not 
       a Device created there has no Component or Deployment until it is migrated.
    3. Verify the flags took effect on **every** instance.
    4. **Mandatory, in either case:** once every instance is confirmed flag-on, run the dry-run
-      and `--apply` **again**. It repairs window moves through drift repair and backfills
+      and `--apply` **again** for the same tenant list. It repairs window moves through drift repair and backfills
       window-created Devices. Running it while flag-on `/v1` writes continue is safe; the M1-05
       writes and the M1-06 migration converge. The gate proves this sequence
       (`test_apply_after_a_mixed_flag_window_converges`): after this apply, CURRENT is on the new
@@ -247,10 +264,52 @@ Device would orphan its default Component, `DEPLOYMENT#CURRENT`, marker and acti
 a projected Device, do **not** delete anything: fix its `pond_id` as above, or escalate to the
 M1-05/M1-06 owner.
 
-For a never-projected Device: take a backup first, delete **both** the
-`TENANT#<tenant>/DEVICE#<device>` row and the `DEVICE#<device>/META` lookup, then re-run the
-dry-run and `--apply`. This is a deliberate exception to "never delete rows", which governs
-rollback.
+For a never-projected Device, the preflight checks above are only reads: a concurrent flag-on
+`/v1` write or a migration run could project the Device between the check and the delete. So:
+
+1. Take a backup. Quiesce `/v1` writes for that tenant and do not run the migration until
+   step 4 is done.
+2. Read both rows and note the Device row's `version`.
+3. Delete **both** rows in **one fenced transaction**. Each Delete is conditioned on the
+   observed version, the tenant, and the absence of both projection link attributes, so the
+   whole transaction is cancelled (nothing deleted) if the Device was projected or changed in
+   the meantime. Replace the placeholders and run
+   `aws dynamodb transact-write-items --transact-items file://delete-legacy-device.json`
+   with this file:
+
+   ```json
+   [
+     {
+       "Delete": {
+         "TableName": "<DYNAMODB_DOMAIN_TABLE>",
+         "Key": {"PK": {"S": "TENANT#<tenant>"}, "SK": {"S": "DEVICE#<device>"}},
+         "ConditionExpression": "#version = :version AND #tenant_id = :tenant_id AND attribute_not_exists(#component_link) AND attribute_not_exists(#projection_version)",
+         "ExpressionAttributeNames": {"#version": "version", "#tenant_id": "tenant_id", "#component_link": "default_component_id", "#projection_version": "v2_projection_version"},
+         "ExpressionAttributeValues": {":version": {"N": "<observed-version>"}, ":tenant_id": {"S": "<tenant>"}}
+       }
+     },
+     {
+       "Delete": {
+         "TableName": "<DYNAMODB_DOMAIN_TABLE>",
+         "Key": {"PK": {"S": "DEVICE#<device>"}, "SK": {"S": "META"}},
+         "ConditionExpression": "#version = :version AND #tenant_id = :tenant_id AND attribute_not_exists(#component_link) AND attribute_not_exists(#projection_version)",
+         "ExpressionAttributeNames": {"#version": "version", "#tenant_id": "tenant_id", "#component_link": "default_component_id", "#projection_version": "v2_projection_version"},
+         "ExpressionAttributeValues": {":version": {"N": "<observed-version>"}, ":tenant_id": {"S": "<tenant>"}}
+       }
+     }
+   ]
+   ```
+
+   A `TransactionCanceledException` with `ConditionalCheckFailed` means the Device changed or
+   was projected: stop, and treat it as projected (fix its `pond_id` or escalate).
+4. Post-delete check: `GetItem` on `COMPONENT#<cmp>/META` (deterministic `cmp`, as above) must
+   return nothing. If it exists, a projection raced the delete: restore both rows from the
+   backup and escalate.
+5. Re-run the dry-run and `--apply`, then lift the quiesce.
+
+The gate executes this exact JSON against the condition-evaluating fake
+(`test_runbook_fenced_device_delete_refuses_projected_devices`). This is a deliberate exception
+to "never delete rows", which governs rollback.
 
 ## Drift repair
 
