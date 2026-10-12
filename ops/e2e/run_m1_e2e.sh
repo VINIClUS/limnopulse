@@ -213,7 +213,7 @@ count_verdicts() {
 enough_verdicts() { [[ "$(count_verdicts)" -ge "$expected" ]]; }
 wait_for "$E2E_TIMEOUT" enough_verdicts || log "timed out waiting for ${expected} verdict(s)"
 
-summary_args=(--raw "$WORK/verdicts.raw" --device-id "$E2E_DEVICE_ID" "${replay_expect[@]}" --jsonl-out "$WORK/verdicts.replay.jsonl")
+summary_args=(--raw "$WORK/verdicts.raw" --device-id "$E2E_DEVICE_ID" "${replay_expect[@]}")
 scenario_args=()
 if [[ "$ALLOW_V2_UNAVAILABLE" == "1" ]]; then
   summary_args+=(--allow-v2-unavailable)
@@ -223,6 +223,8 @@ set +e
 log "replay verdicts (${E2E_DEVICE_ID}):"
 "$PYTHON" "$E2E_DIR/summarize_verdicts.py" "${summary_args[@]}"
 result=$?
+"$PYTHON" "$E2E_DIR/summarize_verdicts.py" --raw "$WORK/verdicts.raw" \
+  --device-id "$E2E_DEVICE_ID" --jsonl >"$WORK/verdicts.replay.jsonl"
 set -e
 
 # API-driven scenarios (ops/e2e/scenarios.py): West->East relocation of a NEW
@@ -253,7 +255,7 @@ done
 # Failed scenarios still report their devices (SCENARIO_DEVICE), and each one
 # counts as a failure, so the final SUMMARY shows failures>0 whenever a
 # scenario made this script fail.
-final_args=(--raw "$WORK/verdicts.raw" "${devices[@]}" "${all_expect[@]}" --jsonl-out "$WORK/verdicts.jsonl" --scenarios-failed "$scenarios_failed")
+final_args=(--raw "$WORK/verdicts.raw" "${devices[@]}" "${all_expect[@]}" --scenarios-failed "$scenarios_failed")
 if [[ "$ALLOW_V2_UNAVAILABLE" == "1" ]]; then
   final_args+=(--allow-v2-unavailable)
 fi
@@ -261,6 +263,8 @@ log "all verdicts:"
 set +e
 "$PYTHON" "$E2E_DIR/summarize_verdicts.py" "${final_args[@]}"
 final=$?
+"$PYTHON" "$E2E_DIR/summarize_verdicts.py" --raw "$WORK/verdicts.raw" "${devices[@]}" \
+  --jsonl >"$WORK/verdicts.jsonl"
 set -e
 if [[ $result -eq 0 ]]; then
   result=$final

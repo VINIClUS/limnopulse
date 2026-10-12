@@ -11,9 +11,8 @@ while (base.endsWith("/")) {
 const tenant = String(env.get("LIMNOPULSE_TENANT") || "tnt_local_001");
 const parts = String(msg.topic || "").split("/");
 // The switch node only lets objects through; never trust that here.
-const reading = msg.payload !== null && typeof msg.payload === "object" && !Array.isArray(msg.payload)
-    ? msg.payload
-    : {};
+const payload = msg.payload;
+const reading = payload && typeof payload === "object" && !Array.isArray(payload) ? payload : {};
 
 const ctx = {
     base: base,

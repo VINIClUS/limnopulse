@@ -9,8 +9,9 @@ Verdicts are counted once per published reading, identified by
 tolerated only when the duplicates agree. With ``--expect-reading`` every
 listed reading needs a verdict and no other reading may have one.
 
-``--raw`` and ``--jsonl-out`` must stay inside the working directory (run from
-the repository root).
+``--raw`` must stay inside the working directory (run from the repository
+root). ``--jsonl`` prints the selected verdicts as JSON lines on stdout instead
+of the summary; the caller redirects it to a file.
 
 Exit codes: 0 pass, 1 a verdict failed (ok=false, ok=null without
 --allow-v2-unavailable, conflicting duplicates, an unexpected reading) or
@@ -150,13 +151,14 @@ def main(argv: list[str] | None = None) -> int:
         help="failed API-driven scenarios; each one counts as a failure",
     )
     parser.add_argument("--count-only", action="store_true")
-    parser.add_argument("--jsonl-out", help="output file inside the working directory")
+    parser.add_argument(
+        "--jsonl", action="store_true", help="print the selected verdicts as JSON lines and exit"
+    )
     args = parser.parse_args(argv)
 
     try:
         expected = parse_expected(args.expect_reading)
         verdicts = parse_stream(read_raw(args.raw))
-        jsonl_out = contained_path(args.jsonl_out) if args.jsonl_out else None
     except SummaryError as exc:
         print(f"summarize: {exc}", file=sys.stderr)
         return 2
@@ -169,10 +171,9 @@ def main(argv: list[str] | None = None) -> int:
         print(len(covered))
         return 0
 
-    if jsonl_out is not None:
-        jsonl_out.write_text(
-            "".join(json.dumps(v, sort_keys=True) + "\n" for v in verdicts), encoding="utf-8"
-        )
+    if args.jsonl:
+        sys.stdout.write("".join(json.dumps(v, sort_keys=True) + "\n" for v in verdicts))
+        return 0
 
     print(f"{'seq':>5}  {'ok':<5}  {'reason':<26}  device / ts / v1_pond_id / resolved / expected")
     failures = 0

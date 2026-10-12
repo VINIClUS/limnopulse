@@ -835,7 +835,6 @@ def test_summarize_rejects_paths_outside_the_working_directory(
 
     assert summarize.main(["--raw", str(outside)]) == 2
     assert summarize.main(["--raw", "../outside.raw"]) == 2
-    assert summarize.main(["--raw", "x.raw", "--jsonl-out", "../out.jsonl"]) == 2
     assert "inside the working directory" in capsys.readouterr().err
     (inside / "dir.raw").mkdir()
     assert summarize.main(["--raw", "dir.raw"]) == 2
@@ -1017,7 +1016,9 @@ def test_run_script_expects_every_published_reading() -> None:
 
     assert "grep '^PUBLISHED '" in runner
     assert '"${replay_expect[@]}" --count-only' in runner
-    assert '"${all_expect[@]}" --jsonl-out' in runner
+    assert '"${all_expect[@]}" --scenarios-failed' in runner
+    assert '--jsonl >"$WORK/verdicts.jsonl"' in runner
+    assert "--jsonl-out" not in runner
     assert '--expect "$' not in runner
     assert 'WORK="$(realpath -m -- "${E2E_WORK_DIR:-$ROOT/.e2e-out/m1-e2e}")"' in runner
     assert 'cd "$ROOT"' in runner
@@ -1150,3 +1151,20 @@ def test_node_functions_avoid_flagged_constructs() -> None:
     assert ".sort()" not in prepare and "/+$/" not in prepare
     assert re.search(r"\) \| 0;", sha) is None
     assert re.search(r"(?<![.\w])(NaN|parseInt)\b", resolve) is None
+
+
+def test_summarize_jsonl_prints_selected_verdicts_without_writing_files(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    summarize = _load("m1_e2e_summarize_jsonl", E2E / "summarize_verdicts.py")
+    monkeypatch.chdir(tmp_path)
+    rows = [
+        {"device_id": "a", "seq": 1, "ts": "t1", "ok": True, "reason": "match"},
+        {"device_id": "b", "seq": 1, "ts": "t1", "ok": True, "reason": "match"},
+    ]
+    (tmp_path / "v.raw").write_text("".join(json.dumps(r) + "\n" for r in rows))
+
+    assert summarize.main(["--raw", "v.raw", "--device-id", "a", "--jsonl"]) == 0
+    lines = capsys.readouterr().out.splitlines()
+    assert [json.loads(line)["device_id"] for line in lines] == ["a"]
+    assert sorted(p.name for p in tmp_path.iterdir()) == ["v.raw"]
