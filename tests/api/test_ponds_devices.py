@@ -707,3 +707,31 @@ def test_flag_on_noncanonical_legacy_device_patch_is_409_not_500() -> None:
             {"detail": "device is not compatible with the v2 projection"},
         )
     assert len(dynamo.transactions) == transactions_before
+
+
+def test_flag_on_unaddressable_ids_keep_legacy_status_codes() -> None:
+    app, dynamo = projection_app()
+    client = TestClient(app, raise_server_exceptions=False)
+    pond_id = client.post("/v1/tenants/tnt_1/ponds", json={"name": "West"}, headers=HEADERS).json()[
+        "pond_id"
+    ]
+    device = client.post(
+        "/v1/tenants/tnt_1/devices", json={"pond_id": pond_id, "name": "Gateway"}, headers=HEADERS
+    ).json()
+    device_path = f"/v1/tenants/tnt_1/devices/{device['device_id']}"
+    transactions_before = len(dynamo.transactions)
+
+    for path in ("/v1/tenants/tnt_1/ponds/a%23b", "/v1/tenants/tnt_1/devices/a%23b"):
+        assert client.get(path, headers=HEADERS).status_code == 404
+        patched = client.patch(path, json={"expected_version": 1, "name": "X"}, headers=HEADERS)
+        assert patched.status_code == 404
+    for bad in ("x#y", ""):
+        created = client.post(
+            "/v1/tenants/tnt_1/devices", json={"pond_id": bad, "name": "X"}, headers=HEADERS
+        )
+        moved = client.patch(
+            device_path, json={"expected_version": 1, "pond_id": bad}, headers=HEADERS
+        )
+        for response in (created, moved):
+            assert (response.status_code, response.json()) == (409, {"detail": "pond not found"})
+    assert len(dynamo.transactions) == transactions_before

@@ -498,9 +498,22 @@ class DynamoV1PondDeviceProjection(DynamoV2RepositoryBase):
         if component_item is None:
             await self._provision_device(plan, previous_pond_id, device, target, now)
             return
+        component_active = (
+            component_from_item(component_item).status is ComponentStatus.ACTIVE
+        )
+        current_item = await self._tenant_item(
+            self.keys.current_deployment(component_id), tenant_id
+        )
         if target is None:
-            return
-        if component_from_item(component_item).status is not ComponentStatus.ACTIVE:
+            if not component_active or current_item is None:
+                return
+            # Reconcile-on-write: the Pond may have changed while the projection was off.
+            target = await self._reconcile_target(
+                plan, tenant_id, device.pond_id, deployment_from_item(current_item)
+            )
+            if target is None:
+                return
+        if not component_active:
             raise ConflictError(COMPONENT_NOT_ACTIVE)
         plan.add(
             "component_check",
@@ -510,9 +523,6 @@ class DynamoV1PondDeviceProjection(DynamoV2RepositoryBase):
                     self.keys.component(component_id), tenant_id, ComponentStatus.ACTIVE.value
                 )
             },
-        )
-        current_item = await self._tenant_item(
-            self.keys.current_deployment(component_id), tenant_id
         )
         site_id, asset_id = target
         if current_item is None:
@@ -575,6 +585,33 @@ class DynamoV1PondDeviceProjection(DynamoV2RepositoryBase):
             },
         )
 
+    async def _reconcile_target(
+        self, plan: _Plan, tenant_id: str, pond_id: str, current: Deployment
+    ) -> tuple[str, str] | None:
+        """Target of the effective legacy Pond when CURRENT drifted away from it, else `None`.
+
+        A dangling, unaddressable or inactive effective Pond leaves CURRENT untouched: drift is
+        repaired opportunistically and never blocks an unrelated `/v1` write.
+        """
+        try:
+            pond_item = await self._legacy_pond_item(tenant_id, pond_id)
+        except ConflictError:
+            return None
+        if pond_item is None:
+            return None
+        asset_id = self._pond_asset_id(tenant_id, pond_item)
+        if asset_id == current.asset_id:
+            return None
+        asset_item = await self._tenant_item(self.keys.asset(tenant_id, asset_id), tenant_id)
+        status = (
+            asset_from_item(asset_item).status
+            if asset_item is not None
+            else asset_status_from_legacy(legacy_pond_from_item(pond_item).status)
+        )
+        if status is not AssetStatus.ACTIVE:
+            return None
+        return await self._pond_target(plan, tenant_id, pond_item, active=True)
+
     async def _provision_device(
         self,
         plan: _Plan,
@@ -620,8 +657,14 @@ class DynamoV1PondDeviceProjection(DynamoV2RepositoryBase):
         self._put_marker(plan, new, seq=2, last_ended_at=transition_at)
 
     async def _legacy_pond_item(self, tenant_id: str, pond_id: str) -> dict[str, Any] | None:
-        with _v2_compatible("pond"):
+        """Legacy Pond row; an identifier v2 cannot address ('#', empty) is "not found" unless a
+        legacy row really exists under it, which is then incompatible (409)."""
+        try:
             key = self.keys.legacy_pond(tenant_id, pond_id)
+        except ValueError:
+            if await self._tenant_item(_LEGACY_KEYS.pond(tenant_id, pond_id), tenant_id) is None:
+                return None
+            raise ConflictError("pond is not compatible with the v2 projection") from None
         return await self._tenant_item(key, tenant_id)
 
     async def _pond_target(

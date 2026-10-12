@@ -1225,3 +1225,77 @@ async def test_site_failures_use_a_neutral_detail() -> None:
     with pytest.raises(ConflictError) as raised:
         await projection(client).create_pond(TENANT, "pond_east", "East", None)
     assert str(raised.value) == "site not available"
+
+
+@pytest.mark.asyncio
+async def test_unaddressable_ids_are_not_found_and_unaddressable_pond_ids_conflict() -> None:
+    client = store()
+    seed_migrated_pond(client, "pond_west")
+    repo = projection(client)
+    await repo.create_device(TENANT, "pond_west", DEV_1, "Gateway", None)
+    before = client.snapshot()
+
+    for bad in ("a#b", ""):
+        assert await repo.get_pond(TENANT, bad) is None
+        assert await repo.get_device(TENANT, bad) is None
+        with pytest.raises(NotFoundError):
+            await repo.update_pond(TENANT, bad, 1, "X", None)
+        with pytest.raises(NotFoundError):
+            await repo.update_device(TENANT, bad, 1, "X", None, None)
+        with pytest.raises(ConflictError, match="^pond not found$"):
+            await repo.create_device(TENANT, bad, DEV_2, "X", None)
+        with pytest.raises(ConflictError, match="^pond not found$"):
+            await repo.update_device(TENANT, DEV_1, 1, None, bad, None)
+    assert client.snapshot() == before
+
+
+@pytest.mark.asyncio
+async def test_flag_toggle_drift_is_reconciled_on_the_next_projected_write() -> None:
+    client = store()
+    seed_migrated_pond(client, "pond_west")
+    seed_migrated_pond(client, "pond_east", name="East")
+    clock = Clock("2026-08-25T10:00:00Z")
+    await projection(client, clock).create_device(TENANT, "pond_west", DEV_1, "Gateway", None)
+    component_id = default_component_id_for_legacy_device(TENANT, DEV_1)
+    # Flag off: the legacy repository moves the Device without touching v2.
+    await DynamoDomainRepository(TABLE, client).update_device(
+        TENANT, DEV_1, 1, None, "pond_east", None
+    )
+    assert client.item(deployment_marker_key(component_id))["seq"] == 1
+
+    clock.set("2026-08-25T12:00:00Z")
+    renamed = await projection(client, clock).update_device(TENANT, DEV_1, 2, "Renamed", None, None)
+
+    assert (renamed.pond_id, renamed.name, renamed.version) == ("pond_east", "Renamed", 3)
+    deployments = DynamoDeploymentRepository(TABLE, client)
+    before = await deployments.get_deployment_at(TENANT, component_id, dt("2026-08-25T11:00:00Z"))
+    after = await deployments.get_deployment_at(TENANT, component_id, dt("2026-08-25T12:30:00Z"))
+    assert before.asset_id == asset_id_for_legacy_pond(TENANT, "pond_west")
+    assert before.ended_at == dt("2026-08-25T12:00:00Z")
+    assert after.asset_id == asset_id_for_legacy_pond(TENANT, "pond_east")
+    assert client.item(deployment_marker_key(component_id))["seq"] == 2
+    await assert_device_projection_matches(client, DEV_1)
+
+    # Already aligned: the next write is not a transition.
+    await projection(client, clock).update_device(TENANT, DEV_1, 3, "Again", None, None)
+    assert len(await deployments.list_component_deployments(TENANT, component_id)) == 2
+
+
+@pytest.mark.asyncio
+async def test_drift_to_a_dangling_pond_leaves_current_untouched() -> None:
+    client = store()
+    seed_migrated_pond(client, "pond_west")
+    await projection(client).create_device(TENANT, "pond_west", DEV_1, "Gateway", None)
+    await DynamoDomainRepository(TABLE, client).update_device(
+        TENANT, DEV_1, 1, None, "pond_gone", None
+    )
+
+    renamed = await projection(client).update_device(TENANT, DEV_1, 2, "Renamed", None, None)
+
+    assert (renamed.pond_id, renamed.version) == ("pond_gone", 3)
+    component_id = default_component_id_for_legacy_device(TENANT, DEV_1)
+    current = await DynamoDeploymentRepository(TABLE, client).get_current_deployment(
+        TENANT, component_id
+    )
+    assert current.asset_id == asset_id_for_legacy_pond(TENANT, "pond_west")
+    assert len(client.transactions[-1]) == 2
