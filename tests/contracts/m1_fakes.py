@@ -69,7 +69,7 @@ _TOKEN = re.compile(
 
 
 class _Condition:
-    """Recursive-descent evaluator for `OR`/`AND`/parentheses over comparisons and
+    """Recursive-descent evaluator for `OR`/`AND`/parentheses over comparisons, `IN (...)`,
     `attribute_exists`, `attribute_not_exists` and `attribute_type(x, :n)`."""
 
     def __init__(self, text: str, names: dict, values: dict, item: dict | None) -> None:
@@ -138,6 +138,16 @@ class _Condition:
             numeric = isinstance(value, (int, Decimal)) and not isinstance(value, bool)
             return expected == "N" and numeric
         operator = self._take()
+        if operator == "IN":
+            # `a IN (:x, :y, ...)`: true when the attribute equals any listed value.
+            assert self._take() == "("
+            candidates = [self._operand(self._take())]
+            while self._peek() == ",":
+                self._take()
+                candidates.append(self._operand(self._take()))
+            assert self._take() == ")"
+            left = self._operand(token)
+            return left is not None and left in candidates
         left, right = self._operand(token), self._operand(self._take())
         if left is None or right is None:
             return False

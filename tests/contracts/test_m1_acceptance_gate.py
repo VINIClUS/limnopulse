@@ -16,11 +16,16 @@ from typing import Any
 import pytest
 from fastapi.testclient import TestClient
 
+from limnopulse_api.adapters.dynamodb_integrations import integration_account_to_item
 from limnopulse_api.adapters.dynamodb_v1_pond_device_projection import (
     DynamoV1PondDeviceProjection,
 )
 from limnopulse_api.api.dependencies import require_tenant_access
 from limnopulse_api.api.openapi_contract import build_v1_openapi_contract, iter_effective_api_routes
+from limnopulse_api.api.v2.schemas.integrations import (
+    DeviceIntegrationCreate,
+    IntegrationAccountCreate,
+)
 from limnopulse_api.core.config import Settings
 from limnopulse_api.core.errors import ConflictError
 from limnopulse_api.domain.deployments import DeploymentStatus
@@ -32,8 +37,9 @@ from limnopulse_api.domain.ids import (
     default_site_id,
     deployment_id_for_legacy_device,
 )
+from limnopulse_api.domain.integrations import DeviceIntegration, IntegrationAccountStatus
 from limnopulse_api.domain.roles import TenantRole
-from limnopulse_api.domain.v2_common import QuotaDimension
+from limnopulse_api.domain.v2_common import QuotaDimension, new_idempotency_receipt
 from limnopulse_api.main import create_app
 from limnopulse_api.migrations.default_site_asset import DefaultSiteAssetMigrator
 from limnopulse_api.repositories.v2_contracts import (
@@ -42,6 +48,8 @@ from limnopulse_api.repositories.v2_contracts import (
     IntegrationRepository,
     SiteAssetRepository,
 )
+from limnopulse_api.services.devices_v2 import DeviceV2CreateCommand, DeviceV2Service
+from limnopulse_api.services.integrations import IntegrationService
 from tests.contracts.m1_fakes import (
     TABLE,
     ConditionalDynamoClient,
@@ -306,6 +314,100 @@ def test_in_memory_repositories_implement_the_four_frozen_protocols() -> None:
         assert isinstance(repositories, protocol)
 
 
+def integration_fixture() -> tuple[ConditionalDynamoClient, DynamoM1Repositories, Any, str, str]:
+    """A native v2 Device plus a pending IntegrationAccount, created through the real services
+    over the real Dynamo adapters."""
+    client = ConditionalDynamoClient()
+    repositories = DynamoM1Repositories.over(client, clock=lambda: NOW)
+    device = asyncio.run(
+        DeviceV2Service(repositories.device_component_repository, clock=lambda: NOW).create(
+            TENANT, DeviceV2CreateCommand(name="Gateway"), "m1-gate-device-0001"
+        )
+    ).entity
+    service = IntegrationService(
+        repositories.integration_repository,
+        repositories.device_component_repository,
+        clock=lambda: NOW,
+    )
+    created = asyncio.run(
+        service.create_integration_account(
+            TENANT,
+            IntegrationAccountCreate(provider_key="vendor.cloud", display_name="Vendor"),
+            "m1-gate-account-0001",
+        )
+    )
+    account_id = json.loads(created.snapshot_json)["integration_account_id"]
+    return client, repositories, service, device.device_id, account_id
+
+
+def test_device_integration_create_commits_through_the_in_condition_fence() -> None:
+    client, repositories, service, device_id, account_id = integration_fixture()
+
+    result = asyncio.run(
+        service.create_device_integration(
+            TENANT,
+            device_id,
+            DeviceIntegrationCreate(integration_account_id=account_id, external_identity="sn-1"),
+            "m1-gate-integration-0001",
+        )
+    )
+
+    assert result.replayed is False
+    integrations = asyncio.run(
+        repositories.integration_repository.list_device_integrations(TENANT, device_id)
+    )
+    assert [item.integration_account_id for item in integrations] == [account_id]
+    assert len([key for key in client.items if key[0].startswith("EXTERNAL_ID#")]) == 1
+    assert client.scan_calls == 0
+
+
+def test_device_integration_for_a_revoked_account_is_a_conflict() -> None:
+    client, repositories, service, device_id, account_id = integration_fixture()
+    account = asyncio.run(
+        repositories.integration_repository.get_integration_account(TENANT, account_id)
+    )
+    revoked = account.model_copy(update={"status": IntegrationAccountStatus.REVOKED})
+    client.seed(integration_account_to_item(revoked, repositories.integration_repository.keys))
+    before = client.snapshot()
+    integration = DeviceIntegration(
+        tenant_id=TENANT,
+        device_integration_id="di_" + "7" * 32,
+        device_id=device_id,
+        integration_account_id=account_id,
+        provider_key="vendor.cloud",
+        external_identity_hash="e" * 64,
+        created_at=NOW,
+        updated_at=NOW,
+        version=1,
+    )
+    receipt = new_idempotency_receipt(
+        tenant_id=TENANT,
+        scope="device-integration-create",
+        key_hash="a" * 64,
+        request_hash="b" * 64,
+        response_snapshot_json="{}",
+        created_at=NOW,
+    )
+
+    # The commit-time `#status IN (:pending, :active)` fence rejects the revoked parent.
+    with pytest.raises(ConflictError, match="not provisionable"):
+        asyncio.run(
+            repositories.integration_repository.create_device_integration(integration, receipt)
+        )
+    with pytest.raises(ConflictError, match="revoked"):
+        asyncio.run(
+            service.create_device_integration(
+                TENANT,
+                device_id,
+                DeviceIntegrationCreate(
+                    integration_account_id=account_id, external_identity="sn-1"
+                ),
+                "m1-gate-integration-0002",
+            )
+        )
+    assert client.snapshot() == before
+
+
 # 2) West -> East relocation keeps the old event-time assignment ------------------------------------
 
 
@@ -565,6 +667,7 @@ def test_v2_flag_on_mounts_exactly_the_m1_groups() -> None:
     [
         {},
         {"api_v2_enabled": True},
+        {"v1_pond_device_projection_enabled": True},
         {"api_v2_enabled": True, "v1_pond_device_projection_enabled": True},
     ],
 )
@@ -578,6 +681,7 @@ def test_v1_contract_matches_the_p0_golden(flags: dict[str, bool]) -> None:
     [
         ({}, V1_TENANT_ROUTE_COUNT),
         ({"api_v2_enabled": True}, V1_TENANT_ROUTE_COUNT + len(M1_V2_OPERATIONS)),
+        ({"v1_pond_device_projection_enabled": True}, V1_TENANT_ROUTE_COUNT),
         (
             {"api_v2_enabled": True, "v1_pond_device_projection_enabled": True},
             V1_TENANT_ROUTE_COUNT + len(M1_V2_OPERATIONS),

@@ -58,9 +58,12 @@ The acceptance gate proves these invariants:
 Use dynamodb-local or real DynamoDB as the reference store. Floci can double-commit concurrent
 conditional transactions and ignores the 1 MB Query page, so its results do not count.
 
-1. **Confirm a backup and PITR.** Confirm point-in-time recovery is enabled on
-   `LimnopulseDomain`, or take an on-demand backup. Record the environment, the table names
-   (`DYNAMODB_DOMAIN_TABLE`, `DYNAMODB_AUDIT_TABLE`) and the pilot tenant IDs.
+1. **Confirm a backup and PITR.** Read the domain table name from the environment's
+   `DYNAMODB_DOMAIN_TABLE` (setting `dynamodb_domain_table`; `LimnopulseDomain` is only the
+   default, e.g. locally). Confirm point-in-time recovery is enabled on **that** table, or take
+   an on-demand backup of it. Record the environment, both table names (`DYNAMODB_DOMAIN_TABLE`,
+   `DYNAMODB_AUDIT_TABLE`) and the pilot tenant IDs. The migration CLI uses the same setting, so
+   run it with the environment's value exported.
 2. **Dry-run an explicit tenant.** Run this from the repository root. The migration never
    discovers tenants and has no `--all`.
 
@@ -78,10 +81,16 @@ conditional transactions and ignores the 1 MB Query page, so its results do not 
    must be `0`, `legacy_links_updated` must be `0` and `already_migrated` must be nonzero.
 5. **Deploy with both flags false.** Set `API_V2_ENABLED=false` and
    `V1_POND_DEVICE_PROJECTION_ENABLED=false`. `/v1` behaves exactly as before.
+
+   Both flags are read once, when `create_app()` builds the app: `Settings` is captured there
+   and the `/v2` routers are mounted (or not) at startup. **Every** flag change in this runbook
+   (enable, rollback, re-enable) therefore takes effect only after a restart or redeploy of
+   **every** API instance; changing the environment alone does nothing. After each restart,
+   [verify the flags took effect](#verify-the-flags-took-effect).
 6. **Pilot `API_V2_ENABLED=true`.** Enable it for the pilot. Smoke each M1 group: list and
    create Sites, Assets, Devices, Components, Capabilities, Integration accounts, Device
    integrations, and start and end Deployments. Every `/v2` create needs an `Idempotency-Key`
-   of 8–128 characters.
+   of 8–128 characters. Restart every API instance and verify the flags took effect.
 7. **Check the `/v1` golden and tenant conformance.** Run
    `tests/contracts/test_v1_openapi_contract.py`, `tests/unit/test_tenant_mapping_conformance.py`
    and `tests/unit/test_no_scan_guard.py` against the deployed revision, or just run the release
@@ -89,7 +98,7 @@ conditional transactions and ignores the 1 MB Query page, so its results do not 
 8. **Re-run the dry-run and `--apply` immediately before enabling the projection.** The flag
    was off, so `/v1` moves made since step 3 may have left drift; this pass repairs it (see
    [Drift repair](#drift-repair)). Then set `V1_POND_DEVICE_PROJECTION_ENABLED=true` for the
-   rollout environment.
+   rollout environment, restart every API instance and verify the flags took effect.
 9. **Run the full gate.** Run the release gate. Then watch the `/v1` and `/v2` `409` and `503`
    rates. A sustained `503` on `/v1` Pond/Device routes means M1 app state is incomplete; roll
    back.
@@ -97,7 +106,9 @@ conditional transactions and ignores the 1 MB Query page, so its results do not 
 ## Rollback
 
 Roll back by changing flags only: set `V1_POND_DEVICE_PROJECTION_ENABLED=false` and
-`API_V2_ENABLED=false`. With the projection off, `/v1` reads come from the legacy `POND#` and
+`API_V2_ENABLED=false`, then restart or redeploy **every** API instance (the flags are read
+only at startup) and [verify the flags took effect](#verify-the-flags-took-effect). With the
+projection off, `/v1` reads come from the legacy `POND#` and
 `DEVICE#` rows (under D1 they do with either flag value). Native v2 Devices never appear in `/v1`.
 
 - **Never delete rows.** Additive v2 rows, the `v2_*` link attributes on legacy rows,
@@ -105,6 +116,24 @@ Roll back by changing flags only: set `V1_POND_DEVICE_PROJECTION_ENABLED=false` 
 - **Before re-enabling after a rollback,** run the dry-run and then `--apply` again so the v2
   rows catch up with `/v1` edits made while the flag was off. After that, follow the rollout
   from step 8.
+
+### Verify the flags took effect
+
+Run these against every restarted instance (or through the load balancer once all are
+replaced):
+
+- `API_V2_ENABLED=false`: `GET /v2/tenants/<pilot>/sites` with a valid member token returns
+  `404`, and the app's OpenAPI document has no `/v2` path.
+- `API_V2_ENABLED=true`: the same request returns `200`, and OpenAPI lists exactly the 13 M1
+  `/v2` paths.
+- Either value: the `/v1` contract still matches the golden
+  (`tests/contracts/test_v1_openapi_contract.py`, or compare `build_v1_openapi_contract` of the
+  deployed revision with `tests/contracts/openapi/v1.json`).
+- `V1_POND_DEVICE_PROJECTION_ENABLED`: `/v1` reads look the same with either value (D1), so
+  confirm the value in the running process's environment for every instance, and check that
+  `GET /v1/tenants/<pilot>/ponds` and `/devices` return `200` (a `503` with the flag on means M1
+  app state is incomplete; roll back). Do not probe with writes: with the flag off a patch to a
+  nonexistent `pond_id` succeeds and creates exactly the `device_missing_pond` state.
 
 ## Migration exit codes
 
@@ -135,7 +164,7 @@ commit it.
 
 | `kind` | Cause | Remedy |
 |---|---|---|
-| `device_missing_pond` | A legacy Device's `pond_id` names no Pond (D5). The whole tenant is blocked. | Preferred: patch the orphan Device through `/v1` to an **existing** `pond_id`; this works with either flag value. Then re-run. With the flag on, a `/v1` create or patch to a **nonexistent** `pond_id` returns `409 "pond not found"`. If the Device must go instead, see [Removing a legacy Device](#removing-a-legacy-device). |
+| `device_missing_pond` | A legacy Device's `pond_id` names no Pond (D5). The whole tenant is blocked. | Patch the Device through `/v1` to an **existing** `pond_id`, then re-run the dry-run and `--apply`. This works with either flag value: with the flag off the next `--apply` repairs the Deployment ([Drift repair](#drift-repair)); with the flag on the `/v1` write reconciles it. With the flag on, a `/v1` create or patch to a **nonexistent** `pond_id` returns `409 "pond not found"`. Delete the Device only under the strict conditions in [Removing a legacy Device](#removing-a-legacy-device). |
 | `tenant_missing` | `TENANT#<id>/META` does not exist. | Check the tenant ID (it is case- and whitespace-sensitive) and remove it from the scope. |
 | `tenant_invalid` | Tenant META does not parse as a legacy Tenant, or its ID is not v2-safe. | Repair the Tenant row from backup, or exclude the tenant until it is fixed. |
 | `site` | A row at the deterministic default Site key has different ownership, or the default Site is not ACTIVE when a new Asset or initial Deployment needs it. | Inspect `TENANT#<id>/SITE#<default_site_id>`. The default Site cannot be archived (D6); restore its ownership and `active` status from backup. |
@@ -151,9 +180,23 @@ commit it.
 
 ### Removing a legacy Device
 
-`/v1` has no DELETE route for Devices, so prefer the patch remedy above. When removal is truly
-needed, it is a manual operation: take a backup first, then delete **both** the
-`TENANT#<tenant>/DEVICE#<device>` row and the `DEVICE#<device>/META` lookup, and re-run the
+`/v1` has no DELETE route for Devices, so prefer the patch remedy above. Deleting legacy rows
+is allowed **only for a Device that was never projected**, which means all of:
+
+- its `TENANT#<tenant>/DEVICE#<device>` row and `DEVICE#<device>/META` lookup carry neither
+  `default_component_id` nor `v2_projection_version` (the link attributes the migration and the
+  flag-on `/v1` writes add), and
+- no `COMPONENT#<cmp>/META` row and no `TENANT#<tenant>/COMPONENT#<cmp>` mirror exist for
+  `cmp = default_component_id_for_legacy_device(tenant, device)`, and no
+  `COMPONENT#<cmp>` partition rows (`DEPLOYMENT#…`) exist.
+
+The migration discovers Devices only through the legacy `DEVICE#` rows, so deleting a projected
+Device would orphan its default Component, `DEPLOYMENT#CURRENT`, marker and active history. For
+a projected Device, do **not** delete anything: fix its `pond_id` as above, or escalate to the
+M1-05/M1-06 owner.
+
+For a never-projected Device: take a backup first, delete **both** the
+`TENANT#<tenant>/DEVICE#<device>` row and the `DEVICE#<device>/META` lookup, then re-run the
 dry-run and `--apply`. This is a deliberate exception to "never delete rows", which governs
 rollback.
 
@@ -170,8 +213,19 @@ rollback.
 - There is no repair into an ARCHIVED Asset or Site, or for a DECOMMISSIONED Component; those
   count as already migrated.
 - Archived legacy Ponds: their Devices keep an ACTIVE Deployment on an ARCHIVED Asset, which
-  mirrors the legacy state. New `/v2` starts, `/v1` moves, or creates into an archived Asset or
-  Site return `409`.
+  mirrors the legacy state.
+- **Archived targets depend on the flag.** With `V1_POND_DEVICE_PROJECTION_ENABLED=true`, `/v1`
+  creates and moves into an archived Pond return `409`, and `/v2` Deployment starts into an
+  archived Asset or Site return `409`. With the projection flag **off** (rollout steps 1–8 and
+  after a rollback), the legacy repository accepts both. The next `--apply` then does this:
+  - **Device moved into an archived Pond while the flag was off:** no repair. The run reports
+    the Device as already migrated (`deployments_created` 0), its `DEPLOYMENT#CURRENT` stays
+    ACTIVE on the previous Pond's Asset, while `/v1` (legacy rows, D1) shows the archived
+    `pond_id`. Flag-on `/v1` writes skip this drift too. Move the Device to an active Pond to
+    converge.
+  - **Device created in an archived Pond while the flag was off:** it is projected like any
+    legacy Device: a new default Component and an ACTIVE Deployment on the ARCHIVED Asset,
+    mirroring the legacy state (counted in `components_created`/`deployments_created`).
 
 ## Behavior changes with the projection flag on (PR #61)
 
@@ -179,8 +233,8 @@ rollback.
   `409 "pond not found"`.
 - Version conflicts read `"pond version conflict"` or `"device version conflict"`. The v1 and v2
   version counters are independent (D2).
-- `409` for archived or inactive targets, and for legacy identifiers that are not
-  v2-compatible.
+- `409` for archived or inactive targets (flag on only; see [Drift repair](#drift-repair) for
+  the flag-off outcome), and for legacy identifiers that are not v2-compatible.
 - `/v2` cannot start or end Deployments of the legacy default Components; it returns `409`
   "legacy default component deployments are managed through /v1" (D3).
 
