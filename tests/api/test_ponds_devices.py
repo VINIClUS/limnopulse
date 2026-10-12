@@ -678,3 +678,32 @@ def test_flag_on_native_v2_device_is_hidden_from_v1() -> None:
         f"/v1/tenants/tnt_1/devices/{native}", json={"expected_version": 1}, headers=HEADERS
     )
     assert patched.status_code == 404
+
+
+def test_flag_on_noncanonical_legacy_device_patch_is_409_not_500() -> None:
+    app, dynamo = projection_app()
+    client = TestClient(app, raise_server_exceptions=False)
+    pond_id = client.post("/v1/tenants/tnt_1/ponds", json={"name": "West"}, headers=HEADERS).json()[
+        "pond_id"
+    ]
+    for pk, sk in (("TENANT#tnt_1", "DEVICE#dev_1"), ("DEVICE#dev_1", "META")):
+        dynamo.seed(
+            {
+                "PK": pk,
+                "SK": sk,
+                "entity_type": "device" if sk != "META" else "device_lookup",
+                **{key: value for key, value in DEVICE_1_JSON.items() if key != "pond_id"},
+                "pond_id": pond_id,
+                "schema_version": 1,
+            }
+        )
+    transactions_before = len(dynamo.transactions)
+
+    assert client.get("/v1/tenants/tnt_1/devices/dev_1", headers=HEADERS).status_code == 200
+    for body in ({"expected_version": 1, "name": "X"}, {"expected_version": 1}):
+        response = client.patch("/v1/tenants/tnt_1/devices/dev_1", json=body, headers=HEADERS)
+        assert (response.status_code, response.json()) == (
+            409,
+            {"detail": "device is not compatible with the v2 projection"},
+        )
+    assert len(dynamo.transactions) == transactions_before

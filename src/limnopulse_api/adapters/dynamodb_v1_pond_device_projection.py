@@ -25,13 +25,15 @@ bounded number of times; every other conditional failure is a `ConflictError`.
 
 import asyncio
 import random
-from collections.abc import Awaitable, Callable, Mapping
+from collections.abc import Awaitable, Callable, Iterator, Mapping
+from contextlib import contextmanager
 from datetime import datetime
 from typing import Any
 
 from botocore.exceptions import ClientError
 
 from limnopulse_api.adapters.dynamodb import (
+    DynamoKeyBuilder,
     is_legacy_device_item,
     legacy_device_from_item,
     legacy_pond_from_item,
@@ -66,7 +68,7 @@ from limnopulse_api.adapters.dynamodb_v2 import (
 from limnopulse_api.core.errors import ConflictError, NotFoundError
 from limnopulse_api.domain.assets import AssetStatus, SiteStatus
 from limnopulse_api.domain.deployments import Deployment, DeploymentStatus
-from limnopulse_api.domain.devices_v2 import ComponentStatus, DeviceComponent
+from limnopulse_api.domain.devices_v2 import ComponentStatus, DeviceComponent, DeviceStatus
 from limnopulse_api.domain.entities import Device, Pond
 from limnopulse_api.domain.ids import (
     asset_id_for_legacy_pond,
@@ -76,9 +78,11 @@ from limnopulse_api.domain.ids import (
 )
 from limnopulse_api.domain.legacy_projection import (
     asset_and_profile_for_legacy_pond,
+    asset_status_from_legacy,
     component_for_legacy_device,
     default_site_for_tenant,
     deployment_for_legacy_device,
+    device_status_from_legacy,
 )
 from limnopulse_api.services.v1_pond_device_projection import (
     DEVICE_COMPONENT_LINK_ATTRIBUTE,
@@ -95,6 +99,8 @@ from limnopulse_api.services.v1_pond_device_projection import (
 
 MAX_PROJECTION_ACTIONS = 25
 MAX_ATTEMPTS = 3
+SITE_NOT_AVAILABLE = "site not available"
+COMPONENT_NOT_ACTIVE = "component is not active"
 
 # Failures caused by a concurrent writer provisioning or moving the same v2 rows: re-read and
 # retry. Any other failed label is a definitive conflict.
@@ -119,12 +125,14 @@ _CONFLICT_MESSAGES = {
     "device_put": "device already exists",
     "device_update": "device version conflict",
     "asset_check": "pond is not active",
-    "site_check": "site is not active",
-    "component_check": "component is not active",
+    "site_check": SITE_NOT_AVAILABLE,
+    "component_check": COMPONENT_NOT_ACTIVE,
 }
 # Site requirements merge: a Put implies an active check, which implies existence.
 _SITE_STRENGTH = {"exists": 1, "active": 2, "put": 3}
 
+# Reads use the legacy key shapes verbatim so `/v1` reads match the legacy repository.
+_LEGACY_KEYS = DynamoKeyBuilder()
 _ACTIVE_TENANT_CONDITION = "attribute_exists(PK) AND #status = :active AND #tenant_id = :tenant_id"
 _TENANT_CONDITION = "attribute_exists(PK) AND #tenant_id = :tenant_id"
 _FENCE_CONDITION = (
@@ -182,6 +190,15 @@ def _only_transaction_conflicts(exc: ClientError) -> bool:
     return codes == {"TransactionConflict"}
 
 
+@contextmanager
+def _v2_compatible(entity: str) -> Iterator[None]:
+    """Legacy identifiers the v2 codecs reject (non-canonical `dev_`, '#', ...) are a 409."""
+    try:
+        yield
+    except ValueError as exc:  # includes pydantic ValidationError
+        raise ConflictError(f"{entity} is not compatible with the v2 projection") from exc
+
+
 async def _jittered_sleep(attempt: int) -> None:
     await asyncio.sleep(random.uniform(0.01, 0.05) * attempt)
 
@@ -203,21 +220,17 @@ class DynamoV1PondDeviceProjection(DynamoV2RepositoryBase):
     # Reads (legacy rows only) ------------------------------------------------------------
 
     async def list_ponds(self, tenant_id: str) -> list[Pond]:
-        items = await self.query_prefix(
-            self.keys.tenant_partition(tenant_id), self.keys.LEGACY_POND_PREFIX
-        )
+        items = await self.query_prefix(f"TENANT#{tenant_id}", self.keys.LEGACY_POND_PREFIX)
         return [legacy_pond_from_item(item) for item in items if item.get("tenant_id") == tenant_id]
 
     async def get_pond(self, tenant_id: str, pond_id: str) -> Pond | None:
-        item = await self.get_item(self.keys.legacy_pond(tenant_id, pond_id))
+        item = await self.get_item(_LEGACY_KEYS.pond(tenant_id, pond_id))
         if item is None or item.get("tenant_id") != tenant_id:
             return None
         return legacy_pond_from_item(item)
 
     async def list_devices(self, tenant_id: str) -> list[Device]:
-        items = await self.query_prefix(
-            self.keys.tenant_partition(tenant_id), self.keys.DEVICE_PREFIX
-        )
+        items = await self.query_prefix(f"TENANT#{tenant_id}", self.keys.DEVICE_PREFIX)
         return [
             legacy_device_from_item(item)
             for item in items
@@ -225,7 +238,7 @@ class DynamoV1PondDeviceProjection(DynamoV2RepositoryBase):
         ]
 
     async def get_device(self, tenant_id: str, device_id: str) -> Device | None:
-        item = await self.get_item(self.keys.legacy_device(tenant_id, device_id))
+        item = await self.get_item(_LEGACY_KEYS.device(tenant_id, device_id))
         if not self._is_v1_device(item, tenant_id):
             return None
         return legacy_device_from_item(item)
@@ -268,7 +281,7 @@ class DynamoV1PondDeviceProjection(DynamoV2RepositoryBase):
             self._put_asset_and_profile(plan, pond, site_id)
             return pond
 
-        return await self._transact(plan_create)
+        return await self._transact(plan_create, "pond")
 
     async def update_pond(
         self,
@@ -279,7 +292,8 @@ class DynamoV1PondDeviceProjection(DynamoV2RepositoryBase):
         description: str | None,
     ) -> Pond:
         async def plan_update(plan: _Plan) -> Pond:
-            pond_key = self.keys.legacy_pond(tenant_id, pond_id)
+            # Legacy key shape first: a missing Pond is a 404 whatever its identifier.
+            pond_key = _LEGACY_KEYS.pond(tenant_id, pond_id)
             pond_item = await self.get_item(pond_key, consistent=True)
             if pond_item is None or pond_item.get("tenant_id") != tenant_id:
                 raise NotFoundError(f"Pond {pond_id} not found")
@@ -359,7 +373,7 @@ class DynamoV1PondDeviceProjection(DynamoV2RepositoryBase):
             )
             return updated
 
-        return await self._transact(plan_update)
+        return await self._transact(plan_update, "pond")
 
     # Device writes -------------------------------------------------------------------------
 
@@ -372,9 +386,7 @@ class DynamoV1PondDeviceProjection(DynamoV2RepositoryBase):
         firmware_version: str | None,
     ) -> Device:
         async def plan_create(plan: _Plan) -> Device:
-            pond_item = await self._tenant_item(
-                self.keys.legacy_pond(tenant_id, pond_id), tenant_id
-            )
+            pond_item = await self._legacy_pond_item(tenant_id, pond_id)
             if pond_item is None:
                 raise ConflictError("pond not found")
             site_id, asset_id = await self._pond_target(plan, tenant_id, pond_item, active=True)
@@ -408,7 +420,7 @@ class DynamoV1PondDeviceProjection(DynamoV2RepositoryBase):
             self._put_marker(plan, deployment, seq=1, last_ended_at=None)
             return device
 
-        return await self._transact(plan_create)
+        return await self._transact(plan_create, "device")
 
     async def update_device(
         self,
@@ -420,8 +432,9 @@ class DynamoV1PondDeviceProjection(DynamoV2RepositoryBase):
         firmware_version: str | None,
     ) -> Device:
         async def plan_update(plan: _Plan) -> Device:
-            device_key = self.keys.legacy_device(tenant_id, device_id)
-            lookup_key = self.keys.device_lookup(device_id)
+            # Legacy key shapes first: a missing Device is a 404 whatever its identifier.
+            device_key = _LEGACY_KEYS.device(tenant_id, device_id)
+            lookup_key = _LEGACY_KEYS.device_lookup(device_id)
             device_item = await self.get_item(device_key, consistent=True)
             if not self._is_v1_device(device_item, tenant_id):
                 raise NotFoundError(f"Device {device_id} not found")
@@ -463,7 +476,7 @@ class DynamoV1PondDeviceProjection(DynamoV2RepositoryBase):
             await self._project_device_update(plan, device_item["pond_id"], updated, now)
             return updated
 
-        return await self._transact(plan_update)
+        return await self._transact(plan_update, "device")
 
     # Projection planning -------------------------------------------------------------------
 
@@ -475,9 +488,7 @@ class DynamoV1PondDeviceProjection(DynamoV2RepositoryBase):
         moving = device.pond_id != previous_pond_id
         target: tuple[str, str] | None = None
         if moving:
-            target_pond = await self._tenant_item(
-                self.keys.legacy_pond(tenant_id, device.pond_id), tenant_id
-            )
+            target_pond = await self._legacy_pond_item(tenant_id, device.pond_id)
             if target_pond is None:
                 raise ConflictError("pond not found")
             target = await self._pond_target(plan, tenant_id, target_pond, active=True)
@@ -490,7 +501,7 @@ class DynamoV1PondDeviceProjection(DynamoV2RepositoryBase):
         if target is None:
             return
         if component_from_item(component_item).status is not ComponentStatus.ACTIVE:
-            raise ConflictError("component is not active")
+            raise ConflictError(COMPONENT_NOT_ACTIVE)
         plan.add(
             "component_check",
             self.keys.component(component_id),
@@ -575,9 +586,12 @@ class DynamoV1PondDeviceProjection(DynamoV2RepositoryBase):
         """Deterministic default Component and Deployment for a not-yet-migrated Device."""
         tenant_id = device.tenant_id
         component = self._put_component(plan, device)
-        previous_pond = await self._tenant_item(
-            self.keys.legacy_pond(tenant_id, previous_pond_id), tenant_id
-        )
+        if device_status_from_legacy(device.status) is DeviceStatus.DECOMMISSIONED:
+            # Same as the migration: a decommissioned Component is never deployed.
+            if target is not None:
+                raise ConflictError(COMPONENT_NOT_ACTIVE)
+            return
+        previous_pond = await self._legacy_pond_item(tenant_id, previous_pond_id)
         if previous_pond is None:
             # A dangling legacy pond_id has no Asset: there is no interval to reconstruct.
             if target is not None:
@@ -605,10 +619,21 @@ class DynamoV1PondDeviceProjection(DynamoV2RepositoryBase):
         self._put_deployment(plan, new, current=True)
         self._put_marker(plan, new, seq=2, last_ended_at=transition_at)
 
+    async def _legacy_pond_item(self, tenant_id: str, pond_id: str) -> dict[str, Any] | None:
+        with _v2_compatible("pond"):
+            key = self.keys.legacy_pond(tenant_id, pond_id)
+        return await self._tenant_item(key, tenant_id)
+
     async def _pond_target(
         self, plan: _Plan, tenant_id: str, pond_item: Mapping[str, Any], *, active: bool
     ) -> tuple[str, str]:
         """`(site_id, asset_id)` of a legacy Pond, provisioning its Asset when not migrated."""
+        with _v2_compatible("pond"):
+            return await self._plan_pond_target(plan, tenant_id, pond_item, active=active)
+
+    async def _plan_pond_target(
+        self, plan: _Plan, tenant_id: str, pond_item: Mapping[str, Any], *, active: bool
+    ) -> tuple[str, str]:
         asset_id = self._pond_asset_id(tenant_id, pond_item)
         asset_key = self.keys.asset(tenant_id, asset_id)
         asset_item = await self._tenant_item(asset_key, tenant_id)
@@ -625,8 +650,11 @@ class DynamoV1PondDeviceProjection(DynamoV2RepositoryBase):
             if active:
                 await self._active_site(plan, tenant_id, asset.site_id)
             return asset.site_id, asset_id
+        pond = legacy_pond_from_item(pond_item)
+        if active and asset_status_from_legacy(pond.status) is AssetStatus.ARCHIVED:
+            raise ConflictError("pond is not active")
         site_id = await self._default_site(plan, tenant_id, "active" if active else "exists")
-        self._put_asset_and_profile(plan, legacy_pond_from_item(pond_item), site_id)
+        self._put_asset_and_profile(plan, pond, site_id)
         pond_key = self.keys.legacy_pond(tenant_id, pond_item["pond_id"])
         if not plan.has(pond_key):
             # Link only; the `/v1` Pond version is untouched by a Device write.
@@ -668,7 +696,7 @@ class DynamoV1PondDeviceProjection(DynamoV2RepositoryBase):
             )
             return site_id
         if site_from_item(site_item).status is not SiteStatus.ACTIVE:
-            raise ConflictError("site is not active")
+            raise ConflictError(SITE_NOT_AVAILABLE)
         plan.add_site(
             "active",
             "site_check",
@@ -690,7 +718,7 @@ class DynamoV1PondDeviceProjection(DynamoV2RepositoryBase):
             return
         site_item = await self._tenant_item(key, tenant_id)
         if site_item is None or site_from_item(site_item).status is not SiteStatus.ACTIVE:
-            raise ConflictError("site is not active")
+            raise ConflictError(SITE_NOT_AVAILABLE)
         plan.add_site(
             "active",
             "site_check",
@@ -845,10 +873,11 @@ class DynamoV1PondDeviceProjection(DynamoV2RepositoryBase):
 
     # Internals -----------------------------------------------------------------------------
 
-    async def _transact(self, build: Callable[[_Plan], Awaitable[Any]]) -> Any:
+    async def _transact(self, build: Callable[[_Plan], Awaitable[Any]], entity: str) -> Any:
         for attempt in range(1, MAX_ATTEMPTS + 1):
             plan = _Plan()
-            result = await build(plan)
+            with _v2_compatible(entity):
+                result = await build(plan)
             if len(plan.actions) > MAX_PROJECTION_ACTIONS:
                 raise ValueError("projection transaction exceeds 25 actions")
             try:
@@ -861,6 +890,7 @@ class DynamoV1PondDeviceProjection(DynamoV2RepositoryBase):
                     raise ConflictError(_CONFLICT_MESSAGES.get(label, "conflict")) from exc
                 if attempt == MAX_ATTEMPTS:
                     raise ConflictError("concurrent projection update") from exc
+                await self._retry_sleep(attempt)
             except ClientError as exc:
                 if attempt == MAX_ATTEMPTS or not _only_transaction_conflicts(exc):
                     raise

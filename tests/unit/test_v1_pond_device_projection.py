@@ -1077,3 +1077,151 @@ def test_pond_model_round_trip_is_unchanged() -> None:
         "tenant_id", "pond_id", "name", "description",
     }
     assert AssetStatus.ACTIVE.value == "active"
+
+
+# Audit follow-ups ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_noncanonical_legacy_device_writes_are_409_not_500() -> None:
+    client = store()
+    seed_migrated_pond(client, "pond_west")
+    seed_migrated_pond(client, "pond_east", name="East")
+    for row in legacy_device_rows("dev_1", "pond_west"):
+        client.seed(row)
+    before = client.snapshot()
+    repo = projection(client)
+
+    for kwargs in (
+        {"name": "Renamed", "pond_id": None},
+        {"name": None, "pond_id": "pond_east"},
+        {"name": None, "pond_id": None},
+    ):
+        with pytest.raises(ConflictError, match="device is not compatible with the v2 projection"):
+            await repo.update_device(TENANT, "dev_1", 1, firmware_version=None, **kwargs)
+    with pytest.raises(ConflictError, match="device is not compatible with the v2 projection"):
+        await repo.create_device(TENANT, "pond_west", "dev_bad", "X", None)
+    assert client.snapshot() == before
+    assert client.transactions == []
+    # Reads and the legacy repository are unchanged for the same row.
+    assert (await repo.get_device(TENANT, "dev_1")).device_id == "dev_1"
+    legacy = DynamoDomainRepository(TABLE, client)
+    assert (await legacy.update_device(TENANT, "dev_1", 1, "Legacy", None, None)).version == 2
+
+
+@pytest.mark.asyncio
+async def test_unsafe_legacy_pond_identifier_is_409_and_missing_is_404() -> None:
+    client = store()
+    client.seed(legacy_pond_item("pond#odd"))
+    repo = projection(client)
+
+    assert (await repo.get_pond(TENANT, "pond#odd")).pond_id == "pond#odd"
+    with pytest.raises(ConflictError, match="pond is not compatible with the v2 projection"):
+        await repo.update_pond(TENANT, "pond#odd", 1, "X", None)
+    with pytest.raises(ConflictError, match="pond is not compatible with the v2 projection"):
+        await repo.create_device(TENANT, "pond#odd", DEV_1, "X", None)
+    with pytest.raises(NotFoundError):
+        await repo.update_pond(TENANT, "pond#missing", 1, "X", None)
+    with pytest.raises(NotFoundError):
+        await repo.update_device(TENANT, "dev#missing", 1, "X", None, None)
+    assert client.transactions == []
+
+
+@pytest.mark.asyncio
+async def test_unmigrated_decommissioned_device_gets_an_undeployed_component() -> None:
+    client = store()
+    seed_migrated_pond(client, "pond_west")
+    seed_migrated_pond(client, "pond_east", name="East")
+    for row in legacy_device_rows(DEV_1, "pond_west"):
+        row["status"] = "decommissioned"
+        client.seed(row)
+    component_id = default_component_id_for_legacy_device(TENANT, DEV_1)
+
+    with pytest.raises(ConflictError, match="component is not active"):
+        await projection(client).update_device(TENANT, DEV_1, 1, None, "pond_east", None)
+    assert client.transactions == []
+
+    renamed = await projection(client).update_device(TENANT, DEV_1, 1, "Retired", None, None)
+
+    assert renamed.version == 2
+    component = client.item(KEYS.component(component_id))
+    assert component["status"] == "decommissioned"
+    assert client.item(KEYS.current_deployment(component_id)) is None
+    assert client.item(deployment_marker_key(component_id)) is None
+    assert not [key for key in client.items if key[0] == f"COMPONENT#{component_id}"
+                and key[1].startswith("DEPLOYMENT#")]
+    with pytest.raises(ConflictError, match="component is not active"):
+        await projection(client).update_device(TENANT, DEV_1, 2, None, "pond_east", None)
+
+
+@pytest.mark.asyncio
+async def test_device_into_unmigrated_archived_pond_is_409() -> None:
+    client = store()
+    client.seed({**legacy_pond_item("pond_west"), "status": "archived"})
+    client.seed(legacy_pond_item("pond_east", name="East"))
+    for row in legacy_device_rows(DEV_1, "pond_east"):
+        client.seed(row)
+
+    with pytest.raises(ConflictError, match="pond is not active"):
+        await projection(client).create_device(TENANT, "pond_west", DEV_2, "X", None)
+    with pytest.raises(ConflictError, match="pond is not active"):
+        await projection(client).update_device(TENANT, DEV_1, 1, None, "pond_west", None)
+    assert client.transactions == []
+
+
+@pytest.mark.asyncio
+async def test_dangling_pond_device_move_starts_a_fresh_interval_without_the_legacy_one() -> None:
+    client = store()
+    seed_migrated_pond(client, "pond_east", name="East")
+    for row in legacy_device_rows(DEV_1, "pond_gone"):
+        client.seed(row)
+    clock = Clock("2026-08-25T11:00:00.5Z")
+
+    moved = await projection(client, clock).update_device(TENANT, DEV_1, 1, None, "pond_east", None)
+
+    assert moved.pond_id == "pond_east"
+    component_id = default_component_id_for_legacy_device(TENANT, DEV_1)
+    deployments = DynamoDeploymentRepository(TABLE, client)
+    history = await deployments.list_component_deployments(TENANT, component_id)
+    assert len(history) == 1
+    (current,) = history
+    assert current.deployment_id != deployment_id_for_legacy_device(TENANT, DEV_1)
+    assert current.started_at == dt("2026-08-25T11:00:00.5Z")
+    assert current.asset_id == asset_id_for_legacy_pond(TENANT, "pond_east")
+    assert await deployments.get_deployment_at(TENANT, component_id, dt(CREATED)) is None
+    assert client.item(deployment_marker_key(component_id))["seq"] == 1
+    await assert_device_projection_matches(client, DEV_1)
+
+
+@pytest.mark.asyncio
+async def test_provisioning_conflicts_back_off_before_retrying() -> None:
+    client = store()
+    client.rendezvous_site_reads()
+    sleeps: list[int] = []
+
+    async def record_sleep(attempt: int) -> None:
+        sleeps.append(attempt)
+
+    def repo() -> DynamoV1PondDeviceProjection:
+        return DynamoV1PondDeviceProjection(
+            TABLE, client, clock=Clock("2026-08-25T10:00:00Z"), retry_sleep=record_sleep
+        )
+
+    await asyncio.gather(
+        repo().create_pond(TENANT, "pond_west", "West", None),
+        repo().create_pond(TENANT, "pond_east", "East", None),
+    )
+
+    assert sleeps == [1]
+
+
+@pytest.mark.asyncio
+async def test_site_failures_use_a_neutral_detail() -> None:
+    client = store()
+    await projection(client).create_pond(TENANT, "pond_west", "West", None)
+    site_key = KEYS.site(TENANT, default_site_id(TENANT))
+    client.items[(site_key["PK"], site_key["SK"])]["status"] = SiteStatus.ARCHIVED.value
+
+    with pytest.raises(ConflictError) as raised:
+        await projection(client).create_pond(TENANT, "pond_east", "East", None)
+    assert str(raised.value) == "site not available"
