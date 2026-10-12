@@ -46,8 +46,9 @@ def key_label(key: Mapping[str, str]) -> str:
 
 
 def is_legacy_device_item(item: Mapping[str, Any]) -> bool:
-    """Legacy `/v1` Device rows carry `pond_id`; native v2 rows never do."""
-    return isinstance(item.get("pond_id"), str) and item.get("schema_version") != 2
+    """Only native v2 rows (`schema_version == 2`) are skipped; every other `DEVICE#` row is
+    legacy and must parse, so a malformed schema-v1 row is reported instead of ignored."""
+    return item.get("schema_version") != 2
 
 
 def _timestamp(value: Any) -> datetime:
@@ -56,8 +57,11 @@ def _timestamp(value: Any) -> datetime:
     return datetime.fromisoformat(value)
 
 
-def _stored_int(value: Any) -> int:
-    """A stored integer (int or integral Decimal); never a bool, string or fraction."""
+def stored_int(value: Any) -> int:
+    """A stored integer (int or integral Decimal); never a bool, string or fraction.
+
+    Every stored version, seq or schema_version the migration reads goes through this.
+    """
     if isinstance(value, bool):
         raise TypeError("stored integer must not be a boolean")
     if isinstance(value, int):
@@ -75,8 +79,8 @@ def legacy_tenant_from_item(item: Mapping[str, Any]) -> Tenant:
         status=item.get("status", "active"),
         created_at=_timestamp(item["created_at"]),
         updated_at=_timestamp(item["updated_at"]),
-        version=_stored_int(item["version"]),
-        schema_version=_stored_int(item.get("schema_version", 1)),
+        version=stored_int(item["version"]),
+        schema_version=stored_int(item.get("schema_version", 1)),
     )
 
 
@@ -89,8 +93,8 @@ def legacy_pond_from_item(item: Mapping[str, Any]) -> Pond:
         status=item.get("status", "active"),
         created_at=_timestamp(item["created_at"]),
         updated_at=_timestamp(item["updated_at"]),
-        version=_stored_int(item["version"]),
-        schema_version=_stored_int(item.get("schema_version", 1)),
+        version=stored_int(item["version"]),
+        schema_version=stored_int(item.get("schema_version", 1)),
     )
 
 
@@ -105,8 +109,8 @@ def legacy_device_from_item(item: Mapping[str, Any]) -> Device:
         status=item.get("status", "active"),
         created_at=_timestamp(item["created_at"]),
         updated_at=_timestamp(item["updated_at"]),
-        version=_stored_int(item["version"]),
-        schema_version=_stored_int(item.get("schema_version", 1)),
+        version=stored_int(item["version"]),
+        schema_version=stored_int(item.get("schema_version", 1)),
     )
 
 
@@ -216,6 +220,29 @@ class DynamoDefaultSiteAssetMigrationStore(DynamoV2RepositoryBase):
             },
         )
 
+    def fence_check_request(
+        self,
+        key: Mapping[str, str],
+        *,
+        tenant_id: str,
+        observed_version: int | None = None,
+        require_active: bool = False,
+    ) -> dict[str, Any]:
+        """Commit-time check that a row still exists for the tenant (at the observed version,
+        and ACTIVE when required)."""
+        condition = "attribute_exists(PK) AND #tenant_id = :tenant_id"
+        names = {"#tenant_id": "tenant_id"}
+        values: dict[str, Any] = {":tenant_id": tenant_id}
+        if observed_version is not None:
+            condition += " AND #version = :observed_version"
+            names["#version"] = "version"
+            values[":observed_version"] = observed_version
+        if require_active:
+            condition += " AND #status = :active"
+            names["#status"] = "status"
+            values[":active"] = "active"
+        return self.condition_check_request(key, condition=condition, names=names, values=values)
+
     def device_fence_check_request(
         self, key: Mapping[str, str], *, tenant_id: str, pond_id: str, observed_version: int
     ) -> dict[str, Any]:
@@ -253,14 +280,6 @@ class DynamoDefaultSiteAssetMigrationStore(DynamoV2RepositoryBase):
     def asset_active_check_request(self, tenant_id: str, asset_id: str) -> dict[str, Any]:
         return self.condition_check_request(
             self.keys.asset(tenant_id, asset_id),
-            condition="attribute_exists(PK) AND #status = :active AND #tenant_id = :tenant_id",
-            names={"#status": "status", "#tenant_id": "tenant_id"},
-            values={":active": "active", ":tenant_id": tenant_id},
-        )
-
-    def component_active_check_request(self, tenant_id: str, component_id: str) -> dict[str, Any]:
-        return self.condition_check_request(
-            self.keys.component(component_id),
             condition="attribute_exists(PK) AND #status = :active AND #tenant_id = :tenant_id",
             names={"#status": "status", "#tenant_id": "tenant_id"},
             values={":active": "active", ":tenant_id": tenant_id},
@@ -327,10 +346,18 @@ class DynamoDefaultSiteAssetMigrationStore(DynamoV2RepositoryBase):
     def record_migration_receipt(
         self, tenant_id: str, *, completed_at: datetime, counts: Mapping[str, int]
     ) -> None:
-        """Upsert the per-tenant marker; it only records runs and is never used to skip work."""
+        """Upsert the per-tenant marker; it only records runs and is never used to skip work.
+
+        Conditioned on the key being free or already holding this tenant's M1 receipt, so a
+        foreign row at the key is never overwritten (`DynamoConditionalConflict`).
+        """
         self.update_item_sync(
             self.update_request(
                 self.keys.migration_receipt(tenant_id),
+                condition=(
+                    "attribute_not_exists(PK) OR (#entity_type = :entity_type "
+                    "AND #tenant_id = :tenant_id AND #migration = :migration)"
+                ),
                 update_expression=(
                     "SET #entity_type = :entity_type, #tenant_id = :tenant_id, "
                     "#migration = :migration, "

@@ -296,7 +296,28 @@ class FakeMigrationDynamo:
         item = self.items.get(self._action_key(action))
         names = request.get("ExpressionAttributeNames", {})
         values = self.deserialize(request.get("ExpressionAttributeValues", {}))
+        return self._holds(condition, item, names, values)
+
+    def _holds(self, condition: str, item: dict | None, names: dict, values: dict) -> bool:
+        """`OR` of `AND`s of `attribute_(not_)exists(x)` / `a = :b`, with parentheses."""
+        condition = condition.strip()
+        if condition.startswith("(") and condition.endswith(")"):
+            inner = condition[1:-1]
+            if _split_top_level(inner, " OR ") and inner.count("(") == inner.count(")"):
+                depth, balanced = 0, True
+                for char in inner:
+                    depth += (char == "(") - (char == ")")
+                    balanced = balanced and depth >= 0
+                if balanced:
+                    condition = inner
+        alternatives = _split_top_level(condition, " OR ")
+        if len(alternatives) > 1:
+            return any(self._holds(part, item, names, values) for part in alternatives)
         for clause in _split_top_level(condition, " AND "):
+            if clause.startswith("("):
+                if not self._holds(clause, item, names, values):
+                    return False
+                continue
             exists = re.fullmatch(r"attribute_(not_)?exists\((\S+)\)", clause)
             if exists:
                 name = names.get(exists.group(2), exists.group(2))
@@ -336,6 +357,21 @@ class FakeMigrationDynamo:
             name = names[default.group(1)]
             return item[name] if name in item else values[default.group(2)]
         return values[expression]
+
+
+def on_transaction_with(
+    fragment: str, hook: Callable[["FakeMigrationDynamo", list[dict]], None]
+) -> Callable[["FakeMigrationDynamo", list[dict]], None]:
+    """A `before_transact` hook that fires once, on the first transaction mentioning `fragment`
+    (the default Site, each Pond and each Device commit in separate transactions)."""
+
+    def armed(fake: "FakeMigrationDynamo", actions: list[dict]) -> None:
+        if fragment not in str(actions):
+            fake.before_transact = armed
+            return
+        hook(fake, actions)
+
+    return armed
 
 
 def _conditional_failure() -> ClientError:
@@ -875,7 +911,11 @@ def test_record_transactions_are_conditional_bounded_and_grouped() -> None:
     )
     run(client, apply=True)
 
-    pond_tx, device_tx = client.transactions
+    site_tx, pond_tx, device_tx = client.transactions
+    assert [next(iter(action)) for action in site_tx] == ["Put", "ConditionCheck"]
+    tenant_fence = site_tx[1]["ConditionCheck"]
+    assert tenant_fence["Key"] == client.serialize({"PK": "TENANT#tnt_1", "SK": "META"})
+    assert "#version = :observed_version" in tenant_fence["ConditionExpression"]
     assert [next(iter(action)) for action in pond_tx] == ["Put", "Put", "ConditionCheck", "Update"]
     assert [next(iter(action)) for action in device_tx] == [
         *["Put"] * 6,
@@ -906,7 +946,9 @@ def test_identical_concurrent_writer_converges_as_already_migrated() -> None:
         ponds=[legacy_pond("pond_1")],
         devices=[legacy_device("probe-1", "pond_1")],
     )
-    client.before_transact = lambda fake, actions: fake.apply_unconditionally(actions)
+    client.before_transact = on_transaction_with(
+        "ASSET#", lambda fake, actions: fake.apply_unconditionally(actions)
+    )
 
     result = run(client, apply=True)
 
@@ -914,7 +956,7 @@ def test_identical_concurrent_writer_converges_as_already_migrated() -> None:
     assert result.assets_created == 0
     assert result.already_migrated == 1  # the raced Pond
     assert result.deployments_created == 1
-    assert len(client.transactions) == 2
+    assert len(client.transactions) == 3  # Site, raced Pond, Device
 
 
 def test_divergent_concurrent_writer_is_a_schema_conflict() -> None:
@@ -963,7 +1005,7 @@ def test_source_row_changed_between_plan_and_write_is_replanned() -> None:
         pond = fake.items[("TENANT#tnt_1", "POND#pond_1")]
         pond.update({"name": "Edited", "version": Decimal(3)})
 
-    client.before_transact = concurrent_v1_edit
+    client.before_transact = on_transaction_with("ASSET#", concurrent_v1_edit)
 
     result = run(client, apply=True)
 
@@ -977,18 +1019,14 @@ def test_source_row_changed_between_plan_and_write_is_replanned() -> None:
         *KEYS.asset("tnt_1", asset_id_for_legacy_pond("tnt_1", "pond_1")).values()
     )
     assert asset["version"] == 3
-    assert len(client.transactions) == 2
+    assert sum("ASSET#" in str(tx) for tx in client.transactions) == 2  # refused, re-planned
 
 
 def test_conditional_site_race_converges() -> None:
     client = FakeMigrationDynamo.with_legacy_tenant(tenant_id="tnt_1", ponds=[], devices=[])
-    original_put = client.put_item
-
-    def racing_put(**kwargs: Any) -> dict[str, Any]:
-        client.apply_unconditionally([{"Put": kwargs}])
-        return original_put(**kwargs)
-
-    client.put_item = racing_put  # type: ignore[method-assign]
+    client.before_transact = on_transaction_with(
+        "SITE#", lambda fake, actions: fake.apply_unconditionally(actions)
+    )
 
     result = run(client, apply=True)
 
@@ -1295,10 +1333,15 @@ def test_transaction_conflict_cancellation_is_retried_after_backoff() -> None:
         ponds=[legacy_pond("pond_1")],
         devices=[legacy_device("probe-1", "pond_1")],
     )
-    client.fail_once["transact_write_items"] = _transaction_conflict()
-    client.fail_once["put_item"] = ClientError(
-        {"Error": {"Code": "TransactionConflictException", "Message": "busy"}}, "PutItem"
-    )
+    client.fail_once["transact_write_items"] = _transaction_conflict()  # the Site transaction
+
+    def busy_pond(fake: FakeMigrationDynamo, actions: list[dict]) -> None:
+        raise ClientError(
+            {"Error": {"Code": "TransactionConflictException", "Message": "busy"}},
+            "TransactWriteItems",
+        )
+
+    client.before_transact = on_transaction_with("ASSET#", busy_pond)
     sleeps: list[float] = []
 
     result = DefaultSiteAssetMigrator(client, clock=fixed_clock, sleep=sleeps.append).run(
@@ -2030,7 +2073,7 @@ def test_site_archived_between_plan_and_pond_commit_is_fenced() -> None:
     def archive_site(fake: FakeMigrationDynamo, actions: list[dict]) -> None:
         fake.items[site_key]["status"] = "archived"
 
-    client.before_transact = archive_site
+    client.before_transact = on_transaction_with("ASSET#", archive_site)
 
     result = run(client, apply=True)
 
@@ -2148,3 +2191,261 @@ def test_current_on_the_pond_asset_under_another_site_is_a_conflict() -> None:
     assert result.result == "schema_conflict"
     assert [c.kind for c in result.conflicts] == ["deployment_current"]
     assert client.transactions == []
+
+
+# Codex round 3 + sweep: survivors, source fences, receipt ownership, stored ints ---------------
+
+
+def _component_keys() -> tuple[tuple[str, str], tuple[str, str]]:
+    return (
+        _item_key(KEYS.component(COMPONENT_ID)),
+        _item_key(KEYS.component_mirror("tnt_1", COMPONENT_ID)),
+    )
+
+
+@pytest.mark.parametrize("survivor", ["canonical", "mirror"])
+def test_missing_component_sibling_is_rebuilt_from_the_survivor(survivor: str) -> None:
+    client = migrated_store()
+    canonical_key, mirror_key = _component_keys()
+    survivor_key, missing_key = (
+        (canonical_key, mirror_key) if survivor == "canonical" else (mirror_key, canonical_key)
+    )
+    client.items[survivor_key].update(
+        {"name": "Renamed in v2", "status": "decommissioned", "version": Decimal(3)}
+    )
+    del client.items[missing_key]
+    client.calls.clear()
+
+    result = run(client, apply=True)
+
+    assert result.result == "success"
+    assert result.components_created == 1
+    rebuilt = client.items[missing_key]
+    survivor_row = client.items[survivor_key]
+    assert {k: v for k, v in rebuilt.items() if k not in {"PK", "SK", "entity_type"}} == {
+        k: v for k, v in survivor_row.items() if k not in {"PK", "SK", "entity_type"}
+    }
+    assert rebuilt["entity_type"] == (
+        "component_mirror" if survivor == "canonical" else "component"
+    )
+    (tx,) = client.transactions
+    fences = [a["ConditionCheck"] for a in tx if "ConditionCheck" in a]
+    survivor_fence = next(
+        f for f in fences if f["Key"] == client.serialize(dict(zip(("PK", "SK"), survivor_key)))
+    )
+    assert "#version = :observed_version" in survivor_fence["ConditionExpression"]
+
+
+def test_component_survivor_changed_before_commit_is_replanned_from_the_new_version() -> None:
+    client = migrated_store()
+    canonical_key, mirror_key = _component_keys()
+    del client.items[mirror_key]
+
+    def rename_survivor(fake: FakeMigrationDynamo, actions: list[dict]) -> None:
+        fake.items[canonical_key].update({"name": "Renamed", "version": Decimal(2)})
+
+    client.before_transact = on_transaction_with("COMPONENT#", rename_survivor)
+
+    result = run(client, apply=True)
+
+    assert result.result == "success"
+    assert client.items[mirror_key]["name"] == "Renamed"
+    assert client.items[mirror_key]["version"] == 2
+
+
+def test_divergent_component_survivor_is_a_conflict() -> None:
+    client = migrated_store()
+    canonical_key, mirror_key = _component_keys()
+    client.items[canonical_key]["device_id"] = "probe-other"
+    del client.items[mirror_key]
+
+    result = run(client, apply=True)
+
+    assert result.result == "schema_conflict"
+    assert [(c.kind, c.key) for c in result.conflicts] == [
+        ("component", f"{canonical_key[0]}/{canonical_key[1]}")
+    ]
+
+
+def test_ended_group_history_on_another_site_is_a_conflict() -> None:
+    client = _ended_group_store()
+    history_key = _item_key(deployment_to_item(_deterministic_deployment(), form="history"))
+    client.items[history_key]["site_id"] = "site_" + "c" * 32
+
+    result = run(client, apply=True)
+
+    assert result.result == "schema_conflict"
+    assert [c.kind for c in result.conflicts] == ["deployment_history"]
+
+
+@pytest.mark.parametrize(
+    "damage",
+    [
+        {"pond_id": None},
+        {"pond_id": 7},
+        {"pond_id": None, "schema_version": None},
+    ],
+)
+def test_malformed_schema_v1_device_row_is_reported_not_skipped(damage: dict[str, Any]) -> None:
+    client = FakeMigrationDynamo.with_legacy_tenant(
+        tenant_id="tnt_1",
+        ponds=[legacy_pond("pond_1")],
+        devices=[legacy_device("probe-1", "pond_1")],
+    )
+    row = client.items[("TENANT#tnt_1", "DEVICE#probe-1")]
+    for name, value in damage.items():
+        if value is None:
+            del row[name]
+        else:
+            row[name] = value
+
+    result = run(client, apply=False)
+
+    assert result.result == "schema_conflict"
+    assert [(c.kind, c.key) for c in result.conflicts] == [
+        ("device_invalid", "TENANT#tnt_1/DEVICE#probe-1")
+    ]
+
+
+def test_lookup_version_diverging_from_the_device_row_is_a_conflict() -> None:
+    client = FakeMigrationDynamo.with_legacy_tenant(
+        tenant_id="tnt_1",
+        ponds=[legacy_pond("pond_1")],
+        devices=[legacy_device("probe-1", "pond_1")],
+    )
+    client.items[("DEVICE#probe-1", "META")]["version"] = Decimal(9)
+
+    result = run(client, apply=True)
+
+    assert result.result == "schema_conflict"
+    assert [(c.kind, c.key) for c in result.conflicts] == [("device_lookup", "DEVICE#probe-1/META")]
+    assert client.write_calls == []
+
+
+def _linked_pond_without_projection() -> FakeMigrationDynamo:
+    """A Pond whose links were set (e.g. by the `/v1` projection) but whose rows are absent."""
+    client = FakeMigrationDynamo.with_legacy_tenant(
+        tenant_id="tnt_1",
+        ponds=[
+            {
+                **legacy_pond("pond_1"),
+                "v2_site_id": default_site_id("tnt_1"),
+                "v2_asset_id": asset_id_for_legacy_pond("tnt_1", "pond_1"),
+                "v2_projection_version": 1,
+            }
+        ],
+        devices=[],
+    )
+    return client
+
+
+def test_pond_plan_without_link_update_fences_the_pond_row() -> None:
+    client = _linked_pond_without_projection()
+
+    result = run(client, apply=True)
+
+    assert result.result == "success"
+    assert (result.assets_created, result.legacy_links_updated) == (1, 0)
+    pond_tx = next(tx for tx in client.transactions if "ASSET#" in str(tx))
+    fence = pond_tx[-1]["ConditionCheck"]
+    assert fence["Key"] == client.serialize({"PK": "TENANT#tnt_1", "SK": "POND#pond_1"})
+    assert "#version = :observed_version" in fence["ConditionExpression"]
+
+
+def test_pond_edited_before_a_fenced_commit_is_replanned() -> None:
+    client = _linked_pond_without_projection()
+
+    def rename_pond(fake: FakeMigrationDynamo, actions: list[dict]) -> None:
+        fake.items[("TENANT#tnt_1", "POND#pond_1")].update(
+            {"name": "Renamed", "version": Decimal(3)}
+        )
+
+    client.before_transact = on_transaction_with("ASSET#", rename_pond)
+
+    result = run(client, apply=True)
+
+    asset_key = KEYS.asset("tnt_1", asset_id_for_legacy_pond("tnt_1", "pond_1"))
+    assert result.result == "success"
+    assert sum("ASSET#" in str(tx) for tx in client.transactions) == 2
+    assert client.get_raw(*asset_key.values())["name"] == "Renamed"
+    assert client.get_raw(*asset_key.values())["version"] == 3
+
+
+def test_foreign_row_at_the_receipt_key_is_never_overwritten() -> None:
+    client = FakeMigrationDynamo()
+    client.add_legacy_tenant("tnt_1", ponds=[], devices=[])
+    client.add_legacy_tenant("tnt_2", ponds=[], devices=[])
+    foreign = {**KEYS.migration_receipt("tnt_1"), "entity_type": "something_else", "owner": "x"}
+    client.put_raw(foreign)
+
+    result = run(client, apply=True, tenants=["tnt_1", "tnt_2"])
+
+    assert result.result == "schema_conflict"
+    assert [(c.tenant_id, c.kind) for c in result.conflicts] == [("tnt_1", "migration_receipt")]
+    assert result.tenants_completed == 1
+    assert client.get_raw(*KEYS.migration_receipt("tnt_1").values()) == normalized(foreign)
+    assert client.get_raw(*KEYS.migration_receipt("tnt_2").values())["run_count"] == 1
+
+
+def test_ended_group_marker_seq_must_not_be_a_boolean() -> None:
+    client = _ended_group_store()
+    client.items[_item_key(deployment_marker_key(COMPONENT_ID))]["seq"] = True
+
+    result = run(client, apply=True)
+
+    assert result.result == "schema_conflict"
+    assert [c.kind for c in result.conflicts] == ["deployment_marker"]
+
+
+def test_profile_without_its_asset_is_a_conflict() -> None:
+    client = FakeMigrationDynamo.with_legacy_tenant(
+        tenant_id="tnt_1", ponds=[legacy_pond("pond_1")], devices=[]
+    )
+    projection = asset_and_profile_for_legacy_pond(pond_model("pond_1"), default_site_id("tnt_1"))
+    client.put_raw(pond_profile_to_item(projection.pond_profile))
+
+    result = run(client, apply=True)
+
+    assert result.result == "schema_conflict"
+    assert [c.kind for c in result.conflicts] == ["asset"]
+
+
+def test_profile_is_rebuilt_from_a_diverged_asset_survivor() -> None:
+    client = FakeMigrationDynamo.with_legacy_tenant(
+        tenant_id="tnt_1", ponds=[legacy_pond("pond_1")], devices=[]
+    )
+    projection = asset_and_profile_for_legacy_pond(pond_model("pond_1"), default_site_id("tnt_1"))
+    client.put_raw(
+        {
+            **asset_to_item(projection.asset),
+            "name": "Renamed in v2",
+            "version": 7,
+            "updated_at": "2026-09-01T00:00:00.000000Z",
+        }
+    )
+
+    result = run(client, apply=True)
+
+    profile_key = _item_key(KEYS.pond_profile(projection.asset.asset_id))
+    assert result.result == "success"
+    assert result.assets_created == 0
+    profile = client.items[profile_key]
+    assert profile["version"] == 7
+    assert profile["updated_at"] == "2026-09-01T00:00:00.000000Z"
+    assert profile["legacy_pond_id"] == "pond_1"
+
+
+def test_tenant_renamed_before_the_site_commit_is_replanned_with_the_new_name() -> None:
+    client = FakeMigrationDynamo.with_legacy_tenant(tenant_id="tnt_1", ponds=[], devices=[])
+
+    def rename_tenant(fake: FakeMigrationDynamo, actions: list[dict]) -> None:
+        fake.items[("TENANT#tnt_1", "META")].update({"name": "Renamed", "version": Decimal(5)})
+
+    client.before_transact = on_transaction_with("SITE#", rename_tenant)
+
+    result = run(client, apply=True)
+
+    assert result.result == "success"
+    assert result.default_sites_created == 1
+    site = client.get_raw(*KEYS.site("tnt_1", default_site_id("tnt_1")).values())
+    assert (site["name"], site["version"]) == ("Renamed", 5)
