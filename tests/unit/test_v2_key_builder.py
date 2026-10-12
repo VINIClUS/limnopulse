@@ -1,4 +1,5 @@
 import json
+import math
 from datetime import UTC, datetime, timedelta, timezone
 from decimal import Decimal
 from hashlib import sha256
@@ -695,7 +696,7 @@ def test_receipt_item_stores_hashed_key_and_ttl_epoch() -> None:
         "request_hash": HEX_B,
         "response_snapshot_json": '{"site_id":"site_1"}',
         "created_at": "2026-08-25T12:00:00.500000Z",
-        "expires_at": int((NOW + timedelta(hours=24)).timestamp()),
+        "expires_at": math.ceil((NOW + timedelta(hours=24)).timestamp()),
     }
     assert isinstance(item["expires_at"], int)
     assert idempotency_receipt_from_item(item) == receipt()
@@ -709,7 +710,7 @@ def test_receipt_put_request_allows_only_absent_or_expired_receipts() -> None:
     assert request["ConditionExpression"] == "attribute_not_exists(PK) OR #expires_at <= :now"
     assert request["ExpressionAttributeNames"] == {"#expires_at": "expires_at"}
     assert plain(request["ExpressionAttributeValues"]) == {":now": int(NOW.timestamp())}
-    assert plain(request["Item"])["expires_at"] == int((NOW + timedelta(hours=24)).timestamp())
+    assert plain(request["Item"])["expires_at"] == math.ceil((NOW + timedelta(hours=24)).timestamp())
 
 
 def test_get_idempotency_replay_returns_snapshot_for_same_request() -> None:
@@ -746,6 +747,23 @@ def test_get_idempotency_replay_treats_expired_receipt_as_absent(age: timedelta)
     base = build_base(client, now=NOW + age)
 
     assert base.get_idempotency_replay_sync("tnt_a", "sites.create", HEX_A, "c" * 64) is None
+
+
+def test_receipt_replays_until_the_exact_sub_second_deadline() -> None:
+    client = FakeDynamoClient()
+    client.seed(idempotency_receipt_to_item(receipt()))
+    deadline = NOW + timedelta(hours=24)
+
+    just_before = build_base(client, now=deadline - timedelta(microseconds=1))
+    assert (
+        just_before.get_idempotency_replay_sync("tnt_a", "sites.create", HEX_A, HEX_B)
+        == '{"site_id":"site_1"}'
+    )
+    at_deadline = build_base(client, now=deadline)
+    assert at_deadline.get_idempotency_replay_sync("tnt_a", "sites.create", HEX_A, HEX_B) is None
+    # The TTL attribute rounds up, so storage never expires the receipt before the deadline.
+    (stored,) = [plain(item) for item in client.items.values()]
+    assert stored["expires_at"] >= deadline.timestamp()
 
 
 @pytest.mark.asyncio

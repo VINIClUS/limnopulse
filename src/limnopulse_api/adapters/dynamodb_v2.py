@@ -6,6 +6,7 @@ the conditional-failure -> `ConflictError` mapping. Entity codecs belong to each
 """
 
 import json
+import math
 import re
 from asyncio import to_thread
 from collections.abc import Callable, Mapping, Sequence
@@ -225,8 +226,9 @@ def idempotency_receipt_to_item(receipt: IdempotencyReceipt) -> dict[str, Any]:
         "request_hash": receipt.request_hash,
         "response_snapshot_json": receipt.response_snapshot_json,
         "created_at": canonical_timestamp_key(receipt.created_at),
-        # Numeric TTL attribute; only receipts may carry it.
-        "expires_at": int(receipt.expires_at.timestamp()),
+        # Numeric TTL attribute; only receipts may carry it. Rounded up so TTL deletion and the
+        # overwrite condition never act before the exact 24-hour deadline.
+        "expires_at": math.ceil(receipt.expires_at.timestamp()),
     }
 
 
@@ -424,7 +426,12 @@ class DynamoV2RepositoryBase:
         item = self.get_item_sync(
             self.keys.idempotency_receipt(tenant_id, scope, key_hash), consistent=True
         )
-        if item is None or int(item["expires_at"]) <= self._now_epoch():
+        if item is None:
+            return None
+        # TTL deletion is lazy and the epoch attribute is whole seconds; expiry is decided on the
+        # exact deadline derived from the stored creation instant.
+        expires_at = parse_canonical_timestamp(item["created_at"]) + IDEMPOTENCY_RECEIPT_TTL
+        if self.clock() >= expires_at:
             return None
         if item["request_hash"] != request_hash:
             raise ConflictError("idempotency key reused with a different request")
