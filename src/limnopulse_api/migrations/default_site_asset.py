@@ -102,6 +102,7 @@ from limnopulse_api.adapters.dynamodb_default_site_asset_migration import (
     legacy_tenant_from_item,
 )
 from limnopulse_api.adapters.dynamodb_deployments import (
+    MARKER_LAST_ENDED_AT_ATTRIBUTE,
     MARKER_SEQ_ATTRIBUTE,
     deployment_from_item,
     deployment_item_key,
@@ -116,7 +117,11 @@ from limnopulse_api.adapters.dynamodb_sites_assets import (
     pond_profile_to_item,
     site_to_item,
 )
-from limnopulse_api.adapters.dynamodb_v2 import DynamoConditionalConflict, utc_now
+from limnopulse_api.adapters.dynamodb_v2 import (
+    DynamoConditionalConflict,
+    parse_canonical_timestamp,
+    utc_now,
+)
 from limnopulse_api.domain.assets import AssetStatus
 from limnopulse_api.domain.deployments import Deployment, DeploymentStatus
 from limnopulse_api.domain.devices_v2 import ComponentStatus
@@ -379,6 +384,14 @@ def _links_needed(
     return needed
 
 
+def _stored_int(row: Mapping[str, Any], name: str, kind: str, key: Mapping[str, str]) -> int:
+    """A stored integer attribute; a missing or non-integer value is a schema conflict."""
+    value = row.get(name)
+    if isinstance(value, bool) or not isinstance(value, int):
+        raise _SchemaConflict(kind, key)
+    return value
+
+
 def _source_key(item: Mapping[str, Any]) -> dict[str, str]:
     return {"PK": item["PK"], "SK": item["SK"]}
 
@@ -457,6 +470,8 @@ class DefaultSiteAssetMigrator:
             state.tenants_completed += 1
             return
 
+        # Planning may have run past the deadline: nothing is written after it.
+        self._check_deadline(deadline)
         tenant_counts: Counter[str] = Counter()
         try:
             self._apply_site(plan, tenant_counts)
@@ -505,6 +520,7 @@ class DefaultSiteAssetMigrator:
                     )
                 except _SchemaConflict as conflict:
                     plan.conflicts.append(conflict)
+                self._check_deadline(deadline)
 
         for page in self.store.query_tenant_prefix_pages(
             tenant_id, LEGACY_DEVICE_PREFIX, page_size=page_size
@@ -520,6 +536,7 @@ class DefaultSiteAssetMigrator:
                     )
                 except _SchemaConflict as conflict:
                     plan.conflicts.append(conflict)
+                self._check_deadline(deadline)
         return plan
 
     # Planning -------------------------------------------------------------------------------
@@ -691,6 +708,7 @@ class DefaultSiteAssetMigrator:
             # The Device row came from an earlier Query page; a /v1 move since then shows up
             # as a lookup mismatch, so re-read the row before calling it a conflict.
             raise _Unstable("device_lookup", lookup_key, lookup)
+        lookup_version = _stored_int(lookup, "version", "device_lookup", lookup_key)
 
         # Mirror, then canonical; both commit together and absent rows are conditional puts.
         mirror_put = self._plan_put(
@@ -725,9 +743,10 @@ class DefaultSiteAssetMigrator:
             V2_PROJECTION_VERSION_ATTRIBUTE: V2_PROJECTION_VERSION,
         }
         updates: list[dict[str, Any]] = []
-        for key, row, kind in (
-            (source_key, item, "device_link"),
-            (lookup_key, lookup, "device_lookup_link"),
+        fences: list[dict[str, Any]] = []
+        for key, row, version, kind in (
+            (source_key, item, device.version, "device_link"),
+            (lookup_key, lookup, lookup_version, "device_lookup_link"),
         ):
             if _links_needed(row, expected_links, kind, key):
                 updates.append(
@@ -737,14 +756,28 @@ class DefaultSiteAssetMigrator:
                             tenant_id=tenant_id,
                             pond_id=device.pond_id,
                             component_id=component.component_id,
-                            observed_version=int(row["version"]),
+                            observed_version=version,
                         )
                     }
                 )
+            else:
+                # Without a link update, fence the row anyway: a /v1 move committed after these
+                # reads must fail the transaction instead of being "repaired" back.
+                fences.append(
+                    {
+                        "ConditionCheck": self.store.device_fence_check_request(
+                            key,
+                            tenant_id=tenant_id,
+                            pond_id=device.pond_id,
+                            observed_version=version,
+                        )
+                    }
+                )
+        actions = (*component_puts, *deployment_actions, *updates)
         return _RecordPlan(
             kind="device",
             source_key=source_key,
-            actions=(*component_puts, *deployment_actions, *updates),
+            actions=(*actions, *fences) if actions else (),
             component_created=bool(component_puts),
             deployment_created=bool(deployment_actions),
             link_updated=bool(updates),
@@ -800,19 +833,17 @@ class DefaultSiteAssetMigrator:
                 # Active but not CURRENT: CURRENT was absent when read, so this is a commit
                 # landing between the reads.
                 raise _Unstable("deployment_current", current_key, mirror)
-            if history is None:
-                raise _Unstable("deployment_history", history_key, [mirror, marker])
-            if marker is None:
-                raise _Unstable("deployment_marker", marker_key, [mirror, history])
+            self._require_ended_group(mirror, history, marker, mirror_key, history_key, marker_key)
             # Ended with nothing CURRENT: already migrated. The migration never restarts an
             # ended interval, because that would invent history.
             return []
-        if not active:
-            return []
+        # Stray rows are rejected before any early return for inactive Devices/Components.
         if history is not None:
             raise _Unstable("deployment_history", history_key, [history, marker])
         if marker is not None:
             raise _Unstable("deployment_marker", marker_key, marker)
+        if not active:
+            return []
         return [
             *(
                 {"Put": self.store.put_new_request(target)}
@@ -829,6 +860,45 @@ class DefaultSiteAssetMigrator:
                 )
             },
         ]
+
+    def _require_ended_group(
+        self,
+        mirror: Mapping[str, Any],
+        history: Mapping[str, Any] | None,
+        marker: Mapping[str, Any] | None,
+        mirror_key: Mapping[str, str],
+        history_key: Mapping[str, str],
+        marker_key: Mapping[str, str],
+    ) -> None:
+        """An ended deterministic Deployment with no CURRENT must be a complete ended group."""
+        try:
+            ended = deployment_from_item(mirror)
+        except (KeyError, TypeError, ValueError) as exc:
+            raise _SchemaConflict("deployment", mirror_key) from exc
+        if ended.status is not DeploymentStatus.ENDED or ended.ended_at is None:
+            raise _Unstable("deployment", mirror_key, mirror)
+        named = deployment_to_item(ended)
+        if history is None or any(
+            history.get(name) != named.get(name)
+            for name in (*_CURRENT_FIELDS, "status", "ended_at", "version")
+        ):
+            raise _Unstable("deployment_history", history_key, [mirror, history])
+        last_ended_at = None if marker is None else marker.get(MARKER_LAST_ENDED_AT_ATTRIBUTE)
+        seq = None if marker is None else marker.get(MARKER_SEQ_ATTRIBUTE)
+        try:
+            marker_ok = (
+                marker is not None
+                and marker.get("tenant_id") == ended.tenant_id
+                and marker.get("component_id") == ended.component_id
+                and isinstance(seq, int)
+                and seq >= 1
+                and isinstance(last_ended_at, str)
+                and parse_canonical_timestamp(last_ended_at) >= ended.ended_at
+            )
+        except ValueError:
+            marker_ok = False
+        if not marker_ok:
+            raise _Unstable("deployment_marker", marker_key, [mirror, marker])
 
     def _asset_active(self, tenant_id: str, asset_id: str, pond: Pond) -> bool:
         """Status of the Pond's Asset; one not written yet will mirror the Pond's status."""
@@ -943,7 +1013,7 @@ class DefaultSiteAssetMigrator:
                     self.store.table_name,
                     current.tenant_id,
                     current.component_id,
-                    observed_seq=int(marker[MARKER_SEQ_ATTRIBUTE]),
+                    observed_seq=marker[MARKER_SEQ_ATTRIBUTE],
                     ended_at=transition_at,
                 )
             },

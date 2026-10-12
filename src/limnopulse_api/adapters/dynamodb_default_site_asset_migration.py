@@ -204,6 +204,24 @@ class DynamoDefaultSiteAssetMigrationStore(DynamoV2RepositoryBase):
             },
         )
 
+    def device_fence_check_request(
+        self, key: Mapping[str, str], *, tenant_id: str, pond_id: str, observed_version: int
+    ) -> dict[str, Any]:
+        """Fence a Device tenant row or lookup on the version and Pond the plan observed."""
+        return self.condition_check_request(
+            key,
+            condition=(
+                "attribute_exists(PK) AND #version = :observed_version "
+                "AND #pond_id = :pond_id AND #tenant_id = :tenant_id"
+            ),
+            names={"#version": "version", "#pond_id": "pond_id", "#tenant_id": "tenant_id"},
+            values={
+                ":observed_version": observed_version,
+                ":pond_id": pond_id,
+                ":tenant_id": tenant_id,
+            },
+        )
+
     def asset_exists_check_request(self, tenant_id: str, asset_id: str) -> dict[str, Any]:
         return self.condition_check_request(
             self.keys.asset(tenant_id, asset_id),

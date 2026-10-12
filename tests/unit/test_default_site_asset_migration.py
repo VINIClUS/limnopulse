@@ -1516,7 +1516,13 @@ def test_drift_repair_transaction_is_fenced_and_bounded() -> None:
         "Update",
         "ConditionCheck",
         "ConditionCheck",
+        "ConditionCheck",
+        "ConditionCheck",
     ]
+    for fence in device_tx[-2:]:
+        condition = fence["ConditionCheck"]["ConditionExpression"]
+        assert "#version = :observed_version" in condition
+        assert "#pond_id = :pond_id" in condition
     replace_current = device_tx[4]["Put"]
     assert "#deployment_id = :deployment_id" in replace_current["ConditionExpression"]
     assert "#version = :expected_version" in replace_current["ConditionExpression"]
@@ -1568,6 +1574,9 @@ def test_ended_deterministic_deployment_without_current_is_already_migrated() ->
         client.items[_item_key(deployment_to_item(deterministic, form=form))].update(
             {"status": "ended", "ended_at": "2026-06-01T09:00:00.000000Z", "version": 2}
         )
+    client.items[_item_key(deployment_marker_key(COMPONENT_ID))].update(
+        {"seq": 2, "last_ended_at": "2026-06-01T09:00:00.000000Z"}
+    )
     client.calls.clear()
 
     result = run(client, apply=True)
@@ -1779,3 +1788,169 @@ def test_stable_partial_deployment_group_stays_a_schema_conflict() -> None:
         ("deployment_marker", f"COMPONENT#{COMPONENT_ID}/DEPLOYMENT#MARKER")
     ]
     assert len(sleeps) == 2
+
+
+# Codex findings: Device fences, ended-group validation, malformed versions, deadline -----------
+
+
+def test_v1_move_between_lookup_and_current_reads_is_not_reverted() -> None:
+    client = migrated_store()
+    client.put_raw(legacy_pond("pond_2"))
+    run(client, apply=True)  # pond_2 Asset exists
+    deterministic = _deterministic_deployment()
+    moved = Deployment(
+        tenant_id="tnt_1",
+        deployment_id=FOREIGN_DEPLOYMENT_ID,
+        component_id=COMPONENT_ID,
+        site_id=default_site_id("tnt_1"),
+        asset_id=asset_id_for_legacy_pond("tnt_1", "pond_2"),
+        started_at=MOVED_AT,
+        created_at=MOVED_AT,
+        updated_at=MOVED_AT,
+        version=1,
+    )
+    current_key = _item_key(deployment_to_item(deterministic, form="current"))
+    seen = {"lookup": False}
+
+    def projection_move(fake: FakeMigrationDynamo, key: tuple[str, str]) -> None:
+        if key == ("DEVICE#probe-1", "META"):
+            seen["lookup"] = True
+        elif key == current_key and seen["lookup"]:
+            fake.before_get_item = None
+            # An M1-05-like flag-on move commits after the lookup read, before CURRENT is read.
+            _move_device_at(fake, "pond_2", MOVED_AT)
+            ended = deterministic.model_copy(
+                update={"status": DeploymentStatus.ENDED, "ended_at": MOVED_AT, "version": 2}
+            )
+            for form in ("mirror", "history"):
+                fake.put_raw(deployment_to_item(ended, form=form))
+            for form in ("mirror", "history", "current"):
+                fake.put_raw(deployment_to_item(moved, form=form))
+            fake.items[_item_key(deployment_marker_key(COMPONENT_ID))].update(
+                {"seq": 2, "last_ended_at": "2026-06-01T09:00:00.000000Z"}
+            )
+
+    client.before_get_item = projection_move
+    client.calls.clear()
+
+    result = run(client, apply=True)
+
+    assert result.result == "success"
+    assert result.deployments_created == 0
+    assert _current(client)["deployment_id"] == FOREIGN_DEPLOYMENT_ID
+    assert _current(client)["asset_id"] == asset_id_for_legacy_pond("tnt_1", "pond_2")
+    assert len(_history_rows(client)) == 2
+    # The stale repair was attempted and refused by the Device fences.
+    assert any("DEPLOYMENT#CURRENT" in str(tx) for tx in client.transactions)
+
+
+def _ended_group_store() -> FakeMigrationDynamo:
+    client = migrated_store()
+    deterministic = _deterministic_deployment()
+    del client.items[_item_key(deployment_to_item(deterministic, form="current"))]
+    for form in ("mirror", "history"):
+        client.items[_item_key(deployment_to_item(deterministic, form=form))].update(
+            {"status": "ended", "ended_at": "2026-06-01T09:00:00.000000Z", "version": 2}
+        )
+    client.items[_item_key(deployment_marker_key(COMPONENT_ID))].update(
+        {"seq": 2, "last_ended_at": "2026-06-01T09:00:00.000000Z"}
+    )
+    return client
+
+
+def test_valid_ended_group_is_already_migrated() -> None:
+    result = run(_ended_group_store(), apply=True)
+    assert result.result == "success"
+    assert result.already_migrated == 2
+
+
+@pytest.mark.parametrize(
+    ("damage", "kind"),
+    [
+        ("history_active", "deployment_history"),
+        ("marker_foreign_component", "deployment_marker"),
+        ("marker_before_end", "deployment_marker"),
+    ],
+)
+def test_inconsistent_ended_group_is_a_schema_conflict(damage: str, kind: str) -> None:
+    client = _ended_group_store()
+    deterministic = _deterministic_deployment()
+    if damage == "history_active":
+        history = client.items[_item_key(deployment_to_item(deterministic, form="history"))]
+        history.update({"status": "active"})
+        del history["ended_at"]
+    elif damage == "marker_foreign_component":
+        client.items[_item_key(deployment_marker_key(COMPONENT_ID))]["component_id"] = (
+            "cmp_" + "e" * 32
+        )
+    else:
+        client.items[_item_key(deployment_marker_key(COMPONENT_ID))]["last_ended_at"] = (
+            "2026-05-01T00:00:00.000000Z"
+        )
+    client.calls.clear()
+
+    result = run(client, apply=True)
+
+    assert result.result == "schema_conflict"
+    assert [c.kind for c in result.conflicts] == [kind]
+    assert client.transactions == []
+
+
+def test_decommissioned_device_with_stray_marker_is_a_schema_conflict() -> None:
+    client = FakeMigrationDynamo.with_legacy_tenant(
+        tenant_id="tnt_1",
+        ponds=[legacy_pond("pond_1")],
+        devices=[legacy_device("probe-1", "pond_1", status="decommissioned")],
+    )
+    client.put_raw(deployment_marker_item("tnt_1", COMPONENT_ID, seq=1, last_ended_at=None))
+
+    result = run(client, apply=True)
+
+    assert result.result == "schema_conflict"
+    assert [c.kind for c in result.conflicts] == ["deployment_marker"]
+    assert client.write_calls == []
+
+
+@pytest.mark.parametrize("version", [None, "three", Decimal("2.5"), True])
+def test_malformed_lookup_version_is_a_schema_conflict(version: Any) -> None:
+    client = FakeMigrationDynamo.with_legacy_tenant(
+        tenant_id="tnt_1",
+        ponds=[legacy_pond("pond_1")],
+        devices=[legacy_device("probe-1", "pond_1")],
+    )
+    lookup = client.items[("DEVICE#probe-1", "META")]
+    if version is None:
+        del lookup["version"]
+    else:
+        lookup["version"] = version
+
+    result = run(client, apply=True)
+
+    assert result.result == "schema_conflict"
+    assert [(c.kind, c.key) for c in result.conflicts] == [("device_lookup", "DEVICE#probe-1/META")]
+    assert client.write_calls == []
+
+
+def test_deadline_passing_during_last_record_planning_writes_nothing() -> None:
+    client = FakeMigrationDynamo.with_legacy_tenant(
+        tenant_id="tnt_1",
+        ponds=[legacy_pond("pond_1")],
+        devices=[legacy_device("probe-1", "pond_1")],
+    )
+    now = {"value": 0.0}
+
+    def expire_during_device_planning(fake: FakeMigrationDynamo, key: tuple[str, str]) -> None:
+        if key == ("DEVICE#probe-1", "META"):
+            now["value"] = 1_000.0
+
+    client.before_get_item = expire_during_device_planning
+    migrator = DefaultSiteAssetMigrator(
+        client, clock=fixed_clock, monotonic=lambda: now["value"], sleep=lambda _delay: None
+    )
+
+    result = migrator.run(["tnt_1"], apply=True, page_size=25, deadline_seconds=300)
+
+    assert result.result == "deadline_exceeded"
+    assert exit_code_for(result.result) == 1
+    assert result.scope_completed is False
+    assert client.write_calls == []
