@@ -576,6 +576,7 @@ async def test_resolve_returns_the_interval_containing_event_time_after_relocati
     assert values[":sk_upper"] == KEYS.deployment_history_upper_bound(dt("2026-08-25T11:30:00Z"))
     assert query["ScanIndexForward"] is False
     assert query["Limit"] == 1
+    assert query["ConsistentRead"] is True
 
 
 @pytest.mark.asyncio
