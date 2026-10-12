@@ -46,9 +46,11 @@ def key_label(key: Mapping[str, str]) -> str:
 
 
 def is_legacy_device_item(item: Mapping[str, Any]) -> bool:
-    """Only native v2 rows (`schema_version == 2`) are skipped; every other `DEVICE#` row is
-    legacy and must parse, so a malformed schema-v1 row is reported instead of ignored."""
-    return item.get("schema_version") != 2
+    """Only clean native v2 rows (`schema_version == 2` and no `pond_id`) are skipped. Every
+    other `DEVICE#` row is legacy and must parse: a malformed schema-v1 row, or a v2 row that
+    still carries `pond_id` (which the v2 repository would also treat as legacy), is reported
+    instead of ignored."""
+    return item.get("schema_version") != 2 or "pond_id" in item
 
 
 def _timestamp(value: Any) -> datetime:

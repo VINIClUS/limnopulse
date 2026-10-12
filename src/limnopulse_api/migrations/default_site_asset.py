@@ -64,6 +64,14 @@ created during the run is read and planned before its Device.
 Exhausted retries mark only that tenant failed (result `failed`, exit 1); other tenants continue.
 The run is idempotent, so rerunning it converges any tenant left incomplete.
 
+Verification: a paginated Query does not see rows written behind its cursor while it runs.
+Before a tenant counts as completed (and before its receipt is written), both prefixes are
+queried again, and records not seen before (or, when applying, records that need actions
+again) are planned and applied or counted. This repeats until a pass finds nothing new, at most
+`MAX_VERIFICATION_PASSES` times, within the same deadline checks. If the last pass still finds
+something, the tenant is failed without a receipt (result `failed`, rerun to converge).
+Counters include the records handled by verification passes.
+
 Invariants every plan keeps:
 
 - Every plan with actions fences each legacy source row it read (Tenant row for the Site,
@@ -106,7 +114,7 @@ import logging
 import random
 import time
 from collections import Counter
-from collections.abc import Callable, Iterable, Mapping, Sequence
+from collections.abc import Callable, Iterable, Iterator, Mapping, Sequence
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta
 from typing import Any, Literal
@@ -179,6 +187,7 @@ MAX_PAGE_SIZE = 100
 MIN_DEADLINE_SECONDS = 1
 MAX_DEADLINE_SECONDS = 3600
 MAX_RECORD_ATTEMPTS = 3
+MAX_VERIFICATION_PASSES = 3
 BACKOFF_BASE_SECONDS = 0.05
 
 MigrationResult = Literal[
@@ -560,7 +569,20 @@ class DefaultSiteAssetMigrator:
         if not apply:
             for name, count in plan.counts().items():
                 state.counts[_CREATED_TO_WOULD.get(name, name)] += count
-            state.tenants_completed += 1
+
+            def account(record: _RecordPlan) -> None:
+                for name, count in record.counts().items():
+                    state.counts[_CREATED_TO_WOULD.get(name, name)] += count
+
+            if self._verify_tenant(
+                plan,
+                apply=False,
+                page_size=page_size,
+                deadline=deadline,
+                account=account,
+                state=state,
+            ):
+                state.tenants_completed += 1
             return
 
         # Planning may have run past the deadline: nothing is written after it.
@@ -570,6 +592,14 @@ class DefaultSiteAssetMigrator:
             self._apply_site(plan, tenant_counts, deadline)
             for record in plan.records:
                 self._apply_record(record, plan, tenant_counts, deadline)
+            verified = self._verify_tenant(
+                plan,
+                apply=True,
+                page_size=page_size,
+                deadline=deadline,
+                account=lambda record: self._apply_record(record, plan, tenant_counts, deadline),
+                state=state,
+            )
         except _SchemaConflict as conflict:
             state.add_conflicts(tenant_id, [conflict])
             return
@@ -579,10 +609,13 @@ class DefaultSiteAssetMigrator:
             return
         finally:
             state.counts.update(tenant_counts)
+        if not verified:
+            return
         self._check_deadline(deadline)
         try:
             self._record_receipt(
                 tenant_id,
+                deadline=deadline,
                 completed_at=self._clock(),
                 counts={
                     name: tenant_counts[name] for name in (*_CREATED_TO_WOULD, "already_migrated")
@@ -598,10 +631,17 @@ class DefaultSiteAssetMigrator:
         state.tenants_completed += 1
 
     def _record_receipt(
-        self, tenant_id: str, *, completed_at: datetime, counts: Mapping[str, int]
+        self,
+        tenant_id: str,
+        *,
+        deadline: float,
+        completed_at: datetime,
+        counts: Mapping[str, int],
     ) -> None:
         if not self.store.migration_receipt_run_count_valid(tenant_id):
             raise _ReceiptRejected
+        # The GetItem above may have run past the deadline: nothing is written after it.
+        self._check_deadline(deadline)
         try:
             self.store.record_migration_receipt(tenant_id, completed_at=completed_at, counts=counts)
         except ClientError as exc:
@@ -629,37 +669,104 @@ class DefaultSiteAssetMigrator:
         except ValueError as exc:
             raise _SchemaConflict("tenant_invalid", meta_key) from exc
         plan = _TenantPlan(tenant=tenant, site_id=site_id, site_action=site_action)
-
-        for page in self.store.query_tenant_prefix_pages(
-            tenant_id, LEGACY_POND_PREFIX, page_size=page_size
-        ):
-            self._check_deadline(deadline)
-            for pond_item in page:
-                self._check_deadline(deadline)
-                try:
-                    plan.records.append(
-                        self._plan_record("pond", pond_item, plan, plan.records.append)
-                    )
-                except _SchemaConflict as conflict:
-                    plan.conflicts.append(conflict)
-                self._check_deadline(deadline)
-
-        for page in self.store.query_tenant_prefix_pages(
-            tenant_id, LEGACY_DEVICE_PREFIX, page_size=page_size
-        ):
-            self._check_deadline(deadline)
-            for device_item in page:
-                self._check_deadline(deadline)
-                if not is_legacy_device_item(device_item):
-                    continue
-                try:
-                    plan.records.append(
-                        self._plan_record("device", device_item, plan, plan.records.append)
-                    )
-                except _SchemaConflict as conflict:
-                    plan.conflicts.append(conflict)
-                self._check_deadline(deadline)
+        for record in self._scan_records(plan, page_size, deadline, plan.records.append):
+            plan.records.append(record)
         return plan
+
+    def _scan_records(
+        self,
+        plan: _TenantPlan,
+        page_size: int,
+        deadline: float,
+        on_new_pond: Callable[[_RecordPlan], None],
+        *,
+        seen: set[tuple[str, str]] | None = None,
+        include_pending: bool = False,
+    ) -> Iterator[_RecordPlan]:
+        """Plan every legacy Pond, then every legacy Device, of the tenant partition.
+
+        Conflicts are collected on the plan. With `seen`, a record is yielded (and recorded as
+        seen) only when it was not seen before or, with `include_pending`, still needs actions.
+        """
+        tenant_id = plan.tenant.tenant_id
+        for kind, prefix in (("pond", LEGACY_POND_PREFIX), ("device", LEGACY_DEVICE_PREFIX)):
+            for page in self.store.query_tenant_prefix_pages(
+                tenant_id, prefix, page_size=page_size
+            ):
+                self._check_deadline(deadline)
+                for item in page:
+                    self._check_deadline(deadline)
+                    if kind == "device" and not is_legacy_device_item(item):
+                        continue
+                    try:
+                        record = self._plan_record(kind, item, plan, on_new_pond)
+                    except _SchemaConflict as conflict:
+                        plan.conflicts.append(conflict)
+                        continue
+                    finally:
+                        self._check_deadline(deadline)
+                    if seen is None:
+                        yield record
+                        continue
+                    key = (record.source_key["PK"], record.source_key["SK"])
+                    if key not in seen or (include_pending and record.actions):
+                        seen.add(key)
+                        yield record
+
+    def _verify_tenant(
+        self,
+        plan: _TenantPlan,
+        *,
+        apply: bool,
+        page_size: int,
+        deadline: float,
+        account: Callable[[_RecordPlan], None],
+        state: _RunState,
+    ) -> bool:
+        """Re-query both prefixes until a pass finds nothing new, at most
+        `MAX_VERIFICATION_PASSES` times.
+
+        A paginated Query can miss rows written behind its cursor. Each pass plans records not
+        seen before (and, when applying, records that need actions again) and hands them to
+        `account`, which applies them or counts them in a dry-run. Returns False and marks the
+        tenant failed when the last pass still finds something (rerun to converge).
+        """
+        seen = {(r.source_key["PK"], r.source_key["SK"]) for r in plan.records}
+        for _ in range(MAX_VERIFICATION_PASSES):
+            found: list[_RecordPlan] = []
+
+            def on_new_pond(record: _RecordPlan, found: list[_RecordPlan] = found) -> None:
+                # A Pond read for a Device goes ahead of that Device in `found`.
+                key = (record.source_key["PK"], record.source_key["SK"])
+                if key not in seen or (apply and record.actions):
+                    seen.add(key)
+                    found.append(record)
+
+            found.extend(
+                self._scan_records(
+                    plan,
+                    page_size,
+                    deadline,
+                    on_new_pond,
+                    seen=seen,
+                    include_pending=apply,
+                )
+            )
+            if plan.conflicts:
+                state.add_conflicts(plan.tenant.tenant_id, plan.conflicts)
+                return False
+            if not found:
+                return True
+            for record in found:
+                self._check_deadline(deadline)
+                account(record)
+        _LOGGER.error(
+            "tenant %s not completed: records still appearing after %d verification passes",
+            plan.tenant.tenant_id,
+            MAX_VERIFICATION_PASSES,
+        )
+        state.tenants_failed += 1
+        return False
 
     # Planning -------------------------------------------------------------------------------
 
@@ -773,6 +880,9 @@ class DefaultSiteAssetMigrator:
 
     def _parse_device(self, tenant_id: str, item: Mapping[str, Any]) -> Device:
         key = _source_key(item)
+        if item.get("schema_version") == 2:
+            # A native v2 shape that still carries `pond_id` is contradictory.
+            raise _SchemaConflict("device_invalid", key)
         device = self._parse(legacy_device_from_item, item, "device_invalid", key)
         if (
             device.tenant_id != tenant_id

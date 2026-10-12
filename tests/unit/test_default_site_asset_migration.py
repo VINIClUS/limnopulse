@@ -597,7 +597,8 @@ def test_queries_only_explicit_tenant_partitions_with_paginated_limit() -> None:
     assert result.would_create_assets == 3
     assert result.would_project_devices == 2
     queries = client.query_calls
-    assert len(queries) == 4  # POND# 2 pages + DEVICE# 2 pages
+    # POND# 2 pages + DEVICE# 2 pages, then the same again for the clean verification pass.
+    assert len(queries) == 8
     for request in queries:
         values = client.deserialize(request["ExpressionAttributeValues"])
         assert values[":pk"] == "TENANT#tnt_1"
@@ -2812,3 +2813,116 @@ def test_archived_legacy_pond_still_projects_its_deployment() -> None:
         if "ConditionCheck" in a and a["ConditionCheck"]["Key"] == asset_key
     )
     assert "#status" not in asset_check["ConditionExpression"]
+
+
+# Codex round 7: contradictory v2 rows, verification passes, receipt deadline ------------------
+
+
+def test_schema_v2_device_row_with_pond_id_is_invalid_not_skipped() -> None:
+    client = FakeMigrationDynamo.with_legacy_tenant(
+        tenant_id="tnt_1",
+        ponds=[legacy_pond("pond_1")],
+        devices=[{**legacy_device("probe-1", "pond_1"), "schema_version": 2}],
+    )
+
+    result = run(client, apply=False)
+
+    assert result.result == "schema_conflict"
+    assert [(c.kind, c.key) for c in result.conflicts] == [
+        ("device_invalid", "TENANT#tnt_1/DEVICE#probe-1")
+    ]
+
+
+def _insert_behind_device_cursor(fake: FakeMigrationDynamo) -> None:
+    """A Pond and a Device written while the Device pages are read, behind the cursor."""
+    fake.put_raw(legacy_pond("pond_0"))
+    for row in (legacy_device("aaa-probe", "pond_0"),):
+        fake.put_raw(row)
+        fake.put_raw(
+            {**row, "PK": "DEVICE#aaa-probe", "SK": "META", "entity_type": "device_lookup"}
+        )
+
+
+@pytest.mark.parametrize("apply", [True, False])
+def test_rows_written_behind_the_query_cursor_are_found_by_verification(apply: bool) -> None:
+    client = FakeMigrationDynamo.with_legacy_tenant(
+        tenant_id="tnt_1",
+        ponds=[legacy_pond("pond_1")],
+        devices=[legacy_device("probe-1", "pond_1"), legacy_device("probe-2", "pond_1")],
+    )
+    original_query = client.query
+    device_pages = {"count": 0}
+
+    def query(**kwargs: Any) -> dict[str, Any]:
+        values = client.deserialize(kwargs["ExpressionAttributeValues"])
+        if values[":sk_prefix"] == "DEVICE#":
+            device_pages["count"] += 1
+            if device_pages["count"] == 2:  # page 1 consumed, cursor past "aaa-probe"
+                _insert_behind_device_cursor(client)
+        return original_query(**kwargs)
+
+    client.query = query  # type: ignore[method-assign]
+
+    result = run(client, apply=apply, page_size=1)
+
+    assert result.result == "success"
+    assert result.scope_completed is True
+    if apply:
+        assert result.assets_created == 2
+        assert result.deployments_created == 3
+        new_component = default_component_id_for_legacy_device("tnt_1", "aaa-probe")
+        assert client.get_raw(*KEYS.current_deployment(new_component).values())["asset_id"] == (
+            asset_id_for_legacy_pond("tnt_1", "pond_0")
+        )
+        assert client.get_raw(*KEYS.migration_receipt("tnt_1").values()) is not None
+    else:
+        assert (result.would_create_assets, result.would_create_deployments) == (2, 3)
+        assert client.write_calls == []
+
+
+def test_writer_that_keeps_inserting_fails_the_tenant_without_a_receipt() -> None:
+    client = FakeMigrationDynamo.with_legacy_tenant(
+        tenant_id="tnt_1", ponds=[legacy_pond("pond_m")], devices=[]
+    )
+    original_query = client.query
+    inserted = {"count": 0}
+
+    def query(**kwargs: Any) -> dict[str, Any]:
+        values = client.deserialize(kwargs["ExpressionAttributeValues"])
+        if values[":sk_prefix"] == "POND#":
+            inserted["count"] += 1
+            client.put_raw(legacy_pond(f"pond_a{inserted['count']:02d}"))
+        return original_query(**kwargs)
+
+    client.query = query  # type: ignore[method-assign]
+
+    result = run(client, apply=True)
+
+    assert result.result == "failed"
+    assert exit_code_for(result.result) == 1
+    assert result.scope_completed is False
+    assert result.tenants_completed == 0
+    assert client.get_raw(*KEYS.migration_receipt("tnt_1").values()) is None
+
+
+def test_deadline_passing_during_the_receipt_read_writes_no_receipt() -> None:
+    client = migrated_store()
+    now = {"value": 0.0}
+    receipt_key = _item_key(KEYS.migration_receipt("tnt_1"))
+
+    def expire_on_receipt_read(fake: FakeMigrationDynamo, key: tuple[str, str]) -> None:
+        if key == receipt_key:
+            now["value"] = 1_000.0
+
+    client.before_get_item = expire_on_receipt_read
+    before = dict(client.items[receipt_key])
+    client.calls.clear()
+    migrator = DefaultSiteAssetMigrator(
+        client, clock=second_clock, monotonic=lambda: now["value"], sleep=lambda _d: None
+    )
+
+    result = migrator.run(["tnt_1"], apply=True, page_size=25, deadline_seconds=300)
+
+    assert result.result == "deadline_exceeded"
+    assert [name for name, _ in client.calls if name == "update_item"] == []
+    assert client.items[receipt_key] == before
