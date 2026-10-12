@@ -4,6 +4,7 @@ from uuid import NAMESPACE_URL, uuid4, uuid5
 # Historical identifiers stay readable; "#" is excluded because IDs are interpolated into keys.
 SAFE_ID_PATTERN = re.compile(r"[A-Za-z0-9][A-Za-z0-9._:-]{0,127}")
 _CANONICAL_SUFFIX = r"_[0-9a-f]{32}"
+_CANONICAL_PREFIX_PATTERN = re.compile(r"[a-z]+")
 
 
 def new_tenant_id() -> str:
@@ -59,6 +60,9 @@ def new_capability_id() -> str:
 
 
 def is_canonical_id(value: str, prefix: str) -> bool:
+    """`prefix` is given without its separator, e.g. "site"; a malformed prefix is a bug."""
+    if not isinstance(prefix, str) or _CANONICAL_PREFIX_PATTERN.fullmatch(prefix) is None:
+        raise ValueError("canonical prefix must be lowercase letters without '_', e.g. 'site'")
     if not isinstance(value, str):
         return False
     return re.fullmatch(re.escape(prefix) + _CANONICAL_SUFFIX, value) is not None

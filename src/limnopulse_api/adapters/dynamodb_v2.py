@@ -151,7 +151,11 @@ class DynamoV2KeyBuilder:
         return "DEPLOYMENT#0", "DEPLOYMENT#:"
 
     def deployment_history_upper_bound(self, observed_at: datetime) -> str:
-        """Inclusive SK bound covering every history row that started at or before the instant."""
+        """Inclusive SK bound covering every history row that started at or before the instant.
+
+        Point-in-time queries must also pass `lower=deployment_history_bounds()[0]`, because
+        `COMPONENT#` partitions also hold `CAPABILITY#` rows that sort below this bound.
+        """
         return f"DEPLOYMENT#{canonical_timestamp_key(observed_at)}#~"
 
     def idempotency_receipt(self, tenant_id: str, scope: str, key_hash: str) -> dict[str, str]:
@@ -308,12 +312,16 @@ class DynamoV2RepositoryBase:
         condition: str | None = None,
         names: Mapping[str, str] | None = None,
         values: Mapping[str, Any] | None = None,
+        return_values: str | None = None,
     ) -> dict[str, Any]:
+        """`return_values` is for standalone `update_item` only; transactions reject it."""
         request: dict[str, Any] = {
             "TableName": self.table_name,
             "Key": self.serialize_item(key),
             "UpdateExpression": update_expression,
         }
+        if return_values is not None:
+            request["ReturnValues"] = return_values
         return self._with_condition(request, condition, names, values)
 
     def condition_check_request(
@@ -540,7 +548,9 @@ class DynamoV2RepositoryBase:
 
     def _normalize_from_dynamo(self, value: Any) -> Any:
         if isinstance(value, Decimal):
-            return int(value) if value % 1 == 0 else float(value)
+            return int(value) if value == value.to_integral_value() else float(value)
+        if isinstance(value, (set, frozenset)):
+            return {self._normalize_from_dynamo(item) for item in value}
         if isinstance(value, list):
             return [self._normalize_from_dynamo(item) for item in value]
         if isinstance(value, Mapping):

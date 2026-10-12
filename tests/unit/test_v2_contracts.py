@@ -185,6 +185,15 @@ def test_canonical_id_validation_is_strict(value: str) -> None:
         require_canonical_id(value, "site")
 
 
+@pytest.mark.parametrize("prefix", ["site_", "Site", "", "si-te", "site#", "s1"])
+def test_canonical_id_rejects_malformed_prefix(prefix: str) -> None:
+    value = new_site_id()
+    with pytest.raises(ValueError, match="prefix"):
+        is_canonical_id(value, prefix)
+    with pytest.raises(ValueError, match="prefix"):
+        require_canonical_id(value, prefix)
+
+
 def test_canonical_id_rejects_non_string_values() -> None:
     assert not is_canonical_id(None, "site")  # type: ignore[arg-type]
 

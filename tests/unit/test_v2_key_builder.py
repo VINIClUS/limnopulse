@@ -541,9 +541,44 @@ def test_update_item_returns_normalized_attributes() -> None:
     client = FakeDynamoClient()
     base = build_base(client)
 
-    request = base.update_request({"PK": "P", "SK": "S"}, update_expression="SET a = :a")
-    request["ReturnValues"] = "ALL_NEW"
+    request = base.update_request(
+        {"PK": "P", "SK": "S"}, update_expression="SET a = :a", return_values="ALL_NEW"
+    )
+
+    assert request["ReturnValues"] == "ALL_NEW"
     assert base.update_item_sync(request) == {"version": 3}
+    assert client.calls[-1][1]["ReturnValues"] == "ALL_NEW"
+
+
+def test_update_request_omits_return_values_by_default() -> None:
+    base = build_base()
+
+    request = base.update_request({"PK": "P", "SK": "S"}, update_expression="SET a = :a")
+
+    assert "ReturnValues" not in request
+
+
+def test_get_item_normalizes_huge_integers_fractions_and_number_sets() -> None:
+    client = FakeDynamoClient()
+    client.seed(
+        {
+            "PK": "P",
+            "SK": "S",
+            "huge": Decimal("1E+30"),
+            "fraction": Decimal("2.5"),
+            "numbers": {Decimal("1E+30"), Decimal("1.5"), Decimal("7")},
+        }
+    )
+    base = build_base(client)
+
+    item = base.get_item_sync({"PK": "P", "SK": "S"})
+
+    assert item["huge"] == 10**30
+    assert isinstance(item["huge"], int)
+    assert item["fraction"] == 2.5
+    assert isinstance(item["fraction"], float)
+    assert item["numbers"] == {10**30, 1.5, 7}
+    assert not any(isinstance(value, Decimal) for value in item["numbers"])
 
 
 @pytest.mark.parametrize(
