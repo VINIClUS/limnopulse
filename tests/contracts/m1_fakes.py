@@ -24,6 +24,7 @@ from limnopulse_api.adapters.dynamodb_deployments import DynamoDeploymentReposit
 from limnopulse_api.adapters.dynamodb_devices_v2 import DynamoDeviceComponentRepository
 from limnopulse_api.adapters.dynamodb_integrations import DynamoIntegrationRepository
 from limnopulse_api.adapters.dynamodb_sites_assets import DynamoSiteAssetRepository
+from limnopulse_api.adapters.dynamodb_v2 import idempotency_receipt_to_item
 from limnopulse_api.core.errors import ConflictError, NotFoundError
 from limnopulse_api.domain.assets import (
     Asset,
@@ -456,7 +457,9 @@ class InMemoryM1Repositories:
     Component canonical row, Asset PondProfile, external identity), the same ownership, parent
     and lifecycle checks in the same order, the same version fences, all-or-nothing commits,
     and the same exception types and messages, including the raw "conditional write conflict"
-    an adapter surfaces for an unclassified conditional failure. Lifecycle transitions are
+    an adapter surfaces for an unclassified conditional failure. A migrated Asset's linked
+    legacy Pond is modelled minimally (`seed_legacy_pond`): presence fence, SET-only mirror of
+    name/description/archive, and an independent legacy version (D2). Lifecycle transitions are
     validated where the adapters validate them (Devices, Components, Deployments); Site and
     Asset transitions are validated by `SiteService`/`AssetService` on top of either backend.
     `test_m1_acceptance_gate.py` proves the parity scenario by scenario.
@@ -474,6 +477,18 @@ class InMemoryM1Repositories:
     receipts: dict[tuple[str, str, str], IdempotencyReceipt] = field(default_factory=dict)
     # Global, cross-tenant claims, like the production `EXTERNAL_ID#<provider>#<sha256>` row.
     external_identities: dict[tuple[str, str], str] = field(default_factory=dict)
+    # Minimal legacy `TENANT#<t>/POND#<p>` rows a migrated Asset mirrors onto (D2, D6).
+    legacy_ponds: dict[tuple[str, str], dict[str, Any]] = field(default_factory=dict)
+
+    def seed_legacy_pond(
+        self, tenant_id: str, pond_id: str, *, name: str, version: int = 1
+    ) -> None:
+        self.legacy_ponds[(tenant_id, pond_id)] = {
+            "name": name,
+            "description": None,
+            "status": "active",
+            "version": version,
+        }
 
     # Idempotency ------------------------------------------------------------------------------
 
@@ -488,12 +503,13 @@ class InMemoryM1Repositories:
         return receipt.response_snapshot_json
 
     def _receipt_taken(self, receipt: IdempotencyReceipt) -> bool:
-        """The adapters' receipt Put condition: `attribute_not_exists(PK) OR expires_at <= now`
-        on whole epoch seconds."""
+        """The adapters' receipt Put condition `attribute_not_exists(PK) OR expires_at <= now`:
+        the stored epoch is the production codec's ceiling, `now` the whole-second clock."""
         existing = self.receipts.get((receipt.tenant_id, receipt.scope, receipt.key_hash))
-        return existing is not None and int(existing.expires_at.timestamp()) > int(
-            self.clock().timestamp()
-        )
+        if existing is None:
+            return False
+        stored_expires_at = idempotency_receipt_to_item(existing)["expires_at"]
+        return stored_expires_at > int(self.clock().timestamp())
 
     def _store_receipt(self, receipt: IdempotencyReceipt) -> None:
         self.receipts[(receipt.tenant_id, receipt.scope, receipt.key_hash)] = receipt
@@ -588,9 +604,10 @@ class InMemoryM1Repositories:
         current = self.assets.get((tenant_id, asset_id))
         if current is None:
             raise NotFoundError("asset not found")
-        if current.pond_profile.legacy_pond_id is not None:
-            raise NotImplementedError("legacy Pond mirroring is only modelled by the Dynamo fake")
         asset, profile = current.asset, current.pond_profile
+        legacy_key = (tenant_id, profile.legacy_pond_id)
+        if profile.legacy_pond_id is not None and legacy_key not in self.legacy_ponds:
+            raise ConflictError("linked legacy pond is missing")
         now = self.clock()
         if asset.version != expected_version:
             raise ConflictError(CONDITIONAL_CONFLICT)
@@ -615,6 +632,13 @@ class InMemoryM1Repositories:
                 }
             )
         updated = AssetWithPondProfile(asset=updated_asset, pond_profile=updated_profile)
+        if profile.legacy_pond_id is not None:
+            # SET-only mirror; the legacy Pond keeps its own version counter (D2).
+            legacy = self.legacy_ponds[legacy_key]
+            legacy.update(_without_none({"name": name, "description": pond_description}))
+            if status is AssetStatus.ARCHIVED:
+                legacy["status"] = AssetStatus.ARCHIVED.value
+            legacy["version"] += 1
         self.assets[(tenant_id, asset_id)] = updated
         return updated
 

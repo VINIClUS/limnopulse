@@ -10,7 +10,7 @@ import importlib.util
 import inspect
 import json
 from collections.abc import Callable
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from decimal import Decimal
 from pathlib import Path
 from typing import Any
@@ -69,7 +69,11 @@ from limnopulse_api.domain.integrations import (
     IntegrationAccountStatus,
 )
 from limnopulse_api.domain.roles import TenantRole
-from limnopulse_api.domain.v2_common import QuotaDimension, new_idempotency_receipt
+from limnopulse_api.domain.v2_common import (
+    IDEMPOTENCY_RECEIPT_TTL,
+    QuotaDimension,
+    new_idempotency_receipt,
+)
 from limnopulse_api.main import create_app
 from limnopulse_api.migrations.default_site_asset import DefaultSiteAssetMigrator
 from limnopulse_api.repositories.v2_contracts import (
@@ -658,15 +662,32 @@ class ParityBundle:
     """The four protocol implementations of one backend, fresh for each scenario."""
 
     def __init__(self, backend: str) -> None:
+        self.clock = Clock(NOW)
+        self.backend = backend
         if backend == "in_memory":
-            repositories = InMemoryM1Repositories(clock=Clock(NOW))
-            self.sites = self.devices = self.integrations = self.deployments = repositories
+            self.memory = InMemoryM1Repositories(clock=self.clock)
+            self.sites = self.devices = self.integrations = self.deployments = self.memory
         else:
-            dynamo = DynamoM1Repositories.over(ConditionalDynamoClient(), clock=lambda: NOW)
+            self.client = ConditionalDynamoClient()
+            dynamo = DynamoM1Repositories.over(self.client, clock=self.clock)
             self.sites = dynamo.site_asset_repository
             self.devices = dynamo.device_component_repository
             self.integrations = dynamo.integration_repository
             self.deployments = dynamo.deployment_repository
+
+    def seed_legacy_pond(self, pond_id: str, name: str) -> None:
+        if self.backend == "in_memory":
+            self.memory.seed_legacy_pond(TENANT_A, pond_id, name=name)
+        else:
+            self.client.seed({**legacy_pond_item(pond_id, tenant_id=TENANT_A), "name": name})
+
+    async def legacy_pond(self, pond_id: str) -> dict[str, Any]:
+        """The legacy Pond fields an Asset update mirrors, plus its own version."""
+        if self.backend == "in_memory":
+            row = self.memory.legacy_ponds[(TENANT_A, pond_id)]
+        else:
+            row = self.client.item(f"TENANT#{TENANT_A}", f"POND#{pond_id}")
+        return {field: row[field] for field in ("name", "description", "status", "version")}
 
 
 TENANT_A, TENANT_B = "tnt_a", "tnt_b"
@@ -675,14 +696,22 @@ P_COMPONENT, P_ACCOUNT, P_DEPLOYMENT = "cmp_" + "4" * 32, "ia_" + "5" * 32, "dep
 T10, T11, T1130 = dt("2026-08-25T10:00:00Z"), dt("2026-08-25T11:00:00Z"), dt("2026-08-25T11:30:00Z")
 
 
-def p_receipt(tenant_id: str, scope: str, index: int, *, request: str = "b", snapshot="{}"):
+def p_receipt(
+    tenant_id: str,
+    scope: str,
+    index: int,
+    *,
+    request: str = "b",
+    snapshot="{}",
+    created_at: datetime = NOW,
+):
     return new_idempotency_receipt(
         tenant_id=tenant_id,
         scope=scope,
         key_hash=f"{index:064x}",
         request_hash=request * 64,
         response_snapshot_json=snapshot,
-        created_at=NOW,
+        created_at=created_at,
     )
 
 
@@ -692,7 +721,12 @@ def p_site(tenant_id: str = TENANT_A, site_id: str = P_SITE, name: str = "Fazend
     )
 
 
-def p_asset(tenant_id: str = TENANT_A, asset_id: str = P_ASSET, site_id: str = P_SITE):
+def p_asset(
+    tenant_id: str = TENANT_A,
+    asset_id: str = P_ASSET,
+    site_id: str = P_SITE,
+    legacy_pond_id: str | None = None,
+):
     asset = Asset(
         tenant_id=tenant_id,
         asset_id=asset_id,
@@ -704,7 +738,12 @@ def p_asset(tenant_id: str = TENANT_A, asset_id: str = P_ASSET, site_id: str = P
         version=1,
     )
     profile = PondProfile(
-        tenant_id=tenant_id, asset_id=asset_id, created_at=NOW, updated_at=NOW, version=1
+        tenant_id=tenant_id,
+        asset_id=asset_id,
+        legacy_pond_id=legacy_pond_id,
+        created_at=NOW,
+        updated_at=NOW,
+        version=1,
     )
     return asset, profile
 
@@ -810,7 +849,77 @@ def _scenario(steps):
     return run
 
 
+MIGRATED_ASSET = "ast_" + "a" * 32
+FRACTIONAL_CREATED_AT = NOW + timedelta(microseconds=500_000)
+FRACTIONAL_EXPIRY = FRACTIONAL_CREATED_AT + IDEMPOTENCY_RECEIPT_TTL  # stored as ceil -> +1s
+
+
+async def p_migrated_asset(r: ParityBundle, *, seed_legacy: bool = True) -> None:
+    """An Asset linked to a legacy Pond, as the migration and the `/v1` projection create it."""
+    if seed_legacy:
+        r.seed_legacy_pond("pond_west", "West")
+    await r.sites.create_asset(
+        *p_asset(asset_id=MIGRATED_ASSET, legacy_pond_id="pond_west"),
+        p_receipt(TENANT_A, "asset-create", 9),
+    )
+
+
+def _migrated_asset_update(**changes: Any):
+    async def steps(r: ParityBundle) -> Any:
+        await p_migrated_asset(r)
+        values = {
+            "name": None,
+            "status": None,
+            "pond_description": None,
+            "pond_profile_expected_version": None,
+            **changes,
+        }
+        updated = await r.sites.update_asset(TENANT_A, MIGRATED_ASSET, 1, **values)
+        return [updated, await r.legacy_pond("pond_west")]
+
+    return steps
+
+
+async def _receipt_reuse_at(r: ParityBundle, observed_at: datetime) -> Any:
+    await r.sites.create_site(
+        p_site(site_id="site_" + "a" * 32),
+        p_receipt(TENANT_A, "site-create", 5, created_at=FRACTIONAL_CREATED_AT),
+    )
+    r.clock.value = observed_at
+    return await r.sites.create_site(
+        p_site(site_id="site_" + "b" * 32),
+        p_receipt(TENANT_A, "site-create", 5, request="c", created_at=observed_at),
+    )
+
+
 PARITY_SCENARIOS: dict[str, Any] = {
+    # Migrated Asset mirrored onto its legacy Pond (D2, D6) ---------------------------------
+    "asset.legacy_pond.rename": _scenario(_migrated_asset_update(name="Renamed")),
+    "asset.legacy_pond.description": _scenario(
+        _migrated_asset_update(pond_description="deep", pond_profile_expected_version=1)
+    ),
+    "asset.legacy_pond.archive": _scenario(_migrated_asset_update(status=AssetStatus.ARCHIVED)),
+    "asset.legacy_pond.missing": _scenario(
+        lambda r: _then(
+            p_migrated_asset(r, seed_legacy=False),
+            lambda: r.sites.update_asset(
+                TENANT_A,
+                MIGRATED_ASSET,
+                1,
+                name="X",
+                status=None,
+                pond_description=None,
+                pond_profile_expected_version=None,
+            ),
+        )
+    ),
+    # Receipt expiry: stored as ceil(created_at + 24h), compared with the whole-second clock --
+    "receipt.at_fractional_expiry_still_taken": _scenario(
+        lambda r: _receipt_reuse_at(r, FRACTIONAL_EXPIRY)
+    ),
+    "receipt.after_expiry_ceiling_accepted": _scenario(
+        lambda r: _receipt_reuse_at(r, FRACTIONAL_EXPIRY + timedelta(microseconds=500_000))
+    ),
     # SiteAssetRepository ------------------------------------------------------------------
     "site.create.duplicate_same_tenant": _scenario(
         lambda r: r.sites.create_site(p_site(), p_receipt(TENANT_A, "site-create", 2))
@@ -1670,6 +1779,40 @@ def test_runbook_fenced_device_delete_refuses_projected_devices(state: str) -> N
         client.transact_write_items(TransactItems=request)
     assert cancelled.value.response["Error"]["Code"] == "TransactionCanceledException"
     assert client.snapshot() == before
+
+
+def test_missing_pond_and_unsafe_device_id_remedies() -> None:
+    """The runbook's remedy order for a Device with a dangling pond and an unsafe id."""
+    client = ConditionalDynamoClient()
+    client.seed(legacy_tenant_item())
+    client.seed(legacy_pond_item(WEST_POND))
+    for item in legacy_device_items("dev_bad", "pond_gone"):
+        client.seed(item)
+
+    def conflicts() -> list[tuple[str, str]]:
+        summary = migrate(client, apply=False)
+        return [(conflict.kind, conflict.key) for conflict in summary.conflicts]
+
+    # The pond is checked first: the unsafe id is not reported yet.
+    assert conflicts() == [("device_missing_pond", f"TENANT#{TENANT}/DEVICE#dev_bad")]
+    # Flag on: the PATCH to an existing pond never reaches the pond.
+    with pytest.raises(ConflictError, match="not compatible with the v2 projection"):
+        asyncio.run(
+            v1_projection(client, Clock(NOW)).update_device(
+                TENANT, "dev_bad", 1, name=None, pond_id=WEST_POND, firmware_version=None
+            )
+        )
+    # Flag off: the same PATCH succeeds and the dry-run now reports the unsafe id.
+    asyncio.run(
+        DynamoDomainRepository(TABLE, client).update_device(
+            TENANT, "dev_bad", 1, name=None, pond_id=WEST_POND, firmware_version=None
+        )
+    )
+    assert conflicts() == [("device_invalid", f"TENANT#{TENANT}/DEVICE#dev_bad")]
+    # It was never projected, so the runbook's fenced delete retires it and the tenant converges.
+    client.transact_write_items(TransactItems=runbook_fenced_delete(TENANT, "dev_bad", 2))
+    assert conflicts() == []
+    assert migrate(client, apply=True).result == "success"
 
 
 # 7) Projection flag with incomplete repository state returns 503 -----------------------------------

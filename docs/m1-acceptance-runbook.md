@@ -233,7 +233,7 @@ commit it.
 
 | `kind` | Cause | Remedy |
 |---|---|---|
-| `device_missing_pond` | A legacy Device's `pond_id` names no Pond (D5). The whole tenant is blocked. | Patch the Device through `/v1` to an **existing** `pond_id`, then re-run the dry-run and `--apply`. This works with either flag value: with the flag off the next `--apply` repairs the Deployment ([Drift repair](#drift-repair)); with the flag on the `/v1` write reconciles it. With the flag on, a `/v1` create or patch to a **nonexistent** `pond_id` returns `409 "pond not found"`. Delete the Device only under the strict conditions in [Removing a legacy Device](#removing-a-legacy-device). |
+| `device_missing_pond` | A legacy Device's `pond_id` names no Pond (D5). The whole tenant is blocked. | First check the Device id is v2-compatible (see [Missing pond and an unsafe Device id](#missing-pond-and-an-unsafe-device-id); the dry-run does **not** report that while the pond is missing). If it is, patch the Device through `/v1` to an **existing** `pond_id`, then re-run the dry-run and `--apply`. This works with either flag value: with the flag off the next `--apply` repairs the Deployment ([Drift repair](#drift-repair)); with the flag on the `/v1` write reconciles it. With the flag on, a `/v1` create or patch to a **nonexistent** `pond_id` returns `409 "pond not found"`. Delete the Device only under the strict conditions in [Removing a legacy Device](#removing-a-legacy-device). |
 | `tenant_missing` | `TENANT#<id>/META` does not exist. | Check the tenant ID (it is case- and whitespace-sensitive) and remove it from the scope. |
 | `tenant_invalid` | Tenant META does not parse as a legacy Tenant, or its ID is not v2-safe. | Repair the Tenant row from backup, or exclude the tenant until it is fixed. |
 | `site` | A row at the deterministic default Site key has different ownership, or the default Site is not ACTIVE when a new Asset or initial Deployment needs it. | Inspect `TENANT#<id>/SITE#<default_site_id>`. The default Site cannot be archived (D6); restore its ownership and `active` status from backup. |
@@ -242,10 +242,35 @@ commit it.
 | `component` | The canonical row and the tenant mirror of the default Component disagree, or belong to another Device. | Restore both Component rows from backup; they must match field for field. |
 | `deployment`, `deployment_current`, `deployment_history`, `deployment_marker` | A Deployment group (mirror, history row, `DEPLOYMENT#CURRENT`, marker) is inconsistent, malformed, or shows a stray history row or marker where no deterministic Deployment exists. | Do not delete history. Compare the group with backup or PITR, restore the missing or divergent row, and re-run. Escalate to the M1-04/M1-06 owner if the history itself is wrong. |
 | `device_lookup` | `DEVICE#<id>/META` disagrees with the tenant `DEVICE#` row the same way on every re-read. | Restore the lookup from the tenant Device row; every field except `PK`, `SK` and `entity_type` must match. |
-| `device_invalid` | A legacy Device row does not parse, or has an identifier that is not v2-compatible. | Fix the row from backup, then re-run. If the Device is junk, see [Removing a legacy Device](#removing-a-legacy-device). Native v2 rows (`schema_version == 2`) are skipped, never reported. |
+| `device_invalid` | A legacy Device row does not parse, or has an identifier that is not v2-compatible ([unsafe identifiers](#unsafe-legacy-identifiers)). | A malformed row: fix it from backup, then re-run. An unsafe identifier cannot be fixed in place (it is the Device's identity, and the M1 projection never renames it); such a Device can never have been projected, so retire it with [Removing a legacy Device](#removing-a-legacy-device) and, if still needed, re-register the hardware under a v2-compatible id. Native v2 rows (`schema_version == 2`) are skipped, never reported. |
 | `pond_invalid` | A legacy Pond row does not parse, or its ID is not v2-safe. | Fix the Pond row from backup. With the flag on, `/v1` returns `409` for such ids. |
 | `pond_missing`, `device_missing` | A source row vanished while the run was planning it, and stayed gone. | Re-run; if it persists, check for concurrent deletes. |
 | `migration_receipt` | `MIGRATION#M1#DEFAULT_SITE_ASSET_DEVICE` exists but is not this tenant's M1 receipt (wrong owner or malformed `run_count`). | Inspect the row. Restore it from backup, or remove it only after confirming with the M1-06 owner. The receipt is an audit trail and is never used to skip validation. |
+
+### Missing pond and an unsafe Device id
+
+A Device can have both a dangling `pond_id` and an identifier that is not v2-compatible
+([unsafe identifiers](#unsafe-legacy-identifiers)). The migrator checks the pond first, so
+the dry-run reports **only** `device_missing_pond` for it, never `device_invalid` alongside.
+For a legacy Device `dev_bad` in pond `pond_gone`, the dry-run prints (exit `2`):
+
+```json
+"conflicts": [{"tenant_id": "<tenant>", "kind": "device_missing_pond", "key": "TENANT#<tenant>/DEVICE#dev_bad"}]
+```
+
+So check the id yourself against `[A-Za-z0-9][A-Za-z0-9._:-]{0,127}` (and, for a `dev_` id,
+exactly `dev_<32 lower-hex>`) before choosing the remedy:
+
+- **Projection flag on:** the prescribed `/v1` PATCH to an existing pond returns `409`
+  ("device is not compatible with the v2 projection"); it never reaches the pond.
+- **Projection flag off:** the same PATCH succeeds. Because the flag is environment-wide and
+  read only at startup, that needs a flag-off deployment (before step 8, after a rollback, or
+  a maintenance window with a restart). The next dry-run then reports `device_invalid` for the
+  Device, which is retired as described in its row above.
+- **Or skip the PATCH:** an unsafe Device was never projected, so it can go straight to
+  [Removing a legacy Device](#removing-a-legacy-device) with either flag value.
+
+The gate pins all three outcomes (`test_missing_pond_and_unsafe_device_id_remedies`).
 
 ### Removing a legacy Device
 
@@ -346,7 +371,7 @@ to "never delete rows", which governs rollback.
   version counters are independent (D2).
 - `409` for archived or inactive targets (flag on only; see [Drift repair](#drift-repair) for
   the flag-off outcome).
-- Legacy identifiers that are not v2-compatible (outside `[A-Za-z0-9][A-Za-z0-9._:-]{0,127}`, or
+- <a id="unsafe-legacy-identifiers"></a>Legacy identifiers that are not v2-compatible (outside `[A-Za-z0-9][A-Za-z0-9._:-]{0,127}`, or
   a `dev_` id that is not `dev_<32 lower-hex>`): flag-on `/v1` **create and update** writes
   return `409`. **Reads do not check this:** `list_ponds`, `get_pond`, `list_devices` and
   `get_device` return the legacy row unchanged (`200`) with either flag value, and a row that does
