@@ -919,7 +919,8 @@ def test_record_transactions_are_conditional_bounded_and_grouped() -> None:
     assert [next(iter(action)) for action in pond_tx] == ["Put", "Put", "ConditionCheck", "Update"]
     assert [next(iter(action)) for action in device_tx] == [
         *["Put"] * 6,
-        "ConditionCheck",
+        "ConditionCheck",  # Asset exists
+        "ConditionCheck",  # default Site ACTIVE
         "Update",
         "Update",
     ]
@@ -1561,7 +1562,11 @@ def test_drift_repair_transaction_is_fenced_and_bounded() -> None:
         "ConditionCheck",
         "ConditionCheck",
         "ConditionCheck",
+        "ConditionCheck",
     ]
+    site_check = device_tx[7]["ConditionCheck"]
+    assert site_check["Key"] == client.serialize(KEYS.site("tnt_1", default_site_id("tnt_1")))
+    assert "#status = :active" in site_check["ConditionExpression"]
     for fence in device_tx[-2:]:
         condition = fence["ConditionCheck"]["ConditionExpression"]
         assert "#version = :observed_version" in condition
@@ -1632,7 +1637,8 @@ def test_ended_deterministic_deployment_without_current_is_already_migrated() ->
 
 def test_inactive_component_is_not_drift_repaired() -> None:
     client = moved_after_migration()
-    client.items[_item_key(KEYS.component(COMPONENT_ID))]["status"] = "decommissioned"
+    for key in _component_keys():  # v2 updates both Component rows together
+        client.items[key]["status"] = "decommissioned"
 
     result = run(client, apply=True)
 
@@ -2130,10 +2136,10 @@ def test_component_decommissioned_between_plan_and_commit_gets_no_deployment() -
     for form in ("mirror", "history", "current"):
         del client.items[_item_key(deployment_to_item(deterministic, form=form))]
     del client.items[_item_key(deployment_marker_key(COMPONENT_ID))]
-    canonical_key = _item_key(KEYS.component(COMPONENT_ID))
 
     def decommission(fake: FakeMigrationDynamo, actions: list[dict]) -> None:
-        fake.items[canonical_key]["status"] = "decommissioned"
+        for key in _component_keys():
+            fake.items[key]["status"] = "decommissioned"
 
     client.before_transact = decommission
     client.calls.clear()
@@ -2171,8 +2177,8 @@ def test_component_probe_profile_id_is_part_of_identity(row: str, damage: str) -
 
 def test_mutable_probe_profile_fields_are_ignored() -> None:
     client = migrated_store()
-    key = _item_key(KEYS.component(COMPONENT_ID))
-    client.items[key]["probe_profile"]["serial_number"] = "SN-42"
+    for row_key in _component_keys():
+        client.items[row_key]["probe_profile"]["serial_number"] = "SN-42"
 
     assert run(client, apply=True).already_migrated == 2
 
@@ -2449,3 +2455,155 @@ def test_tenant_renamed_before_the_site_commit_is_replanned_with_the_new_name() 
     assert result.default_sites_created == 1
     site = client.get_raw(*KEYS.site("tnt_1", default_site_id("tnt_1")).values())
     assert (site["name"], site["version"]) == ("Renamed", 5)
+
+
+# Codex round 4 + sweep: parsed siblings, Site parents on Deployment writes, codec parses -------
+
+
+@pytest.mark.parametrize(
+    "change",
+    [{"name": "Only canonical renamed"}, {"version": Decimal(4)}, {"status": "decommissioned"}],
+)
+def test_component_pair_must_agree_on_persisted_fields(change: dict[str, Any]) -> None:
+    client = migrated_store()
+    canonical_key, _ = _component_keys()
+    client.items[canonical_key].update(change)
+
+    result = run(client, apply=False)
+
+    assert result.result == "schema_conflict"
+    assert [(c.kind, c.key) for c in result.conflicts] == [
+        ("component", f"{canonical_key[0]}/{canonical_key[1]}")
+    ]
+
+
+def test_component_row_that_does_not_parse_is_a_conflict() -> None:
+    client = migrated_store()
+    _, mirror_key = _component_keys()
+    client.items[mirror_key]["status"] = "bogus"
+
+    result = run(client, apply=False)
+
+    assert [(c.kind, c.key) for c in result.conflicts] == [
+        ("component", f"{mirror_key[0]}/{mirror_key[1]}")
+    ]
+
+
+def _archive_default_site(fake: FakeMigrationDynamo) -> None:
+    fake.items[_item_key(KEYS.site("tnt_1", default_site_id("tnt_1")))]["status"] = "archived"
+
+
+def test_drift_into_an_asset_under_an_archived_site_is_not_repaired() -> None:
+    client = moved_after_migration()
+    run(client, apply=False)
+    asset_2 = asset_and_profile_for_legacy_pond(pond_model("pond_2"), default_site_id("tnt_1"))
+    client.put_raw(asset_to_item(asset_2.asset))
+    client.put_raw(pond_profile_to_item(asset_2.pond_profile))
+    _archive_default_site(client)
+    before = dict(_current(client))
+    client.calls.clear()
+
+    result = run(client, apply=True)
+
+    assert result.result == "success"
+    assert result.deployments_created == 0
+    assert _current(client) == before
+    assert not any("DEPLOYMENT#CURRENT" in str(tx) for tx in client.transactions)
+
+
+def test_site_archived_before_the_drift_commit_is_fenced() -> None:
+    client = moved_after_migration()
+    client.before_transact = on_transaction_with(
+        "DEPLOYMENT#CURRENT", lambda fake, actions: _archive_default_site(fake)
+    )
+    before = dict(_current(client))
+
+    result = run(client, apply=True)
+
+    assert result.result == "success"
+    assert result.deployments_created == 0
+    assert _current(client) == before
+
+
+def test_fresh_deployment_under_an_archived_site_is_a_conflict() -> None:
+    client = migrated_store()
+    deterministic = _deterministic_deployment()
+    for form in ("mirror", "history", "current"):
+        del client.items[_item_key(deployment_to_item(deterministic, form=form))]
+    del client.items[_item_key(deployment_marker_key(COMPONENT_ID))]
+    _archive_default_site(client)
+    client.calls.clear()
+
+    result = run(client, apply=True)
+
+    assert result.result == "schema_conflict"
+    assert [c.kind for c in result.conflicts] == ["site"]
+    assert client.transactions == []
+
+
+@pytest.mark.parametrize(
+    ("form", "change", "kind"),
+    [
+        ("mirror", {"updated_at": "2026-12-01T00:00:00.000000Z"}, "deployment_current"),
+        (
+            "mirror",
+            {"status": "ended", "ended_at": "2026-12-01T00:00:00.000000Z"},
+            "deployment_current",
+        ),
+        ("history", {"started_at": "not-a-time"}, "deployment_history"),
+        ("history", {"created_at": "2020-01-01T00:00:00.000000Z"}, "deployment_history"),
+    ],
+)
+def test_active_current_siblings_must_parse_and_match_exactly(
+    form: str, change: dict[str, Any], kind: str
+) -> None:
+    client = migrated_store()
+    deterministic = _deterministic_deployment()
+    key = _item_key(deployment_to_item(deterministic, form=form))
+    client.items[key].update(change)
+    client.calls.clear()
+
+    result = run(client, apply=True)
+
+    assert result.result == "schema_conflict"
+    assert [(c.kind, c.key) for c in result.conflicts] == [(kind, f"{key[0]}/{key[1]}")]
+    assert client.transactions == []
+
+
+def test_ended_group_history_must_match_the_mirror_exactly() -> None:
+    client = _ended_group_store()
+    history_key = _item_key(deployment_to_item(_deterministic_deployment(), form="history"))
+    client.items[history_key]["updated_at"] = "2027-01-01T00:00:00.000000Z"
+
+    result = run(client, apply=True)
+
+    assert [c.kind for c in result.conflicts] == ["deployment_history"]
+
+
+@pytest.mark.parametrize(
+    ("row", "change", "kind"),
+    [
+        ("site", {"status": "bogus"}, "site"),
+        ("asset", {"status": "bogus"}, "asset"),
+        ("asset", {"version": "2"}, "asset"),
+        ("profile", {"created_at": "yesterday"}, "pond_profile"),
+        ("lookup", {"created_at": "yesterday"}, "device_lookup"),
+    ],
+)
+def test_existing_rows_must_parse_through_their_codecs(
+    row: str, change: dict[str, Any], kind: str
+) -> None:
+    client = migrated_store()
+    asset_id = asset_id_for_legacy_pond("tnt_1", "pond_1")
+    key = {
+        "site": _item_key(KEYS.site("tnt_1", default_site_id("tnt_1"))),
+        "asset": _item_key(KEYS.asset("tnt_1", asset_id)),
+        "profile": _item_key(KEYS.pond_profile(asset_id)),
+        "lookup": ("DEVICE#probe-1", "META"),
+    }[row]
+    client.items[key].update(change)
+
+    result = run(client, apply=False)
+
+    assert result.result == "schema_conflict"
+    assert (kind, f"{key[0]}/{key[1]}") in [(c.kind, c.key) for c in result.conflicts]

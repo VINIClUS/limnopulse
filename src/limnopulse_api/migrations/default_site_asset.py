@@ -74,8 +74,16 @@ Invariants every plan keeps:
   PondProfile takes its version and timestamps from the surviving Asset (fenced), only the
   description comes from the Pond; an Asset cannot be rebuilt from its PondProfile (conflict).
   Deployment groups are never rebuilt; inconsistent ones are re-read and then reported.
-- Rows of one Deployment (mirror, history, CURRENT) are compared on every identity field, Site
-  and Asset included; stored versions and `seq` values must be stored integers, never bools.
+- Every existing row a plan accepts is parsed through its public codec (Site, Asset,
+  PondProfile, Component, Deployment, legacy Device lookup), and rows written together must
+  agree: the Component pair, and the mirror/history rows of a Deployment against CURRENT (or
+  each other when ended), on every persisted field. Stored versions and `seq` values must be
+  stored integers, never bools.
+- Every ACTIVE child written carries commit-time checks on its parents up to the Site: an
+  ACTIVE Asset needs an ACTIVE Site; a new Deployment needs its Asset, an ACTIVE Component and
+  an ACTIVE Site (an ARCHIVED Site makes the initial Deployment a `site` conflict); a drift
+  repair needs an ACTIVE Asset, Component and Site, and is skipped (already migrated) when
+  the target Asset or its Site is not ACTIVE.
 - Every write to a deterministic key is conditioned on absence or on observed ownership; the
   migration receipt is written only to a free key or this tenant's own M1 receipt.
 - Only `schema_version == 2` rows under `DEVICE#` are native v2 and skipped; any other row is
@@ -132,11 +140,15 @@ from limnopulse_api.adapters.dynamodb_deployments import (
 from limnopulse_api.adapters.dynamodb_devices_v2 import (
     COMPONENT_ENTITY_TYPE,
     COMPONENT_MIRROR_ENTITY_TYPE,
+    component_from_item,
     component_to_item,
 )
 from limnopulse_api.adapters.dynamodb_sites_assets import (
+    asset_from_item,
     asset_to_item,
+    pond_profile_from_item,
     pond_profile_to_item,
+    site_from_item,
     site_to_item,
 )
 from limnopulse_api.adapters.dynamodb_v2 import (
@@ -437,6 +449,18 @@ def _stored_int(row: Mapping[str, Any], name: str, kind: str, key: Mapping[str, 
         raise _SchemaConflict(kind, key) from exc
 
 
+def _decoded[T](
+    parser: Callable[[Mapping[str, Any]], T], row: Mapping[str, Any] | None
+) -> T | None:
+    """The row through its public codec, or `None` when it is absent or does not parse."""
+    if row is None:
+        return None
+    try:
+        return parser(row)
+    except (KeyError, TypeError, ValueError):
+        return None
+
+
 def _parse_deployment(item: Mapping[str, Any], kind: str, key: Mapping[str, str]) -> Deployment:
     """A stored Deployment row; its version must be a stored integer."""
     _stored_int(item, "version", kind, key)
@@ -662,7 +686,13 @@ class DefaultSiteAssetMigrator:
             raise _SchemaConflict("device_invalid", _source_key(item))
         device = self._parse_device(tenant_id, item)
         self._ensure_pond(device, item, plan, on_new_pond)
-        return self._plan_device(device, item, plan.site_id, plan.ponds[device.pond_id])
+        return self._plan_device(
+            device,
+            item,
+            plan.site_id,
+            plan.ponds[device.pond_id],
+            site_planned=plan.site_action is not None,
+        )
 
     def _ensure_pond(
         self,
@@ -701,6 +731,8 @@ class DefaultSiteAssetMigrator:
                 },
             )
         _require_identity(existing, item, _SITE_FIELDS, "site", key)
+        if _decoded(site_from_item, existing) is None:
+            raise _SchemaConflict("site", key)
         return site.site_id, None
 
     def _parse_pond(self, tenant_id: str, item: Mapping[str, Any]) -> Pond:
@@ -739,8 +771,14 @@ class DefaultSiteAssetMigrator:
         asset = self.store.get_known_item(asset_key)
         if profile is not None:
             _require_identity(profile, profile_item, _PROFILE_FIELDS, "pond_profile", profile_key)
+            _stored_int(profile, "version", "pond_profile", profile_key)
+            if _decoded(pond_profile_from_item, profile) is None:
+                raise _SchemaConflict("pond_profile", profile_key)
         if asset is not None:
             _require_identity(asset, asset_item, _ASSET_FIELDS, "asset", asset_key)
+            _stored_int(asset, "version", "asset", asset_key)
+            if _decoded(asset_from_item, asset) is None:
+                raise _SchemaConflict("asset", asset_key)
         asset_put = profile_put = None
         actions: list[dict[str, Any]] = []
         if asset is None and profile is None:
@@ -827,7 +865,13 @@ class DefaultSiteAssetMigrator:
         )
 
     def _plan_device(
-        self, device: Device, item: Mapping[str, Any], site_id: str, pond: Pond
+        self,
+        device: Device,
+        item: Mapping[str, Any],
+        site_id: str,
+        pond: Pond,
+        *,
+        site_planned: bool,
     ) -> _RecordPlan:
         source_key = _source_key(item)
         tenant_id = device.tenant_id
@@ -850,6 +894,8 @@ class DefaultSiteAssetMigrator:
             # as a lookup mismatch, so re-read the row before calling it a conflict.
             raise _Unstable("device_lookup", lookup_key, lookup)
         lookup_version = _stored_int(lookup, "version", "device_lookup", lookup_key)
+        # The lookup is a full legacy copy and must parse like the Device row.
+        self._parse(legacy_device_from_item, lookup, "device_lookup", lookup_key)
         if lookup_version != device.version:
             # Legacy writes bump both rows together; a gap is a commit between the reads or a
             # stable divergence (schema conflict after the bounded re-reads).
@@ -862,7 +908,9 @@ class DefaultSiteAssetMigrator:
             and component_row.get("status") == ComponentStatus.ACTIVE.value
         )
 
-        deployment_actions = self._plan_deployment(device, deployment, pond, active=active)
+        deployment_actions = self._plan_deployment(
+            device, deployment, pond, active=active, site_planned=site_planned
+        )
         # One commit-time check per existing Component row: ACTIVE when a Deployment is
         # written against it, and unchanged when it is the survivor a sibling is rebuilt from.
         component_checks: list[dict[str, Any]] = []
@@ -937,6 +985,7 @@ class DefaultSiteAssetMigrator:
         pond: Pond,
         *,
         active: bool,
+        site_planned: bool,
     ) -> list[dict[str, Any]]:
         """Actions creating or repairing the default Component's Deployment, or `[]`.
 
@@ -964,6 +1013,9 @@ class DefaultSiteAssetMigrator:
                 return []
             if not self._asset_active(tenant_id, deployment.asset_id, pond):
                 # Like the `/v1` projection, never reconcile into an archived Asset.
+                return []
+            if not self._site_active(tenant_id, deployment.site_id, site_planned):
+                # Nor into an Asset whose Site is archived: already migrated.
                 return []
             return self._drift_repair_actions(device, current, marker, deployment)
 
@@ -995,6 +1047,10 @@ class DefaultSiteAssetMigrator:
             raise _Unstable("deployment_marker", marker_key, marker)
         if not active:
             return []
+        site_key = self.keys.site(tenant_id, deployment.site_id)
+        if not self._site_active(tenant_id, deployment.site_id, site_planned):
+            # An ACTIVE Deployment needs an ACTIVE Site (as an ACTIVE Asset does).
+            raise _SchemaConflict("site", site_key)
         return [
             *(
                 {"Put": self.store.put_new_request(target)}
@@ -1010,6 +1066,7 @@ class DefaultSiteAssetMigrator:
                     tenant_id, deployment.asset_id
                 )
             },
+            {"ConditionCheck": self.store.site_active_check_request(tenant_id, deployment.site_id)},
         ]
 
     def _require_ended_group(
@@ -1025,10 +1082,7 @@ class DefaultSiteAssetMigrator:
         ended = _parse_deployment(mirror, "deployment", mirror_key)
         if ended.status is not DeploymentStatus.ENDED or ended.ended_at is None:
             raise _Unstable("deployment", mirror_key, mirror)
-        named = deployment_to_item(ended)
-        if history is None or any(
-            history.get(name) != named.get(name) for name in (*_SIBLING_FIELDS, "ended_at")
-        ):
+        if _decoded(deployment_from_item, history) != ended:
             raise _Unstable("deployment_history", history_key, [mirror, history])
         last_ended_at = None if marker is None else marker.get(MARKER_LAST_ENDED_AT_ATTRIBUTE)
         try:
@@ -1044,6 +1098,13 @@ class DefaultSiteAssetMigrator:
             marker_ok = False
         if not marker_ok:
             raise _Unstable("deployment_marker", marker_key, [mirror, marker])
+
+    def _site_active(self, tenant_id: str, site_id: str, site_planned: bool) -> bool:
+        """Whether the default Site is ACTIVE; one planned in this run is created ACTIVE."""
+        site = self.store.get_known_item(self.keys.site(tenant_id, site_id))
+        if site is None:
+            return site_planned
+        return site.get("status") == SiteStatus.ACTIVE.value
 
     def _asset_active(self, tenant_id: str, asset_id: str, pond: Pond) -> bool:
         """Status of the Pond's Asset; one not written yet will mirror the Pond's status."""
@@ -1071,12 +1132,14 @@ class DefaultSiteAssetMigrator:
                 "deployment_current",
                 current_key,
             )
-        named = deployment_to_item(current)
-        for form in ("mirror", "history"):
+        # The mirror and history rows CURRENT names must be the same ACTIVE Deployment on every
+        # persisted field; anything else is re-read and, if it persists, a conflict.
+        for form, kind in (("mirror", "deployment_current"), ("history", "deployment_history")):
             key = deployment_item_key(current, form)
             row = self.store.get_known_item(key)
-            if row is None or any(row.get(name) != named.get(name) for name in _SIBLING_FIELDS):
-                raise _Unstable("deployment_current", current_key, [current_item, row])
+            sibling = _decoded(deployment_from_item, row)
+            if sibling != current or row is None or not isinstance(row.get("version"), int):
+                raise _Unstable(kind, key, [current_item, row])
         return current
 
     def _require_marker(
@@ -1173,6 +1236,11 @@ class DefaultSiteAssetMigrator:
             {
                 "ConditionCheck": self.store.asset_active_check_request(
                     current.tenant_id, target.asset_id
+                )
+            },
+            {
+                "ConditionCheck": self.store.site_active_check_request(
+                    current.tenant_id, target.site_id
                 )
             },
         ]
@@ -1273,7 +1341,15 @@ class DefaultSiteAssetMigrator:
                 {"Put": self.store.put_new_request(mirror_item)},
             ]
             return puts, canonical_item, True, None
+        for row, key in ((mirror, mirror_key), (canonical, canonical_key)):
+            if row is not None:
+                _stored_int(row, "version", "component", key)
+                if _decoded(component_from_item, row) is None:
+                    raise _SchemaConflict("component", key)
         if canonical is not None and mirror is not None:
+            # Both rows are written together: they must agree on every persisted field.
+            if _decoded(component_from_item, canonical) != _decoded(component_from_item, mirror):
+                raise _Unstable("component", canonical_key, [mirror, canonical])
             return [], canonical, False, None
         if canonical is not None:
             version = _stored_int(canonical, "version", "component", canonical_key)
