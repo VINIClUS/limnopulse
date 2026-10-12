@@ -348,6 +348,10 @@ def test_second_current_interval_and_backdated_overlap_are_rejected(backend: str
         store.start(probe.component_id, east.asset_id, dt("2026-08-25T10:30:00Z"))
     store.move(probe.component_id, east.asset_id, dt("2026-08-25T11:00:00Z"))
     store.end(probe.component_id, dt("2026-08-25T11:30:00Z"))
+    # Half-open end with no successor: the end instant itself belongs to no interval.
+    assert store.resolve(probe.component_id, dt("2026-08-25T11:30:00Z")) is None
+    last_instant = dt("2026-08-25T11:29:59.999999Z")
+    assert store.resolve(probe.component_id, last_instant).asset_id == east.asset_id
     with pytest.raises(ConflictError):
         store.start(probe.component_id, west.asset_id, dt("2026-08-25T11:15:00Z"))
     store.start(probe.component_id, west.asset_id, dt("2026-08-25T11:30:00Z"))

@@ -17,6 +17,8 @@ The two flags are independent and both default to `false`:
 ## Release gate
 
 Every command must exit `0`. None of them uses production credentials or changes cloud state.
+Run the gate without a repo-root `.env` (move it aside, or export settings in the shell),
+because `Settings` reads it and two `tests/unit/test_settings.py` tests then fail.
 
 ```bash
 uv run --locked --extra dev pytest -q \
@@ -96,7 +98,7 @@ conditional transactions and ignores the 1 MB Query page, so its results do not 
 
 Roll back by changing flags only: set `V1_POND_DEVICE_PROJECTION_ENABLED=false` and
 `API_V2_ENABLED=false`. With the projection off, `/v1` reads come from the legacy `POND#` and
-`DEVICE#` rows again. Native v2 Devices never appear in `/v1`.
+`DEVICE#` rows (under D1 they do with either flag value). Native v2 Devices never appear in `/v1`.
 
 - **Never delete rows.** Additive v2 rows, the `v2_*` link attributes on legacy rows,
   Deployment history, Deployment markers and migration receipts all stay in place.
@@ -106,8 +108,11 @@ Roll back by changing flags only: set `V1_POND_DEVICE_PROJECTION_ENABLED=false` 
 
 ## Migration exit codes
 
-The CLI prints one JSON summary on stdout. Its `result` is one of `success`, `schema_conflict`,
-`deadline_exceeded`, `dynamodb_error`, `configuration_error` or `failed`.
+For every runtime outcome the CLI prints one JSON summary on stdout. Its `result` is one of
+`success`, `schema_conflict`, `deadline_exceeded`, `dynamodb_error`, `configuration_error` or
+`failed`. Usage errors (a `--tenant-file` outside the working directory, neither `--tenant` nor
+`--tenant-file`, bad or out-of-range arguments) exit `1` with a message on stderr and print **no**
+JSON summary.
 
 | Exit | Meaning | Action |
 |---|---|---|
@@ -117,19 +122,20 @@ The CLI prints one JSON summary on stdout. Its `result` is one of `success`, `sc
 
 `failed` means that tenant had transient churn: `TransactionConflict` retries were exhausted,
 or rows were still changing after 3 verification passes. That tenant gets no receipt. Re-run it,
-ideally while `/v1` writes for it are quiet.
+ideally while `/v1` writes for it are quiet. `failed` also covers an unclassified error that
+aborts the whole run; check stderr and the infrastructure, then re-run.
 
 `--tenant-file` must be a regular file of at most 1 MiB inside the working directory, with one
 tenant ID per line. Symlinks are resolved before the check, so run from the repository root. A
 path outside the repository, such as the plan's `/secure/path/...` example, is rejected as a
-configuration error (exit `1`). Copy the file under the repository root first, and do not
+usage error (exit `1`, no JSON summary). Copy the file under the repository root first, and do not
 commit it.
 
 ### Conflict remedies (exit 2)
 
 | `kind` | Cause | Remedy |
 |---|---|---|
-| `device_missing_pond` | A legacy Device's `pond_id` names no Pond (D5). The whole tenant is blocked. | With the projection flag **off**, fix the legacy Device's `pond_id` through `/v1` (patch it to an existing Pond) or remove the stale legacy Device, then re-run. With the flag on, the same `/v1` writes return `409 "pond not found"`. |
+| `device_missing_pond` | A legacy Device's `pond_id` names no Pond (D5). The whole tenant is blocked. | Preferred: patch the orphan Device through `/v1` to an **existing** `pond_id`; this works with either flag value. Then re-run. With the flag on, a `/v1` create or patch to a **nonexistent** `pond_id` returns `409 "pond not found"`. If the Device must go instead, see [Removing a legacy Device](#removing-a-legacy-device). |
 | `tenant_missing` | `TENANT#<id>/META` does not exist. | Check the tenant ID (it is case- and whitespace-sensitive) and remove it from the scope. |
 | `tenant_invalid` | Tenant META does not parse as a legacy Tenant, or its ID is not v2-safe. | Repair the Tenant row from backup, or exclude the tenant until it is fixed. |
 | `site` | A row at the deterministic default Site key has different ownership, or the default Site is not ACTIVE when a new Asset or initial Deployment needs it. | Inspect `TENANT#<id>/SITE#<default_site_id>`. The default Site cannot be archived (D6); restore its ownership and `active` status from backup. |
@@ -138,10 +144,18 @@ commit it.
 | `component` | The canonical row and the tenant mirror of the default Component disagree, or belong to another Device. | Restore both Component rows from backup; they must match field for field. |
 | `deployment`, `deployment_current`, `deployment_history`, `deployment_marker` | A Deployment group (mirror, history row, `DEPLOYMENT#CURRENT`, marker) is inconsistent, malformed, or shows a stray history row or marker where no deterministic Deployment exists. | Do not delete history. Compare the group with backup or PITR, restore the missing or divergent row, and re-run. Escalate to the M1-04/M1-06 owner if the history itself is wrong. |
 | `device_lookup` | `DEVICE#<id>/META` disagrees with the tenant `DEVICE#` row the same way on every re-read. | Restore the lookup from the tenant Device row; every field except `PK`, `SK` and `entity_type` must match. |
-| `device_invalid` | A legacy Device row does not parse, or has an identifier that is not v2-compatible. | Fix the row, or remove the device if it is junk, then re-run. Native v2 rows (`schema_version == 2`) are skipped, never reported. |
+| `device_invalid` | A legacy Device row does not parse, or has an identifier that is not v2-compatible. | Fix the row from backup, then re-run. If the Device is junk, see [Removing a legacy Device](#removing-a-legacy-device). Native v2 rows (`schema_version == 2`) are skipped, never reported. |
 | `pond_invalid` | A legacy Pond row does not parse, or its ID is not v2-safe. | Fix the Pond row from backup. With the flag on, `/v1` returns `409` for such ids. |
 | `pond_missing`, `device_missing` | A source row vanished while the run was planning it, and stayed gone. | Re-run; if it persists, check for concurrent deletes. |
 | `migration_receipt` | `MIGRATION#M1#DEFAULT_SITE_ASSET_DEVICE` exists but is not this tenant's M1 receipt (wrong owner or malformed `run_count`). | Inspect the row. Restore it from backup, or remove it only after confirming with the M1-06 owner. The receipt is an audit trail and is never used to skip validation. |
+
+### Removing a legacy Device
+
+`/v1` has no DELETE route for Devices, so prefer the patch remedy above. When removal is truly
+needed, it is a manual operation: take a backup first, then delete **both** the
+`TENANT#<tenant>/DEVICE#<device>` row and the `DEVICE#<device>/META` lookup, and re-run the
+dry-run and `--apply`. This is a deliberate exception to "never delete rows", which governs
+rollback.
 
 ## Drift repair
 
@@ -173,8 +187,16 @@ commit it.
 ## Local rehearsal
 
 Dynamodb-local is the reference store. The migration needs only `dynamodb-local`; the other
-services are part of the standard local stack. From the repository root, with `.env` copied
-from `.env.example` (`APP_ENV=local`, `DYNAMODB_ENDPOINT_URL=http://localhost:8001`):
+services are part of the standard local stack. From the repository root, export the local
+settings in the shell instead of creating a repo-root `.env`:
+
+```bash
+export APP_ENV=local DYNAMODB_ENDPOINT_URL=http://localhost:8001
+```
+
+A repo-root `.env` is read by `Settings` and breaks two `tests/unit/test_settings.py` tests during
+`make verify`. If you do create one for the rehearsal, move it aside before running the release
+gate.
 
 ```bash
 docker compose up -d redis dynamodb-local influxdb mqtt-broker telegraf elasticmq
