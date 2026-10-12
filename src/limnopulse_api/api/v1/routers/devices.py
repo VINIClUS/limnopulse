@@ -1,6 +1,6 @@
 from fastapi import APIRouter, Depends, HTTPException, status
 
-from limnopulse_api.api.dependencies import DomainRepositoryDep, require_tenant_role
+from limnopulse_api.api.dependencies import V1PondDeviceProjectionDep, require_tenant_role
 from limnopulse_api.api.v1.schemas.common import ErrorResponse
 from limnopulse_api.api.v1.schemas.devices import DeviceCreate, DeviceListResponse, DeviceResponse, DeviceUpdate
 from limnopulse_api.core.errors import ConflictError, NotFoundError
@@ -37,7 +37,7 @@ def _to_device_response(device: Device) -> DeviceResponse:
 )
 async def list_devices(
     tenant_id: str,
-    repository: DomainRepositoryDep,
+    repository: V1PondDeviceProjectionDep,
     _access: TenantAccess = Depends(require_tenant_role(*tuple(READ_ROLES))),
 ) -> DeviceListResponse:
     service = _device_service(repository)
@@ -53,7 +53,7 @@ async def list_devices(
 async def get_device(
     tenant_id: str,
     device_id: str,
-    repository: DomainRepositoryDep,
+    repository: V1PondDeviceProjectionDep,
     _access: TenantAccess = Depends(require_tenant_role(*tuple(READ_ROLES))),
 ) -> DeviceResponse:
     service = _device_service(repository)
@@ -72,7 +72,7 @@ async def get_device(
 async def create_device(
     tenant_id: str,
     payload: DeviceCreate,
-    repository: DomainRepositoryDep,
+    repository: V1PondDeviceProjectionDep,
     _access: TenantAccess = Depends(require_tenant_role(*tuple(WRITE_ROLES))),
 ) -> DeviceResponse:
     service = _device_service(repository)
@@ -92,7 +92,7 @@ async def update_device(
     tenant_id: str,
     device_id: str,
     payload: DeviceUpdate,
-    repository: DomainRepositoryDep,
+    repository: V1PondDeviceProjectionDep,
     _access: TenantAccess = Depends(require_tenant_role(*tuple(WRITE_ROLES))),
 ) -> DeviceResponse:
     service = _device_service(repository)
