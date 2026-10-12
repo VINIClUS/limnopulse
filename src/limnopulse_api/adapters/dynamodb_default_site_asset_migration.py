@@ -57,7 +57,7 @@ def _timestamp(value: Any) -> datetime:
     return datetime.fromisoformat(value)
 
 
-def stored_int(value: Any) -> int:
+def stored_int(value: Any, *, minimum: int | None = None) -> int:
     """A stored integer (int or integral Decimal); never a bool, string or fraction.
 
     Every stored version, seq or schema_version the migration reads goes through this.
@@ -65,10 +65,14 @@ def stored_int(value: Any) -> int:
     if isinstance(value, bool):
         raise TypeError("stored integer must not be a boolean")
     if isinstance(value, int):
-        return value
-    if isinstance(value, Decimal) and value == value.to_integral_value():
-        return int(value)
-    raise TypeError("stored integer has an invalid type")
+        number = value
+    elif isinstance(value, Decimal) and value == value.to_integral_value():
+        number = int(value)
+    else:
+        raise TypeError("stored integer has an invalid type")
+    if minimum is not None and number < minimum:
+        raise TypeError(f"stored integer must be at least {minimum}")
+    return number
 
 
 def legacy_tenant_from_item(item: Mapping[str, Any]) -> Tenant:
@@ -79,8 +83,8 @@ def legacy_tenant_from_item(item: Mapping[str, Any]) -> Tenant:
         status=item.get("status", "active"),
         created_at=_timestamp(item["created_at"]),
         updated_at=_timestamp(item["updated_at"]),
-        version=stored_int(item["version"]),
-        schema_version=stored_int(item.get("schema_version", 1)),
+        version=stored_int(item["version"], minimum=1),
+        schema_version=stored_int(item.get("schema_version", 1), minimum=1),
     )
 
 
@@ -93,8 +97,8 @@ def legacy_pond_from_item(item: Mapping[str, Any]) -> Pond:
         status=item.get("status", "active"),
         created_at=_timestamp(item["created_at"]),
         updated_at=_timestamp(item["updated_at"]),
-        version=stored_int(item["version"]),
-        schema_version=stored_int(item.get("schema_version", 1)),
+        version=stored_int(item["version"], minimum=1),
+        schema_version=stored_int(item.get("schema_version", 1), minimum=1),
     )
 
 
@@ -109,8 +113,8 @@ def legacy_device_from_item(item: Mapping[str, Any]) -> Device:
         status=item.get("status", "active"),
         created_at=_timestamp(item["created_at"]),
         updated_at=_timestamp(item["updated_at"]),
-        version=stored_int(item["version"]),
-        schema_version=stored_int(item.get("schema_version", 1)),
+        version=stored_int(item["version"], minimum=1),
+        schema_version=stored_int(item.get("schema_version", 1), minimum=1),
     )
 
 
@@ -342,6 +346,21 @@ class DynamoDefaultSiteAssetMigrationStore(DynamoV2RepositoryBase):
         )
 
     # Migration receipt ---------------------------------------------------------------------
+
+    def migration_receipt_run_count_valid(self, tenant_id: str) -> bool:
+        """Whether an existing receipt's `run_count` is a non-negative stored integer.
+
+        DynamoDB conditions cannot express "integer", so this consistent read precedes the
+        conditional update, which stays the race fence for ownership and numeric type.
+        """
+        receipt = self.get_item_sync(self.keys.migration_receipt(tenant_id), consistent=True)
+        if receipt is None or "run_count" not in receipt:
+            return True
+        try:
+            stored_int(receipt["run_count"], minimum=0)
+        except TypeError:
+            return False
+        return True
 
     def record_migration_receipt(
         self, tenant_id: str, *, completed_at: datetime, counts: Mapping[str, int]

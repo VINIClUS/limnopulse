@@ -2690,3 +2690,125 @@ def test_existing_site_version_must_be_a_stored_integer(version: Any) -> None:
 
     assert result.result == "schema_conflict"
     assert [(c.kind, c.key) for c in result.conflicts] == [("site", f"{site_key[0]}/{site_key[1]}")]
+
+
+# Codex round 6: numeric ranges, run_count, ACTIVE Asset for new Deployments --------------------
+
+
+@pytest.mark.parametrize("run_count", [Decimal("1.5"), -1])
+def test_receipt_run_count_must_be_a_non_negative_integer(run_count: Any) -> None:
+    client = migrated_store()
+    receipt_key = _item_key(KEYS.migration_receipt("tnt_1"))
+    client.items[receipt_key]["run_count"] = run_count
+    before = dict(client.items[receipt_key])
+
+    result = run(client, apply=True)
+
+    assert result.result == "schema_conflict"
+    assert [c.kind for c in result.conflicts] == ["migration_receipt"]
+    assert client.items[receipt_key] == before
+
+
+def _remove_deployment_group(client: FakeMigrationDynamo) -> None:
+    deterministic = _deterministic_deployment()
+    for form in ("mirror", "history", "current"):
+        del client.items[_item_key(deployment_to_item(deterministic, form=form))]
+    del client.items[_item_key(deployment_marker_key(COMPONENT_ID))]
+
+
+@pytest.mark.parametrize(
+    ("row", "version", "kind"),
+    [
+        ("tenant", 0, "tenant_invalid"),
+        ("pond", 0, "pond_invalid"),
+        ("device", -1, "device_invalid"),
+        ("site", 0, "site"),
+        ("asset", 0, "asset"),
+        ("profile", -2, "pond_profile"),
+        ("component", 0, "component"),
+        ("mirror", 0, "deployment_current"),
+    ],
+)
+def test_stored_versions_must_be_at_least_one(row: str, version: int, kind: str) -> None:
+    client = migrated_store()
+    asset_id = asset_id_for_legacy_pond("tnt_1", "pond_1")
+    keys = {
+        "tenant": [("TENANT#tnt_1", "META")],
+        "pond": [("TENANT#tnt_1", "POND#pond_1")],
+        "device": [("TENANT#tnt_1", "DEVICE#probe-1"), ("DEVICE#probe-1", "META")],
+        "site": [_item_key(KEYS.site("tnt_1", default_site_id("tnt_1")))],
+        "asset": [_item_key(KEYS.asset("tnt_1", asset_id))],
+        "profile": [_item_key(KEYS.pond_profile(asset_id))],
+        "component": list(_component_keys()),
+        "mirror": [_item_key(deployment_to_item(_deterministic_deployment()))],
+    }[row]
+    for key in keys:
+        client.items[key]["version"] = version
+
+    result = run(client, apply=False)
+
+    assert result.result == "schema_conflict"
+    assert kind in [c.kind for c in result.conflicts]
+
+
+def test_asset_archived_through_v2_gets_no_initial_deployment() -> None:
+    client = migrated_store()
+    _remove_deployment_group(client)
+    asset_key = _item_key(KEYS.asset("tnt_1", asset_id_for_legacy_pond("tnt_1", "pond_1")))
+    client.items[asset_key]["status"] = "archived"
+    client.calls.clear()
+
+    result = run(client, apply=True)
+
+    assert result.result == "success"
+    assert (result.deployments_created, result.devices_projected) == (0, 0)
+    assert result.already_migrated == 2
+    assert _current(client) is None
+    assert client.transactions == []
+
+
+def test_asset_archived_between_plan_and_initial_deployment_is_fenced() -> None:
+    client = migrated_store()
+    _remove_deployment_group(client)
+    asset_key = _item_key(KEYS.asset("tnt_1", asset_id_for_legacy_pond("tnt_1", "pond_1")))
+
+    def archive_asset(fake: FakeMigrationDynamo, actions: list[dict]) -> None:
+        fake.items[asset_key]["status"] = "archived"
+
+    client.before_transact = on_transaction_with("DEPLOYMENT#CURRENT", archive_asset)
+    client.calls.clear()
+
+    result = run(client, apply=True)
+
+    assert result.result == "success"
+    assert result.deployments_created == 0
+    assert _current(client) is None
+    refused = client.transactions[0]
+    asset_check = next(
+        a["ConditionCheck"]
+        for a in refused
+        if "ConditionCheck" in a
+        and a["ConditionCheck"]["Key"] == client.serialize(dict(zip(("PK", "SK"), asset_key)))
+    )
+    assert "#status = :active" in asset_check["ConditionExpression"]
+
+
+def test_archived_legacy_pond_still_projects_its_deployment() -> None:
+    client = FakeMigrationDynamo.with_legacy_tenant(
+        tenant_id="tnt_1",
+        ponds=[{**legacy_pond("pond_1"), "status": "archived"}],
+        devices=[legacy_device("probe-1", "pond_1")],
+    )
+
+    result = run(client, apply=True)
+
+    assert result.result == "success"
+    assert result.deployments_created == 1
+    device_tx = client.transactions[-1]
+    asset_key = client.serialize(KEYS.asset("tnt_1", asset_id_for_legacy_pond("tnt_1", "pond_1")))
+    asset_check = next(
+        a["ConditionCheck"]
+        for a in device_tx
+        if "ConditionCheck" in a and a["ConditionCheck"]["Key"] == asset_key
+    )
+    assert "#status" not in asset_check["ConditionExpression"]

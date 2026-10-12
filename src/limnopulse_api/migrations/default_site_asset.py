@@ -78,10 +78,13 @@ Invariants every plan keeps:
   PondProfile, Component, Deployment, legacy Device lookup), and rows written together must
   agree: the Component pair, and the mirror/history rows of a Deployment against CURRENT (or
   each other when ended), on every persisted field. Stored versions and `seq` values must be
-  stored integers, never bools.
+  stored integers >= 1 (never bools); a receipt `run_count` must be an integer >= 0.
 - Every ACTIVE child written carries commit-time checks on its parents up to the Site: an
-  ACTIVE Asset needs an ACTIVE Site; a new Deployment needs its Asset, an ACTIVE Component and
-  an ACTIVE Site (an ARCHIVED Site makes the initial Deployment a `site` conflict); a drift
+  ACTIVE Asset needs an ACTIVE Site; a new Deployment needs an ACTIVE Asset (only the
+  ARCHIVED Asset projected from an ARCHIVED legacy Pond is accepted as is, F3; an Asset
+  archived through v2 under an active Pond gets no Deployment and counts as already
+  migrated), an ACTIVE Component and an ACTIVE Site (an ARCHIVED Site makes the initial
+  Deployment a `site` conflict); a drift
   repair needs an ACTIVE Asset, Component and Site, and is skipped (already migrated) when
   the target Asset or its Site is not ACTIVE.
 - Every write to a deterministic key is conditioned on absence or on observed ownership; the
@@ -445,10 +448,13 @@ def _links_needed(
     return needed
 
 
-def _stored_int(row: Mapping[str, Any], name: str, kind: str, key: Mapping[str, str]) -> int:
-    """A stored integer attribute (via `stored_int`); anything else is a schema conflict."""
+def _stored_int(
+    row: Mapping[str, Any], name: str, kind: str, key: Mapping[str, str], *, minimum: int = 1
+) -> int:
+    """A stored integer attribute (via `stored_int`), at least `minimum` (versions and `seq`
+    start at 1); anything else is a schema conflict."""
     try:
-        return stored_int(row.get(name))
+        return stored_int(row.get(name), minimum=minimum)
     except TypeError as exc:
         raise _SchemaConflict(kind, key) from exc
 
@@ -464,7 +470,7 @@ def _decoded[T](
     if row is None:
         return None
     try:
-        stored_int(row.get("version"))
+        stored_int(row.get("version"), minimum=1)
         return parser(row)
     except (KeyError, TypeError, ValueError):
         return None
@@ -594,6 +600,8 @@ class DefaultSiteAssetMigrator:
     def _record_receipt(
         self, tenant_id: str, *, completed_at: datetime, counts: Mapping[str, int]
     ) -> None:
+        if not self.store.migration_receipt_run_count_valid(tenant_id):
+            raise _ReceiptRejected
         try:
             self.store.record_migration_receipt(tenant_id, completed_at=completed_at, counts=counts)
         except ClientError as exc:
@@ -1068,6 +1076,22 @@ class DefaultSiteAssetMigrator:
             raise _Unstable("deployment_marker", marker_key, marker)
         if not active:
             return []
+        # The Asset status decides the fence. An ARCHIVED legacy Pond projects an ARCHIVED
+        # Asset that still receives its Deployment (legacy state is mirrored, F3). An Asset
+        # ARCHIVED through v2 while its legacy Pond is still active gets no Deployment:
+        # already migrated, like the archived-target drift rule.
+        pond_archived = asset_status_from_legacy(pond.status) is AssetStatus.ARCHIVED
+        asset = self.store.get_known_item(self.keys.asset(tenant_id, deployment.asset_id))
+        asset_archived = (
+            pond_archived if asset is None else asset.get("status") != AssetStatus.ACTIVE.value
+        )
+        if asset_archived and not pond_archived:
+            return []
+        asset_check = (
+            self.store.asset_exists_check_request(tenant_id, deployment.asset_id)
+            if pond_archived
+            else self.store.asset_active_check_request(tenant_id, deployment.asset_id)
+        )
         site_key = self.keys.site(tenant_id, deployment.site_id)
         if not self._site_active(tenant_id, deployment.site_id, site_planned):
             # An ACTIVE Deployment needs an ACTIVE Site (as an ACTIVE Asset does).
@@ -1082,11 +1106,7 @@ class DefaultSiteAssetMigrator:
                     marker_item,
                 )
             ),
-            {
-                "ConditionCheck": self.store.asset_exists_check_request(
-                    tenant_id, deployment.asset_id
-                )
-            },
+            {"ConditionCheck": asset_check},
             {"ConditionCheck": self.store.site_active_check_request(tenant_id, deployment.site_id)},
         ]
 
@@ -1111,7 +1131,7 @@ class DefaultSiteAssetMigrator:
                 marker is not None
                 and marker.get("tenant_id") == ended.tenant_id
                 and marker.get("component_id") == ended.component_id
-                and stored_int(marker.get(MARKER_SEQ_ATTRIBUTE)) >= 1
+                and stored_int(marker.get(MARKER_SEQ_ATTRIBUTE), minimum=1) >= 1
                 and isinstance(last_ended_at, str)
                 and parse_canonical_timestamp(last_ended_at) >= ended.ended_at
             )
