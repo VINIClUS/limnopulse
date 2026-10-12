@@ -1352,3 +1352,72 @@ def test_run_script_stop_pids_skips_reused_pids(tmp_path: Path) -> None:
     finally:
         if sleeper.poll() is None:
             sleeper.kill()
+
+
+@pytest.mark.parametrize(
+    ("script", "body", "reason"),
+    [
+        ("after_v2_components.js", {"items": [{"id": "cmp_x"}]}, "v2-components-bad-item"),
+        (
+            "after_v2_components.js",
+            {"items": [{"component_id": "cmp_x"}, {"id": "cmp_y"}]},
+            "v2-components-bad-item",
+        ),
+        ("after_v2_components.js", [{"component_id": "cmp_x"}], "v2-components-bad-body"),
+        (
+            "after_v2_components.js",
+            {"components": [{"component_id": "cmp_x"}]},
+            "v2-components-bad-body",
+        ),
+        ("resolve_deployment.js", [], "v2-deployments-bad-body"),
+        ("resolve_deployment.js", {"deployments": []}, "v2-deployments-bad-body"),
+    ],
+)
+def test_node_functions_require_the_v2_list_contract(
+    script: str, body: object, reason: str
+) -> None:
+    out = _run_function(
+        script, {"e2e": _ctx(component_id="cmp_x"), "statusCode": 200, "payload": body}
+    )
+
+    assert out[0] is None
+    assert (out[1]["payload"]["ok"], out[1]["payload"]["reason"]) == (False, reason)
+
+
+@pytest.mark.parametrize(
+    ("body", "ok", "reason"),
+    [
+        ({"asset_id": "ast_1", "legacy_pond_id": "pond_a"}, False, "asset-without-legacy-pond-id"),
+        (
+            {"asset_id": "ast_1", "profile": {"legacy_pond_id": "pond_a"}},
+            False,
+            "asset-without-legacy-pond-id",
+        ),
+        ({"asset": {"asset_id": "ast_1"}}, False, "asset-response-mismatch"),
+        ({"asset_id": "ast_1", "pond_profile": {"legacy_pond_id": "pond_a"}}, True, "match"),
+    ],
+)
+def test_node_function_final_verdict_requires_the_asset_contract(
+    body: dict, ok: bool, reason: str
+) -> None:
+    ctx = _ctx(v1_pond_id="pond_a", resolved_asset_id="ast_1", expected_asset_id="ast_1")
+    out = _run_function(
+        "final_verdict.js", {"e2e": ctx, "statusCode": 200, "payload": json.dumps(body)}
+    )
+
+    assert (out[0]["payload"]["ok"], out[0]["payload"]["reason"]) == (ok, reason)
+
+
+def test_ci_stack_stop_api_skips_a_reused_pid(tmp_path: Path) -> None:
+    stack = (E2E / "ci_stack.sh").read_text(encoding="utf-8")
+    functions = "pid_start() {" + stack.split("pid_start() {", 1)[1].split("\ndown() {", 1)[0]
+    sleeper = subprocess.Popen(["sleep", "30"])
+    try:
+        (tmp_path / "uvicorn.pid").write_text(f"{sleeper.pid} 1\n")
+        script = f'STATE="{tmp_path}"\nAPI_PORT=1\nlog() {{ :; }}\n{functions}\nstop_api || true\n'
+        subprocess.run(["bash", "-c", script], check=True, timeout=60)
+        assert sleeper.poll() is None
+        assert not (tmp_path / "uvicorn.pid").exists()
+    finally:
+        sleeper.kill()
+        sleeper.wait(timeout=10)

@@ -88,18 +88,34 @@ up() {
   API_V2_ENABLED=true V1_POND_DEVICE_PROJECTION_ENABLED=true APP_ENV=local AUTH_MODE=dev \
     nohup "$uvicorn_bin" limnopulse_api.main:app \
     --host 127.0.0.1 --port "$API_PORT" >"$STATE/uvicorn.log" 2>&1 &
-  echo $! >"$STATE/uvicorn.pid"
+  # "<pid> <start time>": stop_api only signals the PID while it still has
+  # this /proc start time, never a process that reused it.
+  printf '%s %s\n' "$!" "$(pid_start "$!" || true)" >"$STATE/uvicorn.pid"
   if ! wait_http "http://127.0.0.1:${API_PORT}/readyz" 90; then
     tail -n 80 "$STATE/uvicorn.log" >&2 || true
     return 1
   fi
-  log "stack ready (uvicorn pid $(cat "$STATE/uvicorn.pid"))"
+  log "stack ready (uvicorn pid $(cut -d' ' -f1 "$STATE/uvicorn.pid"))"
+}
+
+pid_start() {
+  local stat
+  stat="$(cat "/proc/$1/stat" 2>/dev/null)" || return 1
+  stat="${stat##*) }"
+  # After "comm) " the state is field 3, so the start time is word 20.
+  set -- $stat
+  printf '%s\n' "${20}"
 }
 
 stop_api() {
   local pids=()
   if [[ -f "$STATE/uvicorn.pid" ]]; then
-    pids+=("$(cat "$STATE/uvicorn.pid")")
+    local saved_pid saved_start
+    read -r saved_pid saved_start <"$STATE/uvicorn.pid" || true
+    if [[ -n "${saved_pid:-}" && -n "${saved_start:-}" \
+      && "$(pid_start "$saved_pid" || true)" == "$saved_start" ]]; then
+      pids+=("$saved_pid")
+    fi
   fi
   # Also stop by command line/port, in case the pidfile is stale or missing.
   local pid

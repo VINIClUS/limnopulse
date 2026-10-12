@@ -39,10 +39,9 @@ function v2Unavailable(status, body) {
     return keys.length === 1 && keys[0] === "detail" && body.detail === "Not Found";
 }
 
-function items(body, key) {
-    if (Array.isArray(body)) return body;
-    if (body && Array.isArray(body.items)) return body.items;
-    if (body && Array.isArray(body[key])) return body[key];
+// The /v2 list contract is {"items": [...]}; anything else is a regression.
+function items(body) {
+    if (body && typeof body === "object" && Array.isArray(body.items)) return body.items;
     return null;
 }
 
@@ -62,7 +61,7 @@ if (v2Unavailable(msg.statusCode, body)) {
 if (msg.statusCode !== 200) {
     return verdict(false, "v2-deployments-error-" + String(msg.statusCode));
 }
-const deployments = items(body, "deployments");
+const deployments = items(body);
 if (deployments === null) {
     return verdict(false, "v2-deployments-bad-body");
 }

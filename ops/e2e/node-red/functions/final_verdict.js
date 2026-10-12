@@ -29,15 +29,13 @@ function parseBody(raw) {
     }
 }
 
+// AssetResponse: {"asset_id": ..., "pond_profile": {"legacy_pond_id": ...}}.
 function legacyPondId(asset) {
-    if (!asset || typeof asset !== "object") return undefined;
-    if (asset.legacy_pond_id !== undefined) return asset.legacy_pond_id;
-    const candidates = [asset.profile, asset.pond_profile, asset.pond, asset.profiles && asset.profiles.pond];
-    for (let i = 0; i < candidates.length; i++) {
-        const p = candidates[i];
-        if (p && typeof p === "object" && p.legacy_pond_id !== undefined) return p.legacy_pond_id;
+    const profile = asset.pond_profile;
+    if (!profile || typeof profile !== "object" || !Object.hasOwn(profile, "legacy_pond_id")) {
+        return undefined;
     }
-    return undefined;
+    return profile.legacy_pond_id;
 }
 
 const body = parseBody(msg.payload);
@@ -45,7 +43,7 @@ if (ctx.native) {
     if (msg.statusCode !== 200 || !body || typeof body !== "object") {
         return verdict(false, "v2-native-asset-lookup-error-" + String(msg.statusCode));
     }
-    const assetId = body.asset_id || (body.asset && body.asset.asset_id);
+    const assetId = body.asset_id;
     if (assetId !== ctx.resolved_asset_id) {
         return verdict(false, "v2-native-asset-mismatch");
     }
@@ -55,7 +53,7 @@ if (ctx.native) {
 if (msg.statusCode !== 200 || !body || typeof body !== "object") {
     return verdict(false, "asset-lookup-error-" + String(msg.statusCode));
 }
-const legacyAssetId = body.asset_id || (body.asset && body.asset.asset_id);
+const legacyAssetId = body.asset_id;
 if (legacyAssetId !== ctx.resolved_asset_id) {
     return verdict(false, "asset-response-mismatch");
 }
