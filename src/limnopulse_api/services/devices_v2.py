@@ -101,9 +101,7 @@ async def create_idempotently[EntityT: BaseModel](
         created = await persist(entity, receipt)
     except ConflictError:
         # A concurrent request with the same key may have won the receipt race.
-        snapshot = await repository.get_idempotency_replay(
-            tenant_id, scope, key_hash, request_hash
-        )
+        snapshot = await repository.get_idempotency_replay(tenant_id, scope, key_hash, request_hash)
         if snapshot is None:
             raise
         return _replayed(entity_type, snapshot)

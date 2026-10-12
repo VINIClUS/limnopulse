@@ -313,11 +313,10 @@ class DynamoDeviceComponentRepository(DynamoV2RepositoryBase):
             ensure_device_transition(current.status, status)
 
         legacy = _is_legacy_device_item(item)
-        now = self.clock()
+        # Never move `updated_at` backwards (clock skew), which would make the row invalid.
+        now = max(self.clock(), current.updated_at)
         # Legacy `/v1` rows keep their second-precision `isoformat()` timestamps.
-        updated_at = (
-            now.replace(microsecond=0).isoformat() if legacy else format_utc_timestamp(now)
-        )
+        updated_at = now.replace(microsecond=0).isoformat() if legacy else format_utc_timestamp(now)
         changes: dict[str, Any] = _without_none(
             {
                 "name": name,
@@ -337,6 +336,7 @@ class DynamoDeviceComponentRepository(DynamoV2RepositoryBase):
                 }
             )
         )
+        updated = device_v2_from_item({**item, **row_changes})
         await self.transact_write(
             [
                 {
@@ -357,7 +357,7 @@ class DynamoDeviceComponentRepository(DynamoV2RepositoryBase):
                 },
             ]
         )
-        return device_v2_from_item({**item, **row_changes})
+        return updated
 
     # Components ------------------------------------------------------------------------------
 
@@ -419,7 +419,7 @@ class DynamoDeviceComponentRepository(DynamoV2RepositoryBase):
             **{
                 **current.model_dump(),
                 **_without_none({"name": name, "status": status}),
-                "updated_at": self.clock(),
+                "updated_at": max(self.clock(), current.updated_at),
                 "version": expected_version + 1,
             }
         )
@@ -505,8 +505,7 @@ class DynamoDeviceComponentRepository(DynamoV2RepositoryBase):
             key,
             update_expression="SET " + ", ".join(assignments),
             condition=(
-                "attribute_exists(PK) AND #version = :expected_version "
-                "AND #tenant_id = :tenant_id"
+                "attribute_exists(PK) AND #version = :expected_version AND #tenant_id = :tenant_id"
             ),
             names=names,
             values=values,

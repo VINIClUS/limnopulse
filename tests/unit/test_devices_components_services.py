@@ -210,9 +210,12 @@ def test_probe_requires_only_a_probe_profile() -> None:
     "payload",
     [
         {"kind": "probe", "name": "P"},
-        {"kind": "probe", "name": "P", "probe_profile": {}, "actuator_profile": {
-            "actuator_type": "relay"
-        }},
+        {
+            "kind": "probe",
+            "name": "P",
+            "probe_profile": {},
+            "actuator_profile": {"actuator_type": "relay"},
+        },
         {"kind": "actuator", "name": "A", "probe_profile": {}},
         {"kind": "hybrid", "name": "H", "probe_profile": {}},
     ],

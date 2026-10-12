@@ -727,3 +727,19 @@ def test_repository_exposes_no_capability_mutation_or_delete() -> None:
     names = {name for name in dir(DynamoDeviceComponentRepository) if not name.startswith("_")}
     assert not {name for name in names if "delete" in name}
     assert not {"update_capability", "replace_capability"} & names
+
+
+@pytest.mark.asyncio
+async def test_updates_never_move_updated_at_backwards() -> None:
+    client = FakeDynamoClient()
+    device = device_v2(created_at=LATER, updated_at=LATER)
+    client.seed(device_v2_to_item(device))
+    client.seed(device_lookup_to_item(device))
+    seed_component(client, probe(created_at=LATER, updated_at=LATER))
+    repo = repository(client, now=NOW)
+    updated_device = await repo.update_device(
+        TENANT_A, DEVICE_1, 1, name="x", firmware_version=None, status=None
+    )
+    updated_component = await repo.update_component(TENANT_A, COMPONENT_1, 1, name="x", status=None)
+    assert updated_device.updated_at == LATER
+    assert updated_component.updated_at == LATER
