@@ -438,9 +438,7 @@ async def test_create_asset_on_site_archived_concurrently_conflicts() -> None:
 async def test_create_site_receipt_race_replays_snapshot() -> None:
     client = FakeDynamoClient()
     client.seed(
-        idempotency_receipt_to_item(
-            receipt(snapshot=site().model_dump_json(), scope="site-create")
-        )
+        idempotency_receipt_to_item(receipt(snapshot=site().model_dump_json(), scope="site-create"))
     )
     client.transaction_error = client_error(
         "TransactionCanceledException", ["None", "ConditionalCheckFailed"]
@@ -554,9 +552,7 @@ async def test_linked_asset_patch_mirrors_and_fences_legacy_pond() -> None:
     values = plain(pond["ExpressionAttributeValues"])
     mirrored = {
         pond["ExpressionAttributeNames"][name]: values[value]
-        for name, value in (
-            part.split(" = ") for part in pond["UpdateExpression"][4:].split(", ")
-        )
+        for name, value in (part.split(" = ") for part in pond["UpdateExpression"][4:].split(", "))
     }
     assert mirrored == {
         "updated_at": "2026-08-25T12:00:00+00:00",
@@ -569,9 +565,7 @@ async def test_linked_asset_patch_mirrors_and_fences_legacy_pond() -> None:
 
 @pytest.mark.asyncio
 async def test_linked_asset_name_patch_mirrors_only_changed_fields() -> None:
-    client = FakeDynamoClient.with_asset_and_profile(
-        asset_version=1, legacy_pond_id="pond_legacy"
-    )
+    client = FakeDynamoClient.with_asset_and_profile(asset_version=1, legacy_pond_id="pond_legacy")
     client.seed(legacy_pond_item(version=1))
 
     await build(client).update_asset(

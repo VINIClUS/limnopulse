@@ -339,9 +339,7 @@ async def test_create_site_generates_canonical_id_and_receipt_and_replays() -> N
     repository = FakeSiteAssetRepository()
     service = SiteService(repository, clock=fixed_clock)
 
-    created = await service.create(
-        tenant_id="tnt_a", name="Farm", idempotency_key="site-create-01"
-    )
+    created = await service.create(tenant_id="tnt_a", name="Farm", idempotency_key="site-create-01")
 
     assert is_canonical_id(created.site_id, "site")
     assert created.status is SiteStatus.ACTIVE
@@ -350,9 +348,10 @@ async def test_create_site_generates_canonical_id_and_receipt_and_replays() -> N
     assert receipt.request_hash == canonical_request_hash(
         {"scope": "site-create", "path": {"tenant_id": "tnt_a"}, "body": {"name": "Farm"}}
     )
-    assert await service.create(
-        tenant_id="tnt_a", name="Farm", idempotency_key="site-create-01"
-    ) == created
+    assert (
+        await service.create(tenant_id="tnt_a", name="Farm", idempotency_key="site-create-01")
+        == created
+    )
     assert len(repository.sites) == 1
     with pytest.raises(ConflictError):
         await service.create(tenant_id="tnt_a", name="Other", idempotency_key="site-create-01")
