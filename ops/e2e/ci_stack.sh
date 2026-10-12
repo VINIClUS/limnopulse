@@ -72,6 +72,9 @@ up() {
     "$UV" run --locked --no-sync python -m "$MIGRATION_MODULE" "${args[@]}" \
       | tee "$STATE/migration-${mode}.json"
   done
+  # A second apply that writes anything is an idempotency regression.
+  "$UV" run --locked --no-sync python "$ROOT/ops/e2e/assert_migration_noop.py" \
+    <"$STATE/migration-apply-again.json"
 
   log "starting API on 127.0.0.1:${API_PORT}"
   # Run the venv's uvicorn directly (nohup execs it), so the recorded PID is

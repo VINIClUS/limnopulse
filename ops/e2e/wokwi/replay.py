@@ -40,6 +40,9 @@ HERE = Path(__file__).resolve().parent
 DEFAULT_CAPTURE = HERE / "serial.log"
 FIXTURE = HERE / "fixtures" / "serial.log"
 MARKER = "READING {"
+# Any "READING " token starts a record, so malformed records (READING null,
+# READING [], truncated JSON) are rejected instead of silently skipped.
+RECORD = re.compile(r"(?<![A-Za-z0-9_])READING ")
 EXPECTED_KEYS = frozenset(
     {
         "ts",
@@ -100,11 +103,12 @@ def format_ts(value: datetime) -> str:
 
 def extract_readings(text: str) -> list[dict]:
     readings: list[dict] = []
+    seen: set[tuple[object, object]] = set()
     for lineno, raw in enumerate(text.splitlines(), start=1):
-        index = raw.find(MARKER)
-        if index < 0:
+        match = RECORD.search(raw)
+        if match is None:
             continue
-        body = raw[index + len("READING ") :].strip()
+        body = raw[match.end() :].strip()
         try:
             payload = json.loads(body)
         except json.JSONDecodeError as exc:
@@ -118,6 +122,12 @@ def extract_readings(text: str) -> list[dict]:
                 f"(extra={sorted(keys - EXPECTED_KEYS)}, missing={sorted(EXPECTED_KEYS - keys)})"
             )
         parse_ts(payload["ts"])
+        identity = (payload["seq"], payload["ts"])
+        if identity in seen:
+            raise ReplayError(
+                f"line {lineno}: duplicate reading seq={identity[0]} ts={identity[1]}"
+            )
+        seen.add(identity)
         readings.append(payload)
     return readings
 

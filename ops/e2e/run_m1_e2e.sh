@@ -66,10 +66,32 @@ export no_proxy="$NO_PROXY"
 
 log() { printf '[m1-e2e] %s\n' "$*" >&2; }
 
+# Pidfile lines are "<pid> <start time>". The start time (field 22 of
+# /proc/<pid>/stat) guards against signalling an unrelated process that
+# reused the PID after an interrupted run.
+pid_start() {
+  local stat
+  stat="$(cat "/proc/$1/stat" 2>/dev/null)" || return 1
+  stat="${stat##*) }"
+  # After "comm) " the state is field 3, so the start time is word 20.
+  set -- $stat
+  printf '%s\n' "${20}"
+}
+
+record_pid() {
+  local start
+  start="$(pid_start "$1")" || start=""
+  printf '%s %s\n' "$1" "$start" >>"$PIDFILE"
+}
+
 stop_pids() {
   [[ -f "$PIDFILE" ]] || return 0
-  while read -r pid; do
+  local pid start
+  while read -r pid start; do
     [[ -n "$pid" ]] || continue
+    if [[ -z "$start" || "$(pid_start "$pid" || true)" != "$start" ]]; then
+      continue  # gone, or the PID now belongs to another process
+    fi
     if kill -0 "$pid" 2>/dev/null; then
       kill "$pid" 2>/dev/null || true
       for _ in 1 2 3 4 5 6 7 8 9 10; do
@@ -145,7 +167,7 @@ NODE_RED_USER_DIR="$WORK/node-red-user" "$NODE_RED_BIN" \
   --port "$NODE_RED_PORT" \
   >"$WORK/node-red.log" 2>&1 &
 node_red_pid=$!
-echo "$node_red_pid" >>"$PIDFILE"
+record_pid "$node_red_pid"
 
 node_red_connected() {
   kill -0 "$node_red_pid" 2>/dev/null || return 2
@@ -172,7 +194,7 @@ log "Node-RED flow running (admin http://127.0.0.1:${NODE_RED_PORT}/)"
 
 "$MQTTX_BIN" sub -h "$MQTT_HOST" -p "$MQTT_PORT" -t "$VERDICT_TOPIC" -q 1 \
   --output-mode clean >"$WORK/verdicts.raw" 2>"$WORK/mqttx-sub.log" &
-echo $! >>"$PIDFILE"
+record_pid $!
 # The mqtt-in subscription is made right after "Connected to broker"; give
 # both subscriptions a moment before publishing (QoS1, non-retained).
 sleep "${E2E_SUBSCRIBE_SETTLE:-2}"
@@ -206,6 +228,13 @@ published_args() {  # published_args <tool output>
 mapfile -t replay_expect < <(published_args "$replay_out")
 if [[ ${#replay_expect[@]} -ne $((expected * 2)) ]]; then
   log "replay.py printed ${#replay_expect[@]} PUBLISHED argument(s) for ${expected} reading(s)"
+  exit 1
+fi
+# The summary keys verdicts by (device_id, seq, ts), so every published
+# identity must be distinct or one verdict could cover several publishes.
+distinct="$(printf '%s\n' "$replay_out" | grep '^PUBLISHED ' | sort -u | wc -l)"
+if [[ "$distinct" -ne "$expected" ]]; then
+  log "replay.py published ${distinct} distinct reading(s) for ${expected} replayed"
   exit 1
 fi
 

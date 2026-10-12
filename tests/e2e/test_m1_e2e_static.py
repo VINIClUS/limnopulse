@@ -1243,3 +1243,112 @@ def test_run_script_refuses_work_dirs_outside_e2e_out(work: str) -> None:
     assert result.returncode == 2
     assert "must be a subdirectory of" in result.stderr
     assert (root / "ops" / "e2e").is_dir() and (root / "src").is_dir()
+
+
+_NOOP_SUMMARY = {
+    "apply": True,
+    "tenants_requested": 1,
+    "tenants_completed": 1,
+    "default_sites_created": 0,
+    "assets_created": 0,
+    "devices_projected": 0,
+    "components_created": 0,
+    "deployments_created": 0,
+    "legacy_links_updated": 0,
+    "already_migrated": 2,
+    "schema_conflicts": 0,
+    "conflicts": [],
+    "scope_completed": True,
+    "result": "success",
+}
+
+
+@pytest.mark.parametrize(
+    ("override", "ok"),
+    [
+        ({}, True),
+        ({"deployments_created": 1}, False),
+        ({"legacy_links_updated": 2}, False),
+        ({"devices_projected": 1}, False),
+        ({"apply": False}, False),
+        ({"result": "failed"}, False),
+        ({"schema_conflicts": 1, "conflicts": [{"kind": "asset"}]}, False),
+    ],
+)
+def test_assert_migration_noop(override: dict, ok: bool) -> None:
+    result = subprocess.run(
+        [sys.executable, str(E2E / "assert_migration_noop.py")],
+        input=json.dumps({**_NOOP_SUMMARY, **override}),
+        capture_output=True,
+        text=True,
+        timeout=30,
+        check=False,
+    )
+
+    assert (result.returncode == 0) is ok, result.stderr
+
+
+def test_ci_stack_checks_the_second_apply_is_a_noop() -> None:
+    stack = (E2E / "ci_stack.sh").read_text(encoding="utf-8")
+
+    assert 'assert_migration_noop.py" \\\n    <"$STATE/migration-apply-again.json"' in stack
+
+
+@pytest.mark.parametrize(
+    "bad",
+    ["READING null", "READING []", 'READING {"ts":', "boot ok READING 42"],
+)
+def test_replay_rejects_every_malformed_reading_record(bad: str) -> None:
+    replay = _load("m1_e2e_replay_malformed", E2E / "wokwi" / "replay.py")
+    good = (E2E / "wokwi" / "fixtures" / "serial.log").read_text(encoding="utf-8")
+
+    with pytest.raises(replay.ReplayError):
+        replay.extract_readings(good + "\n" + bad + "\n")
+
+
+def test_replay_ignores_words_that_only_contain_reading() -> None:
+    replay = _load("m1_e2e_replay_words", E2E / "wokwi" / "replay.py")
+    good = (E2E / "wokwi" / "fixtures" / "serial.log").read_text(encoding="utf-8")
+
+    assert len(replay.extract_readings("PREREADING x\n" + good)) == 3
+
+
+def test_replay_rejects_duplicate_readings() -> None:
+    replay = _load("m1_e2e_replay_dupes", E2E / "wokwi" / "replay.py")
+    good = (E2E / "wokwi" / "fixtures" / "serial.log").read_text(encoding="utf-8")
+    first = next(line for line in good.splitlines() if line.startswith("READING "))
+
+    with pytest.raises(replay.ReplayError, match="duplicate reading"):
+        replay.extract_readings(good + "\n" + first + "\n")
+
+
+def test_run_script_requires_distinct_published_readings_and_checks_pid_identity() -> None:
+    runner = (E2E / "run_m1_e2e.sh").read_text(encoding="utf-8")
+
+    assert "sort -u | wc -l" in runner
+    assert 'record_pid "$node_red_pid"' in runner
+    assert "record_pid $!" in runner
+    assert '>>"$PIDFILE"' in runner.split("record_pid() {", 1)[1].split("}", 1)[0]
+    assert 'echo $! >>"$PIDFILE"' not in runner
+
+
+def test_run_script_stop_pids_skips_reused_pids(tmp_path: Path) -> None:
+    runner = (E2E / "run_m1_e2e.sh").read_text(encoding="utf-8")
+    functions = runner.split("pid_start() {", 1)[1].split("cleanup() {", 1)[0]
+    sleeper = subprocess.Popen(["sleep", "30"])
+    try:
+        pidfile = tmp_path / "pids"
+        # A stale entry whose recorded start time no longer matches the PID.
+        pidfile.write_text(f"{sleeper.pid} 1\n")
+        script = f'PIDFILE="{pidfile}"\npid_start() {{{functions}\nstop_pids\n'
+        subprocess.run(["bash", "-c", script], check=True, timeout=30)
+        assert sleeper.poll() is None
+        # A matching entry is stopped.
+        script = (
+            f'PIDFILE="{pidfile}"\npid_start() {{{functions}\nrecord_pid {sleeper.pid}\nstop_pids\n'
+        )
+        subprocess.run(["bash", "-c", script], check=True, timeout=30)
+        assert sleeper.wait(timeout=10) is not None
+    finally:
+        if sleeper.poll() is None:
+            sleeper.kill()
