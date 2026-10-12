@@ -233,13 +233,19 @@ class DynamoDeploymentRepository(DynamoV2RepositoryBase):
     async def get_deployment_at(
         self, tenant_id: str, component_id: str, observed_at: datetime
     ) -> Deployment | None:
-        """The interval `[started_at, ended_at)` containing `observed_at`, if any."""
+        """The interval `[started_at, ended_at)` containing `observed_at`, if any.
+
+        Strongly consistent: right after a relocation an eventually consistent read could miss
+        the new history row and still see the previous row as open, attributing the observation
+        to the old asset.
+        """
         items = await self.query_range(
             self.keys.component(component_id)["PK"],
             lower=self.keys.deployment_history_bounds()[0],
             upper=self.keys.deployment_history_upper_bound(observed_at),
             ascending=False,
             limit=1,
+            consistent=True,
         )
         if not items or items[0].get("tenant_id") != tenant_id:
             return None
