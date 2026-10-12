@@ -9,6 +9,7 @@ import pytest
 from boto3.dynamodb.types import TypeDeserializer, TypeSerializer
 from botocore.exceptions import ClientError
 
+from limnopulse_api.adapters import dynamodb_v1_pond_device_projection as projection_module
 from limnopulse_api.adapters.dynamodb import (
     DynamoDomainRepository,
     legacy_pond_from_item,
@@ -34,7 +35,14 @@ from limnopulse_api.adapters.dynamodb_v1_pond_device_projection import (
 )
 from limnopulse_api.adapters.dynamodb_v2 import DynamoV2KeyBuilder
 from limnopulse_api.core.errors import ConflictError, NotFoundError
-from limnopulse_api.domain.assets import Asset, AssetStatus, AssetType, PondProfile, SiteStatus
+from limnopulse_api.domain.assets import (
+    Asset,
+    AssetStatus,
+    AssetType,
+    PondProfile,
+    Site,
+    SiteStatus,
+)
 from limnopulse_api.domain.deployments import Deployment, DeploymentStatus
 from limnopulse_api.domain.devices_v2 import DeviceV2
 from limnopulse_api.domain.entities import Pond
@@ -163,6 +171,8 @@ class FakeDynamoClient:
         self.fail_transactions: list[Exception] = []
         self.site_read_barrier: threading.Barrier | None = None
         self.site_barrier_waits = 0
+        # Hook to interleave a concurrent writer between two reads of one planning pass.
+        self.before_get = None
 
     def rendezvous_site_reads(self) -> None:
         self.site_read_barrier = threading.Barrier(2)
@@ -183,6 +193,8 @@ class FakeDynamoClient:
 
     def get_item(self, **kwargs):
         key = self._plain(kwargs["Key"])
+        if self.before_get is not None:
+            self.before_get(key)
         with self.lock:
             item = self.items.get((key["PK"], key["SK"]))
             wait = key["SK"].startswith("SITE#") and self.site_barrier_waits > 0
@@ -1299,3 +1311,169 @@ async def test_drift_to_a_dangling_pond_leaves_current_untouched() -> None:
     )
     assert current.asset_id == asset_id_for_legacy_pond(TENANT, "pond_west")
     assert len(client.transactions[-1]) == 2
+
+
+# Re-audit follow-ups -------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_pond_update_retries_when_a_concurrent_provisioner_lands_between_reads() -> None:
+    client = store()
+    client.seed(legacy_pond_item("pond_west"))
+    asset_id = asset_id_for_legacy_pond(TENANT, "pond_west")
+    profile_key = KEYS.pond_profile(asset_id)
+    raced = []
+
+    def concurrent_provisioning(key: dict) -> None:
+        # A lazy-provisioning Device create commits after the Asset read, before this read.
+        if (key["PK"], key["SK"]) == (profile_key["PK"], profile_key["SK"]) and not raced:
+            raced.append(True)
+            client.before_get = None
+            seed_migrated_pond(client, "pond_west")
+
+    client.before_get = concurrent_provisioning
+    sleeps: list[int] = []
+
+    async def record_sleep(attempt: int) -> None:
+        sleeps.append(attempt)
+
+    repo = DynamoV1PondDeviceProjection(
+        TABLE, client, clock=Clock("2026-08-25T10:00:00Z"), retry_sleep=record_sleep
+    )
+    pond = await repo.update_pond(TENANT, "pond_west", 1, "North", None)
+
+    assert raced and sleeps == [1]
+    assert (pond.version, pond.name) == (2, "North")
+    assert len(client.transactions) == 1
+    await assert_pond_projection_matches(client, "pond_west")
+
+
+@pytest.mark.asyncio
+async def test_persistent_projection_inconsistency_is_409_after_bounded_attempts() -> None:
+    client = store()
+    client.seed(legacy_pond_item("pond_west"))
+    asset_id = seed_migrated_pond(client, "pond_west")
+    asset_key = KEYS.asset(TENANT, asset_id)
+    del client.items[(asset_key["PK"], asset_key["SK"])]
+
+    with pytest.raises(ConflictError, match="pond projection is inconsistent"):
+        await projection(client).update_pond(TENANT, "pond_west", 1, "North", None)
+    assert client.transactions == []
+
+
+async def create_then_move_while_off(client: FakeDynamoClient, pond_id: str) -> str:
+    await projection(client).create_device(TENANT, "pond_west", DEV_1, "Gateway", None)
+    await DynamoDomainRepository(TABLE, client).update_device(TENANT, DEV_1, 1, None, pond_id, None)
+    return default_component_id_for_legacy_device(TENANT, DEV_1)
+
+
+async def assert_rename_skips_reconcile(client: FakeDynamoClient, component_id: str) -> None:
+    before = {key: value for key, value in client.snapshot().items() if "COMPONENT#" in key[0]}
+    renamed = await projection(client).update_device(TENANT, DEV_1, 2, "Renamed", None, None)
+    assert (renamed.name, renamed.version) == ("Renamed", 3)
+    after = {key: value for key, value in client.snapshot().items() if "COMPONENT#" in key[0]}
+    assert after == before
+    current = client.item(KEYS.current_deployment(component_id))
+    assert current is None or current["asset_id"] == asset_id_for_legacy_pond(TENANT, "pond_west")
+
+
+@pytest.mark.asyncio
+async def test_reconcile_skips_drift_into_an_archived_custom_site() -> None:
+    client = store()
+    seed_migrated_pond(client, "pond_west")
+    site_id = "site_" + "7" * 32
+    now = dt("2026-08-25T09:00:00Z")
+    client.seed(
+        site_to_item(
+            Site(
+                tenant_id=TENANT, site_id=site_id, name="Old", status=SiteStatus.ARCHIVED,
+                created_at=now, updated_at=now, version=2,
+            )
+        )
+    )
+    east_asset = asset_id_for_legacy_pond(TENANT, "pond_east")
+    client.seed(
+        legacy_pond_item(
+            "pond_east", name="East", v2_site_id=site_id, v2_asset_id=east_asset,
+            v2_projection_version=1,
+        )
+    )
+    client.seed(asset_to_item(asset(asset_id=east_asset, site_id=site_id, name="East")))
+    client.seed(
+        pond_profile_to_item(
+            PondProfile(
+                tenant_id=TENANT, asset_id=east_asset, legacy_pond_id="pond_east",
+                created_at=now, updated_at=now, version=1,
+            )
+        )
+    )
+    component_id = await create_then_move_while_off(client, "pond_east")
+
+    await assert_rename_skips_reconcile(client, component_id)
+
+
+@pytest.mark.asyncio
+async def test_reconcile_skips_drift_into_a_v2_incompatible_legacy_pond() -> None:
+    client = store()
+    seed_migrated_pond(client, "pond_west")
+    client.seed(legacy_pond_item("pond west 9", name="Spaced"))
+    component_id = await create_then_move_while_off(client, "pond west 9")
+
+    await assert_rename_skips_reconcile(client, component_id)
+    assert client.item(KEYS.asset(TENANT, asset_id_for_legacy_pond(TENANT, "pond west 9"))) is None
+
+
+@pytest.mark.asyncio
+async def test_reconcile_skips_drift_into_archived_ponds() -> None:
+    for migrated in (True, False):
+        client = store()
+        seed_migrated_pond(client, "pond_west")
+        if migrated:
+            east_asset = seed_migrated_pond(client, "pond_east", name="East")
+            key = KEYS.asset(TENANT, east_asset)
+            client.items[(key["PK"], key["SK"])]["status"] = AssetStatus.ARCHIVED.value
+        else:
+            client.seed({**legacy_pond_item("pond_east", name="East"), "status": "archived"})
+        component_id = await create_then_move_while_off(client, "pond_east")
+
+        await assert_rename_skips_reconcile(client, component_id)
+
+
+@pytest.mark.asyncio
+async def test_reconcile_skips_a_decommissioned_component() -> None:
+    client = store()
+    seed_migrated_pond(client, "pond_west")
+    seed_migrated_pond(client, "pond_east", name="East")
+    component_id = await create_then_move_while_off(client, "pond_east")
+    key = KEYS.component(component_id)
+    client.items[(key["PK"], key["SK"])]["status"] = "decommissioned"
+
+    await assert_rename_skips_reconcile(client, component_id)
+
+
+@pytest.mark.asyncio
+async def test_reconcile_into_an_unmigrated_pond_provisions_it_without_bumping_it() -> None:
+    client = store()
+    seed_migrated_pond(client, "pond_west")
+    client.seed(legacy_pond_item("pond_east", name="East"))
+    component_id = await create_then_move_while_off(client, "pond_east")
+
+    await projection(client).update_device(TENANT, DEV_1, 2, "Renamed", None, None)
+
+    pond_row = client.item(KEYS.legacy_pond(TENANT, "pond_east"))
+    assert pond_row["version"] == 1
+    assert pond_row["v2_asset_id"] == asset_id_for_legacy_pond(TENANT, "pond_east")
+    current = client.item(KEYS.current_deployment(component_id))
+    assert current["asset_id"] == asset_id_for_legacy_pond(TENANT, "pond_east")
+    await assert_pond_projection_matches(client, "pond_east")
+    await assert_device_projection_matches(client, DEV_1)
+
+
+@pytest.mark.asyncio
+async def test_internal_value_errors_are_not_mapped_to_conflicts(monkeypatch) -> None:
+    def broken_add(self, label, key, action):
+        raise ValueError("duplicate transaction key")
+
+    monkeypatch.setattr(projection_module._Plan, "add", broken_add)
+    with pytest.raises(ValueError, match="duplicate transaction key"):
+        await projection(store()).create_pond(TENANT, "pond_west", "West", None)
