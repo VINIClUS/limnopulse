@@ -127,6 +127,48 @@ SK = <UTC timestamp>#<audit event id>
 
 Audit records retain actor, action, resource, before/after SHA-256 hashes, IP, user agent, creation time, and 90-day expiry. They never store JWTs, credentials, or mutation payloads.
 
+## M1 v2 domain foundation (behind disabled rollout flags)
+
+The M1 Site, Asset, Device, Component, Capability, IntegrationAccount, DeviceIntegration and temporal Deployment model is implemented behind disabled rollout flags; it is not deployed capability. `API_V2_ENABLED` (default `false`) mounts the M1 `/v2` route groups; `V1_POND_DEVICE_PROJECTION_ENABLED` (default `false`) makes `/v1` Pond/Device writes dual-write to v2 records with lazy provisioning, while `/v1` reads stay on the legacy `POND#`/`DEVICE#` rows; with it on, a `/v1` device create or patch without a `pond_id` returns `409`. The flags are independent; `API_V2_ENABLED` leaves `/v1` paths, dependencies and responses unchanged. Rollout and rollback follow the M1-08 runbook; rollback sets both flags to `false` and restarts without deleting data.
+
+With `API_V2_ENABLED=true` the API mounts only these tenant-scoped groups, each guarded by tenant membership authorization:
+
+```text
+/v2/tenants/{tenant_id}/sites[/{site_id}]
+/v2/tenants/{tenant_id}/assets[/{asset_id}]
+/v2/tenants/{tenant_id}/devices[/{device_id}]
+/v2/tenants/{tenant_id}/devices/{device_id}/components
+/v2/tenants/{tenant_id}/devices/{device_id}/integrations
+/v2/tenants/{tenant_id}/components/{component_id}[/capabilities]
+/v2/tenants/{tenant_id}/integration-accounts
+/v2/tenants/{tenant_id}/deployments[/{deployment_id}/end]
+```
+
+Telemetry/observations, health/calibration, billing, AWS IoT, notification destinations and commands are not part of M1. `/v2` validation errors never fail on non-finite JSON numbers, and integration validation errors never echo rejected input.
+
+The four M1 repositories reuse the API's single DynamoDB client and `LimnopulseDomain`; M1 adds no table, GSI, queue, service or key attribute. M1 `LimnopulseDomain` keys:
+
+| Entity | PK | SK |
+|---|---|---|
+| Site | `TENANT#<tenant_id>` | `SITE#<site_id>` |
+| Asset | `TENANT#<tenant_id>` | `ASSET#<asset_id>` |
+| Pond profile | `ASSET#<asset_id>` | `PROFILE#POND` |
+| Device v2 | `TENANT#<tenant_id>` | `DEVICE#<device_id>` |
+| Device lookup | `DEVICE#<device_id>` | `META` |
+| Component mirror | `TENANT#<tenant_id>` | `COMPONENT#<component_id>` |
+| Component | `COMPONENT#<component_id>` | `META` |
+| Capability | `COMPONENT#<component_id>` | `CAPABILITY#<capability_id>` |
+| Integration account | `TENANT#<tenant_id>` | `INTEGRATION_ACCOUNT#<integration_account_id>` |
+| Device integration | `TENANT#<tenant_id>` | `DEVICE_INTEGRATION#<device_integration_id>` |
+| External-id lookup | `EXTERNAL_ID#<provider_key>#<sha256(provider_key + "\0" + external_identity)>` | `META` |
+| Deployment mirror | `TENANT#<tenant_id>` | `DEPLOYMENT#<deployment_id>` |
+| Deployment history | `COMPONENT#<component_id>` | `DEPLOYMENT#<started_at>#<deployment_id>` |
+| Current deployment | `COMPONENT#<component_id>` | `DEPLOYMENT#CURRENT` |
+| Deployment marker | `COMPONENT#<component_id>` | `DEPLOYMENT#MARKER` |
+| v2 idempotency receipt | `TENANT#<tenant_id>` | `IDEMPOTENCY#<scope>#<sha256(key)>` |
+
+`<started_at>` in deployment history SKs is the canonical UTC key (`canonical_timestamp_key`, `YYYY-MM-DDTHH:MM:SS.ffffffZ` with fixed six-digit microseconds), so lexicographic order is chronological. Idempotency receipts carry the numeric `expires_at` TTL (24 hours); no other M1 record expires.
+
 ## Authentication and tenant authorization
 
 The access token authenticates a user; it does not grant tenant access by itself. Every tenant route resolves an active DynamoDB membership and then enforces the required role.
