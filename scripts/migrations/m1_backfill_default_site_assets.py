@@ -10,6 +10,9 @@ DynamoDB, deadline or unclassified failure (1 takes precedence over 2).
 Run from the repository root:
     python -m scripts.migrations.m1_backfill_default_site_assets --tenant tnt_x \
         --page-size 25 --deadline-seconds 300 [--apply]
+
+--tenant-file is resolved relative to, and must stay inside, the working directory (run from the
+repo root); it must be a regular file of at most 1 MiB. Symlinks are resolved before the check.
 """
 
 import argparse
@@ -35,6 +38,8 @@ from limnopulse_api.migrations.default_site_asset import (
 )
 
 TENANT_SCOPE_REQUIRED = "--tenant or --tenant-file is required"
+TENANT_FILE_OUTSIDE_CWD = "--tenant-file must be inside the current working directory"
+MAX_TENANT_FILE_BYTES = 1024 * 1024
 
 
 class Migrator(Protocol):
@@ -87,10 +92,27 @@ def build_parser() -> argparse.ArgumentParser:
     return parser
 
 
+def _contained_tenant_file(path: Path) -> Path:
+    """Resolve `path` (symlinks included) and require a regular file inside the working dir."""
+    base = Path.cwd().resolve()
+    try:
+        resolved = (base / path).resolve(strict=True)
+    except (OSError, RuntimeError) as exc:
+        raise _UsageError(f"cannot read --tenant-file: {type(exc).__name__}") from exc
+    if not resolved.is_relative_to(base):
+        raise _UsageError(TENANT_FILE_OUTSIDE_CWD)
+    if not resolved.is_file():
+        raise _UsageError("--tenant-file must be a regular file")
+    if resolved.stat().st_size > MAX_TENANT_FILE_BYTES:
+        raise _UsageError("--tenant-file must be at most 1 MiB")
+    return resolved
+
+
 def read_tenant_file(path: Path) -> list[str]:
     """One tenant per line; blank lines, comments, NUL bytes and '#' are rejected."""
+    contained = _contained_tenant_file(path)
     try:
-        content = path.read_text(encoding="utf-8")
+        content = contained.read_text(encoding="utf-8")
     except (OSError, UnicodeDecodeError) as exc:
         raise _UsageError(f"cannot read --tenant-file: {type(exc).__name__}") from exc
     lines = content.splitlines()

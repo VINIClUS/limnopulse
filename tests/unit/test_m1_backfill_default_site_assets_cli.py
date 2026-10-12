@@ -97,6 +97,7 @@ def test_cli_has_no_all_or_discovery_flag(capsys, migrator: FakeMigrator) -> Non
 def test_cli_deduplicates_tenants_and_maps_conflict_to_exit_two(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys
 ) -> None:
+    monkeypatch.chdir(tmp_path)
     fake = FakeMigrator("schema_conflict")
     monkeypatch.setattr(cli, "build_migrator", lambda: fake)
     tenant_file = tmp_path / "tenants.txt"
@@ -112,8 +113,9 @@ def test_cli_deduplicates_tenants_and_maps_conflict_to_exit_two(
 
 
 def test_cli_merges_flags_and_file_preserving_first_seen_order(
-    tmp_path: Path, migrator: FakeMigrator
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, migrator: FakeMigrator
 ) -> None:
+    monkeypatch.chdir(tmp_path)
     tenant_file = tmp_path / "tenants.txt"
     tenant_file.write_text("tnt_c\r\ntnt_a\n", encoding="utf-8")
 
@@ -177,8 +179,13 @@ def test_cli_usage_errors_exit_one_without_running(
     ["tnt_1\n\ntnt_2\n", "tnt_1\n   \n", "# comment\n", "tnt_1\x00\n", ""],
 )
 def test_cli_rejects_invalid_tenant_files(
-    content: str, tmp_path: Path, capsys, migrator: FakeMigrator
+    content: str,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys,
+    migrator: FakeMigrator,
 ) -> None:
+    monkeypatch.chdir(tmp_path)
     tenant_file = tmp_path / "tenants.txt"
     tenant_file.write_text(content, encoding="utf-8")
 
@@ -187,7 +194,10 @@ def test_cli_rejects_invalid_tenant_files(
     assert migrator.calls == []
 
 
-def test_cli_missing_tenant_file_exits_one(tmp_path: Path, capsys, migrator: FakeMigrator) -> None:
+def test_cli_missing_tenant_file_exits_one(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys, migrator: FakeMigrator
+) -> None:
+    monkeypatch.chdir(tmp_path)
     assert main(["--tenant-file", str(tmp_path / "missing.txt")]) == 1
     assert "cannot read --tenant-file" in capsys.readouterr().err
     assert migrator.calls == []
@@ -263,3 +273,70 @@ def test_production_client_kwargs_never_inject_local_credentials() -> None:
         app_env="prod", aws_region="sa-east-1", dynamodb_endpoint_url=None
     )
     assert cli.dynamodb_client_kwargs(settings) == {"region_name": "sa-east-1"}
+
+
+@pytest.fixture
+def workdir(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
+    """A working directory with a sibling directory outside it."""
+    cwd = tmp_path / "cwd"
+    cwd.mkdir()
+    (tmp_path / "outside").mkdir()
+    (tmp_path / "outside" / "tenants.txt").write_text("tnt_1\n", encoding="utf-8")
+    monkeypatch.chdir(cwd)
+    return cwd
+
+
+def _assert_rejected(argv: list[str], capsys, migrator: FakeMigrator, message: str) -> None:
+    assert main(argv) == 1
+    captured = capsys.readouterr()
+    assert message in captured.err
+    assert captured.out == ""
+    assert migrator.calls == []
+
+
+def test_tenant_file_absolute_path_outside_cwd_is_rejected(
+    workdir: Path, capsys, migrator: FakeMigrator
+) -> None:
+    outside = workdir.parent / "outside" / "tenants.txt"
+    _assert_rejected(["--tenant-file", str(outside)], capsys, migrator, cli.TENANT_FILE_OUTSIDE_CWD)
+
+
+def test_tenant_file_parent_traversal_is_rejected(
+    workdir: Path, capsys, migrator: FakeMigrator
+) -> None:
+    _assert_rejected(
+        ["--tenant-file", "../outside/tenants.txt"],
+        capsys,
+        migrator,
+        cli.TENANT_FILE_OUTSIDE_CWD,
+    )
+
+
+def test_tenant_file_symlink_escaping_cwd_is_rejected(
+    workdir: Path, capsys, migrator: FakeMigrator
+) -> None:
+    (workdir / "link.txt").symlink_to(workdir.parent / "outside" / "tenants.txt")
+    _assert_rejected(["--tenant-file", "link.txt"], capsys, migrator, cli.TENANT_FILE_OUTSIDE_CWD)
+
+
+def test_tenant_file_directory_is_rejected(workdir: Path, capsys, migrator: FakeMigrator) -> None:
+    (workdir / "tenants").mkdir()
+    _assert_rejected(["--tenant-file", "tenants"], capsys, migrator, "must be a regular file")
+
+
+def test_tenant_file_larger_than_one_mib_is_rejected(
+    workdir: Path, capsys, migrator: FakeMigrator
+) -> None:
+    (workdir / "big.txt").write_text("tnt_1\n" * 200_000, encoding="utf-8")
+    _assert_rejected(["--tenant-file", "big.txt"], capsys, migrator, "at most 1 MiB")
+
+
+def test_tenant_file_relative_inside_cwd_is_read(workdir: Path, migrator: FakeMigrator) -> None:
+    (workdir / "scope").mkdir()
+    (workdir / "scope" / "tenants.txt").write_text("tnt_1\ntnt_2\n", encoding="utf-8")
+    (workdir / "inner-link.txt").symlink_to(workdir / "scope" / "tenants.txt")
+
+    assert main(["--tenant-file", "scope/tenants.txt"]) == 0
+    assert main(["--tenant-file", "inner-link.txt"]) == 0
+    assert migrator.calls[0]["tenants"] == ["tnt_1", "tnt_2"]
+    assert migrator.calls[1]["tenants"] == ["tnt_1", "tnt_2"]
