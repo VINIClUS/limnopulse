@@ -122,7 +122,7 @@ from limnopulse_api.adapters.dynamodb_v2 import (
     parse_canonical_timestamp,
     utc_now,
 )
-from limnopulse_api.domain.assets import AssetStatus
+from limnopulse_api.domain.assets import AssetStatus, SiteStatus
 from limnopulse_api.domain.deployments import Deployment, DeploymentStatus
 from limnopulse_api.domain.devices_v2 import ComponentStatus
 from limnopulse_api.domain.entities import Device, Pond, Tenant
@@ -157,7 +157,13 @@ MigrationResult = Literal[
 _SITE_FIELDS = ("tenant_id", "site_id")
 _ASSET_FIELDS = ("tenant_id", "asset_id", "site_id", "asset_type")
 _PROFILE_FIELDS = ("tenant_id", "asset_id", "legacy_pond_id")
-_COMPONENT_FIELDS = ("tenant_id", "component_id", "device_id", "kind")
+_COMPONENT_FIELDS = (
+    "tenant_id",
+    "component_id",
+    "device_id",
+    "kind",
+    "probe_profile.probe_profile_id",
+)
 _DEPLOYMENT_FIELDS = ("tenant_id", "deployment_id", "component_id", "started_at")
 _CURRENT_FIELDS = (*_DEPLOYMENT_FIELDS, "asset_id")
 _MARKER_FIELDS = ("tenant_id", "component_id")
@@ -360,6 +366,16 @@ class _RunState:
         )
 
 
+def _field(row: Mapping[str, Any] | None, name: str) -> Any:
+    """Attribute value; a dotted name walks nested maps (`None` when any level is absent)."""
+    value: Any = row
+    for part in name.split("."):
+        if not isinstance(value, Mapping):
+            return None
+        value = value.get(part)
+    return value
+
+
 def _require_identity(
     existing: Mapping[str, Any],
     expected: Mapping[str, Any],
@@ -367,7 +383,7 @@ def _require_identity(
     kind: str,
     key: Mapping[str, str],
 ) -> None:
-    if any(existing.get(name) != expected.get(name) for name in fields):
+    if any(_field(existing, name) != _field(expected, name) for name in fields):
         raise _SchemaConflict(kind, key)
 
 
@@ -474,10 +490,9 @@ class DefaultSiteAssetMigrator:
         self._check_deadline(deadline)
         tenant_counts: Counter[str] = Counter()
         try:
-            self._apply_site(plan, tenant_counts)
+            self._apply_site(plan, tenant_counts, deadline)
             for record in plan.records:
-                self._check_deadline(deadline)
-                self._apply_record(record, plan, tenant_counts)
+                self._apply_record(record, plan, tenant_counts, deadline)
         except _SchemaConflict as conflict:
             state.add_conflicts(tenant_id, [conflict])
             return
@@ -487,6 +502,7 @@ class DefaultSiteAssetMigrator:
             return
         finally:
             state.counts.update(tenant_counts)
+        self._check_deadline(deadline)
         self.store.record_migration_receipt(
             tenant_id,
             completed_at=self._clock(),
@@ -586,7 +602,9 @@ class DefaultSiteAssetMigrator:
         if kind == "pond":
             pond = self._parse_pond(tenant_id, item)
             plan.ponds[pond.pond_id] = pond
-            return self._plan_pond(pond, item, plan.site_id)
+            return self._plan_pond(
+                pond, item, plan.site_id, site_planned=plan.site_action is not None
+            )
         if not is_legacy_device_item(item):
             raise _SchemaConflict("device_invalid", _source_key(item))
         device = self._parse_device(tenant_id, item)
@@ -612,6 +630,7 @@ class DefaultSiteAssetMigrator:
         on_new_pond(self._plan_record("pond", pond_item, plan, on_new_pond))
 
     def _plan_site(self, tenant: Tenant) -> tuple[str, dict[str, Any] | None]:
+        """Site id and the Put creating it, or `None` when it already exists."""
         site = default_site_for_tenant(tenant)
         item = site_to_item(site)
         key = self.keys.site(site.tenant_id, site.site_id)
@@ -638,7 +657,9 @@ class DefaultSiteAssetMigrator:
             raise _SchemaConflict("device_invalid", key)
         return device
 
-    def _plan_pond(self, pond: Pond, item: Mapping[str, Any], site_id: str) -> _RecordPlan:
+    def _plan_pond(
+        self, pond: Pond, item: Mapping[str, Any], site_id: str, *, site_planned: bool
+    ) -> _RecordPlan:
         source_key = _source_key(item)
         try:
             projection = asset_and_profile_for_legacy_pond(pond, site_id)
@@ -652,6 +673,21 @@ class DefaultSiteAssetMigrator:
         profile_put = self._plan_put(profile_item, _PROFILE_FIELDS, "pond_profile")
         asset_put = self._plan_put(asset_item, _ASSET_FIELDS, "asset")
         actions = [action for action in (asset_put, profile_put) if action is not None]
+        if asset_put is not None and projection.asset.status is AssetStatus.ACTIVE:
+            # An ACTIVE Asset needs an ACTIVE Site, checked again at commit time (the Site Put
+            # is never part of this transaction). ARCHIVED Assets mirror legacy state as is.
+            # The Site is read here (not taken from the tenant plan) so a re-plan after the
+            # commit-time check failed sees its current status.
+            site_key = self.keys.site(pond.tenant_id, site_id)
+            site = self.store.get_known_item(site_key)
+            if site is None:
+                if not site_planned:
+                    raise _SchemaConflict("site", site_key)
+            elif site.get("status") != SiteStatus.ACTIVE.value:
+                raise _SchemaConflict("site", site_key)
+            actions.append(
+                {"ConditionCheck": self.store.site_active_check_request(pond.tenant_id, site_id)}
+            )
 
         asset_id = projection.asset.asset_id
         link_updated = _links_needed(
@@ -806,8 +842,15 @@ class DefaultSiteAssetMigrator:
         current_item = self.store.get_known_item(current_key)
         if current_item is not None:
             current = self._current_deployment(current_item, deployment, current_key)
-            marker = self._require_marker(tenant_id, deployment.component_id)
-            if current.asset_id == deployment.asset_id or not active:
+            marker = self._require_marker(
+                tenant_id, deployment.component_id, current_started_at=current.started_at
+            )
+            if current.asset_id == deployment.asset_id:
+                if current.site_id != deployment.site_id:
+                    # Same Asset under another Site cannot be right; re-read before conflict.
+                    raise _Unstable("deployment_current", current_key, current_item)
+                return []
+            if not active:
                 return []
             if not self._asset_active(tenant_id, deployment.asset_id, pond):
                 # Like the `/v1` projection, never reconcile into an archived Asset.
@@ -859,6 +902,17 @@ class DefaultSiteAssetMigrator:
                     tenant_id, deployment.asset_id
                 )
             },
+            *(
+                []
+                if component_planned
+                else [
+                    {
+                        "ConditionCheck": self.store.component_active_check_request(
+                            tenant_id, deployment.component_id
+                        )
+                    }
+                ]
+            ),
         ]
 
     def _require_ended_group(
@@ -940,7 +994,14 @@ class DefaultSiteAssetMigrator:
                 raise _Unstable("deployment_current", current_key, [current_item, row])
         return current
 
-    def _require_marker(self, tenant_id: str, component_id: str) -> Mapping[str, Any]:
+    def _require_marker(
+        self, tenant_id: str, component_id: str, *, current_started_at: datetime
+    ) -> Mapping[str, Any]:
+        """Marker of a Component with an active CURRENT: owned, `seq >= 1` and never ahead.
+
+        `last_ended_at`, when present, must not be after CURRENT's start, so the D10 fence a
+        repair advances from it never moves backwards.
+        """
         marker_key = deployment_marker_key(component_id)
         marker = self.store.get_known_item(marker_key)
         if marker is None:
@@ -949,10 +1010,21 @@ class DefaultSiteAssetMigrator:
         if (
             marker.get("tenant_id") != tenant_id
             or marker.get("component_id") != component_id
+            or isinstance(seq, bool)
             or not isinstance(seq, int)
             or seq < 1
         ):
             raise _SchemaConflict("deployment_marker", marker_key)
+        last_ended_at = marker.get(MARKER_LAST_ENDED_AT_ATTRIBUTE)
+        if last_ended_at is not None:
+            try:
+                ok = isinstance(last_ended_at, str) and (
+                    parse_canonical_timestamp(last_ended_at) <= current_started_at
+                )
+            except ValueError:
+                ok = False
+            if not ok:
+                raise _Unstable("deployment_marker", marker_key, marker)
         return marker
 
     def _drift_repair_actions(
@@ -1035,13 +1107,14 @@ class DefaultSiteAssetMigrator:
 
     # Apply ----------------------------------------------------------------------------------
 
-    def _apply_site(self, plan: _TenantPlan, counts: Counter[str]) -> None:
+    def _apply_site(self, plan: _TenantPlan, counts: Counter[str], deadline: float) -> None:
         action = plan.site_action
         for attempt in range(MAX_RECORD_ATTEMPTS + 1):
             if action is None:
                 return
             if attempt == MAX_RECORD_ATTEMPTS:
                 break
+            self._check_deadline(deadline)
             try:
                 self.store.put_item_sync(action)
             except DynamoConditionalConflict:
@@ -1056,13 +1129,17 @@ class DefaultSiteAssetMigrator:
             _, action = self._plan_site(plan.tenant)
         raise _RetryExhausted("default site")
 
-    def _apply_record(self, record: _RecordPlan, plan: _TenantPlan, counts: Counter[str]) -> None:
+    def _apply_record(
+        self, record: _RecordPlan, plan: _TenantPlan, counts: Counter[str], deadline: float
+    ) -> None:
         for attempt in range(MAX_RECORD_ATTEMPTS + 1):
             if not record.actions:
                 counts["already_migrated"] += 1
                 return
             if attempt == MAX_RECORD_ATTEMPTS:
                 break
+            # Checked before every write, retries included: nothing is written after it.
+            self._check_deadline(deadline)
             try:
                 self.store.transact_write_sync(record.actions)
             except DynamoConditionalConflict:
@@ -1074,10 +1151,12 @@ class DefaultSiteAssetMigrator:
             else:
                 counts.update(record.counts())
                 return
-            record = self._replan(record, plan, counts)
+            record = self._replan(record, plan, counts, deadline)
         raise _RetryExhausted(record.kind)
 
-    def _replan(self, record: _RecordPlan, plan: _TenantPlan, counts: Counter[str]) -> _RecordPlan:
+    def _replan(
+        self, record: _RecordPlan, plan: _TenantPlan, counts: Counter[str], deadline: float
+    ) -> _RecordPlan:
         """Re-read the source row and known keys after a failed write."""
         item = self.store.get_known_item(record.source_key)
         if item is None:
@@ -1086,7 +1165,7 @@ class DefaultSiteAssetMigrator:
             record.kind,
             item,
             plan,
-            lambda pond_record: self._apply_record(pond_record, plan, counts),
+            lambda pond_record: self._apply_record(pond_record, plan, counts, deadline),
         )
 
     # Helpers --------------------------------------------------------------------------------

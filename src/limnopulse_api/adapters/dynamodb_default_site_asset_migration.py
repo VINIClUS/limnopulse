@@ -18,6 +18,7 @@ edit makes the migration re-plan that record instead of overwriting it.
 
 from collections.abc import Iterator, Mapping
 from datetime import datetime
+from decimal import Decimal
 from typing import Any
 
 from limnopulse_api.adapters.dynamodb_deployments import deployment_to_item
@@ -55,6 +56,17 @@ def _timestamp(value: Any) -> datetime:
     return datetime.fromisoformat(value)
 
 
+def _stored_int(value: Any) -> int:
+    """A stored integer (int or integral Decimal); never a bool, string or fraction."""
+    if isinstance(value, bool):
+        raise TypeError("stored integer must not be a boolean")
+    if isinstance(value, int):
+        return value
+    if isinstance(value, Decimal) and value == value.to_integral_value():
+        return int(value)
+    raise TypeError("stored integer has an invalid type")
+
+
 def legacy_tenant_from_item(item: Mapping[str, Any]) -> Tenant:
     return Tenant(
         tenant_id=item["tenant_id"],
@@ -63,8 +75,8 @@ def legacy_tenant_from_item(item: Mapping[str, Any]) -> Tenant:
         status=item.get("status", "active"),
         created_at=_timestamp(item["created_at"]),
         updated_at=_timestamp(item["updated_at"]),
-        version=int(item["version"]),
-        schema_version=int(item.get("schema_version", 1)),
+        version=_stored_int(item["version"]),
+        schema_version=_stored_int(item.get("schema_version", 1)),
     )
 
 
@@ -77,8 +89,8 @@ def legacy_pond_from_item(item: Mapping[str, Any]) -> Pond:
         status=item.get("status", "active"),
         created_at=_timestamp(item["created_at"]),
         updated_at=_timestamp(item["updated_at"]),
-        version=int(item["version"]),
-        schema_version=int(item.get("schema_version", 1)),
+        version=_stored_int(item["version"]),
+        schema_version=_stored_int(item.get("schema_version", 1)),
     )
 
 
@@ -93,8 +105,8 @@ def legacy_device_from_item(item: Mapping[str, Any]) -> Device:
         status=item.get("status", "active"),
         created_at=_timestamp(item["created_at"]),
         updated_at=_timestamp(item["updated_at"]),
-        version=int(item["version"]),
-        schema_version=int(item.get("schema_version", 1)),
+        version=_stored_int(item["version"]),
+        schema_version=_stored_int(item.get("schema_version", 1)),
     )
 
 
@@ -228,6 +240,14 @@ class DynamoDefaultSiteAssetMigrationStore(DynamoV2RepositoryBase):
             condition="attribute_exists(PK) AND #tenant_id = :tenant_id",
             names={"#tenant_id": "tenant_id"},
             values={":tenant_id": tenant_id},
+        )
+
+    def site_active_check_request(self, tenant_id: str, site_id: str) -> dict[str, Any]:
+        return self.condition_check_request(
+            self.keys.site(tenant_id, site_id),
+            condition="attribute_exists(PK) AND #status = :active AND #tenant_id = :tenant_id",
+            names={"#status": "status", "#tenant_id": "tenant_id"},
+            values={":active": "active", ":tenant_id": tenant_id},
         )
 
     def asset_active_check_request(self, tenant_id: str, asset_id: str) -> dict[str, Any]:

@@ -876,7 +876,7 @@ def test_record_transactions_are_conditional_bounded_and_grouped() -> None:
     run(client, apply=True)
 
     pond_tx, device_tx = client.transactions
-    assert [next(iter(action)) for action in pond_tx] == ["Put", "Put", "Update"]
+    assert [next(iter(action)) for action in pond_tx] == ["Put", "Put", "ConditionCheck", "Update"]
     assert [next(iter(action)) for action in device_tx] == [
         *["Put"] * 6,
         "ConditionCheck",
@@ -1954,3 +1954,197 @@ def test_deadline_passing_during_last_record_planning_writes_nothing() -> None:
     assert exit_code_for(result.result) == 1
     assert result.scope_completed is False
     assert client.write_calls == []
+
+
+# Codex round 2: stored types, archived Site, marker fence, apply deadline, Component checks ----
+
+
+@pytest.mark.parametrize(
+    ("row", "value", "kind"),
+    [
+        ("tenant", "4", "tenant_invalid"),
+        ("tenant", True, "tenant_invalid"),
+        ("pond", "2", "pond_invalid"),
+        ("pond", True, "pond_invalid"),
+        ("device", "3", "device_invalid"),
+        ("device", Decimal("3.5"), "device_invalid"),
+    ],
+)
+def test_legacy_versions_must_be_stored_integers(row: str, value: Any, kind: str) -> None:
+    client = FakeMigrationDynamo.with_legacy_tenant(
+        tenant_id="tnt_1",
+        ponds=[legacy_pond("pond_1")],
+        devices=[legacy_device("probe-1", "pond_1")],
+    )
+    key = {
+        "tenant": ("TENANT#tnt_1", "META"),
+        "pond": ("TENANT#tnt_1", "POND#pond_1"),
+        "device": ("TENANT#tnt_1", "DEVICE#probe-1"),
+    }[row]
+    client.items[key]["version"] = value
+
+    dry = run(client, apply=False)
+
+    assert dry.result == "schema_conflict"
+    assert [(c.kind, c.key) for c in dry.conflicts] == [(kind, f"{key[0]}/{key[1]}")]
+
+
+def _archived_site(tenant_id: str = "tnt_1") -> dict[str, Any]:
+    site = default_site_for_tenant(tenant_model(tenant_id))
+    return {**site_to_item(site), "status": "archived"}
+
+
+def test_active_asset_is_never_created_under_an_archived_site() -> None:
+    client = FakeMigrationDynamo.with_legacy_tenant(
+        tenant_id="tnt_1", ponds=[legacy_pond("pond_1")], devices=[]
+    )
+    client.put_raw(_archived_site())
+
+    result = run(client, apply=True)
+
+    assert result.result == "schema_conflict"
+    assert [(c.kind, c.key) for c in result.conflicts] == [
+        ("site", f"TENANT#tnt_1/SITE#{default_site_id('tnt_1')}")
+    ]
+    assert client.write_calls == []
+
+
+def test_archived_pond_asset_may_be_created_under_an_archived_site() -> None:
+    client = FakeMigrationDynamo.with_legacy_tenant(
+        tenant_id="tnt_1", ponds=[{**legacy_pond("pond_1"), "status": "archived"}], devices=[]
+    )
+    client.put_raw(_archived_site())
+
+    result = run(client, apply=True)
+
+    assert result.result == "success"
+    assert result.assets_created == 1
+
+
+def test_site_archived_between_plan_and_pond_commit_is_fenced() -> None:
+    client = FakeMigrationDynamo.with_legacy_tenant(
+        tenant_id="tnt_1", ponds=[legacy_pond("pond_1")], devices=[]
+    )
+    site_key = _item_key(KEYS.site("tnt_1", default_site_id("tnt_1")))
+
+    def archive_site(fake: FakeMigrationDynamo, actions: list[dict]) -> None:
+        fake.items[site_key]["status"] = "archived"
+
+    client.before_transact = archive_site
+
+    result = run(client, apply=True)
+
+    assert result.result == "schema_conflict"
+    assert [c.kind for c in result.conflicts] == ["site"]
+    assert result.assets_created == 0
+    assert (
+        client.get_raw(*KEYS.asset("tnt_1", asset_id_for_legacy_pond("tnt_1", "pond_1")).values())
+        is None
+    )
+
+
+@pytest.mark.parametrize("scenario", ["already_migrated", "drift"])
+def test_marker_ended_after_current_start_is_a_conflict(scenario: str) -> None:
+    client = migrated_store() if scenario == "already_migrated" else moved_after_migration()
+    client.items[_item_key(deployment_marker_key(COMPONENT_ID))]["last_ended_at"] = (
+        "2027-01-01T00:00:00.000000Z"
+    )
+    client.calls.clear()
+
+    result = run(client, apply=True)
+
+    assert result.result == "schema_conflict"
+    assert [c.kind for c in result.conflicts] == ["deployment_marker"]
+    assert not any("DEPLOYMENT#CURRENT" in str(tx) for tx in client.transactions)
+
+
+def test_deadline_passing_during_retry_backoff_stops_before_the_next_write() -> None:
+    client = FakeMigrationDynamo.with_legacy_tenant(
+        tenant_id="tnt_1", ponds=[legacy_pond("pond_1")], devices=[]
+    )
+    client.fail_once["transact_write_items"] = _transaction_conflict()
+    now = {"value": 0.0}
+
+    def slow_backoff(_delay: float) -> None:
+        now["value"] = 1_000.0
+
+    migrator = DefaultSiteAssetMigrator(
+        client, clock=fixed_clock, monotonic=lambda: now["value"], sleep=slow_backoff
+    )
+
+    result = migrator.run(["tnt_1"], apply=True, page_size=25, deadline_seconds=300)
+
+    assert result.result == "deadline_exceeded"
+    assert exit_code_for(result.result) == 1
+    assert len(client.transactions) == 1
+    assert [name for name, _ in client.write_calls if name == "update_item"] == []  # no receipt
+    assert client.get_raw(*KEYS.migration_receipt("tnt_1").values()) is None
+
+
+def test_component_decommissioned_between_plan_and_commit_gets_no_deployment() -> None:
+    client = migrated_store()
+    deterministic = _deterministic_deployment()
+    for form in ("mirror", "history", "current"):
+        del client.items[_item_key(deployment_to_item(deterministic, form=form))]
+    del client.items[_item_key(deployment_marker_key(COMPONENT_ID))]
+    canonical_key = _item_key(KEYS.component(COMPONENT_ID))
+
+    def decommission(fake: FakeMigrationDynamo, actions: list[dict]) -> None:
+        fake.items[canonical_key]["status"] = "decommissioned"
+
+    client.before_transact = decommission
+    client.calls.clear()
+
+    result = run(client, apply=True)
+
+    assert result.result == "success"
+    assert (result.deployments_created, result.devices_projected) == (0, 0)
+    assert result.already_migrated == 2
+    assert _current(client) is None
+    refused = client.transactions[0]
+    checks = [a["ConditionCheck"]["Key"] for a in refused if "ConditionCheck" in a]
+    assert client.serialize(KEYS.component(COMPONENT_ID)) in checks
+
+
+@pytest.mark.parametrize("row", ["canonical", "mirror"])
+@pytest.mark.parametrize("damage", ["wrong", "missing"])
+def test_component_probe_profile_id_is_part_of_identity(row: str, damage: str) -> None:
+    client = migrated_store()
+    key = _item_key(
+        KEYS.component(COMPONENT_ID)
+        if row == "canonical"
+        else KEYS.component_mirror("tnt_1", COMPONENT_ID)
+    )
+    if damage == "wrong":
+        client.items[key]["probe_profile"] = {"probe_profile_id": "prb_" + "f" * 32}
+    else:
+        del client.items[key]["probe_profile"]
+
+    result = run(client, apply=False)
+
+    assert result.result == "schema_conflict"
+    assert [(c.kind, c.key) for c in result.conflicts] == [("component", f"{key[0]}/{key[1]}")]
+
+
+def test_mutable_probe_profile_fields_are_ignored() -> None:
+    client = migrated_store()
+    key = _item_key(KEYS.component(COMPONENT_ID))
+    client.items[key]["probe_profile"]["serial_number"] = "SN-42"
+
+    assert run(client, apply=True).already_migrated == 2
+
+
+def test_current_on_the_pond_asset_under_another_site_is_a_conflict() -> None:
+    client = migrated_store()
+    deterministic = _deterministic_deployment()
+    for form in ("mirror", "history", "current"):
+        client.items[_item_key(deployment_to_item(deterministic, form=form))]["site_id"] = (
+            "site_" + "d" * 32
+        )
+    client.calls.clear()
+
+    result = run(client, apply=True)
+
+    assert result.result == "schema_conflict"
+    assert [c.kind for c in result.conflicts] == ["deployment_current"]
+    assert client.transactions == []
