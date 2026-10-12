@@ -43,7 +43,11 @@ from limnopulse_api.domain.devices_v2 import (
     DeviceStatus,
     DeviceV2,
 )
-from limnopulse_api.domain.integrations import DeviceIntegration, IntegrationAccount
+from limnopulse_api.domain.integrations import (
+    DeviceIntegration,
+    IntegrationAccount,
+    IntegrationAccountStatus,
+)
 from limnopulse_api.domain.v2_common import IdempotencyReceipt
 from limnopulse_api.services.assets import AssetService
 from limnopulse_api.services.components import (
@@ -450,6 +454,8 @@ class InMemoryM1Repositories:
     capabilities: dict[tuple[str, str, str], CapabilityDeclaration] = field(default_factory=dict)
     integration_accounts: dict[tuple[str, str], IntegrationAccount] = field(default_factory=dict)
     device_integrations: dict[tuple[str, str], DeviceIntegration] = field(default_factory=dict)
+    # Global, cross-tenant claims, like the production `EXTERNAL_ID#<provider>#<sha256>` row.
+    external_identities: dict[tuple[str, str], str] = field(default_factory=dict)
     deployments: dict[str, list[Deployment]] = field(default_factory=dict)
     receipts: dict[tuple[str, str, str], IdempotencyReceipt] = field(default_factory=dict)
 
@@ -465,12 +471,14 @@ class InMemoryM1Repositories:
             raise ConflictError("idempotency key reused with a different request")
         return receipt.response_snapshot_json
 
+    def _receipt_taken(self, receipt: IdempotencyReceipt) -> bool:
+        existing = self.receipts.get((receipt.tenant_id, receipt.scope, receipt.key_hash))
+        return existing is not None and existing.expires_at > self.clock()
+
     def _claim(self, receipt: IdempotencyReceipt) -> None:
-        key = (receipt.tenant_id, receipt.scope, receipt.key_hash)
-        existing = self.receipts.get(key)
-        if existing is not None and existing.expires_at > self.clock():
+        if self._receipt_taken(receipt):
             raise ConflictError("idempotency key already used")
-        self.receipts[key] = receipt
+        self.receipts[(receipt.tenant_id, receipt.scope, receipt.key_hash)] = receipt
 
     # Sites and Assets -------------------------------------------------------------------------
 
@@ -672,10 +680,29 @@ class InMemoryM1Repositories:
     async def create_device_integration(
         self, integration: DeviceIntegration, receipt: IdempotencyReceipt
     ) -> DeviceIntegration:
+        """All-or-nothing, classified in the production adapter's order: receipt, account,
+        device, then the global external identity claim."""
         key = (integration.tenant_id, integration.device_integration_id)
+        identity = (integration.provider_key, integration.external_identity_hash)
+        account = self.integration_accounts.get(
+            (integration.tenant_id, integration.integration_account_id)
+        )
+        device = self.devices.get((integration.tenant_id, integration.device_id))
+        if self._receipt_taken(receipt):
+            raise ConflictError("idempotency key already used")
+        if account is None or account.status not in {
+            IntegrationAccountStatus.PENDING,
+            IntegrationAccountStatus.ACTIVE,
+        }:
+            raise ConflictError("integration account is not provisionable")
+        if device is None or device.status is DeviceStatus.DECOMMISSIONED:
+            raise ConflictError("device is decommissioned")
+        if identity in self.external_identities:
+            raise ConflictError("external identity already claimed")
         if key in self.device_integrations:
             raise ConflictError("device integration already exists")
         self._claim(receipt)
+        self.external_identities[identity] = integration.tenant_id
         self.device_integrations[key] = integration
         return integration
 

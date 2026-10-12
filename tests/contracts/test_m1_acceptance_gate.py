@@ -16,6 +16,7 @@ from typing import Any
 import pytest
 from fastapi.testclient import TestClient
 
+from limnopulse_api.adapters.dynamodb_deployments import deployment_marker_key
 from limnopulse_api.adapters.dynamodb_integrations import integration_account_to_item
 from limnopulse_api.adapters.dynamodb_v1_pond_device_projection import (
     DynamoV1PondDeviceProjection,
@@ -37,7 +38,11 @@ from limnopulse_api.domain.ids import (
     default_site_id,
     deployment_id_for_legacy_device,
 )
-from limnopulse_api.domain.integrations import DeviceIntegration, IntegrationAccountStatus
+from limnopulse_api.domain.integrations import (
+    DeviceIntegration,
+    IntegrationAccount,
+    IntegrationAccountStatus,
+)
 from limnopulse_api.domain.roles import TenantRole
 from limnopulse_api.domain.v2_common import QuotaDimension, new_idempotency_receipt
 from limnopulse_api.main import create_app
@@ -408,6 +413,95 @@ def test_device_integration_for_a_revoked_account_is_a_conflict() -> None:
     assert client.snapshot() == before
 
 
+def _identity_claim_backends() -> list[tuple[str, Any, Any]]:
+    """(name, IntegrationRepository, DeviceComponentRepository) for both implementations."""
+    in_memory = InMemoryM1Repositories(clock=Clock(NOW))
+    dynamo = DynamoM1Repositories.over(ConditionalDynamoClient(), clock=lambda: NOW)
+    return [
+        ("in_memory", in_memory, in_memory),
+        ("dynamo", dynamo.integration_repository, dynamo.device_component_repository),
+    ]
+
+
+def _receipt(tenant_id: str, scope: str, index: int):
+    return new_idempotency_receipt(
+        tenant_id=tenant_id,
+        scope=scope,
+        key_hash=f"{index:064x}",
+        request_hash="b" * 64,
+        response_snapshot_json="{}",
+        created_at=NOW,
+    )
+
+
+def _claim(integrations: Any, tenant_id: str, index: int, account_id: str, device_id: str):
+    integration = DeviceIntegration(
+        tenant_id=tenant_id,
+        device_integration_id=f"di_{index:032x}",
+        device_id=device_id,
+        integration_account_id=account_id,
+        provider_key="vendor.cloud",
+        external_identity_hash="c" * 64,
+        created_at=NOW,
+        updated_at=NOW,
+        version=1,
+    )
+    return asyncio.run(
+        integrations.create_device_integration(
+            integration, _receipt(tenant_id, "device-integration-create", index)
+        )
+    )
+
+
+def _seed_tenant(integrations: Any, devices: Any, tenant_id: str, index: int) -> tuple[str, str]:
+    account = IntegrationAccount(
+        tenant_id=tenant_id,
+        integration_account_id=f"ia_{index:032x}",
+        provider_key="vendor.cloud",
+        display_name="Vendor",
+        created_at=NOW,
+        updated_at=NOW,
+        version=1,
+    )
+    device = DeviceV2(
+        tenant_id=tenant_id,
+        device_id=f"dev_{index:032x}",
+        name="Gateway",
+        created_at=NOW,
+        updated_at=NOW,
+        version=1,
+    )
+    asyncio.run(
+        integrations.create_integration_account(
+            account, _receipt(tenant_id, "integration-account-create", index)
+        )
+    )
+    asyncio.run(devices.create_device(device, _receipt(tenant_id, "device-create", index)))
+    return account.integration_account_id, device.device_id
+
+
+def test_external_identity_claims_are_global_on_both_backends() -> None:
+    outcomes = {}
+    for name, integrations, devices in _identity_claim_backends():
+        account_a, device_a = _seed_tenant(integrations, devices, "tnt_a", 1)
+        account_b, device_b = _seed_tenant(integrations, devices, "tnt_b", 2)
+        _claim(integrations, "tnt_a", 10, account_a, device_a)
+        messages = []
+        # Same tenant, a different integration id, the same provider identity.
+        with pytest.raises(ConflictError) as same_tenant:
+            _claim(integrations, "tnt_a", 11, account_a, device_a)
+        messages.append(str(same_tenant.value))
+        # Another tenant claiming the same provider identity.
+        with pytest.raises(ConflictError) as cross_tenant:
+            _claim(integrations, "tnt_b", 12, account_b, device_b)
+        messages.append(str(cross_tenant.value))
+        listed = asyncio.run(integrations.list_device_integrations("tnt_b", device_b))
+        assert listed == [], name
+        outcomes[name] = messages
+
+    assert outcomes["in_memory"] == outcomes["dynamo"] == ["external identity already claimed"] * 2
+
+
 # 2) West -> East relocation keeps the old event-time assignment ------------------------------------
 
 
@@ -565,6 +659,48 @@ def test_pure_core_has_no_aws_thing_certificate_shadow_or_redis_authority() -> N
 # 6) Applying the migration twice duplicates nothing ------------------------------------------------
 
 
+MIGRATION_RECEIPT_KEY = (f"TENANT#{TENANT}", "MIGRATION#M1#DEFAULT_SITE_ASSET_DEVICE")
+
+
+def assert_second_apply_only_bumped_the_receipt(
+    after_first: dict[tuple[str, str], dict], after_second: dict[tuple[str, str], dict]
+) -> None:
+    """Idempotency over the full key union: nothing added, removed or changed except the
+    receipt, which exists after both applies and records exactly one more run."""
+    assert MIGRATION_RECEIPT_KEY in after_first and MIGRATION_RECEIPT_KEY in after_second
+    assert after_first[MIGRATION_RECEIPT_KEY]["run_count"] == 1
+    assert after_second[MIGRATION_RECEIPT_KEY]["run_count"] == 2
+    assert set(after_first) == set(after_second)
+    without_receipt = [
+        {key: item for key, item in snapshot.items() if key != MIGRATION_RECEIPT_KEY}
+        for snapshot in (after_first, after_second)
+    ]
+    assert without_receipt[0] == without_receipt[1]
+
+
+def _deterministic_row_keys() -> dict[str, tuple[str, str]]:
+    component_id = default_component_id_for_legacy_device(TENANT, LEGACY_DEVICE)
+    marker = deployment_marker_key(component_id)
+    return {
+        "pond_profile": (f"ASSET#{asset_id_for_legacy_pond(TENANT, WEST_POND)}", "PROFILE#POND"),
+        "current": (f"COMPONENT#{component_id}", "DEPLOYMENT#CURRENT"),
+        "marker": (marker["PK"], marker["SK"]),
+    }
+
+
+@pytest.mark.parametrize("row", ["pond_profile", "current", "marker"])
+def test_idempotency_check_detects_a_row_lost_between_applies(row: str) -> None:
+    client = migrated_store()
+    after_first = client.snapshot()
+    key = _deterministic_row_keys()[row]
+    assert key in after_first
+    after_second = {k: dict(v) for k, v in after_first.items() if k != key}
+    after_second[MIGRATION_RECEIPT_KEY]["run_count"] = 2
+
+    with pytest.raises(AssertionError):
+        assert_second_apply_only_bumped_the_receipt(after_first, after_second)
+
+
 def test_migration_dry_run_then_apply_twice_duplicates_nothing() -> None:
     client = legacy_store()
     legacy = client.snapshot()
@@ -588,10 +724,7 @@ def test_migration_dry_run_then_apply_twice_duplicates_nothing() -> None:
     assert second.already_migrated > 0
     assert second.schema_conflicts == 0
 
-    receipt = ("TENANT#" + TENANT, "MIGRATION#M1#DEFAULT_SITE_ASSET_DEVICE")
-    changed = {key for key, item in client.snapshot().items() if after_first.get(key) != item}
-    assert changed == {receipt}
-    assert client.item(*receipt)["run_count"] == 2
+    assert_second_apply_only_bumped_the_receipt(after_first, client.snapshot())
     assert client.keys_with_sk_prefix("SITE#") == {
         (f"TENANT#{TENANT}", f"SITE#{default_site_id(TENANT)}")
     }

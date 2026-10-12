@@ -100,8 +100,9 @@ conditional transactions and ignores the 1 MB Query page, so its results do not 
    [Drift repair](#drift-repair)). Then set `V1_POND_DEVICE_PROJECTION_ENABLED=true` for the
    rollout environment, restart every API instance and verify the flags took effect.
 9. **Run the full gate.** Run the release gate. Then watch the `/v1` and `/v2` `409` and `503`
-   rates. A sustained `503` on `/v1` Pond/Device routes means M1 app state is incomplete; roll
-   back.
+   rates. Diagnose a sustained `503` on `/v1` Pond/Device routes with
+   [Diagnosing 503 on /v1 Ponds and Devices](#diagnosing-503-on-v1-ponds-and-devices) before
+   touching any flag.
 
 ## Rollback
 
@@ -131,9 +132,38 @@ replaced):
   deployed revision with `tests/contracts/openapi/v1.json`).
 - `V1_POND_DEVICE_PROJECTION_ENABLED`: `/v1` reads look the same with either value (D1), so
   confirm the value in the running process's environment for every instance, and check that
-  `GET /v1/tenants/<pilot>/ponds` and `/devices` return `200` (a `503` with the flag on means M1
-  app state is incomplete; roll back). Do not probe with writes: with the flag off a patch to a
+  `GET /v1/tenants/<pilot>/ponds` and `/devices` return `200` (for a `503`, see
+  [Diagnosing 503 on /v1 Ponds and Devices](#diagnosing-503-on-v1-ponds-and-devices)). Do not probe with writes: with the flag off a patch to a
   nonexistent `pond_id` succeeds and creates exactly the `device_missing_pond` state.
+
+### Diagnosing 503 on /v1 Ponds and Devices
+
+A `503 {"detail": "service unavailable"}` on `/v1` Ponds or Devices has more than one cause, and
+the body is identical for all of them:
+
+- **Infrastructure:** `main.py` maps every DynamoDB `ClientError` and `BotoCoreError` to that
+  same `503` on every route, and membership resolution (which also reads DynamoDB and Redis)
+  runs before the Pond/Device handler.
+- **Incomplete M1 app state (flag on only):** `get_v1_pond_device_projection` in
+  `api/dependencies.py` raises `HTTPException(status_code=503, detail="service unavailable")`
+  when any of `site_asset_repository`, `device_component_repository`,
+  `integration_repository` or `deployment_repository` is missing from `app.state`, or when the
+  Site/Asset repository has no `table_name`/`client`. It **logs nothing** distinctive, so
+  identify it by elimination.
+
+Steps:
+
+1. For the same tenant and token, call `/v1` routes that do not use the projection, e.g.
+   `GET /v1/tenants/<t>/alert-rules` and a telemetry read. If they also return `503`, it is an
+   infrastructure or membership failure.
+2. Check the API logs around the failing requests for a logged DynamoDB/botocore, Redis or
+   membership exception (the infrastructure handler itself does not log; look for the
+   framework/server error logs and the dependency's own logs and metrics).
+3. **Infrastructure:** fix the dependency (DynamoDB, network, credentials, Redis). Do **not**
+   change any flag.
+4. **Only Ponds/Devices fail, other `/v1` routes are healthy, and no infrastructure error is
+   logged:** this is the projection's missing-repository `503`. Roll back the flags (see
+   [Rollback](#rollback)), then fix the deployment so all four M1 repositories are created.
 
 ## Migration exit codes
 
@@ -234,7 +264,14 @@ rollback.
 - Version conflicts read `"pond version conflict"` or `"device version conflict"`. The v1 and v2
   version counters are independent (D2).
 - `409` for archived or inactive targets (flag on only; see [Drift repair](#drift-repair) for
-  the flag-off outcome), and for legacy identifiers that are not v2-compatible.
+  the flag-off outcome).
+- Legacy identifiers that are not v2-compatible (outside `[A-Za-z0-9][A-Za-z0-9._:-]{0,127}`, or
+  a `dev_` id that is not `dev_<32 lower-hex>`): flag-on `/v1` **create and update** writes
+  return `409`. **Reads do not check this:** `list_ponds`, `get_pond`, `list_devices` and
+  `get_device` return the legacy row unchanged (`200`) with either flag value, and a row that does
+  not parse as a legacy Pond or Device at all fails the request with `500`. A successful read
+  therefore does not mean a row is v2-compatible. The migration dry-run is the detector: it
+  reports such rows as `pond_invalid` or `device_invalid` (exit `2`).
 - `/v2` cannot start or end Deployments of the legacy default Components; it returns `409`
   "legacy default component deployments are managed through /v1" (D3).
 
