@@ -4,6 +4,7 @@ import boto3
 import redis.asyncio as redis
 from botocore.exceptions import BotoCoreError, ClientError
 from fastapi import FastAPI
+from fastapi.exceptions import RequestValidationError
 from fastapi.requests import Request
 from fastapi.responses import JSONResponse
 from influxdb_client import InfluxDBClient
@@ -12,6 +13,10 @@ from limnopulse_api.adapters.alert_events import DynamoAlertEventRepository
 from limnopulse_api.adapters.alert_rules import DynamoAlertRuleRepository
 from limnopulse_api.adapters.leads import DynamoLeadRepository
 from limnopulse_api.adapters.dynamodb import DynamoDomainRepository
+from limnopulse_api.adapters.dynamodb_deployments import DynamoDeploymentRepository
+from limnopulse_api.adapters.dynamodb_devices_v2 import DynamoDeviceComponentRepository
+from limnopulse_api.adapters.dynamodb_integrations import DynamoIntegrationRepository
+from limnopulse_api.adapters.dynamodb_sites_assets import DynamoSiteAssetRepository
 from limnopulse_api.adapters.influxdb import InfluxTelemetryRepository
 from limnopulse_api.adapters.notification_preferences import (
     DynamoNotificationPreferenceRepository,
@@ -19,6 +24,7 @@ from limnopulse_api.adapters.notification_preferences import (
 from limnopulse_api.adapters.redis import RedisCacheRepository
 from limnopulse_api.adapters.telegram_bindings import DynamoTelegramBindingRepository
 from limnopulse_api.api.router import build_api_router
+from limnopulse_api.api.v2.router import v2_safe_request_validation_exception_handler
 from limnopulse_api.auth.providers import build_auth_provider
 from limnopulse_api.core.config import Settings, get_settings
 from limnopulse_api.core.errors import TelemetryQueryError
@@ -76,6 +82,10 @@ def create_app(settings: Settings | None = None) -> FastAPI:
                 "redis_client",
                 "telemetry_repository",
                 "influxdb_client",
+                "site_asset_repository",
+                "device_component_repository",
+                "integration_repository",
+                "deployment_repository",
             )
         ):
             yield
@@ -113,6 +123,18 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         app.state.telegram_binding_repository = DynamoTelegramBindingRepository(
             table_name=resolved_settings.dynamodb_domain_table,
             client=dynamodb_client,
+        )
+        app.state.site_asset_repository = DynamoSiteAssetRepository(
+            resolved_settings.dynamodb_domain_table, dynamodb_client
+        )
+        app.state.device_component_repository = DynamoDeviceComponentRepository(
+            resolved_settings.dynamodb_domain_table, dynamodb_client
+        )
+        app.state.integration_repository = DynamoIntegrationRepository(
+            resolved_settings.dynamodb_domain_table, dynamodb_client
+        )
+        app.state.deployment_repository = DynamoDeploymentRepository(
+            resolved_settings.dynamodb_domain_table, dynamodb_client
         )
         if resolved_settings.auth_mode == "dev":
             app.state.cognito_identity_verifier = DevIdentityVerifier()
@@ -179,8 +201,12 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     app.add_exception_handler(BotoCoreError, _handle_infrastructure_error)
     app.add_exception_handler(ClientError, _handle_infrastructure_error)
     app.add_exception_handler(TelemetryQueryError, _handle_infrastructure_error)
+    app.add_exception_handler(RequestValidationError, v2_safe_request_validation_exception_handler)
     app.include_router(
-        build_api_router(telegram_webhook_enabled=resolved_settings.telegram_webhook_enabled)
+        build_api_router(
+            telegram_webhook_enabled=resolved_settings.telegram_webhook_enabled,
+            enable_v2=resolved_settings.api_v2_enabled,
+        )
     )
     return app
 

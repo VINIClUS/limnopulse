@@ -1,10 +1,10 @@
 from limnopulse_api.domain.entities import Pond
 from limnopulse_api.domain.ids import new_pond_id
-from limnopulse_api.repositories.domain import DomainRepository
+from limnopulse_api.repositories.v1_pond_device_projection import V1PondDeviceProjection
 
 
 class PondService:
-    def __init__(self, repository: DomainRepository) -> None:
+    def __init__(self, repository: V1PondDeviceProjection) -> None:
         self.repository = repository
 
     async def list(self, tenant_id: str) -> list[Pond]:
