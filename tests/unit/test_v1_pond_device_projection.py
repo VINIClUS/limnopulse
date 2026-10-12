@@ -183,16 +183,15 @@ class FakeDynamoClient:
 
     def get_item(self, **kwargs):
         key = self._plain(kwargs["Key"])
-        if self.site_read_barrier is not None and key["SK"].startswith("SITE#"):
-            # The first two Site reads rendezvous, so both writers observe "no Site yet".
-            with self.lock:
-                wait = self.site_barrier_waits > 0
-                self.site_barrier_waits -= 1
-            if wait:
-                self.site_read_barrier.wait(timeout=5)
         with self.lock:
             item = self.items.get((key["PK"], key["SK"]))
-            return {} if item is None else {"Item": self._encode(item)}
+            wait = key["SK"].startswith("SITE#") and self.site_barrier_waits > 0
+            self.site_barrier_waits -= int(wait)
+        if wait:
+            # The first two Site reads both complete before either writer continues, so both
+            # observe "no Site yet".
+            self.site_read_barrier.wait(timeout=5)
+        return {} if item is None else {"Item": self._encode(item)}
 
     def query(self, **kwargs):
         self.queries.append(kwargs)
