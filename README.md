@@ -166,7 +166,7 @@ for secrets, backfill, rollout, rollback, retry semantics and DLQ handling.
 Two independent rollout flags, both `false` by default (see `.env.example`):
 
 - `API_V2_ENABLED` mounts the M1 `/v2` domain API.
-- `V1_POND_DEVICE_PROJECTION_ENABLED` serves `/v1` Pond/Device reads from v2 records.
+- `V1_POND_DEVICE_PROJECTION_ENABLED` makes `/v1` Pond/Device writes dual-write to v2 records and lazily provision them; `/v1` reads stay on the legacy `POND#`/`DEVICE#` rows. With it on, a `/v1` device create or patch without a `pond_id` returns `409`.
 
 With `API_V2_ENABLED=true` only the M1 route groups are mounted:
 
@@ -186,7 +186,7 @@ GET/POST  /v2/tenants/{tenant_id}/deployments
 POST      /v2/tenants/{tenant_id}/deployments/{deployment_id}/end
 ```
 
-There are no `/v2` telemetry, observation, health, calibration, billing, AWS IoT, notification-destination or command routes. `/v1` is unchanged with either flag. Rollout follows the M1-08 runbook (to be added). A local `.env` with `API_V2_ENABLED=true` changes the default route count that the tenant-mapping conformance tests expect, so keep it `false` when running the test suite.
+There are no `/v2` telemetry, observation, health, calibration, billing, AWS IoT, notification-destination or command routes. `API_V2_ENABLED` does not change any `/v1` path, dependency or response. Rollout follows the M1-08 runbook (to be added). A local `.env` with `API_V2_ENABLED=true` changes the default route count that the tenant-mapping conformance tests expect, so keep it `false` when running the test suite.
 
 ## Local Telemetry Ingestion
 

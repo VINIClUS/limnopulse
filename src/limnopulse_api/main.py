@@ -201,9 +201,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     app.add_exception_handler(BotoCoreError, _handle_infrastructure_error)
     app.add_exception_handler(ClientError, _handle_infrastructure_error)
     app.add_exception_handler(TelemetryQueryError, _handle_infrastructure_error)
-    app.add_exception_handler(
-        RequestValidationError, v2_safe_request_validation_exception_handler
-    )
+    app.add_exception_handler(RequestValidationError, v2_safe_request_validation_exception_handler)
     app.include_router(
         build_api_router(
             telegram_webhook_enabled=resolved_settings.telegram_webhook_enabled,

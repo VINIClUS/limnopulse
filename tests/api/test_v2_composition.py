@@ -66,6 +66,12 @@ FORBIDDEN_V2_FRAGMENTS = (
 )
 
 
+@pytest.fixture(autouse=True)
+def _isolate_flag_environment(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.delenv("API_V2_ENABLED", raising=False)
+    monkeypatch.delenv("V1_POND_DEVICE_PROJECTION_ENABLED", raising=False)
+
+
 def _settings(**overrides: object) -> Settings:
     return Settings(_env_file=None, app_env="test", auth_mode="dev", **overrides)
 
@@ -252,3 +258,26 @@ def test_v1_validation_errors_keep_framework_default_body() -> None:
     )
     assert (custom.status_code, custom.json()) == (default.status_code, default.json())
     assert default.json()["detail"][0]["input"] == "x"
+
+
+def test_non_finite_body_returns_json_422_behind_root_path() -> None:
+    app = create_app(_settings(api_v2_enabled=True))
+    app.state.membership_service = _WriterMembershipService()
+    app.state.site_asset_repository = _UnreachableRepository()
+    app.state.alert_event_repository = _UnreachableRepository()
+
+    with TestClient(app, root_path="/api", raise_server_exceptions=False) as client:
+        response = client.post(
+            f"/api/v2/tenants/{TENANT}/sites",
+            content='{"name": NaN}',
+            headers={**AUTH, "Content-Type": "application/json"},
+        )
+        v1_response = client.get(
+            f"/api/v1/tenants/{TENANT}/alert-events/active", params={"limit": "x"}, headers=AUTH
+        )
+
+    assert response.status_code == 422
+    assert "NaN" not in response.text
+    assert json.loads(response.text)["detail"]
+    assert v1_response.status_code == 422
+    assert v1_response.json()["detail"][0]["input"] == "x"

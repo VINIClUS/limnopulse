@@ -8,6 +8,7 @@ from fastapi.encoders import jsonable_encoder
 from fastapi.exception_handlers import request_validation_exception_handler
 from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse, Response
+from starlette._utils import get_route_path
 
 from limnopulse_api.api.v2.routers import (
     assets,
@@ -43,7 +44,7 @@ def _json_safe(value: Any) -> Any:
 
 
 def _is_v2_request(request: Request) -> bool:
-    path = request.scope.get("path", "")
+    path = get_route_path(request.scope)
     return path == V2_PREFIX or path.startswith(f"{V2_PREFIX}/")
 
 
