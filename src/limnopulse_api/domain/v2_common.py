@@ -10,6 +10,8 @@ from limnopulse_api.core.errors import ConflictError
 from limnopulse_api.domain.ids import require_device_id, require_safe_id
 
 IDEMPOTENCY_RECEIPT_TTL = timedelta(hours=24)
+IDEMPOTENCY_KEY_MIN_LENGTH = 8
+IDEMPOTENCY_KEY_MAX_LENGTH = 128
 SHA256_HEX_PATTERN = r"^[0-9a-f]{64}$"
 CAPABILITY_KEY_PATTERN = r"^[a-z][a-z0-9]*(?:[._][a-z0-9]+)*$"
 PROVIDER_KEY_PATTERN = r"^[a-z][a-z0-9_]*(?:\.[a-z0-9_]+)*$"

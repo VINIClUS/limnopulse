@@ -19,6 +19,8 @@ from botocore.exceptions import ClientError
 
 from limnopulse_api.core.errors import ConflictError
 from limnopulse_api.domain.v2_common import (
+    IDEMPOTENCY_KEY_MAX_LENGTH,
+    IDEMPOTENCY_KEY_MIN_LENGTH,
     IDEMPOTENCY_RECEIPT_TTL,
     PROVIDER_KEY_PATTERN,
     IdempotencyReceipt,
@@ -26,8 +28,6 @@ from limnopulse_api.domain.v2_common import (
 )
 
 MAX_TRANSACTION_ACTIONS = 100
-IDEMPOTENCY_KEY_MIN_LENGTH = 8
-IDEMPOTENCY_KEY_MAX_LENGTH = 128
 RECEIPT_ENTITY_TYPE = "idempotency_receipt"
 
 
