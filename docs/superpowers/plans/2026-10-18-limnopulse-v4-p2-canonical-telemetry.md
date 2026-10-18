@@ -1205,11 +1205,12 @@ Each task runs in its own Claude Code session on its branch. The orchestrator se
 2. **Red.** Write only the focused tests. Run them and record the red output: command, exit code, failure summary. Commit with `test(p2-nn): …` and push the branch.
 3. **Test audit gate.**
    - **Reviewers.** Two fresh reviewer subagents, given only the issue, this plan section and the test diff, each produce a table: test id → acceptance criterion → mutant it kills → verdict (useful / weak / redundant / wrong).
-   - **Mutants.** For encoders, guards, thresholds, D7/D8 and parity, the session applies at least three mutants locally and records the failing test ids.
+   - **Mutants (red phase).** No implementation exists yet, so the "mutant it kills" column names the concrete wrong implementation each test would reject. Tests that would pass against a trivially wrong or empty implementation are rewritten.
    - **Hand-off.** The session fixes the findings, pushes, and ends its turn with `TESTS READY <sha>`, the red-run evidence and both tables. It also comments that summary on the task issue.
    - **Approval.** The orchestrator runs its own independent audit and replies `TESTS APPROVED <sha>` or lists the required changes. It records the approval as an issue comment.
    - **Freeze.** Tests are frozen at the approved sha. Any later change to an approved test needs re-approval. The PR body includes `git diff --stat <sha>..HEAD -- tests '**/*_test.go'` and links the approval.
 4. **Green.** Implement the minimum production code needed to pass. Run the focused tests, `make verify-python`, `make verify-go`, `git diff --check` and the `/v1` OpenAPI `--check`. Run `make verify-influx` (local `run_local_influxd.sh`) when integration tests exist.
+   - **Mutation check.** Apply at least three deliberate mutants to the new production code, prioritizing encoders, guards, thresholds, D7/D8 and parity paths. Confirm that an approved test fails for each mutant, then revert. Record the mutant → failing test id table in the PR. A surviving mutant means a missing test, which needs re-approval.
 5. **Review.** Two independent reviewer subagents audit the full diff against this plan: one for correctness and the other for behavior/contract. Fix every finding with a regression test.
 6. **PR.** Open one PR that closes the task issue. Its body records the fail-then-pass evidence, the approval link, every gate command and its result, and the head sha. Subscribe to PR activity. Address automated reviews (Codex, Sonar) with fixes or reasoned replies. End the turn with `PR READY #<n> <sha>`.
 7. **Merge.**
