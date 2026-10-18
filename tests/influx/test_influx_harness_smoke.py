@@ -45,9 +45,9 @@ EXPECTED = [(MEASUREMENT, "value", "p1", 21.5, POINT_TIME)]
 def server() -> Iterator[InfluxDBClient]:
     """An independent client built from the contract defaults, not from the harness."""
     client = InfluxDBClient(
-        url=os.getenv("INFLUX_INTEGRATION_URL", "http://127.0.0.1:8086"),
-        token=os.getenv("INFLUX_INTEGRATION_TOKEN", "local-dev-token"),
-        org=os.getenv("INFLUX_INTEGRATION_ORG", "limnopulse"),
+        url=os.getenv("INFLUX_INTEGRATION_URL") or "http://127.0.0.1:8086",
+        token=os.getenv("INFLUX_INTEGRATION_TOKEN") or "local-dev-token",
+        org=os.getenv("INFLUX_INTEGRATION_ORG") or "limnopulse",
     )
     try:
         yield client
