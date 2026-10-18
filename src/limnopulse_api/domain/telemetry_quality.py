@@ -16,6 +16,7 @@ from limnopulse_api.domain.telemetry_v2 import (
     QualityFlag,
     QualityProvenance,
     QualityState,
+    require_telemetry_time,
 )
 
 
@@ -43,9 +44,15 @@ def _microseconds(delta: timedelta) -> int:
     return delta.days * _MICROSECONDS_PER_DAY + delta.seconds * 1_000_000 + delta.microseconds
 
 
+def _delay(observed_at: datetime, received_at: datetime) -> timedelta:
+    # Subtract UTC instants: same-tzinfo aware datetimes subtract as wall clocks (DST folds),
+    # and the shared validator rejects naive or out-of-window times like the encoder does.
+    return require_telemetry_time(received_at) - require_telemetry_time(observed_at)
+
+
 def delay_ms(observed_at: datetime, received_at: datetime) -> int:
     """`(received_us - observed_us) // 1000`: exact integer floor, negative values included."""
-    return _microseconds(received_at - observed_at) // 1000
+    return _microseconds(_delay(observed_at, received_at)) // 1000
 
 
 def classify_quality(
@@ -71,12 +78,12 @@ def classify_quality(
         state = QualityState.OUT_OF_RANGE
         provenance.append(QualityProvenance.PLAUSIBLE_RANGE)
 
-    delay = received_at - observed_at
+    delay = _delay(observed_at, received_at)
     if -delay > policy.future_skew_threshold:
         flags.add(QualityFlag.CLOCK_SKEW_FUTURE)
     if delay > policy.past_extreme_skew_threshold:
         flags.add(QualityFlag.CLOCK_SKEW_PAST_EXTREME)
-    if flags:
+    if flags:  # only the two skew flags can be set at this point
         provenance.append(QualityProvenance.CLOCK_SKEW)
     if delay > policy.delay_threshold:
         flags.add(QualityFlag.DELAYED)

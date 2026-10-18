@@ -1,8 +1,10 @@
 """P2-02: versioned, injectable unit conversion (`unit-mapping@1`, D2)."""
 
 import ast
+import copy
 import inspect
 import math
+import pickle
 import struct
 from collections.abc import Mapping
 from decimal import Decimal
@@ -149,6 +151,16 @@ def test_unit_conversion_error_carries_reason_and_detail() -> None:
     assert isinstance(error, Exception)
     assert error.reason is QuarantineReason.UNIT_UNSUPPORTED
     assert error.detail == "unit 'x' not accepted"
+    assert "unit 'x' not accepted" in str(error)
+
+
+def test_unit_conversion_error_survives_pickle_and_copy() -> None:
+    error = UnitConversionError(QuarantineReason.VALUE_INVALID, "value must be finite")
+    for clone in (pickle.loads(pickle.dumps(error)), copy.copy(error), copy.deepcopy(error)):
+        assert type(clone) is UnitConversionError
+        assert clone.reason is QuarantineReason.VALUE_INVALID
+        assert clone.detail == "value must be finite"
+        assert str(clone) == str(error)
 
 
 # --- every row of the locked table ----------------------------------------------------------

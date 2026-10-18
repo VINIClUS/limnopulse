@@ -70,9 +70,13 @@ class UnitConversionError(Exception):
     """
 
     def __init__(self, reason: QuarantineReason, detail: str) -> None:
-        super().__init__(f"{reason}: {detail}")
+        # Both constructor arguments live in `args`, so pickle and copy rebuild the error.
+        super().__init__(reason, detail)
         self.reason = reason
         self.detail = detail
+
+    def __str__(self) -> str:
+        return f"{self.reason}: {self.detail}"
 
 
 def _invalid(detail: str) -> UnitConversionError:

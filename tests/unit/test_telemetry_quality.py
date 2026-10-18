@@ -5,6 +5,7 @@ import inspect
 import math
 from collections.abc import Mapping
 from datetime import UTC, datetime, timedelta, timezone
+from zoneinfo import ZoneInfo
 
 import pytest
 
@@ -441,6 +442,55 @@ def test_delay_ms_is_exact_over_the_whole_telemetry_time_range() -> None:
     micros = (delta.days * 86_400 + delta.seconds) * 1_000_000 + delta.microseconds
     assert delay_ms(observed, received) == micros // 1000
     assert delay_ms(received, observed) == (-micros) // 1000
+
+
+NEW_YORK = ZoneInfo("America/New_York")
+
+
+def test_fall_back_fold_is_compared_as_instants() -> None:
+    # 01:30 EDT (05:30Z) then 01:30 EST (06:30Z): same wall clock and tzinfo, one hour apart.
+    observed = datetime(2026, 11, 1, 1, 30, tzinfo=NEW_YORK, fold=0)
+    received = datetime(2026, 11, 1, 1, 30, tzinfo=NEW_YORK, fold=1)
+    assert delay_ms(observed, received) == 3_600_000
+    quality = classify_quality(
+        metric(), 25.0, observed_at=observed, received_at=received, replay=False
+    )
+    assert quality == expected(VALID, (DELAYED,), (TIMELINESS,))
+
+
+def test_spring_forward_gap_is_compared_as_instants() -> None:
+    # 01:58 EST (06:58Z) then 03:02 EDT (07:02Z): 64 wall-clock minutes, 4 real minutes.
+    observed = datetime(2026, 3, 8, 1, 58, tzinfo=NEW_YORK)
+    received = datetime(2026, 3, 8, 3, 2, tzinfo=NEW_YORK)
+    assert delay_ms(observed, received) == 240_000
+    quality = classify_quality(
+        metric(), 25.0, observed_at=observed, received_at=received, replay=False
+    )
+    assert quality == expected()
+
+
+@pytest.mark.parametrize("naive_side", ["observed", "received"])
+def test_naive_datetimes_are_rejected(naive_side: str) -> None:
+    aware = OBSERVED
+    naive = OBSERVED.replace(tzinfo=None)
+    observed, received = (naive, aware) if naive_side == "observed" else (aware, naive)
+    with pytest.raises(ValueError):
+        delay_ms(observed, received)
+    with pytest.raises(ValueError):
+        classify_quality(metric(), 25.0, observed_at=observed, received_at=received, replay=False)
+
+
+@pytest.mark.parametrize(
+    "outside", [MIN_TELEMETRY_TIME - MICRO, datetime(1969, 12, 31, 23, 0, tzinfo=UTC)]
+)
+def test_instants_outside_the_telemetry_window_are_rejected(outside: datetime) -> None:
+    for observed, received in ((outside, OBSERVED), (OBSERVED, outside)):
+        with pytest.raises(ValueError):
+            delay_ms(observed, received)
+        with pytest.raises(ValueError):
+            classify_quality(
+                metric(), 25.0, observed_at=observed, received_at=received, replay=False
+            )
 
 
 def test_delay_ms_compares_instants_across_offsets() -> None:
