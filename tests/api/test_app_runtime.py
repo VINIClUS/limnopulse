@@ -13,6 +13,8 @@ from limnopulse_api.adapters.dynamodb_deployments import DynamoDeploymentReposit
 from limnopulse_api.adapters.dynamodb_devices_v2 import DynamoDeviceComponentRepository
 from limnopulse_api.adapters.dynamodb_integrations import DynamoIntegrationRepository
 from limnopulse_api.adapters.dynamodb_sites_assets import DynamoSiteAssetRepository
+from limnopulse_api.adapters.influxdb import InfluxTelemetryRepository
+from limnopulse_api.adapters.influxdb_v2_reader import InfluxObservationReader
 from limnopulse_api.adapters.notification_preferences import (
     DynamoNotificationPreferenceRepository,
 )
@@ -28,6 +30,7 @@ from limnopulse_api.services.telegram_bindings import TelegramBindingService
 from limnopulse_api.services.telegram_webhook_secret import (
     StaticTelegramWebhookSecretVerifier,
 )
+from limnopulse_api.services.telemetry_v2_writes import ObservationWriteService
 
 TEST_ISSUER = "https://cognito-idp.us-east-1.amazonaws.com/pool_1"
 M1_REPOSITORY_TYPES = {
@@ -36,6 +39,19 @@ M1_REPOSITORY_TYPES = {
     "integration_repository": DynamoIntegrationRepository,
     "deployment_repository": DynamoDeploymentRepository,
 }
+P2_STATE_NAMES = ("observation_reader", "observation_writer", "observation_write_service")
+P2_FLAG_ENVIRONMENT = (
+    "TELEMETRY_V2_WRITE_ENABLED",
+    "TELEMETRY_LEGACY_DUAL_WRITE_ENABLED",
+    "API_V2_TELEMETRY_ENABLED",
+    "V1_TELEMETRY_READ_SOURCE",
+)
+
+
+@pytest.fixture(autouse=True)
+def _isolate_p2_flag_environment(monkeypatch) -> None:
+    for name in P2_FLAG_ENVIRONMENT:
+        monkeypatch.delenv(name, raising=False)
 
 
 class FakeRedisClient:
@@ -163,6 +179,8 @@ def test_app_lifespan_wires_runtime_dependencies(monkeypatch) -> None:
     assert not hasattr(app.state, "telemetry_repository")
     for name in M1_REPOSITORY_TYPES:
         assert not hasattr(app.state, name)
+    for name in P2_STATE_NAMES:
+        assert not hasattr(app.state, name)
 
     with TestClient(app):
         assert dynamo_calls == [
@@ -226,6 +244,18 @@ def test_app_lifespan_wires_runtime_dependencies(monkeypatch) -> None:
         assert app.state.telemetry_repository.query_api is fake_query_api
         assert app.state.telemetry_repository.org == "limnopulse"
         assert app.state.telemetry_repository.bucket == "limnopulse_raw"
+        assert type(app.state.telemetry_repository) is InfluxTelemetryRepository
+        # The fake client has no write_api(): with every switch off none may be created.
+        assert isinstance(app.state.observation_reader, InfluxObservationReader)
+        assert app.state.observation_reader.query_api is fake_query_api
+        assert app.state.observation_reader.org == "limnopulse"
+        assert app.state.observation_reader.bucket == "limnopulse_raw"
+        assert app.state.observation_writer is None
+        assert isinstance(app.state.observation_write_service, ObservationWriteService)
+        assert app.state.observation_write_service.writer is None
+        assert app.state.observation_write_service.legacy_writer is None
+        write_service = app.state.observation_write_service
+        assert write_service.site_assets is app.state.site_asset_repository
         assert isinstance(app.state.auth_provider, CognitoJwtAuthProvider)
         assert app.state.auth_provider.key_store.cache is app.state.cache_repository
 
@@ -382,7 +412,7 @@ def test_lifespan_wires_m1_repositories_to_the_one_dynamo_client(
         assert {repository.table_name for repository in repositories} == {"DomainUnderTest"}
 
 
-@pytest.mark.parametrize("prewired_name", list(M1_REPOSITORY_TYPES))
+@pytest.mark.parametrize("prewired_name", [*M1_REPOSITORY_TYPES, *P2_STATE_NAMES])
 def test_prewired_m1_repository_skips_runtime_wiring(monkeypatch, prewired_name: str) -> None:
     def fail(*args, **kwargs):
         raise AssertionError("prewired test apps must not create runtime clients")
