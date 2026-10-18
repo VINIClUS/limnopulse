@@ -1,10 +1,12 @@
 """Unit tests for the dual-write service (P2-03): switches, D7 exclusions and failure order."""
 
+import asyncio
 import inspect
 from collections.abc import Sequence
 from datetime import UTC, datetime
 
 import pytest
+
 from limnopulse_api.core.errors import TelemetryWriteError
 from limnopulse_api.domain.assets import Asset, AssetType, AssetWithPondProfile, PondProfile
 from limnopulse_api.domain.telemetry_v2 import (
@@ -528,20 +530,40 @@ async def test_legacy_failure_after_v2_success_raises(retryable: bool) -> None:
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("failing", ["v2", "legacy"])
-async def test_any_writer_failure_surfaces_as_telemetry_write_error(failing: str) -> None:
-    """D9: any failure raises TelemetryWriteError, even one a writer did not classify."""
+async def test_unclassified_writer_failure_is_a_permanent_telemetry_write_error(
+    failing: str,
+) -> None:
+    """D9: any failure raises TelemetryWriteError. The writer owns transport classification, so
+    an exception that reaches the service unclassified is a bug and must not loop: permanent."""
     item = scenario("legacy_sample")
-    error = OSError("socket closed")
+    error = RuntimeError("boom")
     harness = Harness(
         site_assets=assets_for(item),
         v2_error=error if failing == "v2" else None,
         legacy_error=error if failing == "legacy" else None,
     )
 
-    with pytest.raises(TelemetryWriteError):
+    with pytest.raises(TelemetryWriteError) as raised:
         await harness.service.write(item.observations)
 
+    assert raised.value.retryable is False
+    assert raised.value.__cause__ is error
     assert harness.events == (["v2"] if failing == "v2" else ["v2", "legacy"])
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("failing", ["v2", "legacy"])
+async def test_writer_cancellation_propagates_unwrapped(failing: str) -> None:
+    item = scenario("legacy_sample")
+    error = asyncio.CancelledError()
+    harness = Harness(
+        site_assets=assets_for(item),
+        v2_error=error if failing == "v2" else None,
+        legacy_error=error if failing == "legacy" else None,
+    )
+
+    with pytest.raises(asyncio.CancelledError):
+        await harness.service.write(item.observations)
 
 
 # --- batch limit ------------------------------------------------------------------------------
@@ -571,10 +593,9 @@ async def test_batch_over_the_limit_is_rejected_before_any_write(v2: bool, legac
     item = scenario("multi_point_series")
     harness = Harness(site_assets=assets_for(item), v2=v2, legacy=legacy)
 
-    with pytest.raises((ValueError, TelemetryWriteError)) as raised:
+    with pytest.raises(TelemetryWriteError) as raised:
         await harness.service.write(_batch(MAX_OBSERVATIONS_PER_BATCH + 1))
 
-    if isinstance(raised.value, TelemetryWriteError):
-        assert raised.value.retryable is False
+    assert raised.value.retryable is False
     assert harness.events == []
     assert harness.site_assets.lookups == []
