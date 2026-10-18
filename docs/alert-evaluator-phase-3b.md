@@ -108,13 +108,13 @@ so staging and production need no new setting.
 
 - `legacy` reads the `water_quality` measurement. Its Flux and behavior are
   unchanged.
-- `v2` reads `observation_numeric` for the same `/v1` rules. The rule's pond
+- `v2` reads `observation_numeric` for the same `/v1` rules (P2 plan D12). The rule's pond
   maps to `asset_id_for_legacy_pond` and its legacy metric to `metric_key`.
   Only rows from the device's legacy default Component are kept, so native v2
   probes never reach `/v1` rules; they reach alerts only through AlertRuleV2,
   which is deferred. Only `quality_state == "valid"` points count. An
   out-of-range value is therefore visible to the legacy reader but excluded
-  by `v2`; this divergence is intentional. An absent sequence (`-1`) is read
+  by `v2`; this divergence is intentional (D15). An absent sequence (`-1`) is read
   as 0, like a legacy point without `seq`.
 
 Coverage, staleness and aggregation are shared by both readers. The
@@ -126,7 +126,7 @@ the legacy metric names. A query failure on either reader is recorded as
 Enable `v2` only where a producer writes every legacy device to
 `observation_numeric` and the keyed divergence check reports zero missing or
 different tuples over the longer of the longest rule window and the legacy read
-window. Production enablement is a P3 exit step. To roll back, set the value
+window (D16). Production enablement is a P3 exit step. To roll back, set the value
 to `legacy` or remove it.
 
 ## Results and observability
