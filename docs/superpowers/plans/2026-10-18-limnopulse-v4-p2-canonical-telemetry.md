@@ -649,7 +649,7 @@ summary:  data = source(-period, 3 metrics) |> filter(_field == "value") |> grou
 
 **Python shaping.**
 - `metric_key` → legacy field name; Asset → pond via the requested pond or `list_ponds`.
-- `rssi` (stored as a float) becomes an `int` when integral and is hidden otherwise; `seq` comes from the integer `sequence` column. Models are built from `int` values, with no reliance on Pydantic lax coercion.
+- `rssi` (stored as a float) becomes an `int` when integral and is hidden otherwise. Precondition: canonical observations come only from the P2-06 normalizer (D13), whose unit mapping rejects a non-integral integer metric or `|v| >= MAX_EXACT_INTEGER` (`value_invalid`). Every stored `rssi` is therefore legacy-encodable, and its `sequence` is ranked like any other; `seq` comes from the integer `sequence` column. Models are built from `int` values, with no reliance on Pydantic lax coercion.
 - A legacy series is one (tenant, pond, device): `source` and `topic` are constant per device (D8). Readings keep the legacy per-series `limit` and come in series-key (`device_id`) order, then by time.
 - Latest keeps, per series, only the fields whose last point is at the series' newest time (the legacy pivot of `last()` rows). It then takes the newest series per pond, with the first series in `device_id` order winning a tie.
 - `seq` is merged only into a returned row with the same `_time`.
