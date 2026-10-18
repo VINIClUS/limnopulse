@@ -66,7 +66,8 @@ starts influxd on `127.0.0.1:8086`, leaves it running in the background with
 `influxd.pid` and `influxd.log` in that directory, waits for `/health`,
 checks that the server is v2.7.11 and onboards the default org and token
 through `POST /api/v2/setup`. A re-run reuses the instance it started, and an
-"onboarding has already been completed" conflict counts as success. It refuses
+"onboarding has already been completed" conflict counts as success unless
+the cached instance was onboarded with a different org or token. It refuses
 to start when another server (for example the compose InfluxDB) already
 answers on the port. `INFLUXD_PORT` overrides the port; then also set
 `INFLUX_INTEGRATION_URL=http://127.0.0.1:$INFLUXD_PORT` for the tests. Stop it

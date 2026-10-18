@@ -15,6 +15,7 @@ INSTALL_DIR="${CACHE_DIR}/influxdb2-2.7.11"
 BINARY="${INSTALL_DIR}/usr/bin/influxd"
 PID_FILE="${CACHE_DIR}/influxd.pid"
 PORT_FILE="${CACHE_DIR}/influxd.port"
+ONBOARDED_FILE="${CACHE_DIR}/influxd.onboarded"
 LOG_FILE="${CACHE_DIR}/influxd.log"
 BASE_URL="http://127.0.0.1:${PORT}"
 ORG="${INFLUX_INTEGRATION_ORG:-limnopulse}"
@@ -132,14 +133,22 @@ else
   echo "Started influxd (pid ${pid}) on ${BASE_URL}"
 fi
 
-# Onboard the harness defaults. A conflict means a previous run already did.
+# Onboard the harness defaults. A conflict means a previous run already did;
+# it is accepted only when that run onboarded the same org and token.
+onboarding="$(printf 'org=%s\ntoken-sha256=%s\n' "${ORG}" "$(printf '%s' "${TOKEN}" | sha256sum | cut -d ' ' -f 1)")"
 RESPONSE="$(mktemp)"
 status="$(curl -sS -o "${RESPONSE}" -w '%{http_code}' -X POST "${BASE_URL}/api/v2/setup" \
   -H 'Content-Type: application/json' \
   -d "{\"username\":\"limnopulse\",\"password\":\"local-dev-password\",\"org\":$(json_string "${ORG}"),\"bucket\":\"limnopulse_dev\",\"token\":$(json_string "${TOKEN}")}")"
 if [[ "${status}" == "201" ]]; then
+  printf '%s\n' "${onboarding}" >"${ONBOARDED_FILE}"
   echo "Onboarded org ${ORG} on ${BASE_URL}"
 elif grep -q '"conflict"' "${RESPONSE}" && grep -q 'onboarding has already been completed' "${RESPONSE}"; then
+  if [[ -f "${ONBOARDED_FILE}" && "$(cat "${ONBOARDED_FILE}")" != "${onboarding}" ]]; then
+    echo "influxd on ${BASE_URL} was onboarded with a different INFLUX_INTEGRATION_ORG or INFLUX_INTEGRATION_TOKEN;" \
+      "use the original values or delete ${CACHE_DIR} to start over" >&2
+    exit 1
+  fi
   echo "Onboarding has already been completed on ${BASE_URL}"
 else
   echo "setup failed with HTTP ${status}: $(cat "${RESPONSE}")" >&2
