@@ -55,7 +55,7 @@ Every dependency boundary is a merge to `main`. P2 ships **dark** (D16): no depl
   - the harness lifecycle;
   - small wording fixes.
 - r7.1 (P2-01 review): CI InfluxDB image pinned by digest to a true 2.7.11; Go integration tests run with -count=1.
-- r7.2 (P2-07 review): /v1 projection Flux shape corrected on InfluxDB 2.7.11.
+- r7.2 (P2-07 review): /v1 projection Flux shape corrected on InfluxDB 2.7.11 (map-free Flux plus Python shaping; summary means within rel 1e-12).
 
 ## Global Constraints
 
@@ -117,7 +117,7 @@ Epic #22 requires the metric/unit and dual-write contracts to be frozen before d
 | D7 | Legacy dual-write eligibility | Dual-write only when all three hold: the observation's Component is `default_component_id_for_legacy_device(tenant_id, device_id)`; the resolved Asset exists and carries `PondProfile.legacy_pond_id`; and the metric has a `legacy_field`. Ineligible observations, including a missing Asset, are excluded from legacy and counted, not raised. Native v2 probes never appear in `water_quality`. |
 | D8 | Legacy series identity | Dual-written legacy points **always** use the stored Telegraf identity, whatever the canonical `source_type`: measurement `water_quality`; tags `device_id`, `pond_id`, `schema_version="1"`, `source="mqtt"`, `tenant_id` and `topic="limnopulse/v1/devices/<device_id>/readings"` (the Telegraf `mqtt_consumer` default `topic_tag`). The legacy measurement is a `/v1` compatibility projection and no reader uses `source`/`topic`. Its series key is therefore a function of `(tenant, pond, device)` only, so a redelivery, a correction or a transport change never forks a legacy series, and Telegraf coexistence never double-counts. `_time` is the exact `observed_at`: Telegraf does not apply agent `precision` to service inputs. A P2-00 test parses `infra/telegraf/telegraf.conf` and fails if the measurement, static tags, topic pattern or `topic_tag` change. |
 | D9 | Write switches | `TELEMETRY_V2_WRITE_ENABLED` and `TELEMETRY_LEGACY_DUAL_WRITE_ENABLED` are independent and default to `false`. The write path writes v2 first, then legacy. Any failure raises `TelemetryWriteError` and nothing is reported as written; the caller must not acknowledge and must redeliver (ack contract, P2-06). Idempotent identity makes redelivery safe. An InfluxDB 422 is a **partial write** (other lines may be stored) and maps to `retryable=False`. |
-| D10 | `/v1` projection | `V1_TELEMETRY_READ_SOURCE=legacy\|v2` (default `legacy`) swaps the implementation behind the existing `TelemetryRepository` protocol. The v2 projection: reads only the seven legacy metrics; reads only legacy default Components (D7 mirror); reads only the Asset for the legacy pond; includes every quality state (legacy has none); and reproduces legacy series tables and their per-table `sort`/`limit`/`last()` semantics. For data dual-written from legacy default Components, the four `/v1` shapes are byte-identical, sub-second times included. One narrow case is outside the equivalence domain: an identity rewritten from a present to an absent `sequence`. The legacy line omits `seq`, as Telegraf does, so InfluxDB keeps the old legacy `seq` while v2 stores `-1`. Writing a sentinel into `water_quality` would change legacy-visible `/v1` values, and a read-before-write would add an InfluxDB round trip per batch. Neither cost is justified, so the runbook lists this case as a known limitation. |
+| D10 | `/v1` projection | `V1_TELEMETRY_READ_SOURCE=legacy\|v2` (default `legacy`) swaps the implementation behind the existing `TelemetryRepository` protocol. The v2 projection: reads only the seven legacy metrics; reads only legacy default Components (D7 mirror); reads only the Asset for the legacy pond; includes every quality state (legacy has none); and reproduces legacy series tables and their per-table `sort`/`limit`/`last()` semantics. For data dual-written from legacy default Components, the four `/v1` shapes are byte-identical, sub-second times included, except the summary float means, which match within rel 1e-12; summaries cover completed windows only (r7.2). One narrow case is outside the equivalence domain: an identity rewritten from a present to an absent `sequence`. The legacy line omits `seq`, as Telegraf does, so InfluxDB keeps the old legacy `seq` while v2 stores `-1`. Writing a sentinel into `water_quality` would change legacy-visible `/v1` values, and a read-before-write would add an InfluxDB round trip per batch. Neither cost is justified, so the runbook lists this case as a known limitation. |
 | D11 | `/v2` telemetry API | `API_V2_TELEMETRY_ENABLED` (default `false`, valid only with `API_V2_ENABLED=true`) mounts exactly `GET metric-definitions`, `GET observations` and `GET observations/latest`. `API_V2_ENABLED` alone still mounts only the 13 M1 paths. `observations/latest` is a latest-by-`observed_at` data view, not a health or freshness view (ADR-006). |
 | D12 | Alert evaluator | `ALERT_EVALUATOR_TELEMETRY_SOURCE=legacy\|v2` (default `legacy`). With `v2`, `/v1` rules (pond, optional device, legacy metric) read `observation_numeric` through a new `WindowReader`. The reader: maps the pond to `asset_id_for_legacy_pond` and the metric to `metric_key`; keeps only legacy default Components (rows whose `component_id != DefaultComponentIDForLegacyDevice(tenant, device)` are dropped before `EvaluateSamples`); and keeps only `quality_state == "valid"` (V4 §16.3 default). Coverage, staleness, aggregation and the completeness delay (`AllowedLateness`/`LatestCompleteSlot`) stay unchanged. Alert events keep legacy metric names. Native probes reach alerts only through AlertRuleV2 (D17). |
 | D13 | Trusted mapping and phase split | P2 has no public ingress. The normalizer receives a `TrustedSourceContext` built by trusted code: tests, the P2 dev CLI, and later the P3 worker. P2 delivers the bounded `QuarantinedObservation` record, the no-fallback rule and the ack contract. Moved to **P3/P6 entry gates of #15/#17**, and blocking production canonical writes (D16): quarantine/DLQ persistence, connector-health marking, device/component last-seen, operator reconciliation (§10.2), external-identity-to-DeviceIntegration resolution, sequence gap/regression state, durable queue redrive, and emission of the §23.2 metrics. |
@@ -618,55 +618,56 @@ GET /v2/tenants/{tenant_id}/observations/latest
 
 ### `/v1` projection semantics (P2-07)
 
-`V2ProjectedTelemetryRepository(*, query_api, org, bucket, domain_repository)` implements the existing `TelemetryRepository` over `observation_numeric`. The r2 form of this Flux shape was verified equal to the legacy adapter on InfluxDB 2.7.11. The r3/r4 refinements (per-point pivot, `seq` branch, `_field`-preserving `last()`) are re-verified by P2-07's equivalence tests, which are the authority. r7.2 records the shape those tests proved on 2.7.11:
+`V2ProjectedTelemetryRepository(*, query_api, org, bucket, domain_repository)` implements the existing `TelemetryRepository` over `observation_numeric`. P2-07's equivalence tests on InfluxDB 2.7.11 are the authority. r7.2 replaces the earlier Flux-side legacy shaping (per-point pivot, `map` to the legacy shape, `union`, legacy tail) with **map-free Flux plus Python shaping**:
 
 ```text
-from(bucket: B) |> range(<same bounds as legacy>)
-  |> filter(_measurement == "observation_numeric") |> filter(tenant_id == T) |> filter(asset_id <in pond assets>)
-  |> filter(fn: (r) => contains(value: r["component_id"], set: <legacy default component ids>))
-  |> filter(fn: (r) => contains(value: r["metric_key"], set: <7 keys>))
-  |> filter(fn: (r) => contains(value: r["_field"], set: ["value","sequence","ingested_at_ns","event_id"]))
-  |> pivot(rowKey: ["_time"], columnKey: ["_field"], valueColumn: "_value")     // each table is one series: one row per point
-  |> <three branches, each ending in group(<legacy series key + _field>), then union():
-       floats: filter(metric_key != rssi) → map → {legacy shape, _field: legacy name(metric_key), _value: value (float)}
-       rssi:   filter(metric_key == rssi) → map → {legacy shape, _field: "rssi", _value: int(v: value)}
-       seq:    filter sequence != -1 FIRST (absent sequences rank lowest exactly as in build_legacy_points)
-               → group by (legacy series key, _time) → sort(ingested_at_ns, event_id) → last(column: "sequence")
-               → map → {legacy shape, _field: "seq", _value: sequence (int, never float)}>
-  |> group(columns: ["_start","_stop","_measurement","tenant_id","pond_id","device_id","source","schema_version","topic","_field"])
-  |> <legacy tail: pivot/sort/limit | sort(_time) → last() → pivot | summary>
+source  = from(bucket: B) |> range(<same bounds as legacy>)
+            |> filter(_measurement == "observation_numeric") |> filter(tenant_id == T)
+            |> filter(asset_id == A1 or …)                    // pond assets only
+            |> filter(component_id == C1 or …)                // legacy default components only
+            |> filter(metric_key == M1 or …)                  // 7 legacy metrics (3 for summary)
+readings: source |> filter(_field == "value") |> group(tenant_id, asset_id, device_id)
+            |> pivot(rowKey: ["_time"], columnKey: ["metric_key"]) |> sort(_time) |> limit(n)
+latest:   source(-24h) |> filter(_field == "value") |> last()        // storage last() per series and metric
+seq:      source([first returned _time, last returned _time + 1 µs))
+            |> filter(_field == "sequence" or "ingested_at_ns" or "event_id") |> pivot(rowKey: ["_time"], columnKey: ["_field"])
+            |> filter(sequence != -1)                                  // absent sequences rank lowest
+            |> group(tenant_id, asset_id, device_id)                   // one table per legacy series
+            |> sort(["_time", "ingested_at_ns", "event_id"], desc: true) |> unique(column: "_time")   // (latest: limit(n: 1))
+summary:  data = source(-period, 3 metrics) |> filter(_field == "value") |> group(columns: ["metric_key"])
+            data |> aggregateWindow(every: <i>, fn: mean, createEmpty: false) |> yield("series")
+            data |> mean()/min()/max()/count() |> yield(...)
 ```
 
-`legacy shape` means:
-- `_measurement`: `"water_quality"`.
-- `pond_id`: taken from the asset.
-- `source`: always `"mqtt"` and `topic`: always `limnopulse/v1/devices/<device_id>/readings`, both constants (D8), so the projection needs no `source_type`.
-- `schema_version`: `"1"`.
+**Flux constraints (2.7.11).**
+1. Filters are `==`/`or` chains, which storage pushes down; `contains()` is not pushed down and scans the whole tenant.
+2. One `from()` per query: two yields sharing one source lose the pushdown.
+3. No per-row `map`. A vectorized `map` emits its columns in a varying order, so a later `pivot` panics non-deterministically (`column _start:time is not of type string`). A row-based `map` is deterministic but too slow (~0.06 ms per row).
+4. The `seq` winner is ranked per legacy series with `sort(desc) |> unique(column: "_time")`, never with one table per timestamp (`group(..., "_time")`).
+5. The `seq` query only spans the rows the first query returned, so its cost follows `limit`, not the read range.
+6. The summary uses storage aggregates (`aggregateWindow(fn: mean)`, `mean()`, `min()`, `max()`, `count()`) grouped by `metric_key`; raw rows are never transferred.
 
-**Branch constraints (2.7.11).**
-- Float metrics and `rssi` are separate branches: one `map` cannot return both an int and a float `_value` (`map: type conflict: int != float`).
-- Group each branch by the legacy series key plus `_field` before `union()`. Otherwise tables that share a group key but differ in `_value` type collide (`schema collision`).
-- Every branch must reach the tail pivot with an identical column layout. A different layout can panic non-deterministically (`column _start:time is not of type string`).
+**Python shaping.**
+- `metric_key` → legacy field name; Asset → pond via the requested pond or `list_ponds`.
+- `rssi` (stored as a float) becomes an `int` when integral and is hidden otherwise; `seq` comes from the integer `sequence` column. Models are built from `int` values, with no reliance on Pydantic lax coercion.
+- A legacy series is one (tenant, pond, device): `source` and `topic` are constant per device (D8). Readings keep the legacy per-series `limit` and come in series-key (`device_id`) order, then by time.
+- Latest keeps, per series, only the fields whose last point is at the series' newest time (the legacy pivot of `last()` rows). It then takes the newest series per pond, with the first series in `device_id` order winning a tie.
+- `seq` is merged only into a returned row with the same `_time`.
 
+**Rules.**
 - **Component set.** It is `{default_component_id_for_legacy_device(t, d.device_id) for d in domain_repository.list_devices(t)}`. Native v2 Components are never visible through `/v1`.
-- **`seq` tie-break.** `seq` for a legacy `(series, _time)` group is the sequence of the point with the greatest `ingested_at_ns`, then the greatest `event_id`. This is the same rule as `build_legacy_points`, and a test covers conflicting sequences at the same time.
-- **Legacy series tables.** Group by the legacy series key plus `_field` before any `last()`, `sort` or `limit`. Legacy `limit(n)` and `sort` apply **per series table**, which means per device (source and topic are constant per device, D8), not globally. Legacy `last()` runs per field table.
-- **Latest.**
-  - Keep `_field` in the group key through `sort(_time)` → `last()`. Grouping without `_field` would collapse all metrics into one row.
-  - Then pivot straight to the legacy row key, as legacy does. Never regroup without `_field` first: that merges integer (`rssi`, `seq`) and float `_value` columns into one table, and the pivot fails with `schema collision` (r7.2 correction).
+- **Asset → pond.** Only the Asset for the legacy pond (`asset_id_for_legacy_pond`). A pond ID from `list_ponds` that fails `require_safe_id` is skipped (it can never be dual-written, D7).
+- **`seq` tie-break.** `seq` for a legacy `(series, _time)` is the sequence of the point with the greatest `ingested_at_ns`, then the greatest `event_id`, among points whose sequence is present. This is the same rule as `build_legacy_points`; if all are absent, `seq` is omitted.
 - **Summary.**
-  - Keep the legacy period/interval table (24h→5m, 7d/30d→1h) and the `do_mg_l`, `ph` and `temp_c` series with mean/min/max/count. Sort by `device_id, _time` after `group(columns: ["_field"])` and before aggregation.
-  - The legacy `mean` is aggregated in storage. Each series is summed in time order, the series sums are added in device order, and the total is divided by the count. A single-pass `mean()` rounds differently in any row order, so the projection rebuilds it with a two-level `reduce` over the sorted rows. This parity depends on the InfluxDB version, because it follows storage pushdown behavior. The equivalence suite on the pinned 2.7.11 CI image is the guard for future upgrades.
-  - Windows use `window(every: <i>, createEmpty: false) |> <mean> |> duplicate(column: "_stop", as: "_time")`, never `aggregateWindow(fn: mean)`: its fast path re-orders rows, and the full stdlib expansion is rewritten into the same fast path.
-  - The last summary window is stamped with the query's `now()`, as in legacy. Summary equivalence therefore covers completed windows only.
+  - Keep the legacy period/interval table (24h→5m, 7d/30d→1h) and the `do_mg_l`, `ph` and `temp_c` series with mean/min/max/count.
   - Errors are wrapped in `TelemetryQueryError`.
-  (r7.2 correction.)
-- **Error propagation.** The other methods propagate errors exactly like the legacy adapter.
-- **Integer fields.**
-  - The `seq` branch keeps the integer type end to end (`_value: r.sequence`, never converted to float), so sequences up to `MAX_SEQUENCE` stay exact; a boundary test covers `2**53 + 1` and `2**63 - 1`.
-  - `rssi` is reconstructed with `int(v: r.value)`. Python checks `float.is_integer()` for `rssi`.
-  - There is no reliance on Pydantic lax coercion.
+  - **Parity rule (r7.2 relaxation).** `min`, `max`, `count`, the window timestamps and the window set are exact. The float means (`statistics.*.mean` and every `series[*]` window mean) match within `math.isclose(rel_tol=1e-12, abs_tol=0)`.
+  - Reason: InfluxDB storage sums partials per (series, shard group) in series-key order. The v2 series keys differ from the legacy ones by design (`component_id` and the other ownership tags), so last-ulp agreement would need a shard-aware reimplementation, which is fragile and version-sensitive. No consumer depends on last-ulp means: the alert evaluator has its own Go reader, and dashboards round.
+  - The last summary window is stamped with the query's `now()`, as in legacy. Summary equivalence covers completed windows only.
+- **Error propagation.** The other methods, including the `seq` query, propagate errors exactly like the legacy adapter.
+- **Integer fields.** `seq` stays an integer end to end, so sequences up to `MAX_SEQUENCE` stay exact; a boundary test covers `2**53 + 1` and `2**63 - 1`.
 - **No time flooring.** Legacy dual-write stores exact time.
+- **Version sensitivity.** These shapes and the parity rule follow storage behavior of the pinned InfluxDB 2.7.11. The equivalence suite on the pinned CI image is the guard for future upgrades.
 
 ### Go evaluator v2 reader (P2-05)
 
@@ -1139,19 +1140,20 @@ Each task also owns the new test files named in its section.
     - `legacy_sample`, `sub_second`, `out_of_range`;
     - the `multi_point_series` scenario rebased to the captured `now` (≥ 30 points, 2 devices, 2 ponds), with a `limit` smaller than the rows;
     - **test-local** observations built in this test file, not added to the frozen vectors:
-      - extra legacy devices in one pond, so that pond has ≥ 3 devices whose per-bucket float sum is order-dependent;
+      - extra legacy devices in one pond, so that pond has ≥ 3 devices;
+      - a pond whose points span two shard groups (summary under the r7.2 mean tolerance);
       - one device with mixed `quality_state`;
     - native probes on a legacy pond Asset;
     - two observations at the same `(device, observed_at)` with conflicting sequences (the tie-break), and sequences `2**53 + 1` and `2**63 - 1` (integer exactness);
     - another tenant.
   - **Domain-level equality:** for the four methods, `InfluxTelemetryRepository` and `V2ProjectedTelemetryRepository` return equal objects, and every compared result is non-empty.
-  - **HTTP-level equality:** two apps, each with its repository injected, return byte-identical JSON for the four `/v1` endpoints.
+  - **HTTP-level equality:** two apps, each with its repository injected, return byte-identical JSON for the four `/v1` endpoints, except the summary float means, which match within rel 1e-12; summaries cover completed windows only (r7.2).
   - **Exclusions:** native probes and the other tenant are absent.
 - [ ] **Step 3: Run red, commit, test gate,** then implement after approval.
 - [ ] **Step 4: Run** `make verify-influx` **and the shared gates.**
 
 **Acceptance criteria:**
-- [ ] Byte and semantic `/v1` equivalence is proven on real InfluxDB.
+- [ ] Byte and semantic `/v1` equivalence is proven on real InfluxDB: byte-identical except the summary float means, which match within rel 1e-12; summaries cover completed windows only.
 - [ ] No `/v1` file changes.
 - [ ] Error semantics identical.
 
@@ -1229,7 +1231,7 @@ Each task also owns the new test files named in its section.
 - Modify: `docs/adr/ADR-006-telemetry-has-three-timestamps.md`, `docs/adr/ADR-007-influx-v2-dual-write-migration.md` (append a `**Phase split (P2).**` paragraph at the end of `## Implementation gate`, with no new heading; `test_architecture_inventory.py` pins the heading tuple and stays unmodified and green), `README.md` (runbook link)
 
 **Gate invariants:**
-1. The same legacy sample, including sub-second, is visible identically through `/v1` in both read modes: four endpoints, byte-identical JSON, non-empty (real InfluxDB).
+1. The same legacy sample, including sub-second, is visible identically through `/v1` in both read modes: four endpoints, byte-identical JSON except the summary float means, which match within rel 1e-12 (summaries cover completed windows only), non-empty (real InfluxDB).
 2. `/v2` serves two probes of the same metric as distinct series, and they are absent from `/v1`.
 3. No device-supplied tenant authority.
 4. Duplicate, replay, re-classified and shuffled writes are idempotent: one stored point per identity (real InfluxDB).
