@@ -448,3 +448,19 @@ def test_field_quarantine_excerpt_is_strict_json_for_hostile_values(
         assert record.metric_key in metric_keys
     _strict_json(record.source_excerpt_json)
     assert len(record.source_excerpt_json.encode("utf-8")) <= MAX_QUARANTINE_EXCERPT_BYTES
+
+
+@pytest.mark.parametrize(
+    "ts",
+    ["BAD" + "é" * 3000, "BAD" + '"\\' * 3000, "BAD" + "\x01" * 3000, "BAD" + "\ud800" * 3000],
+    ids=["multibyte", "escaped", "control", "surrogate"],
+)
+def test_truncated_reading_excerpt_is_still_strict_json(ts: str) -> None:
+    record = assert_reading_quarantined(map_legacy_reading(context(), example() | {"ts": ts}))
+
+    assert record.truncated is True
+    excerpt = _strict_json(record.source_excerpt_json)
+    assert isinstance(excerpt, str)
+    assert excerpt.startswith('{"battery_v"')
+    assert len(record.source_excerpt_json.encode("utf-8")) <= MAX_QUARANTINE_EXCERPT_BYTES
+    assert len(record.source_excerpt_json.encode("utf-8")) > MAX_QUARANTINE_EXCERPT_BYTES - 16

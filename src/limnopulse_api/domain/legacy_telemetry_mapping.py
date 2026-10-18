@@ -60,18 +60,33 @@ def _excerptable(value: object, depth: int = 0) -> object:
     return str(value)
 
 
+def _utf8_size(text: str) -> int:
+    return len(text.encode("utf-8"))
+
+
 def bounded_excerpt(source: object) -> tuple[str, bool]:
-    """JSON of `source`, cut to `MAX_QUARANTINE_EXCERPT_BYTES` UTF-8 bytes; flags truncation.
+    """JSON of `source` within `MAX_QUARANTINE_EXCERPT_BYTES` UTF-8 bytes; flags truncation.
 
     Never raises for any payload value: non-JSON values are stringified, non-finite floats
-    become strings, and lone surrogates are escaped so the text is always encodable.
+    become strings, and lone surrogates are escaped so the text is always encodable. A
+    truncated excerpt stays valid JSON: it is a JSON string holding the longest prefix of the
+    full serialization that fits.
     """
     text = json.dumps(_excerptable(source), ensure_ascii=False, sort_keys=True, allow_nan=False)
-    encoded = text.encode("utf-8", errors="backslashreplace")
-    if len(encoded) <= MAX_QUARANTINE_EXCERPT_BYTES:
-        return encoded.decode("utf-8"), False
-    # A cut inside a multi-byte character drops that character, never exceeding the bound.
-    return encoded[:MAX_QUARANTINE_EXCERPT_BYTES].decode("utf-8", errors="ignore"), True
+    text = text.encode("utf-8", errors="backslashreplace").decode("utf-8")
+    if _utf8_size(text) <= MAX_QUARANTINE_EXCERPT_BYTES:
+        return text, False
+    low, high = 0, len(text)
+    while low < high:  # longest prefix whose JSON string literal fits the bound
+        middle = (low + high + 1) // 2
+        if (
+            _utf8_size(json.dumps(text[:middle], ensure_ascii=False))
+            <= MAX_QUARANTINE_EXCERPT_BYTES
+        ):
+            low = middle
+        else:
+            high = middle - 1
+    return json.dumps(text[:low], ensure_ascii=False), True
 
 
 def bounded_detail(detail: str) -> str:
