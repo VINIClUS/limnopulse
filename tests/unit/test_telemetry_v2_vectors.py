@@ -335,7 +335,12 @@ def test_out_of_range_scenario_is_written_with_state_and_provenance() -> None:
     assert item.observation.metric_key == "water.dissolved_oxygen"
     assert item.observation.value == 75.0
     assert item.quality.state is QualityState.OUT_OF_RANGE
-    assert QualityProvenance.PLAUSIBLE_RANGE in item.quality.provenance
+    assert item.quality.flags == ()
+    assert item.quality.provenance == (
+        QualityProvenance.SCHEMA_VALIDATION,
+        QualityProvenance.UNIT_MAPPING,
+        QualityProvenance.PLAUSIBLE_RANGE,
+    )
     assert item.resolved.component_id == default_component_id_for_legacy_device(
         item.resolved.tenant_id, item.resolved.device_id
     )
@@ -351,8 +356,15 @@ def test_delayed_replay_scenario_carries_both_flags() -> None:
     assert len(loaded.v2_lines) >= 1
     assert loaded.legacy_count == 1
     for item in loaded.observations:
-        assert QualityFlag.DELAYED in item.quality.flags
-        assert QualityFlag.REPLAY in item.quality.flags
+        assert item.quality.flags == (QualityFlag.DELAYED, QualityFlag.REPLAY)
+        assert item.quality.provenance == (
+            QualityProvenance.SCHEMA_VALIDATION,
+            QualityProvenance.UNIT_MAPPING,
+            QualityProvenance.TIMELINESS,
+            QualityProvenance.REPLAY,
+        )
+        assert item.quality.state is QualityState.VALID
+        assert item.source.received_at - item.observation.observed_at <= timedelta(days=30)
         assert item.delivery.delayed is True
         assert item.delivery.replay is True
         assert item.source.received_at - item.observation.observed_at > timedelta(seconds=300)
@@ -421,6 +433,7 @@ def test_multi_point_series_scenario_shape() -> None:
         assert len(ordered) >= 2
         assert all(b - a == timedelta(minutes=1) for a, b in pairwise(ordered))
     assert len(loaded.observations) >= 30
+    assert loaded.legacy_count >= 30
     assert loaded.legacy_count == sum(len(times) for times in times_by_device.values())
 
 

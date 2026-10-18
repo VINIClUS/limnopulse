@@ -1,6 +1,7 @@
 import dataclasses
 import json
 import math
+import re
 from datetime import UTC, datetime, timedelta
 
 import pytest
@@ -148,9 +149,9 @@ def observation(
     )
 
 
-def legacy_sample(**kwargs: object) -> list[CanonicalObservation]:
+def legacy_sample(*, sequence: int | None = 1, **kwargs: object) -> list[CanonicalObservation]:
     return [
-        observation(metric_key, value, sequence=1, **kwargs)
+        observation(metric_key, value, sequence=sequence, **kwargs)
         for metric_key, value in LEGACY_SAMPLE.items()
     ]
 
@@ -284,7 +285,8 @@ def test_encode_observation_line_writes_sentinels_for_absent_optionals() -> None
     assert ",sequence=-1i," in f",{fields},"
     assert ',integration_id="",' in f",{fields},"
     assert ',source_event_id="",' in f",{fields},"
-    assert [pair.split("=", 1)[0] for pair in fields.split(",")] == sorted(OBSERVATION_FIELD_KEYS)
+    unquoted = re.sub(r'"(?:[^"\\]|\\.)*"', '""', fields)
+    assert [pair.split("=", 1)[0] for pair in unquoted.split(",")] == sorted(OBSERVATION_FIELD_KEYS)
     assert timestamp == str(OBSERVED_NS)
 
 
@@ -310,7 +312,7 @@ def test_time_is_integer_microseconds_times_one_thousand() -> None:
         received_at=last,
         ingested_at=last,
     )
-    expected_ns = int((last - datetime(1970, 1, 1, tzinfo=UTC)) / timedelta(microseconds=1)) * 1000
+    expected_ns = ((last - datetime(1970, 1, 1, tzinfo=UTC)) // timedelta(microseconds=1)) * 1000
 
     line = encode_observation_line(item)
 
@@ -602,6 +604,17 @@ def test_encode_legacy_line_rejects_unencodable_points(fields, observed_at) -> N
     )
     with pytest.raises(ValueError):
         encode_legacy_line(point)
+
+
+def test_encode_legacy_line_coerces_field_types_by_legacy_schema() -> None:
+    point = LegacyPoint(
+        tenant_id=TENANT,
+        pond_id=POND,
+        device_id=DEVICE,
+        observed_at=OBSERVED,
+        fields={"temp_c": 25, "rssi": -67.0, "seq": 3},
+    )
+    assert encode_legacy_line(point).endswith(" rssi=-67i,seq=3i,temp_c=25.0 1783598400000000000")
 
 
 def test_encode_legacy_line_escapes_tag_values() -> None:
