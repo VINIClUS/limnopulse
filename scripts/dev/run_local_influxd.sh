@@ -58,7 +58,7 @@ running() {
 
 install_influxd() {
   WORK_DIR="$(mktemp -d)"
-  curl -fsSL -o "${WORK_DIR}/${TARBALL}" "${DOWNLOAD_URL}"
+  curl --proto "=https" --tlsv1.2 -fsSL -o "${WORK_DIR}/${TARBALL}" "${DOWNLOAD_URL}"
   if ! echo "${TARBALL_SHA256}  ${WORK_DIR}/${TARBALL}" | sha256sum -c --status; then
     echo "sha256 checksum mismatch for ${TARBALL}; refusing to install it" >&2
     exit 1
