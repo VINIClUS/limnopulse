@@ -10,6 +10,11 @@ import (
 
 type LookupEnv func(string) (string, bool)
 
+const (
+	TelemetrySourceLegacy = "legacy"
+	TelemetrySourceV2     = "v2"
+)
+
 type RunConfig struct {
 	AppEnv                  string
 	EvaluationTime          *time.Time
@@ -39,6 +44,9 @@ type RunConfig struct {
 	InfluxDBOrg             string
 	InfluxDBBucket          string
 	OTLPEndpoint            string
+	// TelemetrySource selects the window reader: "legacy" (water_quality) or
+	// "v2" (observation_numeric).
+	TelemetrySource string
 }
 
 func defaultRunConfig() RunConfig {
@@ -66,6 +74,7 @@ func defaultRunConfig() RunConfig {
 		InfluxDBToken:          "local-dev-token",
 		InfluxDBOrg:            "limnopulse",
 		InfluxDBBucket:         "limnopulse_raw",
+		TelemetrySource:        TelemetrySourceLegacy,
 	}
 }
 
@@ -100,6 +109,7 @@ func LoadRunConfig(args []string, lookup LookupEnv) (RunConfig, error) {
 	fs.IntVar(&config.MinimumPoints, "min-points", config.MinimumPoints, "minimum occupied buckets")
 	fs.DurationVar(&config.AllowedLateness, "allowed-lateness", config.AllowedLateness, "telemetry lateness allowance")
 	fs.DurationVar(&config.MaximumSampleAge, "max-sample-age", config.MaximumSampleAge, "maximum sample age")
+	fs.StringVar(&config.TelemetrySource, "telemetry-source", config.TelemetrySource, "window reader source: legacy or v2")
 	if err := fs.Parse(args); err != nil {
 		return RunConfig{}, err
 	}
@@ -132,15 +142,16 @@ var qualityFlagToEnv = map[string]string{
 
 func applyEnvironment(config *RunConfig, lookup LookupEnv, explicit map[string]bool) error {
 	stringValues := map[string]*string{
-		"APP_ENV":                     &config.AppEnv,
-		"AWS_REGION":                  &config.AWSRegion,
-		"DYNAMODB_DOMAIN_TABLE":       &config.DynamoDBTable,
-		"DYNAMODB_ENDPOINT_URL":       &config.DynamoDBEndpoint,
-		"INFLUXDB_URL":                &config.InfluxDBURL,
-		"INFLUXDB_TOKEN":              &config.InfluxDBToken,
-		"INFLUXDB_ORG":                &config.InfluxDBOrg,
-		"INFLUXDB_BUCKET_RAW":         &config.InfluxDBBucket,
-		"OTEL_EXPORTER_OTLP_ENDPOINT": &config.OTLPEndpoint,
+		"APP_ENV":                          &config.AppEnv,
+		"AWS_REGION":                       &config.AWSRegion,
+		"DYNAMODB_DOMAIN_TABLE":            &config.DynamoDBTable,
+		"DYNAMODB_ENDPOINT_URL":            &config.DynamoDBEndpoint,
+		"INFLUXDB_URL":                     &config.InfluxDBURL,
+		"INFLUXDB_TOKEN":                   &config.InfluxDBToken,
+		"INFLUXDB_ORG":                     &config.InfluxDBOrg,
+		"INFLUXDB_BUCKET_RAW":              &config.InfluxDBBucket,
+		"OTEL_EXPORTER_OTLP_ENDPOINT":      &config.OTLPEndpoint,
+		"ALERT_EVALUATOR_TELEMETRY_SOURCE": &config.TelemetrySource,
 	}
 	for key, target := range stringValues {
 		if value, ok := lookup(key); ok {
@@ -227,6 +238,9 @@ func validateRunConfig(
 	}
 	if config.ExpectedSampleInterval <= 0 || config.MinimumCoverageRatio <= 0 || config.MinimumCoverageRatio > 1 || config.MinimumPoints < 1 || config.AllowedLateness < 0 || config.MaximumSampleAge <= 0 {
 		return fmt.Errorf("quality settings are invalid")
+	}
+	if config.TelemetrySource != TelemetrySourceLegacy && config.TelemetrySource != TelemetrySourceV2 {
+		return fmt.Errorf("telemetry-source must be legacy or v2")
 	}
 	if config.AppEnv != "local" && config.AppEnv != "test" && config.AppEnv != "staging" && config.AppEnv != "prod" {
 		return fmt.Errorf("APP_ENV must be local, test, staging or prod")
