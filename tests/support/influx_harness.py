@@ -60,7 +60,11 @@ def influx_bucket() -> Iterator[str]:
 
 @contextmanager
 def influx_clients(bucket: str) -> Iterator[tuple[QueryApi, WriteApi]]:
-    """Yield a ``(query_api, write_api)`` pair; writes are synchronous."""
+    """Yield a ``(query_api, write_api)`` pair; writes are synchronous.
+
+    ``bucket`` names the bucket the caller works with; the APIs are not bound to
+    it, so pass it to every ``write`` and Flux query.
+    """
     client = _client()
     try:
         with client.write_api(write_options=SYNCHRONOUS) as write_api:
