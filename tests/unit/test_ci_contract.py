@@ -41,6 +41,12 @@ def test_verify_workflow_is_read_only_and_credential_free() -> None:
         "opentofu/setup-opentofu",
     }
 
+    pins: dict[str, set[str]] = {}
+    for ref in action_refs:
+        name, _, sha = ref.partition("@")
+        pins.setdefault(name, set()).add(sha)
+    assert all(len(shas) == 1 for shas in pins.values()), pins
+
     workflow = yaml.load(text, Loader=yaml.BaseLoader)
     assert set(workflow["jobs"]) == {
         "python",
@@ -48,6 +54,7 @@ def test_verify_workflow_is_read_only_and_credential_free() -> None:
         "opentofu",
         "compose",
         "frontend",
+        "influx",
     }
     expected_jobs = {
         "python": (
@@ -57,6 +64,15 @@ def test_verify_workflow_is_read_only_and_credential_free() -> None:
         "go": (["actions/checkout", "actions/setup-go"], "verify-go"),
         "opentofu": (["actions/checkout", "opentofu/setup-opentofu"], "verify-tofu"),
         "compose": (["actions/checkout"], "verify-compose"),
+        "influx": (
+            [
+                "actions/checkout",
+                "actions/setup-python",
+                "astral-sh/setup-uv",
+                "actions/setup-go",
+            ],
+            "verify-influx",
+        ),
     }
     for job_name, (expected_actions, target) in expected_jobs.items():
         steps = workflow["jobs"][job_name]["steps"]
@@ -72,6 +88,51 @@ def test_verify_workflow_is_read_only_and_credential_free() -> None:
     frontend_runs = [step["run"] for step in frontend_steps if "run" in step]
     assert frontend_actions == ["actions/checkout", "actions/setup-node"]
     assert frontend_runs == ["npm ci", "npm test", "npm run typecheck", "npm run build"]
+
+    assert [name for name, job in workflow["jobs"].items() if "services" in job] == [
+        "influx"
+    ]
+
+
+def test_influx_job_uses_a_throwaway_influxdb_service_with_the_harness_defaults() -> None:
+    text = (ROOT / ".github/workflows/verify.yml").read_text(encoding="utf-8")
+    workflow = yaml.load(text, Loader=yaml.BaseLoader)
+    job = workflow["jobs"]["influx"]
+
+    assert job["runs-on"] == "ubuntu-latest"
+    assert list(job["services"]) == ["influxdb"]
+    service = job["services"]["influxdb"]
+    assert service["image"] == "influxdb:2.7.11-alpine"
+    assert service["ports"] == ["8086:8086"]
+
+    env = service["env"]
+    assert env["DOCKER_INFLUXDB_INIT_MODE"] == "setup"
+    assert env["DOCKER_INFLUXDB_INIT_ORG"] == "limnopulse"
+    assert env["DOCKER_INFLUXDB_INIT_ADMIN_TOKEN"] == "local-dev-token"
+    for required in (
+        "DOCKER_INFLUXDB_INIT_USERNAME",
+        "DOCKER_INFLUXDB_INIT_PASSWORD",
+        "DOCKER_INFLUXDB_INIT_BUCKET",
+    ):
+        assert env[required]
+
+    options = service["options"]
+    assert '--health-cmd "influx ping"' in options
+    for flag in ("--health-interval", "--health-timeout", "--health-retries"):
+        assert flag in options
+
+    # Readiness comes from the service health check; the job runs nothing else.
+    assert [step["run"] for step in job["steps"] if "run" in step] == [
+        "make verify-influx"
+    ]
+    # The harness defaults already match the service; no job-level overrides.
+    assert "env" not in job
+    for step in job["steps"]:
+        assert "env" not in step
+
+    # The dev token and password exist only in the throwaway service container.
+    assert text.count("local-dev-token") == 1
+    assert text.count(env["DOCKER_INFLUXDB_INIT_PASSWORD"]) == 1
 
 
 def test_makefile_exposes_safe_reproducible_targets() -> None:
@@ -90,12 +151,21 @@ def test_makefile_exposes_safe_reproducible_targets() -> None:
         ],
         "verify-compose": ["docker compose config --quiet"],
     }
+    influx_recipe = [
+        "uv sync --locked --extra dev",
+        "RUN_INFLUX_INTEGRATION=1 uv run --locked --no-sync python -m pytest -q tests/influx",
+        "RUN_INFLUX_INTEGRATION=1 go test -race -run 'TestInfluxIntegration' ./...",
+    ]
 
     phony_match = re.search(r"^\.PHONY:\s+(.+)$", makefile, flags=re.MULTILINE)
     assert phony_match is not None
-    assert set(phony_match.group(1).split()) == {"verify", *expected}
+    assert set(phony_match.group(1).split()) == {"verify", "verify-influx", *expected}
 
-    for target, commands in expected.items():
+    verify_rule = re.search(r"^verify:(.*)$", makefile, flags=re.MULTILINE)
+    assert verify_rule is not None
+    assert verify_rule.group(1).split() == list(expected)
+
+    for target, commands in {**expected, "verify-influx": influx_recipe}.items():
         result = subprocess.run(
             ["make", "--no-print-directory", "-n", "UV=uv", "TOFU=tofu", target],
             cwd=ROOT,
@@ -119,7 +189,7 @@ def test_makefile_exposes_safe_reproducible_targets() -> None:
     ]
 
     lowered = makefile.lower()
-    for forbidden in ("tofu plan", "tofu apply", "docker compose up"):
+    for forbidden in ("tofu plan", "tofu apply", "docker compose up", "local-dev-token"):
         assert forbidden not in lowered
 
 
