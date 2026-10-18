@@ -14,9 +14,9 @@ from types import SimpleNamespace
 from typing import Any
 
 import pytest
-from limnopulse_api.adapters.influxdb_v1_projection import V2ProjectedTelemetryRepository
 
 from limnopulse_api.adapters.influxdb import InfluxTelemetryRepository
+from limnopulse_api.adapters.influxdb_v1_projection import V2ProjectedTelemetryRepository
 from limnopulse_api.core.errors import TelemetryQueryError
 from limnopulse_api.domain.ids import (
     asset_id_for_legacy_pond,
@@ -512,7 +512,8 @@ async def test_summary_sorts_by_device_then_time_after_field_group(
     ordered(flat, start, ['sort(columns:["device_id","_time"])', f"every:{interval}"])
     for result in ("series", "mean", "min", "max", "count"):
         assert f'yield(name:"{result}")' in flat[start:]
-    for function in ("mean()", "min()", "max()", "count()"):
+    # `mean` is rebuilt with `reduce` (legacy sums per series), so only these are pinned.
+    for function in ("min()", "max()", "count()"):
         assert function in flat[start:]
     assert "limit(" not in flat
 

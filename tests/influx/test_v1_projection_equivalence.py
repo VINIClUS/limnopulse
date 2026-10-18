@@ -8,7 +8,8 @@ relative to a `now` captured once per test; every compared result is asserted no
 
 from __future__ import annotations
 
-from collections.abc import Iterator
+import itertools
+from collections.abc import Iterable, Iterator
 from contextlib import contextmanager
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
@@ -16,9 +17,9 @@ from typing import Any
 
 import pytest
 from fastapi.testclient import TestClient
-from limnopulse_api.adapters.influxdb_v1_projection import V2ProjectedTelemetryRepository
 
 from limnopulse_api.adapters.influxdb import InfluxTelemetryRepository
+from limnopulse_api.adapters.influxdb_v1_projection import V2ProjectedTelemetryRepository
 from limnopulse_api.adapters.influxdb_v2_writer import InfluxObservationWriter
 from limnopulse_api.core.config import Settings
 from limnopulse_api.domain.assets import Asset, AssetType, AssetWithPondProfile, PondProfile
@@ -52,12 +53,14 @@ TIE_DEVICE = "tie-device-001"
 NATIVE_COMPONENT = "cmp_0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f"
 SEQ_2_53_PLUS_1 = 2**53 + 1
 SEQ_MAX = 2**63 - 1
-# Two samples per device in one 5-minute window. Device-major (legacy series order) and
-# time-major float summation give different sums and means; `seed` asserts it.
+# Two samples per device in one 5-minute window. Legacy InfluxDB sums each series in time
+# order and then adds the series sums in device order. For these values that total differs,
+# in sum and in mean, from a single-pass sum over every interleaving that keeps each device's
+# time order (device-major included); `seed` asserts it.
 SUM_VALUES = {
-    "sum-device-1": (22.7, 20.4),
-    "sum-device-2": (21.1, 25.5),
-    "sum-device-3": (25.3, 61.3),
+    "sum-device-1": (26.5, 25.3),
+    "sum-device-2": (28.0, 26.8),
+    "sum-device-3": (26.9, 61.3),
 }
 TEMPLATE = scenario("legacy_sample").observations[0]
 OUT_OF_RANGE_QUALITY = scenario("out_of_range").observations[0].quality
@@ -444,17 +447,32 @@ def _five_minute_floor(value: datetime) -> datetime:
     return value.replace(minute=value.minute - value.minute % 5, second=0, microsecond=0)
 
 
+def _float_sum(values: Iterable[float]) -> float:
+    total = 0.0
+    for value in values:
+        total += value
+    return total
+
+
+def _legacy_series_total() -> float:
+    """Each series summed in time order, then the series sums added in device order."""
+    return _float_sum(_float_sum(values) for values in SUM_VALUES.values())
+
+
 def _assert_summation_is_order_dependent() -> None:
-    device_major = 0.0
-    for values in SUM_VALUES.values():
-        for value in values:
-            device_major += value
-    time_major = 0.0
-    for index in range(2):
-        for values in SUM_VALUES.values():
-            time_major += values[index]
-    assert device_major != time_major
-    assert device_major / 6 != time_major / 6
+    series = list(SUM_VALUES.values())
+    count = sum(len(values) for values in series)
+    legacy_total = _legacy_series_total()
+    # Every interleaving of the devices that keeps each device's own time order.
+    slots = [index for index, values in enumerate(series) for _ in values]
+    for order in set(itertools.permutations(slots)):
+        positions = [0] * len(series)
+        interleaved = []
+        for device in order:
+            interleaved.append(series[device][positions[device]])
+            positions[device] += 1
+        assert _float_sum(interleaved) != legacy_total, interleaved
+        assert _float_sum(interleaved) / count != legacy_total / count, interleaved
 
 
 def _run(awaitable):
@@ -499,8 +517,13 @@ def _reading_calls(seeded: Seeded) -> list[dict[str, Any]]:
         {"pond_id": "pond_north", "start": "-2h", "stop": None, "limit": 7},
         {"pond_id": "pond_sum", "start": "-2h", "stop": None, "limit": 1},
         {"pond_id": "pond_tie", "start": "-2h", "stop": None, "limit": 3},
-        # A relative stop bound.
-        {"pond_id": "pond_north", "start": "-2h", "stop": "-5m", "limit": 1000},
+        # A relative start with an absolute stop.
+        {
+            "pond_id": "pond_north",
+            "start": "-2h",
+            "stop": _iso(now - timedelta(minutes=5)),
+            "limit": 1000,
+        },
         # Absolute bounds, sub-second data included.
         {
             "pond_id": "pond_local_001",
@@ -611,11 +634,7 @@ async def test_summary_mean_keeps_legacy_float_summation_order(
     with repositories(influx_bucket, seeded.devices) as (legacy, projected, _recording, _domain):
         expected = await legacy.query_summary(tenant_id=TENANT, pond_id="pond_sum", period="24h")
         actual = await projected.query_summary(tenant_id=TENANT, pond_id="pond_sum", period="24h")
-    device_major = 0.0
-    for values in SUM_VALUES.values():
-        for value in values:
-            device_major += value
-    assert expected.statistics["temp_c"].mean == device_major / 6
+    assert expected.statistics["temp_c"].mean == _legacy_series_total() / 6
     assert actual.statistics["temp_c"].mean == expected.statistics["temp_c"].mean
     assert [point.temp_c for point in actual.series] == [point.temp_c for point in expected.series]
     assert len(actual.series) == 1
