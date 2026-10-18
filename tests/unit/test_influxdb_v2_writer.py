@@ -12,6 +12,8 @@ from influxdb_client.rest import ApiException
 from urllib3.exceptions import (
     ConnectTimeoutError,
     HTTPError,
+    LocationParseError,
+    LocationValueError,
     MaxRetryError,
     NewConnectionError,
     ProtocolError,
@@ -392,3 +394,45 @@ async def test_status_zero_api_exception_is_a_retryable_transport_failure(
 
     assert raised.value.retryable is True
     assert not any("schema" in record.getMessage().lower() for record in caplog.records)
+
+
+# --- added after approval (pre-approved by the orchestrator PR audit) -------------------------
+
+
+class _AsyncWriteApi:
+    async def write(self, *args: object, **kwargs: object) -> None:  # pragma: no cover
+        raise AssertionError("never awaited by a synchronous writer")
+
+
+def test_coroutine_write_api_is_rejected() -> None:
+    """WriteApiAsync.write returns a coroutine the writer would never await: nothing written."""
+    with pytest.raises(ValueError):
+        InfluxObservationWriter(write_api=_AsyncWriteApi(), bucket=BUCKET, org=ORG)
+
+
+@pytest.mark.asyncio
+async def test_status_zero_log_is_not_a_schema_conflict(caplog: pytest.LogCaptureFixture) -> None:
+    caplog.set_level(logging.DEBUG)
+    writer = make_writer(FakeWriteApi({1: ApiException(status=0, reason="SSLError\nEOF")}))
+
+    with pytest.raises(TelemetryWriteError):
+        await _write(writer, "observations")
+
+    assert caplog.records
+    assert all("schema" not in record.getMessage().lower() for record in caplog.records)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("method", WRITE_METHODS)
+@pytest.mark.parametrize(
+    "error",
+    [LocationParseError("http://[bad"), LocationValueError("No host specified.")],
+    ids=lambda error: type(error).__name__,
+)
+async def test_malformed_url_errors_are_permanent(method: str, error: BaseException) -> None:
+    writer = make_writer(FakeWriteApi({1: error}))
+
+    with pytest.raises(TelemetryWriteError) as raised:
+        await _write(writer, method)
+
+    assert raised.value.retryable is False

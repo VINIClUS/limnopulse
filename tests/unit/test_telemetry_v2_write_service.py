@@ -9,6 +9,7 @@ import pytest
 
 from limnopulse_api.core.errors import TelemetryWriteError
 from limnopulse_api.domain.assets import Asset, AssetType, AssetWithPondProfile, PondProfile
+from limnopulse_api.domain.ids import default_component_id_for_legacy_device
 from limnopulse_api.domain.telemetry_v2 import (
     MAX_OBSERVATIONS_PER_BATCH,
     CanonicalObservation,
@@ -616,3 +617,36 @@ async def test_native_probes_need_no_asset_lookup() -> None:
     assert outcome_tuple(outcome) == (2, 0, 2)
     assert harness.site_assets.lookups == []
     assert harness.legacy_writer.written == []
+
+
+# --- added after approval (pre-approved by the orchestrator PR audit) -------------------------
+
+
+@pytest.mark.asyncio
+async def test_an_asset_of_one_tenant_never_makes_another_tenant_eligible() -> None:
+    """D7 and tenant authority: tenant B has no Asset X, so its observation on X is excluded even
+    though tenant A owns Asset X with a legacy pond."""
+    item = scenario("legacy_sample")
+    owned = item.observations[0]
+    other_tenant = "tnt_other_002"
+    foreign = owned.model_copy(
+        update={
+            "resolved": owned.resolved.model_copy(
+                update={
+                    "tenant_id": other_tenant,
+                    "component_id": default_component_id_for_legacy_device(
+                        other_tenant, owned.resolved.device_id
+                    ),
+                }
+            )
+        }
+    )
+    harness = Harness(site_assets=assets_for(item), v2=False)
+
+    outcome = await harness.service.write([owned, foreign])
+
+    assert outcome_tuple(outcome) == (0, 1, 1)
+    (point,) = harness.legacy_writer.written
+    assert point.tenant_id == owned.resolved.tenant_id
+    assert point.pond_id == "pond_local_001"
+    assert (other_tenant, owned.resolved.asset_id) in harness.site_assets.lookups

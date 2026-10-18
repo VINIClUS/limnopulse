@@ -12,7 +12,11 @@ from dataclasses import dataclass
 from limnopulse_api.core.errors import TelemetryWriteError
 from limnopulse_api.domain.ids import default_component_id_for_legacy_device
 from limnopulse_api.domain.telemetry_v2 import MAX_OBSERVATIONS_PER_BATCH, CanonicalObservation
-from limnopulse_api.domain.telemetry_v2_schema import build_legacy_points, is_legacy_eligible
+from limnopulse_api.domain.telemetry_v2_schema import (
+    LegacyPoint,
+    build_legacy_points,
+    is_legacy_eligible,
+)
 from limnopulse_api.repositories.telemetry_v2 import LegacyObservationWriter, ObservationWriter
 from limnopulse_api.repositories.v2_contracts import SiteAssetReader
 
@@ -56,11 +60,20 @@ class ObservationWriteService:
             v2_points = len(observations)
         legacy_points = legacy_excluded = 0
         if self.legacy_dual_write_enabled and self.legacy_writer is not None:
-            legacy_pond_by_asset = await self._legacy_pond_by_asset(observations)
-            points = build_legacy_points(observations, legacy_pond_by_asset)
-            legacy_excluded = sum(
-                not is_legacy_eligible(o, legacy_pond_by_asset) for o in observations
-            )
+            ponds_by_tenant = await self._legacy_ponds_by_tenant(observations)
+            by_tenant: dict[str, list[CanonicalObservation]] = {}
+            for o in observations:
+                by_tenant.setdefault(o.resolved.tenant_id, []).append(o)
+            # One map per tenant: an Asset found for one tenant never makes another tenant's
+            # observation eligible, even if the asset IDs collide.
+            points: list[LegacyPoint] = []
+            for tenant_id in sorted(by_tenant):
+                tenant_observations = by_tenant[tenant_id]
+                legacy_pond_by_asset = ponds_by_tenant.get(tenant_id, {})
+                points.extend(build_legacy_points(tenant_observations, legacy_pond_by_asset))
+                legacy_excluded += sum(
+                    not is_legacy_eligible(o, legacy_pond_by_asset) for o in tenant_observations
+                )
             if points:
                 await _guarded(self.legacy_writer.write_legacy_points(points))
             legacy_points = len(points)
@@ -68,16 +81,16 @@ class ObservationWriteService:
             v2_points=v2_points, legacy_points=legacy_points, legacy_excluded=legacy_excluded
         )
 
-    async def _legacy_pond_by_asset(
+    async def _legacy_ponds_by_tenant(
         self, observations: Sequence[CanonicalObservation]
-    ) -> dict[str, str]:
+    ) -> dict[str, dict[str, str]]:
         """Resolve each distinct Asset once for this call; a missing Asset or pond is omitted.
 
         Only legacy default Components can be dual-written (D7), so native probes never make
         legacy dual-write depend on the Asset store.
         """
         resolved: set[tuple[str, str]] = set()
-        legacy_pond_by_asset: dict[str, str] = {}
+        ponds_by_tenant: dict[str, dict[str, str]] = {}
         for o in observations:
             if o.resolved.component_id != default_component_id_for_legacy_device(
                 o.resolved.tenant_id, o.resolved.device_id
@@ -92,8 +105,8 @@ class ObservationWriteService:
             except Exception as exc:
                 raise TelemetryWriteError("Asset lookup failed", retryable=True) from exc
             if asset is not None and asset.pond_profile.legacy_pond_id is not None:
-                legacy_pond_by_asset[o.resolved.asset_id] = asset.pond_profile.legacy_pond_id
-        return legacy_pond_by_asset
+                ponds_by_tenant.setdefault(key[0], {})[key[1]] = asset.pond_profile.legacy_pond_id
+        return ponds_by_tenant
 
 
 async def _guarded(write: Awaitable[None]) -> None:

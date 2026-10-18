@@ -6,6 +6,7 @@ are retryable; any other 4xx (including a 422 partial write) is permanent. Logs 
 messages never carry payload values or the server's response body.
 """
 
+import inspect
 import logging
 from collections.abc import Sequence
 from typing import Any
@@ -14,7 +15,7 @@ from anyio import to_thread
 from influxdb_client import WritePrecision
 from influxdb_client.client.write_api import WriteType
 from influxdb_client.rest import ApiException
-from urllib3.exceptions import HTTPError
+from urllib3.exceptions import HTTPError, LocationValueError
 
 from limnopulse_api.core.errors import TelemetryWriteError
 from limnopulse_api.domain.telemetry_v2 import CanonicalObservation
@@ -39,6 +40,8 @@ class InfluxObservationWriter:
             raise ValueError("max_lines_per_request must be positive")
         # A batching or asynchronous WriteApi returns before the server answers and reports
         # errors only to a callback, so a failed write would be acknowledged as written.
+        if inspect.iscoroutinefunction(getattr(write_api, "write", None)):
+            raise ValueError("write_api must be a synchronous WriteApi, not WriteApiAsync")
         write_options = getattr(write_api, "_write_options", None)
         if write_options is not None and write_options.write_type is not WriteType.synchronous:
             raise ValueError("write_api must use synchronous write options")
@@ -61,6 +64,11 @@ class InfluxObservationWriter:
                 await to_thread.run_sync(self._write_chunk, chunk)
             except ApiException as exc:
                 error = _classify_api_error(exc, len(chunk))
+            except LocationValueError as exc:
+                # A malformed InfluxDB URL is configuration, not transport: retrying cannot help.
+                error = TelemetryWriteError(
+                    f"InfluxDB URL is invalid: {type(exc).__name__}", retryable=False
+                )
             except (HTTPError, OSError) as exc:
                 error = TelemetryWriteError(
                     f"InfluxDB write failed in transport: {type(exc).__name__}", retryable=True
@@ -81,6 +89,9 @@ def _classify_api_error(exc: ApiException, line_count: int) -> TelemetryWriteErr
     if status == 0:
         # No HTTP response: influxdb-client reports a urllib3 SSLError (TLS negotiation or
         # certificate failure) this way, so it is a transport failure.
+        _LOGGER.warning(
+            "InfluxDB write got no HTTP response (TLS or client error): lines=%s", line_count
+        )
         return TelemetryWriteError("InfluxDB write failed before a response", retryable=True)
     if status == _TOO_MANY_REQUESTS or status >= _SERVER_ERROR:
         return TelemetryWriteError(f"InfluxDB write failed with HTTP {status}", retryable=True)
