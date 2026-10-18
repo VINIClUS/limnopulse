@@ -1148,3 +1148,37 @@ async def test_component_of_another_tenant_is_rejected_even_if_the_reader_return
     )
 
     assert record.reason is QuarantineReason.COMPONENT_NOT_OWNED
+
+
+class MismatchedDeployments:
+    """A misbehaving reader returning a Deployment that does not belong to the request."""
+
+    def __init__(self, deployment: Deployment) -> None:
+        self.deployment = deployment
+
+    async def get_deployment_at(
+        self, tenant_id: str, component_id: str, observed_at: datetime
+    ) -> Deployment | None:
+        return self.deployment
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("mismatch", ["tenant", "component"])
+async def test_deployment_of_another_tenant_or_component_is_unresolved(
+    world: World, mismatch: str
+) -> None:
+    if mismatch == "tenant":
+        foreign = await world.repos.get_current_deployment(
+            OTHER_TENANT, world.other_tenant_component
+        )
+        assert foreign is not None
+        foreign = foreign.model_copy(update={"component_id": COMPONENT})
+    else:
+        foreign = world.east_deployment.model_copy(update={"component_id": world.second_component})
+    subject = TelemetryNormalizer(
+        components=world.repos, deployments=MismatchedDeployments(foreign), clock=lambda: INGESTED
+    )
+
+    record = only_quarantined(await subject.normalize(context(), [observation()]))
+
+    assert record.reason is QuarantineReason.DEPLOYMENT_UNRESOLVED

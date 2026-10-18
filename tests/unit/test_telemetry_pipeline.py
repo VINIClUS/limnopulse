@@ -686,3 +686,14 @@ def test_pinned_replay_through_the_pipeline_restores_the_v1_point_in_the_same_se
     assert outcome.written.v2_points == 1
     assert outcome.counts["flag.replay"] == 1
     assert len(original.store.legacy) == 1
+
+
+@pytest.mark.asyncio
+async def test_outcome_counts_are_read_only(harness: Harness) -> None:
+    outcome = await harness.pipeline.ingest_legacy_reading(
+        legacy_context(FIRST_TS + timedelta(seconds=2)), example()
+    )
+
+    with pytest.raises(TypeError):
+        outcome.counts["accepted"] = 0  # type: ignore[index]
+    assert outcome.counts["accepted"] == 7

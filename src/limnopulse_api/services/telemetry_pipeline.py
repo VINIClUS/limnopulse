@@ -9,6 +9,7 @@ records are returned, and the caller must persist them before acknowledging (P3)
 
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
+from types import MappingProxyType
 from typing import Any
 
 from limnopulse_api.domain.legacy_telemetry_mapping import map_legacy_reading
@@ -29,7 +30,7 @@ from limnopulse_api.services.telemetry_v2_writes import (
 class PipelineOutcome:
     written: TelemetryWriteOutcome
     quarantined: tuple[QuarantinedObservation, ...]
-    counts: Mapping[str, int]  # closed keys of `NormalizationResult.counts()`
+    counts: Mapping[str, int]  # read-only; closed keys of `NormalizationResult.counts()`
 
 
 class TelemetryPipeline:
@@ -63,5 +64,7 @@ class TelemetryPipeline:
             quarantined=mapper_quarantined + normalized.quarantined,
         )
         return PipelineOutcome(
-            written=written, quarantined=result.quarantined, counts=result.counts()
+            written=written,
+            quarantined=result.quarantined,
+            counts=MappingProxyType(dict(result.counts())),
         )

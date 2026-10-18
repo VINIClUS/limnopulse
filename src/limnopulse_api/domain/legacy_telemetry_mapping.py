@@ -38,26 +38,61 @@ class LegacyMappingResult:
 
 
 _MAX_EXCERPT_DEPTH = 32
+_MAX_EXCERPT_NODES = 4096
 _MAX_EXCERPT_INTEGER_BITS = 256
 
 
-def _excerptable(value: object, depth: int = 0) -> object:
-    """A strict-JSON-safe copy: string keys, finite numbers, bounded depth and integer size."""
-    if depth > _MAX_EXCERPT_DEPTH:
-        return "<nested too deeply>"
-    if value is None or isinstance(value, bool | str):
-        return value
-    if isinstance(value, int):
-        if value.bit_length() > _MAX_EXCERPT_INTEGER_BITS:
-            return f"<integer of {value.bit_length()} bits>"
-        return value
-    if isinstance(value, float):
-        return value if math.isfinite(value) else repr(value)
-    if isinstance(value, Mapping):
-        return {str(key): _excerptable(item, depth + 1) for key, item in value.items()}
-    if isinstance(value, list | tuple):
-        return [_excerptable(item, depth + 1) for item in value]
-    return str(value)
+class _Excerpter:
+    """Builds a strict-JSON-safe copy with string keys, finite numbers and bounded size.
+
+    Cycles, depth beyond `_MAX_EXCERPT_DEPTH` and more than `_MAX_EXCERPT_NODES` nodes are cut
+    with a marker and set `cut`, so cyclic or heavily shared structures finish in bounded time.
+    """
+
+    def __init__(self) -> None:
+        self.nodes = 0
+        self.cut = False
+        self._path: set[int] = set()
+
+    def _marker(self, text: str) -> str:
+        self.cut = True
+        return text
+
+    def copy(self, value: object, depth: int = 0) -> object:
+        self.nodes += 1
+        if self.nodes > _MAX_EXCERPT_NODES:
+            return self._marker("<truncated>")
+        if depth > _MAX_EXCERPT_DEPTH:
+            return self._marker("<nested too deeply>")
+        if value is None or isinstance(value, bool | str):
+            return value
+        if isinstance(value, int):
+            return value if value.bit_length() <= _MAX_EXCERPT_INTEGER_BITS else _int_text(value)
+        if isinstance(value, float):
+            return value if math.isfinite(value) else repr(value)
+        if isinstance(value, Mapping | list | tuple):
+            if id(value) in self._path:
+                return self._marker("<cycle>")
+            self._path.add(id(value))
+            try:
+                if isinstance(value, Mapping):
+                    return {
+                        _key_text(key): self.copy(item, depth + 1) for key, item in value.items()
+                    }
+                return [self.copy(item, depth + 1) for item in value]
+            finally:
+                self._path.discard(id(value))
+        return str(value)
+
+
+def _int_text(value: int) -> str:
+    return f"<integer of {value.bit_length()} bits>"
+
+
+def _key_text(key: object) -> str:
+    if isinstance(key, int) and not isinstance(key, bool):
+        return str(key) if key.bit_length() <= _MAX_EXCERPT_INTEGER_BITS else _int_text(key)
+    return str(key)
 
 
 def _utf8_size(text: str) -> int:
@@ -68,14 +103,17 @@ def bounded_excerpt(source: object) -> tuple[str, bool]:
     """JSON of `source` within `MAX_QUARANTINE_EXCERPT_BYTES` UTF-8 bytes; flags truncation.
 
     Never raises for any payload value: non-JSON values are stringified, non-finite floats
-    become strings, and lone surrogates are escaped so the text is always encodable. A
+    become strings, lone surrogates are escaped so the text is always encodable, and cycles or
+    oversized structures are cut (and flagged as truncated). A
     truncated excerpt stays valid JSON: it is a JSON string holding the longest prefix of the
     full serialization that fits.
     """
-    text = json.dumps(_excerptable(source), ensure_ascii=False, sort_keys=True, allow_nan=False)
+    excerpter = _Excerpter()
+    safe = excerpter.copy(source)
+    text = json.dumps(safe, ensure_ascii=False, sort_keys=True, allow_nan=False)
     text = text.encode("utf-8", errors="backslashreplace").decode("utf-8")
     if _utf8_size(text) <= MAX_QUARANTINE_EXCERPT_BYTES:
-        return text, False
+        return text, excerpter.cut
     low, high = 0, len(text)
     while low < high:  # longest prefix whose JSON string literal fits the bound
         middle = (low + high + 1) // 2
@@ -131,6 +169,11 @@ def map_legacy_reading(
             truncated=truncated,
         )
 
+    if not isinstance(payload, Mapping):
+        record = quarantine(
+            QuarantineReason.OBSERVED_AT_INVALID, "payload must be a JSON object", payload
+        )
+        return LegacyMappingResult(observations=(), quarantined=(record,))
     try:
         observed_at = _TIMESTAMP.validate_python(payload.get("ts"))
     except ValueError as exc:  # pydantic ValidationError, or an oversized integer input

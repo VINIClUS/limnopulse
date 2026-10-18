@@ -2,6 +2,7 @@
 
 import json
 import math
+import time
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any
@@ -464,3 +465,44 @@ def test_truncated_reading_excerpt_is_still_strict_json(ts: str) -> None:
     assert excerpt.startswith('{"battery_v"')
     assert len(record.source_excerpt_json.encode("utf-8")) <= MAX_QUARANTINE_EXCERPT_BYTES
     assert len(record.source_excerpt_json.encode("utf-8")) > MAX_QUARANTINE_EXCERPT_BYTES - 16
+
+
+# Regression (orchestrator PR audit): poison-message safety --------------------------------------
+
+
+@pytest.mark.parametrize(
+    "payload",
+    [[{"ts": "2026-07-09T12:00:00Z"}], "2026-07-09T12:00:00Z", None, 7, b"{}"],
+    ids=["list", "str", "null", "int", "bytes"],
+)
+def test_non_object_payload_quarantines_the_reading(payload: object) -> None:
+    record = assert_reading_quarantined(map_legacy_reading(context(), payload))  # type: ignore[arg-type]
+
+    assert "payload must be a JSON object" in record.detail
+    _strict_json(record.source_excerpt_json)
+
+
+def _self_referencing() -> list[Any]:
+    cycle: list[Any] = []
+    cycle.extend([cycle, cycle])
+    return cycle
+
+
+def _deeply_shared() -> list[Any]:
+    shared: list[Any] = [1]
+    for _ in range(64):
+        shared = [shared, shared]
+    return shared
+
+
+@pytest.mark.parametrize("build", [_self_referencing, _deeply_shared], ids=["cycle", "shared"])
+def test_cyclic_or_shared_payload_values_give_a_bounded_truncated_excerpt(build: Any) -> None:
+    started = time.perf_counter()
+
+    record = assert_reading_quarantined(
+        map_legacy_reading(context(), {"ts": "bad", "note": build()})
+    )
+
+    assert time.perf_counter() - started < 2.0
+    assert record.truncated is True
+    _strict_json(record.source_excerpt_json)

@@ -87,7 +87,11 @@ class TelemetryNormalizer:
     ) -> NormalizationResult:
         if len(observations) > MAX_OBSERVATIONS_PER_BATCH:
             raise ValueError(f"telemetry batch exceeds {MAX_OBSERVATIONS_PER_BATCH} observations")
-        versions = context.mapping_versions or self.default_versions
+        versions = (
+            context.mapping_versions
+            if context.mapping_versions is not None
+            else self.default_versions
+        )
         self._require_known(versions)
         call = _NormalizationCall(self, context, versions)
         accepted: list[CanonicalObservation] = []
@@ -158,7 +162,11 @@ class _NormalizationCall:
         except UnitConversionError as exc:
             raise _Quarantine(exc.reason, exc.detail) from exc
         deployment = await self._deployment_at(source.component_id, source.observed_at)
-        if deployment is None:
+        if (
+            deployment is None
+            or deployment.tenant_id != context.tenant_id
+            or deployment.component_id != source.component_id
+        ):
             raise _Quarantine(
                 QuarantineReason.DEPLOYMENT_UNRESOLVED,
                 "no deployment contains observed_at",
