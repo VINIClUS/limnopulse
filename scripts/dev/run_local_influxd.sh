@@ -29,6 +29,12 @@ cleanup() {
 }
 trap cleanup EXIT
 
+# The pinned release is the linux/amd64 build.
+if [[ "$(uname -s)" != "Linux" || "$(uname -m)" != "x86_64" ]]; then
+  echo "run_local_influxd.sh supports linux/amd64 only (this host is $(uname -s)/$(uname -m))" >&2
+  exit 1
+fi
+
 healthy() {
   curl -fsS --max-time 2 "${BASE_URL}/health" >/dev/null 2>&1
 }
@@ -73,6 +79,17 @@ running() {
   [[ ! -r "/proc/${pid}/comm" || "$(cat "/proc/${pid}/comm")" == "influxd" ]]
 }
 
+# Stop the influxd this run started and forget it, so a later run never
+# reuses a process that failed to start properly.
+abort_start() {
+  local pid="$1"
+  shift
+  echo "$*" >&2
+  kill "${pid}" 2>/dev/null || true
+  rm -f "${PID_FILE}" "${PORT_FILE}"
+  exit 1
+}
+
 install_influxd() {
   WORK_DIR="$(mktemp -d)"
   curl --proto "=https" --tlsv1.2 -fsSL -o "${WORK_DIR}/${TARBALL}" "${DOWNLOAD_URL}"
@@ -101,8 +118,8 @@ if running; then
     exit 1
   fi
   version="$(health_version)"
-  if [[ -n "${version}" && "${version}" != "v2.7.11" ]]; then
-    echo "the reused server on ${BASE_URL} is InfluxDB ${version}, not v2.7.11; stop it first" >&2
+  if [[ "${version}" != "v2.7.11" ]]; then
+    echo "the reused server on ${BASE_URL} reports version '${version}', not v2.7.11; stop it first" >&2
     exit 1
   fi
 else
@@ -123,12 +140,10 @@ else
   echo "${pid}" >"${PID_FILE}"
   echo "${PORT}" >"${PORT_FILE}"
   if ! wait_healthy "${pid}" || ! kill -0 "${pid}" 2>/dev/null; then
-    echo "influxd did not start on ${BASE_URL}; see ${LOG_FILE}" >&2
-    exit 1
+    abort_start "${pid}" "influxd did not start on ${BASE_URL}; see ${LOG_FILE}"
   fi
   if [[ "$(health_version)" != "v2.7.11" ]]; then
-    echo "the server on ${BASE_URL} is not InfluxDB v2.7.11" >&2
-    exit 1
+    abort_start "${pid}" "the server on ${BASE_URL} is not InfluxDB v2.7.11"
   fi
   echo "Started influxd (pid ${pid}) on ${BASE_URL}"
 fi
@@ -137,7 +152,7 @@ fi
 # it is accepted only when that run onboarded the same org and token.
 onboarding="$(printf 'org=%s\ntoken-sha256=%s\n' "${ORG}" "$(printf '%s' "${TOKEN}" | sha256sum | cut -d ' ' -f 1)")"
 RESPONSE="$(mktemp)"
-status="$(curl -sS -o "${RESPONSE}" -w '%{http_code}' -X POST "${BASE_URL}/api/v2/setup" \
+status="$(curl -sS --max-time 10 -o "${RESPONSE}" -w '%{http_code}' -X POST "${BASE_URL}/api/v2/setup" \
   -H 'Content-Type: application/json' \
   -d "{\"username\":\"limnopulse\",\"password\":\"local-dev-password\",\"org\":$(json_string "${ORG}"),\"bucket\":\"limnopulse_dev\",\"token\":$(json_string "${TOKEN}")}")"
 if [[ "${status}" == "201" ]]; then
@@ -146,7 +161,7 @@ if [[ "${status}" == "201" ]]; then
 elif grep -q '"conflict"' "${RESPONSE}" && grep -q 'onboarding has already been completed' "${RESPONSE}"; then
   if [[ -f "${ONBOARDED_FILE}" && "$(cat "${ONBOARDED_FILE}")" != "${onboarding}" ]]; then
     echo "influxd on ${BASE_URL} was onboarded with a different INFLUX_INTEGRATION_ORG or INFLUX_INTEGRATION_TOKEN;" \
-      "use the original values or delete ${CACHE_DIR} to start over" >&2
+      "use the original values, or stop it (kill \"\$(cat ${PID_FILE})\") and delete ${CACHE_DIR} to start over" >&2
     exit 1
   fi
   echo "Onboarding has already been completed on ${BASE_URL}"

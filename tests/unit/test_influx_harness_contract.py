@@ -10,6 +10,7 @@ import socket
 import stat
 import subprocess
 import sys
+import time
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -548,7 +549,9 @@ def test_verification_docs_describe_the_influx_gate() -> None:
 # PATH shims for the runner's behaviour. The fake curl answers like curl:
 # -o writes the body, -w prints %{http_code} and expands escapes such as \n,
 # -f/--fail suppresses the body and exits 22 on HTTP >= 400, --fail-with-body
-# keeps it, and loopback URLs fail with exit 7 unless FAKE_HEALTHY=1.
+# keeps it, and loopback URLs fail with exit 7 unless FAKE_HEALTHY=1 or the
+# FAKE_UP_FILE exists. /health reports FAKE_HEALTH_VERSION (default v2.7.11;
+# set it empty to omit the version).
 FAKE_CURL = r"""#!/usr/bin/env bash
 printf 'curl %s\n' "$*" >> "$FAKE_LOG"
 out=""; fmt=""; fail=0; keep_body=0; url=""
@@ -571,14 +574,22 @@ code=404; body=""
 case "$url" in
   https://dl.influxdata.com/*) code=200; body="this is not the influxdb tarball" ;;
   http://127.0.0.1:*)
-    if [ "${FAKE_HEALTHY:-0}" != 1 ]; then
+    if [ "${FAKE_HEALTHY:-0}" != 1 ] && { [ -z "${FAKE_UP_FILE:-}" ] || [ ! -e "${FAKE_UP_FILE}" ]; }; then
       # Nothing listens: behave like curl against a closed port.
       echo "curl: (7) Failed to connect to 127.0.0.1: Connection refused" >&2
       if [ -n "$fmt" ]; then printf '%b' "${fmt//%\{http_code\}/000}"; fi
       exit 7
     fi
     case "$url" in
-      */health) code=200; body='{"name":"influxdb","status":"pass"}' ;;
+      */health)
+        code=200
+        version="${FAKE_HEALTH_VERSION-v2.7.11}"
+        if [ -n "$version" ]; then
+          body='{"name":"influxdb","status":"pass","version":"'"$version"'"}'
+        else
+          body='{"name":"influxdb","status":"pass"}'
+        fi
+        ;;
       */api/v2/setup) code="$FAKE_SETUP_CODE"; body="$FAKE_SETUP_BODY" ;;
     esac
     ;;
@@ -697,3 +708,79 @@ def test_local_runner_refuses_a_tarball_with_the_wrong_sha256(runner_env) -> Non
     output = (result.stdout + result.stderr).lower()
     assert "sha256" in output or "checksum" in output, output
     assert not (runner_env.cache / "influxd.pid").exists()
+
+
+def test_local_runner_refuses_a_reused_server_that_reports_no_version(live_influxd) -> None:
+    live_influxd.env["FAKE_HEALTH_VERSION"] = ""
+
+    result, calls = live_influxd.run(422, CONFLICT)
+
+    assert result.returncode != 0, result.stdout + result.stderr
+    assert "v2.7.11" in result.stderr
+    assert not any("/api/v2/setup" in call for call in calls), calls
+
+
+def _install_fake_influxd(runner_env, body: str) -> None:
+    binary = runner_env.cache / "influxdb2-2.7.11" / "usr" / "bin" / "influxd"
+    binary.parent.mkdir(parents=True)
+    binary.write_text(body, encoding="utf-8")
+    binary.chmod(0o755)
+
+
+def _gone(pid: int) -> bool:
+    for _ in range(50):
+        try:
+            state = Path(f"/proc/{pid}/stat").read_text(encoding="utf-8").split(") ")[1][0]
+        except (FileNotFoundError, IndexError):
+            return True
+        if state == "Z":
+            return True
+        time.sleep(0.1)
+    return False
+
+
+def test_local_runner_cleans_up_when_influxd_never_becomes_healthy(runner_env) -> None:
+    _install_fake_influxd(runner_env, "#!/usr/bin/env bash\nexit 1\n")
+
+    result, calls = runner_env.run(201, "{}")
+
+    assert result.returncode != 0, result.stdout + result.stderr
+    assert not (runner_env.cache / "influxd.pid").exists()
+    assert not (runner_env.cache / "influxd.port").exists()
+    assert not any("/api/v2/setup" in call for call in calls), calls
+
+
+def test_local_runner_stops_a_started_server_with_the_wrong_version(runner_env) -> None:
+    up_file = runner_env.tmp_path / "fake-up"
+    pid_file = runner_env.tmp_path / "fake-influxd.pid"
+    _install_fake_influxd(
+        runner_env,
+        f'#!/usr/bin/env bash\necho "$$" > "{pid_file}"\ntouch "{up_file}"\nexec sleep 300\n',
+    )
+    runner_env.env["FAKE_UP_FILE"] = str(up_file)
+    runner_env.env["FAKE_HEALTH_VERSION"] = "v2.7.12"
+
+    result, calls = runner_env.run(201, "{}")
+
+    assert result.returncode != 0, result.stdout + result.stderr
+    assert "v2.7.11" in result.stderr
+    started = int(pid_file.read_text(encoding="utf-8"))
+    assert _gone(started), f"influxd stand-in {started} still runs"
+    assert not (runner_env.cache / "influxd.pid").exists()
+    assert not (runner_env.cache / "influxd.port").exists()
+    assert not any("/api/v2/setup" in call for call in calls), calls
+
+
+def test_local_runner_refuses_a_host_that_is_not_linux_amd64(runner_env) -> None:
+    uname = runner_env.tmp_path / "bin" / "uname"
+    uname.write_text(
+        '#!/usr/bin/env bash\ncase "$1" in -s) echo Darwin ;; -m) echo arm64 ;; esac\n',
+        encoding="utf-8",
+    )
+    uname.chmod(0o755)
+
+    result, calls = runner_env.run(201, "{}")
+
+    assert result.returncode != 0
+    assert "linux/amd64" in result.stderr
+    assert not any(call.startswith(("curl", "influxd")) for call in calls), calls

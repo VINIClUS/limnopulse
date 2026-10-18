@@ -106,7 +106,10 @@ def test_influx_job_uses_a_throwaway_influxdb_service_with_the_harness_defaults(
     services = list(job["services"].values())
     assert len(services) == 1
     service = services[0]
-    assert service["image"] == "influxdb:2.7.11-alpine"
+    # A digest-pinned true 2.7.11; the 2.7.11-alpine tag drifted to 2.7.12.
+    assert service["image"] == (
+        "influxdb:2.7.11@sha256:d92a10e9e75aff18eca38ff3a8f0b4a800706a5dd44d1b0ece264af04458525b"
+    )
     assert service["ports"] in (["8086:8086"], ["127.0.0.1:8086:8086"])
 
     env = service["env"]
@@ -156,7 +159,7 @@ def test_makefile_exposes_safe_reproducible_targets() -> None:
     influx_recipe = [
         "uv sync --locked --extra dev",
         "RUN_INFLUX_INTEGRATION=1 uv run --locked --no-sync python -m pytest -q tests/influx",
-        "RUN_INFLUX_INTEGRATION=1 go test -race -run 'TestInfluxIntegration' ./...",
+        "RUN_INFLUX_INTEGRATION=1 go test -race -count=1 -run 'TestInfluxIntegration' ./...",
     ]
 
     phony_match = re.search(r"^\.PHONY:\s+(.+)$", makefile, flags=re.MULTILINE)

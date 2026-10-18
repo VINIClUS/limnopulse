@@ -37,7 +37,11 @@ InfluxDB 2.7.11: the Python tests in `tests/influx/` and every Go test named
 `make verify-influx` is not part of `make verify`. Without that variable the
 default `make verify-python` and `make verify-go` skip these tests, so they
 never need InfluxDB. The CI `influx` job runs the target against a throwaway
-`influxdb:2.7.11-alpine` service container. The dev token `local-dev-token` is
+InfluxDB 2.7.11 service container, `influxdb:2.7.11@sha256:d92a10e9e75aff18eca38ff3a8f0b4a800706a5dd44d1b0ece264af04458525b`.
+It is pinned by digest because the `influxdb:2.7.11-alpine` tag was rebuilt
+with InfluxDB 2.7.12, and the integration tests must run the same 2.7.11 as
+the local runner. Go integration tests run with `-count=1`, so a cached result
+never stands in for a run against the server. The dev token `local-dev-token` is
 a fixed, non-secret default that exists only in throwaway instances (that CI
 service container and the local influxd below); no repository secret is used.
 

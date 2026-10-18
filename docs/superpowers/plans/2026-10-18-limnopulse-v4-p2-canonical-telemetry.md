@@ -54,6 +54,7 @@ Every dependency boundary is a merge to `main`. P2 ships **dark** (D16): no depl
   - test-local projection fixtures;
   - the harness lifecycle;
   - small wording fixes.
+- r7.1 (P2-01 review): CI InfluxDB image pinned by digest to a true 2.7.11; Go integration tests run with -count=1.
 
 ## Global Constraints
 
@@ -564,11 +565,11 @@ P2-08 creates these app-state names:
 
 **CI:**
 - `.github/workflows/verify.yml` gains job `influx`, running exactly `make verify-influx`.
-- The job uses service container `influxdb:2.7.11-alpine`, initialized with the defaults above. Readiness comes from service `options: --health-cmd "influx ping"`, not an extra `run:` step.
+- The job uses service container `influxdb:2.7.11@sha256:d92a10e9e75aff18eca38ff3a8f0b4a800706a5dd44d1b0ece264af04458525b`, initialized with the defaults above. It is pinned by digest because the `influxdb:2.7.11-alpine` tag was rebuilt with InfluxDB 2.7.12. Readiness comes from service `options: --health-cmd "influx ping"`, not an extra `run:` step.
 - `make verify-influx` runs:
   - `$(UV) sync --locked --extra dev`
   - `RUN_INFLUX_INTEGRATION=1 $(UV) run --locked --no-sync python -m pytest -q tests/influx`
-  - `RUN_INFLUX_INTEGRATION=1 go test -race -run 'TestInfluxIntegration' ./...`
+  - `RUN_INFLUX_INTEGRATION=1 go test -race -count=1 -run 'TestInfluxIntegration' ./...`
 - `verify-influx` joins `.PHONY`. The aggregate `make verify` is unchanged; `test_ci_contract.py` keeps it as a separate expectation.
 
 ### `/v2` telemetry API (P2-04, mounted by P2-08)
@@ -806,7 +807,7 @@ Each task also owns the new test files named in its section.
     - the job set `{python, go, opentofu, compose, frontend, influx}`; `python`, `go`, `opentofu`, `compose` and `influx` each run exactly `make <target>`, and `frontend` keeps its pinned npm steps;
     - the exact `verify-influx` recipe via `make -n`, with `verify-influx` in `.PHONY` and outside the `verify` aggregate;
     - the SHA-pinned action set and no `secrets.`;
-    - the service image `influxdb:2.7.11-alpine` with a health-cmd.
+    - the service image `influxdb:2.7.11@sha256:d92a10e9e75aff18eca38ff3a8f0b4a800706a5dd44d1b0ece264af04458525b` (a true 2.7.11; the `-alpine` tag drifted to 2.7.12) with a health-cmd.
   - `test_influx_harness_contract.py` covers:
     - the env names and defaults;
     - the harness module importable without skipping;

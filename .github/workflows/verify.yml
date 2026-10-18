@@ -67,7 +67,8 @@ jobs:
     runs-on: ubuntu-latest
     services:
       influxdb:
-        image: influxdb:2.7.11-alpine
+        # Pinned by digest: the 2.7.11-alpine tag was rebuilt with InfluxDB 2.7.12.
+        image: influxdb:2.7.11@sha256:d92a10e9e75aff18eca38ff3a8f0b4a800706a5dd44d1b0ece264af04458525b
         # Throwaway onboarding that matches the harness defaults.
         env:
           DOCKER_INFLUXDB_INIT_MODE: setup
