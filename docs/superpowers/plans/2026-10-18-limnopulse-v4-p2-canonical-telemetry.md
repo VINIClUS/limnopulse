@@ -24,7 +24,7 @@ Every dependency boundary is a merge to `main`. P2 ships **dark** (D16): no depl
 
 **Epic:** #22 (roadmap #14). **Planning baseline:** `main@2918532` (M1 complete; `make verify-python` 2120 passed / 8 skipped; `go test -race ./...` green).
 
-**Revision:** r6.
+**Revision:** r7.
 - r2 applied the findings of five independent audits (three local agents and two cloud sessions, one of which ran real InfluxDB 2.7.11 experiments) and the first Codex review of PR #76.
 - r3 applies the second Codex review:
   - `source_type` and `seq` handling in the `/v1` projection;
@@ -48,6 +48,12 @@ Every dependency boundary is a merge to `main`. P2 ships **dark** (D16): no depl
   - deterministic aggregation order in `EvaluateSamples`;
   - a presence-aware `seq` winner in the projection;
   - microsecond canonical time precision.
+- r7 applies the final plan↔issue consistency audit:
+  - the ADR phase split as a paragraph (headings are pinned by a test);
+  - the Go `V2Row`/`V2Querier`;
+  - test-local projection fixtures;
+  - the harness lifecycle;
+  - small wording fixes.
 
 ## Global Constraints
 
@@ -117,7 +123,7 @@ Epic #22 requires the metric/unit and dual-write contracts to be frozen before d
 | D15 | Out-of-range values | An out-of-range value is written (to v2 and, when eligible, to legacy) with `quality_state=out_of_range` and provenance `plausible_range`. Legacy reads still show it, as today. v2 quality-gated alert reads exclude it. This divergence is intentional, tested in P2-05, and documented in the runbook. |
 | D16 | P2 ships dark | No deployed service calls the pipeline in P2; only `scripts/dev/ingest_reading_v2.py` does, and Telegraf keeps writing only `water_quality`. `ALERT_EVALUATOR_TELEMETRY_SOURCE=v2` and `V1_TELEMETRY_READ_SOURCE=v2` may be enabled only where a producer writes every legacy device to `observation_numeric` and the keyed divergence check reports zero missing or different `(pond, device, metric, _time, value)` tuples over max(longest rule window, legacy read window). Production enablement is a P3 exit step. |
 | D17 | AlertRuleV2 deferred | `/v2/alert-rules`, §16.2 selectors, §16.3 declared quality policies and §7.3 `metric_key` rules are deferred to a separate backlog issue, to start after P3/P6. They need health condition keys and non-null confidence. P2 delivers only the `/v1`-rule v2 read adapter (§24 Phase 2 "move the v2 alert adapter first", §16.4). |
-| D18 | ADR phase split recorded | P2-09 appends a "Phase split" section to ADR-006 and ADR-007 that names what P2 proves and what P3 must prove before production canonical writes. The orchestrator records the same entry gates on Epic #15. |
+| D18 | ADR phase split recorded | P2-09 appends a `**Phase split (P2).**` paragraph, with no new Markdown heading, at the end of `## Implementation gate` in ADR-006 and ADR-007. The paragraph names what P2 proves and what P3 must prove before production canonical writes. `tests/unit/test_architecture_inventory.py` pins each ADR's exact heading tuple, so it stays unmodified and green. The orchestrator records the same entry gates on Epic #15. |
 
 ### Spec deltas (V4 §10 → this plan)
 
@@ -548,12 +554,12 @@ P2-08 creates these app-state names:
 - `tests/influx/conftest.py` (P2-01) re-exports the fixtures and marks every `tests/influx` item skipped without the env.
 
 **Go:**
-- P2-01 owns `internal/alertevaluator/influx/integration_harness_test.go`, which provides `newIntegrationBucket(t) (client, bucket)` and `writeLines(t, …)` and creates/deletes buckets through `BucketsAPI()`.
+- P2-01 owns `internal/alertevaluator/influx/integration_harness_test.go` (`package influx`, so P2-05 tests can call it), which provides `newIntegrationBucket(t) (client, bucket)` and `writeLines(t, …)` and creates/deletes buckets through `BucketsAPI()`.
 - It also provides `TestInfluxIntegrationHarnessSmoke`.
 
 **`scripts/dev/run_local_influxd.sh`** runs InfluxDB 2.7.11 without Docker:
 - downloads `influxdb2-2.7.11_linux_amd64.tar.gz`, checks SHA-256 `8d7872013cad3524fb728ca8483d0adc30125ad1af262ab826dcf5d1801159cf`, and unpacks into `${XDG_CACHE_HOME:-$HOME/.cache}/limnopulse/influxd`. The tarball has no `influx` CLI;
-- starts on a loopback port and waits for `/health`;
+- binds `127.0.0.1:8086` by default (`INFLUXD_PORT` overrides), waits for `/health`, and leaves influxd running in the background with a PID file in the cache dir. It exits 0 and is idempotent on re-run: it reuses a running instance;
 - runs setup through `curl -X POST /api/v2/setup`. A `conflict` "onboarding has already been completed" response counts as success.
 
 **CI:**
@@ -690,11 +696,11 @@ from(bucket: <b>)
 | P2-02 | `domain/telemetry_units.py`, `domain/telemetry_quality.py` | Pure functions only; no I/O |
 | P2-03 | `adapters/influxdb_v2_writer.py`, `services/telemetry_v2_writes.py` | No settings, `main.py` or `/v1` files |
 | P2-04 | `adapters/influxdb_v2_reader.py`, `services/telemetry_v2.py`, `api/v2/routers/observations.py`, `api/v2/routers/metric_definitions.py`, `api/v2/schemas/observations.py`, `api/v2/schemas/metric_definitions.py`, `api/v2/telemetry_dependencies.py` | Routers unmounted; no edit to `api/v2/router.py`, `api/v2/dependencies.py` or `main.py` |
-| P2-05 | `internal/alertevaluator/influx/{query_v2,client_v2,legacy_ids}.go` and their tests, `internal/alertevaluator/config.go`, `config_test.go`, `cmd/alert-evaluator/main.go`, `main_test.go`, `internal/alertevaluator/quality.go` + `quality_test.go` (deterministic summation order only), `docs/alert-evaluator-phase-3b.md` (telemetry-source section) | No Python; no semantic change to `EvaluateSamples` beyond deterministic order; no change to `state_machine.go` or the legacy `query.go`/`client.go` behavior |
+| P2-05 | `internal/alertevaluator/influx/{query_v2,client_v2,legacy_ids}.go` and their tests (`query_v2_test.go`, `client_v2_test.go`, `legacy_ids_test.go`, `parity_integration_test.go`), `internal/alertevaluator/config.go`, `config_test.go`, `cmd/alert-evaluator/main.go`, `main_test.go`, `internal/alertevaluator/quality.go` + `quality_test.go` (deterministic summation order only), `docs/alert-evaluator-phase-3b.md` (telemetry-source section) | No Python; no semantic change to `EvaluateSamples` beyond deterministic order; no change to `state_machine.go` or the legacy `query.go`/`client.go` behavior |
 | P2-06 | `services/telemetry_normalizer.py`, `domain/legacy_telemetry_mapping.py`, `services/telemetry_pipeline.py` | No InfluxDB I/O; no settings |
 | P2-07 | `adapters/influxdb_v1_projection.py` | No change to `/v1` routers, services, schemas, `repositories/telemetry.py` or `adapters/influxdb.py` |
 | P2-08 | `core/config.py`, `main.py`, `api/router.py`, `api/v2/router.py`, `scripts/dev/ingest_reading_v2.py`, `.env.example`, `README.md`, `docs/architecture.md` (new section only; pinned header unchanged), `tests/api/test_v2_composition.py`, `tests/api/test_app_runtime.py` | Integration hotspot owner; no feature logic |
-| P2-09 | `tests/contracts/test_p2_acceptance_gate.py`, `tests/influx/test_p2_acceptance_influx.py`, `docs/p2-telemetry-rollout-runbook.md`, `docs/adr/ADR-006-*.md` and `docs/adr/ADR-007-*.md` (append "Phase split" only), README runbook link | No production feature code |
+| P2-09 | `tests/contracts/test_p2_acceptance_gate.py`, `tests/influx/test_p2_acceptance_influx.py`, `docs/p2-telemetry-rollout-runbook.md`, `docs/adr/ADR-006-*.md` and `docs/adr/ADR-007-*.md` (append the `**Phase split (P2).**` paragraph at the end of `## Implementation gate`; no new heading), README runbook link | No production feature code |
 
 Each task also owns the new test files named in its section.
 
@@ -742,10 +748,11 @@ Each task also owns the new test files named in its section.
   - Models reject naive datetimes, extra fields, NaN/Infinity, booleans as values, a sequence above `MAX_SEQUENCE`, bad ID prefixes and non-allowlisted metadata.
   - `SourceObservation` has no tenant/site/asset/deployment/device field.
   - `CanonicalObservation` rejects a mismatched `event_id` and inconsistent delivery/flag mirrors.
-  - `observation_event_id` is stable and independent of versions, quality and non-`observed_at` times.
+  - `observation_event_id` is stable and independent of versions, quality, `received_at`, `ingested_at` and `source_event_id`.
   - `NormalizationResult.counts()` keys are closed.
 - [ ] **Step 2: Write failing schema tests.**
   - `encode_observation_line` output equals each scenario's golden lines byte-for-byte: sorted tags/fields, escaping, `repr` floats, integer suffixes and range, integer-nanosecond time.
+  - Integers carry the `i` suffix and are rejected outside the signed 64-bit range; time is integer µs × 1000.
   - The optional `probe_id` tag is omitted when absent. Optional fields are always written, with sentinels `sequence=-1i`, `source_event_id=""` and `integration_id=""`. JSON fields over 512 bytes, non-finite values and datetimes outside `[MIN_TELEMETRY_TIME, MAX_TELEMETRY_TIME)` are rejected.
   - The guard rejects unknown or missing tags, invalid IDs, unknown metrics, `quality_state`/`source_type`/event IDs/metadata as tags, and a wrong `schema_version`.
   - `build_legacy_points` + `encode_legacy_line` honor D7, D8 and the grouping/tie-break rules, with exact sub-second time, constant `source=mqtt` and `topic` tags for every source type, and `rssi`/`seq` as integers.
@@ -796,7 +803,7 @@ Each task also owns the new test files named in its section.
 
 - [ ] **Step 1: Write failing tests.**
   - `test_ci_contract.py` covers:
-    - the job set `{python, go, opentofu, compose, frontend, influx}`, with each job running exactly `make <target>`;
+    - the job set `{python, go, opentofu, compose, frontend, influx}`; `python`, `go`, `opentofu`, `compose` and `influx` each run exactly `make <target>`, and `frontend` keeps its pinned npm steps;
     - the exact `verify-influx` recipe via `make -n`, with `verify-influx` in `.PHONY` and outside the `verify` aggregate;
     - the SHA-pinned action set and no `secrets.`;
     - the service image `influxdb:2.7.11-alpine` with a health-cmd.
@@ -880,7 +887,7 @@ Each task also owns the new test files named in its section.
     - `ApiException` with status 429 or ≥ 500 → `TelemetryWriteError(retryable=True)`;
     - 422 (partial write, for example a field-type conflict) and other 4xx → `retryable=False`, with a schema-conflict log entry that contains no payload values;
     - `urllib3.exceptions.HTTPError` (connection refused, connect/read timeout) and `OSError` → `retryable=True`.
-- **`ObservationWriteService(*, writer, legacy_writer, site_assets: SiteAssetReader, v2_write_enabled: bool, legacy_dual_write_enabled: bool)`.**
+- **`ObservationWriteService(*, writer: ObservationWriter | None, legacy_writer: LegacyObservationWriter | None, site_assets: SiteAssetReader, v2_write_enabled: bool, legacy_dual_write_enabled: bool)`.** A writer may be `None` only when its switch is off; any other combination is a `ValueError` at construction.
   - `async write(observations) -> TelemetryWriteOutcome(v2_points: int, legacy_points: int, legacy_excluded: int)`.
   - Writes v2 first, then legacy.
   - Resolves `legacy_pond_by_asset` through Asset lookups, cached per call; a missing Asset is excluded and counted.
@@ -898,7 +905,7 @@ Each task also owns the new test files named in its section.
   - An Asset-lookup exception is retryable.
 - [ ] **Step 2: Write failing integration tests** (real InfluxDB).
   - Writing the same scenario twice and in shuffled order yields an identical stored point set.
-  - Re-writing the same identity with a **different quality classification** (a value corrected to out-of-range), a **different `received_at`**, and `sequence`/`source_event_id` changed from a value to absent yields exactly one point per identity. Every field equals the last write, so the sentinels replace the stale values.
+  - Re-writing the same identity with a **different quality classification** (a value corrected to out-of-range), a **different `received_at`**, and `sequence`/`source_event_id` changed from a value to absent yields exactly one point per identity. Every **`observation_numeric`** field equals the last write, so the sentinels replace the stale values. The legacy `seq` keeps its old value, which is the D10 known limitation, and the test asserts that too.
   - A dual-written legacy point plus a Telegraf-shaped line for the same reading yield one point, and one row through `InfluxTelemetryRepository.query_readings`. The Telegraf-shaped line is built from the parsed `telegraf.conf` plus Telegraf defaults (`topic`), whole-second and sub-second.
   - A closed loopback port raises `TelemetryWriteError(retryable=True)`.
 - [ ] **Step 3: Run red, commit, test gate,** then implement after approval.
@@ -945,6 +952,7 @@ Each task also owns the new test files named in its section.
   - Global sort and limit; latest is one item per `(component, metric)`.
 - [ ] **Step 2: Write failing service and API tests** (isolated app with the unmounted routers).
   - The 403/404/422/503 matrix.
+  - Query-bound tests: `start`/`stop` at `MIN_TELEMETRY_TIME` and `MAX_TELEMETRY_TIME`, just outside both, and `stop=0001-01-01T00:00:00Z`, which gives 422, never 500.
   - The exactly-one-selector rule; the 31-day range limit; naive timestamps rejected; unknown `metric_key` rejected.
   - A cross-tenant selector gives 404 with zero reader calls.
   - `{"items": [...]}` shapes.
@@ -979,9 +987,12 @@ Each task also owns the new test files named in its section.
 - Test: `internal/alertevaluator/influx/query_v2_test.go`, `internal/alertevaluator/influx/legacy_ids_test.go`, `internal/alertevaluator/influx/parity_integration_test.go` (`TestInfluxIntegration*`, using the P2-01 Go helpers), `internal/alertevaluator/config_test.go`, `internal/alertevaluator/quality_test.go`, `cmd/alert-evaluator/main_test.go`
 
 **Interfaces:**
-- `V2WindowReader{Bucket string; Querier Querier}` implements `alertevaluator.WindowReader`.
+- `V2WindowReader{Bucket string; Querier V2Querier}` implements `alertevaluator.WindowReader`. The types live in `query_v2.go`:
+  - `type V2Querier interface { Query(context.Context, string) ([]V2Row, error) }`;
+  - `V2Row{Time time.Time; DeviceID, ComponentID string; Value float64; Sequence int64}`.
+  - The legacy `Row`/`Querier` are unchanged.
 - `BuildV2Query(bucket, rule, spec) (string, error)`.
-- `ClientV2Querier{API api.QueryAPI}`, unit-testable via `api.NewQueryTableResult(io.NopCloser(...))`.
+- `ClientV2Querier{API api.QueryAPI}` implements `V2Querier` and is unit-testable via `api.NewQueryTableResult(io.NopCloser(...))` in `client_v2_test.go`.
 - `AssetIDForLegacyPond(tenantID, pondID string) string`, `DefaultComponentIDForLegacyDevice(tenantID, deviceID string) string` and `MetricKeyForLegacyMetric(metric string) (string, bool)`.
 - `RunConfig.TelemetrySource`: `legacy` or `v2`, default `legacy`, set via `ALERT_EVALUATOR_TELEMETRY_SOURCE` or `--telemetry-source`. An invalid value is a configuration error; the staging/prod validation rules are unchanged.
 - `main.go` selects the reader.
@@ -1108,12 +1119,15 @@ Each task also owns the new test files named in its section.
   - The asset→pond mapping from `list_ponds`.
   - Legacy grouping before `last()`/pivot/`limit`.
   - The summary sort.
-  - The `rssi` `int(v:)` reconstruction and the integer-typed `seq` branch.
+  - The `rssi` `int(v:)` reconstruction, and the `seq` branch using `_value: r.sequence` (never converted to float or wrapped in `int(v:)`).
   - Summary period validation and `TelemetryQueryError` wrapping; the other methods propagate errors.
 - [ ] **Step 2: Write failing equivalence tests** (real InfluxDB).
   - **Setup:** dual-write through the P2-03 `ObservationWriteService`, with both switches on, into one bucket. Write these scenarios:
     - `legacy_sample`, `sub_second`, `out_of_range`;
-    - the `multi_point_series` scenario rebased to the captured `now`: ≥ 30 points, 2 devices, 2 ponds, a `limit` smaller than the rows, a device with mixed `quality_state`, and ≥ 3 devices with values whose float sum depends on order;
+    - the `multi_point_series` scenario rebased to the captured `now` (≥ 30 points, 2 devices, 2 ponds), with a `limit` smaller than the rows;
+    - **test-local** observations built in this test file, not added to the frozen vectors:
+      - extra legacy devices in one pond, so that pond has ≥ 3 devices whose per-bucket float sum is order-dependent;
+      - one device with mixed `quality_state`;
     - native probes on a legacy pond Asset;
     - two observations at the same `(device, observed_at)` with conflicting sequences (the tie-break), and sequences `2**53 + 1` and `2**63 - 1` (integer exactness);
     - another tenant.
@@ -1199,7 +1213,7 @@ Each task also owns the new test files named in its section.
 
 **Files:**
 - Create: `tests/contracts/test_p2_acceptance_gate.py`, `tests/influx/test_p2_acceptance_influx.py`, `docs/p2-telemetry-rollout-runbook.md`
-- Modify: `docs/adr/ADR-006-telemetry-has-three-timestamps.md`, `docs/adr/ADR-007-influx-v2-dual-write-migration.md` (append a "Phase split" section; `test_architecture_inventory.py` must stay green), `README.md` (runbook link)
+- Modify: `docs/adr/ADR-006-telemetry-has-three-timestamps.md`, `docs/adr/ADR-007-influx-v2-dual-write-migration.md` (append a `**Phase split (P2).**` paragraph at the end of `## Implementation gate`, with no new heading; `test_architecture_inventory.py` pins the heading tuple and stays unmodified and green), `README.md` (runbook link)
 
 **Gate invariants:**
 1. The same legacy sample, including sub-second, is visible identically through `/v1` in both read modes: four endpoints, byte-identical JSON, non-empty (real InfluxDB).
@@ -1214,7 +1228,7 @@ Each task also owns the new test files named in its section.
    - no event ID, source event ID, integration ID, quality, source type or metadata is a tag value.
 8. Out-of-range values are stored with `quality_state=out_of_range` and the `plausible_range` provenance.
 9. **InfluxDB outage after acceptance.** A queue fake drives real InfluxDB behind a `write_api` wrapper that fails the first N calls. The pipeline never acknowledges, and redelivery recovers the exact v2 and legacy point set.
-10. The flag matrix (every combination of the four Python switches with `API_V2_ENABLED`) keeps the `/v1` golden and exact route sets.
+10. The flag matrix (every **valid** combination of the four Python switches with `API_V2_ENABLED`) keeps the `/v1` golden and exact route sets. `API_V2_TELEMETRY_ENABLED` without `API_V2_ENABLED` asserts the validation error.
 11. The runbook states the D16 precondition. Its release gate lists `make verify-influx` (Go parity included) and maps every ADR-005/006/007 gate to its proving test, or to **DEFERRED → #15** with the reason.
 
 **Runbook sections:**
@@ -1226,11 +1240,13 @@ Each task also owns the new test files named in its section.
 - stop-dual-write criteria (§10.6);
 - rollback (flags only; never delete points);
 - retention note (D6);
+- the D15 out-of-range divergence (legacy reads and alerts show such values; v2 quality-gated alerts exclude them);
+- the D10 known limitation (a present-to-absent `seq` rewrite);
 - known out-of-scope items: the D13 list, D17 AlertRuleV2, P6 calibration states and #6.
 
 - [ ] **Step 1: Write the failing gate tests.**
 - [ ] **Step 2: Run red, commit, test gate.**
-- [ ] **Step 3: Write the runbook and the ADR phase-split appendices, then run the full gate** locally (`run_local_influxd.sh`) and in CI.
+- [ ] **Step 3: Write the runbook and the ADR phase-split paragraphs, then run the full gate** locally (`run_local_influxd.sh`) and in CI.
 
 **Acceptance criteria:**
 - [ ] All 11 invariants are green in CI (`python`, `go`, `influx`) and locally.
