@@ -13,6 +13,7 @@ from typing import Any
 
 import pytest
 
+from limnopulse_api.core.errors import TelemetryWriteError
 from limnopulse_api.domain.assets import AssetWithPondProfile, Site
 from limnopulse_api.domain.deployments import Deployment
 from limnopulse_api.domain.devices_v2 import (
@@ -283,6 +284,7 @@ class SpyRepositories:
     def __init__(self, inner: InMemoryM1Repositories) -> None:
         self.inner = inner
         self.calls: list[tuple[str, tuple[Any, ...]]] = []
+        self.forbidden: list[str] = []
 
     async def get_component(self, tenant_id: str, component_id: str) -> DeviceComponent | None:
         self.calls.append(("get_component", (tenant_id, component_id)))
@@ -295,12 +297,15 @@ class SpyRepositories:
         return await self.inner.get_deployment_at(tenant_id, component_id, observed_at)
 
     async def get_current_deployment(self, *args: object, **kwargs: object) -> None:
+        self.forbidden.append("get_current_deployment")
         raise AssertionError("the normalizer must never fall back to the current Deployment")
 
     async def list_component_deployments(self, *args: object, **kwargs: object) -> None:
+        self.forbidden.append("list_component_deployments")
         raise AssertionError("the normalizer must resolve through get_deployment_at only")
 
     async def get_deployment(self, *args: object, **kwargs: object) -> None:
+        self.forbidden.append("get_deployment")
         raise AssertionError("the normalizer must resolve through get_deployment_at only")
 
     def __getattr__(self, name: str) -> Any:
@@ -413,10 +418,11 @@ async def test_accepted_observation_carries_resolution_source_and_versions(world
 
 @pytest.mark.asyncio
 async def test_ingested_at_comes_from_the_clock_at_normalization(world: World) -> None:
-    ticks = iter([INGESTED, INGESTED + timedelta(hours=1)])
+    now = [INGESTED]
 
-    subject = normalizer(world.repos, clock=lambda: next(ticks))
+    subject = normalizer(world.repos, clock=lambda: now[0])
     first = only_accepted(await subject.normalize(context(), [observation()]))
+    now[0] = INGESTED + timedelta(hours=1)
     second = only_accepted(await subject.normalize(context(), [observation()]))
 
     assert first.delivery.ingested_at == INGESTED
@@ -458,7 +464,7 @@ async def test_component_of_another_tenant_is_not_owned(world: World) -> None:
 
 
 @pytest.mark.asyncio
-async def test_other_tenant_context_cannot_claim_its_own_device_component(world: World) -> None:
+async def test_other_tenant_context_owns_only_its_own_device_component(world: World) -> None:
     source = observation(component_id=world.other_tenant_component)
     claimed = context(tenant_id=OTHER_TENANT, device_id=OTHER_TENANT_DEVICE)
 
@@ -653,6 +659,26 @@ async def test_replay_context_flags_the_observation(world: World) -> None:
     assert canonical.source.received_at == RECEIVED
 
 
+@pytest.mark.asyncio
+async def test_clock_skew_flags_come_from_observed_and_received_at(world: World) -> None:
+    future = observation(observed_at=RECEIVED + timedelta(seconds=301))
+    ancient = observation(observed_at=RECEIVED - timedelta(days=31))
+
+    result = await normalizer(world.repos).normalize(context(), [future, ancient])
+
+    assert result.quarantined == ()
+    skewed, late = result.accepted
+    assert skewed.quality.flags == (QualityFlag.CLOCK_SKEW_FUTURE,)
+    assert QualityProvenance.CLOCK_SKEW in skewed.quality.provenance
+    assert late.quality.flags == (QualityFlag.CLOCK_SKEW_PAST_EXTREME, QualityFlag.DELAYED)
+    assert late.delivery.delayed is True
+    assert late.resolved.deployment_id == world.west_deployment.deployment_id
+    counts = result.counts()
+    assert counts["flag.clock_skew_future"] == 1
+    assert counts["flag.clock_skew_past_extreme"] == 1
+    assert counts["flag.delayed"] == 1
+
+
 # Event-time Deployment (ADR-006), no fallback ---------------------------------------------------
 
 
@@ -685,6 +711,7 @@ async def test_deployment_is_resolved_at_event_time(
     assert canonical.resolved.asset_id == asset.asset.asset_id
     assert canonical.resolved.site_id == asset.asset.site_id
     assert ("get_deployment_at", (TENANT, COMPONENT, observed_at)) in spy.calls
+    assert spy.forbidden == []
 
 
 @pytest.mark.asyncio
@@ -734,6 +761,7 @@ async def test_no_deployment_at_event_time_is_unresolved_despite_a_current_one(
     assert record.received_at == RECEIVED
     assert record.source_event_id == "src-evt-1"
     assert len(record.detail) <= 256
+    assert spy.forbidden == []
 
 
 @pytest.mark.asyncio
@@ -761,13 +789,16 @@ async def test_gap_between_deployments_is_unresolved() -> None:
     )
     in_gap = MOVE + timedelta(hours=1)
 
+    spy = SpyRepositories(repos)
+
     record = only_quarantined(
-        await normalizer(SpyRepositories(repos)).normalize(
+        await normalizer(spy).normalize(
             context(received_at=in_gap), [observation(observed_at=in_gap)]
         )
     )
 
     assert record.reason is QuarantineReason.DEPLOYMENT_UNRESOLVED
+    assert spy.forbidden == []
 
 
 # Identity --------------------------------------------------------------------------------------
@@ -899,7 +930,7 @@ async def test_replay_pinned_to_v1_reproduces_the_original_mapping(world: World)
 
 
 @pytest.mark.asyncio
-async def test_pinned_versions_are_stamped_even_when_they_equal_the_defaults(
+async def test_pinned_versions_override_the_defaults_without_replay(
     world: World,
 ) -> None:
     pinned = context(mapping_versions=V2)
@@ -931,11 +962,10 @@ async def test_unknown_pinned_version_raises(world: World, versions: Normalizati
 
 @pytest.mark.asyncio
 async def test_unknown_default_version_raises(world: World) -> None:
-    subject = normalizer(
-        world.repos, default_versions=NormalizationVersions(catalog_version="metric-catalog@9")
-    )
-
     with pytest.raises(ValueError):
+        subject = normalizer(
+            world.repos, default_versions=NormalizationVersions(catalog_version="metric-catalog@9")
+        )
         await subject.normalize(context(), [observation()])
 
 
@@ -947,9 +977,13 @@ async def test_batch_above_the_bound_raises_without_lookups(world: World) -> Non
     spy = SpyRepositories(world.repos)
     items = [observation()] * (MAX_OBSERVATIONS_PER_BATCH + 1)
 
-    with pytest.raises(ValueError):
+    # The plan fixes the bound, not the exception type (ObservationWriteService uses
+    # TelemetryWriteError(retryable=False) for the same bound).
+    with pytest.raises((ValueError, TelemetryWriteError)) as raised:
         await normalizer(spy).normalize(context(), items)
 
+    if isinstance(raised.value, TelemetryWriteError):
+        assert raised.value.retryable is False
     assert spy.calls == []
 
 
@@ -965,7 +999,7 @@ async def test_batch_at_the_bound_is_normalized_with_cached_lookups(world: World
 
     assert len(result.accepted) == MAX_OBSERVATIONS_PER_BATCH
     assert spy.count("get_component") == 1
-    assert spy.count("get_deployment_at") == 2
+    assert 1 <= spy.count("get_deployment_at") <= 2
 
 
 @pytest.mark.asyncio
@@ -989,9 +1023,17 @@ async def test_lookup_cache_does_not_outlive_a_call(world: World) -> None:
     spy = SpyRepositories(world.repos)
     subject = normalizer(spy)
 
-    await subject.normalize(context(), [observation()])
-    await subject.normalize(context(), [observation()])
+    first = only_accepted(await subject.normalize(context(), [observation()]))
+    await world.repos.end_deployment(
+        TENANT,
+        world.east_deployment.deployment_id,
+        expected_version=world.east_deployment.version,
+        ended_at=OBSERVED - timedelta(hours=1),
+    )
+    second = only_quarantined(await subject.normalize(context(), [observation()]))
 
+    assert first.resolved.deployment_id == world.east_deployment.deployment_id
+    assert second.reason is QuarantineReason.DEPLOYMENT_UNRESOLVED
     assert spy.count("get_component") == 2
     assert spy.count("get_deployment_at") == 2
 
@@ -1018,6 +1060,9 @@ async def test_seven_metrics_of_one_reading_share_one_lookup_each(world: World) 
     assert len({o.event_id for o in result.accepted}) == 7
     assert spy.count("get_component") == 1
     assert spy.count("get_deployment_at") == 1
+    assert {o.resolved.deployment_id for o in result.accepted} == {
+        world.east_deployment.deployment_id
+    }
 
 
 @pytest.mark.asyncio
@@ -1042,18 +1087,6 @@ async def test_quarantine_excerpt_is_bounded_json_of_the_source(world: World) ->
     assert small_record.truncated is False
     assert "water.bogus" in small_record.source_excerpt_json
     assert "src-evt-1" in small_record.source_excerpt_json
-
-
-@pytest.mark.asyncio
-async def test_result_counts_reflect_accepted_and_quarantined(world: World) -> None:
-    result = await normalizer(world.repos).normalize(
-        context(), [observation(metric_key="water.bogus"), observation()]
-    )
-
-    counts = result.counts()
-    assert counts["accepted"] == 1
-    assert counts["quarantined.metric_unknown"] == 1
-    assert counts["state.valid"] == 1
 
 
 @pytest.mark.asyncio

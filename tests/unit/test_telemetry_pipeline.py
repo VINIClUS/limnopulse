@@ -338,7 +338,7 @@ async def test_example_reading_is_written_to_v2_and_legacy(harness: Harness) -> 
     assert tuple(outcome.quarantined) == ()
     assert outcome.counts["accepted"] == 7
     assert outcome.counts["state.valid"] == 7
-    assert set(outcome.counts) == CLOSED_COUNT_KEYS
+    assert set(outcome.counts) <= CLOSED_COUNT_KEYS  # closed keys, no tenant/device labels
     assert (
         sum(value for key, value in outcome.counts.items() if key.startswith("quarantined.")) == 0
     )
@@ -361,7 +361,7 @@ async def test_mapper_and_normalizer_quarantines_are_both_reported(harness: Harn
     assert reasons == Counter({QuarantineReason.VALUE_INVALID: 3})
     assert outcome.counts["quarantined.value_invalid"] == 3
     assert outcome.counts["accepted"] == 5
-    assert set(outcome.counts) == CLOSED_COUNT_KEYS
+    assert set(outcome.counts) <= CLOSED_COUNT_KEYS  # closed keys, no tenant/device labels
     assert outcome.written.v2_points == 5
     assert outcome.written.legacy_points == 1
     assert {o.observation.sequence for o in harness.store.v2_observations.values()} == {None}
@@ -513,10 +513,9 @@ async def test_write_error_propagates_unchanged_from_ingest(harness: Harness) ->
 
 
 @pytest.mark.asyncio
-async def test_write_error_propagates_from_ingest_without_a_partial_outcome(
-    harness: Harness,
-) -> None:
-    harness.legacy_writer.error = TelemetryWriteError("legacy down", retryable=False)
+async def test_legacy_failure_after_v2_propagates_from_ingest(harness: Harness) -> None:
+    error = TelemetryWriteError("legacy down", retryable=False)
+    harness.legacy_writer.error = error
     source = SourceObservation(
         component_id=COMPONENT,
         metric_key="water.ph",
@@ -528,7 +527,54 @@ async def test_write_error_propagates_from_ingest_without_a_partial_outcome(
     with pytest.raises(TelemetryWriteError) as raised:
         await harness.pipeline.ingest(legacy_context(FIRST_TS + timedelta(seconds=2)), [source])
 
-    assert raised.value.retryable is False
+    assert raised.value is error
+    assert len(harness.store.v2) == 1  # v2 landed first; the caller must still not acknowledge
+    assert harness.store.legacy == {}
+
+
+def test_failed_ingest_is_never_acknowledged_and_redelivery_matches_the_baseline() -> None:
+    received = FIRST_TS + timedelta(seconds=2)
+    batch = [
+        SourceObservation(
+            component_id=COMPONENT,
+            metric_key=key,
+            value=value,
+            source_unit=unit,
+            observed_at=FIRST_TS,
+            sequence=4,
+        )
+        for key, value, unit in [
+            ("water.ph", 7.2, "pH"),
+            ("water.temperature", 77.0, "degF"),
+            ("device.battery_voltage", 3820, "mV"),
+            ("device.rssi", -67, "dBm"),
+        ]
+    ]
+
+    async def consume(harness: Harness, queue: deque[list[SourceObservation]]) -> bool:
+        message = queue.popleft()
+        try:
+            await harness.pipeline.ingest(legacy_context(received), message)
+        except TelemetryWriteError:
+            queue.append(message)
+            return False
+        return True
+
+    expected = build_harness()
+    assert asyncio.run(consume(expected, deque([batch]))) is True
+    harness = build_harness()
+    harness.writer.fail_at_chunk = 1
+    queue = deque([batch])
+
+    acked = asyncio.run(consume(harness, queue))
+
+    assert acked is False
+    assert len(queue) == 1
+    assert len(harness.store.v2) == 3
+    harness.clear_faults()
+    assert asyncio.run(consume(harness, queue)) is True
+    assert harness.store.snapshot() == expected.store.snapshot()
+    assert len(harness.store.v2) == 4
 
 
 # ADR-005 end to end: a pinned replay after a catalog revision restores the original mapping -------

@@ -253,8 +253,8 @@ def test_small_reading_quarantine_excerpt_is_complete_json() -> None:
 
 @pytest.mark.parametrize(
     "seq",
-    [True, False, -1, MAX_SEQUENCE + 1, 2**64],
-    ids=["true", "false", "negative", "above-max", "uint64"],
+    [True, False, -1, MAX_SEQUENCE + 1, 2**64, "1", 1.0, [1]],
+    ids=["true", "false", "negative", "above-max", "uint64", "string", "float", "list"],
 )
 def test_bad_seq_quarantines_only_seq_and_keeps_the_observations(seq: object) -> None:
     result = map_legacy_reading(context(), example() | {"seq": seq})
@@ -294,8 +294,8 @@ def test_absent_seq_maps_to_no_sequence_without_quarantine() -> None:
 
 @pytest.mark.parametrize(
     "value",
-    [True, False, "7.2", math.nan, math.inf, -math.inf],
-    ids=["true", "false", "string", "nan", "inf", "-inf"],
+    [True, False, "7.2", math.nan, math.inf, -math.inf, [7.2], {"v": 7.2}],
+    ids=["true", "false", "string", "nan", "inf", "-inf", "list", "object"],
 )
 def test_bad_field_value_quarantines_only_that_field(value: object) -> None:
     result = map_legacy_reading(context(), example() | {"ph": value})
@@ -350,7 +350,18 @@ def test_integer_values_keep_their_numeric_type_for_the_normalizer() -> None:
 
     observations = by_metric(result)
     assert observations["water.ph"].value == 7
+    assert type(observations["water.ph"].value) is int
     assert observations["device.rssi"].value == -67.0
+    assert type(observations["device.rssi"].value) is float
+
+
+def test_out_of_range_values_are_emitted_for_the_normalizer_to_classify() -> None:
+    result = map_legacy_reading(context(), example() | {"ph": 20.0, "temp_c": -40})
+
+    assert tuple(result.quarantined) == ()
+    observations = by_metric(result)
+    assert observations["water.ph"].value == 20.0
+    assert observations["water.temperature"].value == -40
 
 
 # Tenancy: payload claims never influence anything -----------------------------------------------
