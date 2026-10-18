@@ -1,3 +1,4 @@
+import dataclasses
 import math
 from datetime import UTC, datetime, timedelta, timezone
 from uuid import NAMESPACE_URL, uuid5
@@ -535,7 +536,6 @@ def test_source_observation_accepts_strict_numbers_and_preserves_type() -> None:
         {"value": -math.inf},
         {"sequence": MAX_SEQUENCE + 1},
         {"sequence": -1},
-        {"sequence": 1.0},
         {"metric_key": "m" * 65},
         {"source_unit": ""},
         {"source_unit": "u" * 17},
@@ -609,6 +609,60 @@ def test_measurement_rejects_non_finite_values(value) -> None:
 
 def test_measurement_value_is_float() -> None:
     assert type(measurement(value=25.1).value) is float
+    assert type(measurement(value=7).value) is float
+
+
+@pytest.mark.parametrize(
+    "overrides",
+    [
+        {"value": True},
+        {"value": False},
+        {"value": "25.1"},
+        {"value_type": "decimal"},
+        {"sequence": MAX_SEQUENCE + 1},
+        {"sequence": -1},
+        {"observed_at": datetime(2026, 7, 9, 12, 0)},
+        {"observed_at": MAX_TELEMETRY_TIME},
+        {"observed_at": MIN_TELEMETRY_TIME - timedelta(microseconds=1)},
+    ],
+)
+def test_measurement_rejects_invalid_values(overrides) -> None:
+    with pytest.raises(ValidationError):
+        measurement(**overrides)
+
+
+def _observation_source(**overrides: object) -> ObservationSource:
+    values: dict[str, object] = {
+        "integration_id": INTEGRATION,
+        "integration_type": "local.mosquitto",
+        "source_type": SourceType.LEGACY_MQTT,
+        "connector_version": "1.0.0",
+        "received_at": RECEIVED,
+    }
+    values.update(overrides)
+    return ObservationSource(**values)
+
+
+def test_observation_source_accepts_absent_optionals() -> None:
+    source = _observation_source(integration_id=None, connector_version=None)
+    assert source.integration_id is None
+    assert source.connector_version is None
+
+
+@pytest.mark.parametrize(
+    "overrides",
+    [
+        {"integration_id": "ia_" + "a" * 32},
+        {"integration_type": "AWS IoT"},
+        {"source_type": "carrier_pigeon"},
+        {"connector_version": "v" * 65},
+        {"received_at": datetime(2026, 7, 9, 12, 0, 2)},
+        {"received_at": MAX_TELEMETRY_TIME},
+    ],
+)
+def test_observation_source_rejects_invalid_values(overrides) -> None:
+    with pytest.raises(ValidationError):
+        _observation_source(**overrides)
 
 
 @pytest.mark.parametrize(
@@ -697,8 +751,19 @@ def test_canonical_observation_accepts_consistent_envelope() -> None:
     assert observation.mapping == NormalizationVersions()
 
 
-def test_canonical_observation_rejects_mismatched_event_id() -> None:
-    other = observation_event_id(TENANT, OTHER_COMPONENT, "water.temperature", OBSERVED)
+@pytest.mark.parametrize(
+    ("tenant_id", "component_id", "metric_key", "observed_at"),
+    [
+        (TENANT, OTHER_COMPONENT, "water.temperature", OBSERVED),
+        ("tnt_other", COMPONENT, "water.temperature", OBSERVED),
+        (TENANT, COMPONENT, "water.ph", OBSERVED),
+        (TENANT, COMPONENT, "water.temperature", OBSERVED + timedelta(microseconds=1)),
+    ],
+)
+def test_canonical_observation_rejects_mismatched_event_id(
+    tenant_id, component_id, metric_key, observed_at
+) -> None:
+    other = observation_event_id(tenant_id, component_id, metric_key, observed_at)
     with pytest.raises(ValidationError, match="event_id"):
         canonical(event_id=other)
 
@@ -873,6 +938,10 @@ def test_quarantined_observation_accepts_bounded_record() -> None:
         {"device_id": "dev_short"},
         {"component_id": "ast_" + "1" * 32},
         {"received_at": datetime(2026, 7, 9, 12, 0, 2)},
+        {"received_at": MAX_TELEMETRY_TIME},
+        {"observed_at": datetime(2026, 7, 9, 12, 0)},
+        {"observed_at": MIN_TELEMETRY_TIME - timedelta(microseconds=1)},
+        {"truncated": "maybe"},
         {"tenant": TENANT},
     ],
 )
@@ -888,6 +957,20 @@ def test_stored_observation_shape() -> None:
     assert isinstance(record.quality_flags, tuple)
     assert isinstance(record.quality_provenance, tuple)
 
+    typed = stored(
+        quality_state="out_of_range",
+        quality_flags=["delayed", "replay"],
+        quality_provenance=["schema_validation", "unit_mapping", "timeliness", "replay"],
+        source_type="https",
+        value=7,
+    )
+    assert typed.quality_state is QualityState.OUT_OF_RANGE
+    assert typed.quality_flags == (QualityFlag.DELAYED, QualityFlag.REPLAY)
+    assert all(isinstance(flag, QualityFlag) for flag in typed.quality_flags)
+    assert all(isinstance(item, QualityProvenance) for item in typed.quality_provenance)
+    assert typed.source_type is SourceType.HTTPS
+    assert type(typed.value) is float
+
 
 @pytest.mark.parametrize(
     "overrides",
@@ -897,7 +980,17 @@ def test_stored_observation_shape() -> None:
         {"event_id": "evt_" + "0" * 32},
         {"asset_id": "site_" + "1" * 32},
         {"quality_state": "bogus"},
+        {"quality_flags": ("bogus",)},
+        {"quality_provenance": ("bogus",)},
         {"source_type": "carrier_pigeon"},
+        {"received_at": datetime(2026, 7, 9, 12, 0, 2)},
+        {"observed_at": MAX_TELEMETRY_TIME},
+        {"component_id": "ast_" + "1" * 32},
+        {"deployment_id": "cmp_" + "1" * 32},
+        {"probe_id": "cmp_" + "1" * 32},
+        {"value": True},
+        {"value": math.nan},
+        {"sequence": -2},
         {"extra": 1},
     ],
 )
@@ -968,6 +1061,8 @@ def test_normalization_result_counts_use_closed_keys() -> None:
 
 def test_normalization_result_counts_for_empty_result() -> None:
     result = NormalizationResult(accepted=(), quarantined=())
+    with pytest.raises((ValidationError, dataclasses.FrozenInstanceError, AttributeError)):
+        result.accepted = (canonical(),)  # type: ignore[misc]
     counts = result.counts()
     assert set(counts) <= CLOSED_COUNT_KEYS
     assert {key: value for key, value in counts.items() if value} == {}

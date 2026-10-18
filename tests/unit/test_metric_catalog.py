@@ -158,6 +158,20 @@ def test_catalog_api_is_keyword_only_for_registry_parameters() -> None:
         metric_catalog(METRIC_CATALOG_VERSION, METRIC_CATALOGS)  # type: ignore[misc]
 
 
+@pytest.mark.parametrize("value_type", ["decimal", "", None])
+def test_metric_definition_rejects_unknown_value_type(value_type) -> None:
+    with pytest.raises(ValidationError):
+        MetricDefinition(
+            metric_key="water.chlorophyll",
+            display_name="Chlorophyll",
+            canonical_unit="ug/L",
+            value_type=value_type,
+            plausible_min=0,
+            plausible_max=500,
+            legacy_field=None,
+        )
+
+
 def test_metric_definition_is_frozen() -> None:
     definition = metric_catalog()[0]
     with pytest.raises(ValidationError):

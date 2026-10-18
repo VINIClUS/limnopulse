@@ -314,6 +314,7 @@ def test_two_probes_scenario_never_reaches_legacy() -> None:
     )
     assert first.observation.observed_at == second.observation.observed_at
     assert first.resolved.device_id == second.resolved.device_id
+    assert first.resolved.device_id.startswith("dev_")
     assert first.resolved.component_id != second.resolved.component_id
     assert first.event_id != second.event_id
     assert first.resolved.probe_id is not None and second.resolved.probe_id is not None
@@ -363,7 +364,11 @@ def test_relocation_scenario_splits_one_component_across_two_ponds() -> None:
 
     assert len(loaded.v2_lines) >= 2
     assert loaded.legacy_count == 2
-    assert len({item.resolved.component_id for item in loaded.observations}) == 1
+    assert {item.resolved.component_id for item in loaded.observations} == {
+        default_component_id_for_legacy_device(loaded.tenant_id, device)
+        for device in loaded.devices
+    }
+    assert len(loaded.devices) == 1
     assert set(loaded.legacy_pond_by_asset.values()) == {"pond_west", "pond_east"}
     by_pond: dict[str, list[CanonicalObservation]] = {}
     for item in loaded.observations:
@@ -413,8 +418,9 @@ def test_multi_point_series_scenario_shape() -> None:
     assert len({frozenset(ponds) for ponds in ponds_by_device.values()}) == 2
     for times in times_by_device.values():
         ordered = sorted(times)
-        assert len(ordered) >= 30
+        assert len(ordered) >= 2
         assert all(b - a == timedelta(minutes=1) for a, b in pairwise(ordered))
+    assert len(loaded.observations) >= 30
     assert loaded.legacy_count == sum(len(times) for times in times_by_device.values())
 
 

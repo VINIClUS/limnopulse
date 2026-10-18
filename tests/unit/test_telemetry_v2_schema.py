@@ -406,9 +406,11 @@ def test_quality_json_over_512_bytes_is_rejected() -> None:
         len(json.dumps([item.value for item in oversized_provenance], separators=(",", ":"))) > 512
     )
 
-    with pytest.raises(ValueError):
+    # The encoder serializes the tuples exactly as given (defense in depth); the byte bound is the
+    # rejection reason, not ordering or uniqueness.
+    with pytest.raises(ValueError, match="512"):
         encode_observation_line(_with_quality(observation(), flags=oversized_flags))
-    with pytest.raises(ValueError):
+    with pytest.raises(ValueError, match="512"):
         encode_observation_line(_with_quality(observation(), provenance=oversized_provenance))
 
 
@@ -450,6 +452,32 @@ def test_observation_tags_are_identity_and_ownership_only() -> None:
         "tenant_id": TENANT,
     }
     assert "probe_id" not in observation_tags(observation(probe_id=None))
+
+
+@pytest.mark.parametrize(
+    "resolved_update",
+    [
+        {"component_id": "prb_" + "1" * 32},
+        {"tenant_id": "bad tenant"},
+        {"asset_id": "site_" + "1" * 32},
+    ],
+)
+def test_encoder_applies_the_cardinality_guard(resolved_update) -> None:
+    item = observation()
+    item = item.model_copy(update={"resolved": item.resolved.model_copy(update=resolved_update)})
+    with pytest.raises(ValueError):
+        encode_observation_line(item)
+
+
+def test_encoder_rejects_non_catalog_metric() -> None:
+    with pytest.raises(ValueError):
+        encode_observation_line(replace_measurement(observation(), metric_key="water.chlorophyll"))
+
+
+def test_native_probe_tags_pass_the_guard() -> None:
+    tags = observation_tags(observation(component_id=NATIVE_COMPONENT, probe_id="prb_" + "f" * 32))
+    validate_observation_tags(tags)
+    assert tags["component_id"] == NATIVE_COMPONENT
 
 
 def test_valid_tags_pass_the_guard() -> None:
@@ -557,6 +585,25 @@ def test_encode_legacy_line_matches_telegraf_shape() -> None:
     )
 
 
+@pytest.mark.parametrize(
+    ("fields", "observed_at"),
+    [
+        ({"ph": math.nan}, OBSERVED),
+        ({"ph": math.inf}, OBSERVED),
+        ({"seq": 2**63}, OBSERVED),
+        ({"rssi": -(2**63) - 1}, OBSERVED),
+        ({"ph": 7.2}, MAX_TELEMETRY_TIME),
+        ({"ph": 7.2}, MIN_TELEMETRY_TIME - timedelta(microseconds=1)),
+    ],
+)
+def test_encode_legacy_line_rejects_unencodable_points(fields, observed_at) -> None:
+    point = LegacyPoint(
+        tenant_id=TENANT, pond_id=POND, device_id=DEVICE, observed_at=observed_at, fields=fields
+    )
+    with pytest.raises(ValueError):
+        encode_legacy_line(point)
+
+
 def test_encode_legacy_line_escapes_tag_values() -> None:
     point = LegacyPoint(
         tenant_id=TENANT,
@@ -628,6 +675,11 @@ def test_d7_excludes_default_component_of_another_device() -> None:
         component_id=default_component_id_for_legacy_device(TENANT, "local-device-002")
     )
     assert build_legacy_points([foreign], LEGACY_POND_BY_ASSET) == ()
+
+
+def test_d7_excludes_metrics_without_legacy_field() -> None:
+    no_legacy_field = replace_measurement(observation(), metric_key="water.chlorophyll")
+    assert build_legacy_points([no_legacy_field], LEGACY_POND_BY_ASSET) == ()
 
 
 def test_d7_excludes_assets_without_legacy_pond() -> None:
