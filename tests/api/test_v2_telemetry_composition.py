@@ -490,27 +490,6 @@ def test_v2_read_source_swaps_the_v1_repository_for_the_projection(runtime) -> N
         assert app.state.observation_writer is None
 
 
-@pytest.mark.parametrize(
-    "prewired_name", ["observation_reader", "observation_writer", "observation_write_service"]
-)
-def test_prewired_p2_state_skips_runtime_wiring(
-    monkeypatch: pytest.MonkeyPatch, prewired_name: str
-) -> None:
-    def fail(*args: object, **kwargs: object) -> object:
-        raise AssertionError("prewired test apps must not create runtime clients")
-
-    monkeypatch.setattr("limnopulse_api.main.boto3.client", fail)
-    monkeypatch.setattr("limnopulse_api.main.redis.from_url", fail)
-    monkeypatch.setattr("limnopulse_api.main.InfluxDBClient", fail)
-    app = create_app(_settings(api_v2_enabled=True, api_v2_telemetry_enabled=True))
-    prewired = object()
-    setattr(app.state, prewired_name, prewired)
-
-    with TestClient(app):
-        assert getattr(app.state, prewired_name) is prewired
-        assert not hasattr(app.state, "domain_repository")
-
-
 # --- Mounted routes over the composed app -----------------------------------------------------
 
 

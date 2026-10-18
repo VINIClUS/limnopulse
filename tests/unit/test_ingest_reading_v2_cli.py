@@ -2,20 +2,25 @@
 
 Test seams: the module-level `boto3`, `InfluxDBClient` and `TelemetryPipeline` names. Settings
 come from the environment (the test runs in an empty working directory, so no `.env` applies).
-Exit codes: 0 when nothing is quarantined (including the both-switches-off dry run, which
-normalizes and writes zero points), 2 when anything is quarantined, 1 on any error. Stdout is
+Settings may be built per run or through `get_settings()` (its cache is cleared around each
+test). Exit codes: 0 when nothing is quarantined (including the both-switches-off dry run, which
+normalizes and writes zero points), 2 when anything is quarantined, 1 on any error, usage errors
+included (2 is reserved for quarantine). Stdout is
 one JSON object of counts: `written` (the `TelemetryWriteOutcome` fields), `quarantined` (the
 number of quarantined records) and `counts` (the pipeline's closed-key counters).
 """
 
 import json
 import re
+import subprocess
+import sys
 from datetime import UTC, datetime
 from pathlib import Path
 from types import MappingProxyType, SimpleNamespace
 from typing import Any, ClassVar, Self
 
 import pytest
+from botocore.exceptions import EndpointConnectionError
 from influxdb_client.client.write_api import SYNCHRONOUS, WriteOptions, WriteType
 from pydantic import TypeAdapter
 
@@ -23,6 +28,7 @@ from limnopulse_api.adapters.dynamodb_deployments import DynamoDeploymentReposit
 from limnopulse_api.adapters.dynamodb_devices_v2 import DynamoDeviceComponentRepository
 from limnopulse_api.adapters.dynamodb_sites_assets import DynamoSiteAssetRepository
 from limnopulse_api.adapters.influxdb_v2_writer import InfluxObservationWriter
+from limnopulse_api.core.config import get_settings
 from limnopulse_api.core.errors import TelemetryWriteError
 from limnopulse_api.domain.legacy_telemetry_mapping import map_legacy_reading
 from limnopulse_api.domain.telemetry_v2 import (
@@ -143,16 +149,18 @@ def cli(monkeypatch: pytest.MonkeyPatch, tmp_path: Path):
     FakePipeline.instances = []
     FakePipeline.result = _outcome()
     FakeInfluxClient.instances = []
-    boto_calls: list[str] = []
+    boto_calls: list[tuple[str, dict[str, object]]] = []
     fake_dynamo = object()
 
     def fake_boto3_client(service_name: str, *args: object, **kwargs: object) -> object:
-        boto_calls.append(service_name)
+        boto_calls.append((service_name, kwargs))
         return fake_dynamo
 
+    # Every flag is set explicitly, so a developer `.env` can never decide a test's switches.
     for name in FLAG_ENVIRONMENT:
-        monkeypatch.delenv(name, raising=False)
+        monkeypatch.setenv(name, "legacy" if name == "V1_TELEMETRY_READ_SOURCE" else "false")
     monkeypatch.chdir(tmp_path)
+    get_settings.cache_clear()
     monkeypatch.setenv("APP_ENV", "test")
     monkeypatch.setenv("AUTH_MODE", "dev")
     monkeypatch.setenv("INFLUXDB_URL", "http://influx.test:8086")
@@ -160,6 +168,8 @@ def cli(monkeypatch: pytest.MonkeyPatch, tmp_path: Path):
     monkeypatch.setenv("INFLUXDB_ORG", "org_cli")
     monkeypatch.setenv("INFLUXDB_BUCKET_RAW", "raw_cli")
     monkeypatch.setenv("DYNAMODB_DOMAIN_TABLE", "DomainCli")
+    monkeypatch.setenv("DYNAMODB_ENDPOINT_URL", "http://dynamodb.test:8001")
+    monkeypatch.setenv("AWS_REGION", "sa-east-1")
     monkeypatch.setenv("TELEMETRY_V2_WRITE_ENABLED", "true")
     monkeypatch.setenv("TELEMETRY_LEGACY_DUAL_WRITE_ENABLED", "true")
     monkeypatch.setattr(ingest_reading_v2.boto3, "client", fake_boto3_client)
@@ -168,9 +178,10 @@ def cli(monkeypatch: pytest.MonkeyPatch, tmp_path: Path):
 
     reading = tmp_path / "reading.json"
     reading.write_text(EXAMPLE_READING.read_text(encoding="utf-8"), encoding="utf-8")
-    return SimpleNamespace(
+    yield SimpleNamespace(
         dynamo=fake_dynamo, boto_calls=boto_calls, reading=reading, tmp_path=tmp_path
     )
+    get_settings.cache_clear()
 
 
 def _run(*extra: str, file: Path | None, tenant: str = TENANT) -> int:
@@ -212,11 +223,14 @@ def test_any_quarantined_record_exits_2(cli, capsys, v2: int, legacy: int) -> No
 
     code = _run(file=cli.reading)
 
-    out, _ = capsys.readouterr()
+    out, err = capsys.readouterr()
     assert code == 2
     summary = json.loads(out)
     assert summary["quarantined"] == 1
     assert summary["written"]["v2_points"] == v2
+    assert summary["written"]["legacy_points"] == legacy
+    assert summary["counts"] == COUNTS
+    assert TOKEN not in out and TOKEN not in err
 
 
 @pytest.mark.parametrize(
@@ -225,8 +239,10 @@ def test_any_quarantined_record_exits_2(cli, capsys, v2: int, legacy: int) -> No
         TelemetryWriteError("observation write failed", retryable=True),
         TelemetryWriteError("observation write rejected", retryable=False),
         ValueError("telemetry batch exceeds 1000 observations"),
+        EndpointConnectionError(endpoint_url="http://dynamodb.test:8001"),
+        RuntimeError("unexpected failure"),
     ],
-    ids=["write-retryable", "write-permanent", "caller-misuse"],
+    ids=["write-retryable", "write-permanent", "caller-misuse", "dynamodb", "unexpected"],
 )
 def test_pipeline_errors_exit_1_and_report_nothing_written(cli, capsys, error: Exception) -> None:
     FakePipeline.result = error
@@ -278,9 +294,47 @@ def test_a_payload_that_is_not_a_json_object_exits_1_without_ingesting(
     assert "v2_points" not in out
 
 
-def test_a_missing_file_exits_1(cli) -> None:
+def test_a_missing_file_exits_1(cli, capsys) -> None:
     assert _run(file=cli.tmp_path / "missing.json") == 1
     assert all(pipeline.calls == [] for pipeline in FakePipeline.instances)
+    out, err = capsys.readouterr()
+    assert TOKEN not in out and TOKEN not in err
+
+
+def _exit_code(argv: list[str]) -> int:
+    try:
+        return ingest_reading_v2.main(argv)
+    except SystemExit as exc:
+        return exc.code if isinstance(exc.code, int) else 1
+
+
+@pytest.mark.parametrize(
+    "argv",
+    [
+        ["--device", DEVICE],
+        ["--tenant", TENANT],
+        ["--tenant", TENANT, "--device", DEVICE, "--unknown-flag"],
+    ],
+    ids=["no-tenant", "no-device", "unknown-flag"],
+)
+def test_a_usage_error_exits_1_never_the_quarantine_code(cli, argv: list[str]) -> None:
+    assert _exit_code([*argv, "--file", str(cli.reading)]) == 1
+    assert all(pipeline.calls == [] for pipeline in FakePipeline.instances)
+
+
+def test_the_script_entry_point_returns_main_exit_code_to_the_shell(cli) -> None:
+    script = ROOT / "scripts/dev/ingest_reading_v2.py"
+    result = subprocess.run(
+        [sys.executable, str(script), "--tenant", TENANT, "--device", DEVICE, "--file", "missing"],
+        cwd=cli.tmp_path,
+        capture_output=True,
+        text=True,
+        timeout=60,
+        check=False,
+    )
+
+    assert result.returncode == 1, result.stderr
+    assert TOKEN not in result.stdout and TOKEN not in result.stderr
 
 
 @pytest.mark.parametrize(
@@ -320,8 +374,11 @@ def test_the_context_comes_only_from_cli_arguments(cli) -> None:
     assert context.integration_id is None
     assert context.replay is False
     assert context.mapping_versions is None
+    assert context.connector_version is None
     assert context.received_at == datetime(2026, 10, 18, 12, 0, 5, tzinfo=UTC)
-    assert sent == payload
+    # The payload is handed over as read: the CLI never writes its own tenant into it.
+    assert {key: sent[key] for key in _example_payload()} == _example_payload()
+    assert sent.get("tenant_id") != TENANT
 
 
 def test_default_received_at_is_the_current_time(cli) -> None:
@@ -330,7 +387,7 @@ def test_default_received_at_is_the_current_time(cli) -> None:
     after = datetime.now(UTC)
 
     context, _ = _only_call()
-    assert before <= context.received_at <= after
+    assert before.replace(microsecond=0) <= context.received_at <= after
 
 
 def test_without_observed_at_the_file_ts_is_kept(cli) -> None:
@@ -340,11 +397,17 @@ def test_without_observed_at_the_file_ts_is_kept(cli) -> None:
     assert sent == _example_payload()
 
 
-def test_observed_at_iso_replaces_ts_verbatim(cli) -> None:
+def test_observed_at_iso_replaces_ts_with_that_instant(cli) -> None:
     assert _run("--observed-at", "2026-10-18T11:59:00.250+00:00", file=cli.reading) == 0
 
     _, sent = _only_call()
-    assert sent == _example_payload() | {"ts": "2026-10-18T11:59:00.250+00:00"}
+    assert {k: v for k, v in sent.items() if k != "ts"} == {
+        k: v for k, v in _example_payload().items() if k != "ts"
+    }
+    assert TELEGRAF_TIMESTAMP.fullmatch(sent["ts"]) is not None, sent["ts"]
+    assert _TIMESTAMP.validate_python(sent["ts"]) == datetime(
+        2026, 10, 18, 11, 59, 0, 250000, tzinfo=UTC
+    )
 
 
 def test_observed_at_now_rewrites_ts_to_a_current_telegraf_timestamp(cli) -> None:
@@ -414,7 +477,10 @@ def test_write_switches_build_one_synchronous_raw_bucket_writer(
 def test_the_normalizer_uses_the_dynamodb_m1_repositories_and_a_utc_clock(cli) -> None:
     assert _run(file=cli.reading) == 0
 
-    assert cli.boto_calls and set(cli.boto_calls) == {"dynamodb"}
+    assert cli.boto_calls and {name for name, _ in cli.boto_calls} == {"dynamodb"}
+    for _, kwargs in cli.boto_calls:
+        assert kwargs.get("endpoint_url") == "http://dynamodb.test:8001"
+        assert kwargs.get("region_name") == "sa-east-1"
     normalizer = FakePipeline.instances[0].normalizer
     assert isinstance(normalizer, TelemetryNormalizer)
     assert isinstance(normalizer.components, DynamoDeviceComponentRepository)

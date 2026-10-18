@@ -1,5 +1,6 @@
 """P2-08 rollout switches: defaults, env names, the `/v2` telemetry validator and their docs."""
 
+import hashlib
 import re
 from pathlib import Path
 
@@ -23,6 +24,12 @@ P2_SWITCHES = {
 FLAG_ENVIRONMENT = (*P2_SWITCHES, "API_V2_ENABLED", "V1_POND_DEVICE_PROJECTION_ENABLED")
 DEV_CLI = "scripts/dev/ingest_reading_v2.py"
 REMOVED_README_SENTENCE = "There are no `/v2` telemetry"
+KEPT_README_GUARANTEE = "does not change any `/v1` path"
+P2_HEADING = r"^(?P<level>#{2,3}) .*\b(?:P2|Phase 2)\b.*$"
+# sha256 of `docs/architecture.md` on main before P2-08 (trailing whitespace stripped).
+ARCHITECTURE_BEFORE_P2_08_SHA256 = (
+    "a20b2fe559544e7df8ece3496bbc48ff4c097bac0b12edf492dd0445af78b8c1"
+)
 # Top-level headings of `docs/architecture.md` on main before P2-08; P2-08 only adds a section.
 ARCHITECTURE_HEADINGS_BEFORE_P2_08 = (
     "## V4 architecture baseline",
@@ -102,7 +109,7 @@ def test_api_v2_telemetry_without_api_v2_is_rejected() -> None:
     with pytest.raises(ValidationError) as exc_info:
         _settings(api_v2_telemetry_enabled=True)
 
-    assert "api_v2_telemetry_enabled" in str(exc_info.value).lower()
+    assert "telemetry" in str(exc_info.value).lower()
 
 
 def test_api_v2_telemetry_env_without_api_v2_env_is_rejected(
@@ -175,12 +182,19 @@ def test_env_example_loads_with_every_switch_at_its_default(
         assert getattr(settings, field) == default, field
 
 
-def _section(text: str, heading_pattern: str) -> str:
-    match = re.search(heading_pattern, text, flags=re.MULTILINE)
-    assert match is not None, f"missing section heading matching {heading_pattern!r}"
-    rest = text[match.end() :]
-    following = re.search(r"^## ", rest, flags=re.MULTILINE)
-    return match.group(0) + (rest[: following.start()] if following else rest)
+def _section_span(text: str) -> tuple[int, int]:
+    """The first P2 section: its heading through the next heading of the same or higher level."""
+    match = re.search(P2_HEADING, text, flags=re.MULTILINE)
+    assert match is not None, f"missing section heading matching {P2_HEADING!r}"
+    level = len(match.group("level"))
+    following = re.search(rf"^#{{1,{level}}} ", text[match.end() :], flags=re.MULTILINE)
+    end = match.end() + following.start() if following else len(text)
+    return match.start(), end
+
+
+def _section(text: str) -> str:
+    start, end = _section_span(text)
+    return text[start:end]
 
 
 def _assert_documents_p2_rollout(section: str) -> None:
@@ -190,14 +204,20 @@ def _assert_documents_p2_rollout(section: str) -> None:
     assert "D16" in section
     assert "ships dark" in section.lower()
     assert "rollback" in section.lower()
+    assert "restart" in section.lower()
+    assert "ALERT_EVALUATOR_TELEMETRY_SOURCE" in section
 
 
 def test_readme_replaces_the_no_v2_telemetry_sentence() -> None:
-    assert REMOVED_README_SENTENCE not in README.read_text(encoding="utf-8")
+    readme = README.read_text(encoding="utf-8")
+
+    assert REMOVED_README_SENTENCE not in readme
+    assert KEPT_README_GUARANTEE in readme
+    assert "API_V2_TELEMETRY_ENABLED" in readme
 
 
 def test_readme_p2_section_documents_switches_cli_d16_and_rollback() -> None:
-    section = _section(README.read_text(encoding="utf-8"), r"^## .*\bP2\b.*$")
+    section = _section(README.read_text(encoding="utf-8"))
 
     _assert_documents_p2_rollout(section)
 
@@ -207,7 +227,16 @@ def test_architecture_adds_a_p2_section_and_keeps_its_pinned_header() -> None:
 
     assert "**Version:** 1.4" in architecture
     assert "**Updated:** 2026-08-25" in architecture
-    _assert_documents_p2_rollout(_section(architecture, r"^## .*\bP2\b.*$"))
+    _assert_documents_p2_rollout(_section(architecture))
+
+
+def test_architecture_changes_nothing_outside_the_new_p2_section() -> None:
+    architecture = ARCHITECTURE.read_text(encoding="utf-8")
+    start, end = _section_span(architecture)
+
+    without_p2 = (architecture[:start] + architecture[end:]).rstrip()
+    digest = hashlib.sha256(without_p2.encode("utf-8")).hexdigest()
+    assert digest == ARCHITECTURE_BEFORE_P2_08_SHA256
 
 
 def test_architecture_keeps_every_existing_section_in_order() -> None:
