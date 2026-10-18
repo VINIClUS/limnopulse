@@ -29,6 +29,7 @@ from limnopulse_api.domain.metric_catalog import METRIC_CATALOGS
 from limnopulse_api.domain.telemetry_quality import QUALITY_POLICIES, QualityPolicy
 from limnopulse_api.domain.telemetry_units import UNIT_MAPPINGS
 from limnopulse_api.domain.telemetry_v2 import (
+    MAX_OBSERVATIONS_PER_BATCH,
     CanonicalObservation,
     NormalizationResult,
     NormalizationVersions,
@@ -427,6 +428,45 @@ async def test_unknown_pinned_version_propagates_and_writes_nothing(harness: Har
 
     assert harness.writer.calls == 0
     assert harness.store.v2 == {}
+
+
+class RecordingWriteService:
+    """Mirrors `ObservationWriteService.write`; records every call."""
+
+    def __init__(self) -> None:
+        self.calls: list[Sequence[CanonicalObservation]] = []
+
+    async def write(self, observations: Sequence[CanonicalObservation]) -> TelemetryWriteOutcome:
+        self.calls.append(observations)
+        return TelemetryWriteOutcome(v2_points=0, legacy_points=0, legacy_excluded=0)
+
+
+@pytest.mark.asyncio
+async def test_over_limit_batch_raises_value_error_before_any_write(harness: Harness) -> None:
+    write_service = RecordingWriteService()
+    pipeline = TelemetryPipeline(
+        normalizer=TelemetryNormalizer(
+            components=harness.repos, deployments=harness.repos, clock=lambda: INGESTED
+        ),
+        write_service=write_service,
+    )
+    source = SourceObservation(
+        component_id=COMPONENT,
+        metric_key="water.ph",
+        value=7.2,
+        source_unit="pH",
+        observed_at=FIRST_TS,
+    )
+
+    # P3 consumer contract: ValueError is caller misuse; TelemetryWriteError is a write failure.
+    with pytest.raises(ValueError) as raised:
+        await pipeline.ingest(
+            legacy_context(FIRST_TS + timedelta(seconds=2)),
+            [source] * (MAX_OBSERVATIONS_PER_BATCH + 1),
+        )
+
+    assert not isinstance(raised.value, TelemetryWriteError)
+    assert write_service.calls == []
 
 
 # Ack contract (D9): failed writes are never acknowledged; redelivery recovers -------------------

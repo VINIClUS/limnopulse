@@ -977,13 +977,11 @@ async def test_batch_above_the_bound_raises_without_lookups(world: World) -> Non
     spy = SpyRepositories(world.repos)
     items = [observation()] * (MAX_OBSERVATIONS_PER_BATCH + 1)
 
-    # The plan fixes the bound, not the exception type (ObservationWriteService uses
-    # TelemetryWriteError(retryable=False) for the same bound).
-    with pytest.raises((ValueError, TelemetryWriteError)) as raised:
+    with pytest.raises(ValueError) as raised:
         await normalizer(spy).normalize(context(), items)
 
-    if isinstance(raised.value, TelemetryWriteError):
-        assert raised.value.retryable is False
+    # A caller error, not a write failure: only TelemetryWriteError means "not durably written".
+    assert not isinstance(raised.value, TelemetryWriteError)
     assert spy.calls == []
 
 

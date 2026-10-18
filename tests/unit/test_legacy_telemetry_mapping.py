@@ -185,7 +185,7 @@ def test_missing_ts_quarantines_the_whole_reading() -> None:
         1783598400.0,
         True,
         None,
-        datetime(2026, 7, 9, 12, 0),  # naive datetime object
+        datetime(2026, 7, 9, 12, 0),  # noqa: DTZ001 - naive datetime object
     ],
     ids=[
         "naive",
