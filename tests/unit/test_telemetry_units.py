@@ -118,7 +118,8 @@ def assert_rejected(
     error = caught.value
     assert error.reason is reason
     assert isinstance(error.detail, str)
-    assert error.detail
+    # P2-06 copies the detail into `QuarantinedObservation.detail` (max 256 characters).
+    assert 0 < len(error.detail) <= 256
     return error
 
 
@@ -129,6 +130,10 @@ def test_registry_is_keyed_by_version_and_only_contains_unit_mapping_v1() -> Non
     assert isinstance(UNIT_MAPPINGS, Mapping)
     assert UNIT_MAPPING_VERSION == "unit-mapping@1"
     assert set(UNIT_MAPPINGS) == {"unit-mapping@1"}
+    with pytest.raises(TypeError):
+        UNIT_MAPPINGS["unit-mapping@2"] = UNIT_MAPPINGS["unit-mapping@1"]  # type: ignore[index]
+    with pytest.raises(TypeError):
+        del UNIT_MAPPINGS["unit-mapping@1"]  # type: ignore[attr-defined]
 
 
 def test_default_version_parameter_is_the_frozen_unit_mapping_version() -> None:
@@ -239,6 +244,28 @@ def test_unknown_or_wrong_case_unit_is_unit_unsupported(metric_key: str, source_
     assert_rejected(QuarantineReason.UNIT_UNSUPPORTED, metric_key, 1.0, source_unit)
 
 
+@pytest.mark.parametrize(
+    ("metric_key", "value", "source_unit"),
+    [
+        (RSSI, MAX_EXACT_INTEGER, "V"),
+        (RSSI, -60.5, "dbm"),
+        (RSSI, 10**400, "V"),
+        (RSSI, math.nan, "dBm "),
+        (TEMPERATURE, True, "degc"),
+        (TEMPERATURE, math.inf, "F"),
+        (TEMPERATURE, "25", "furlongs"),
+        (DISSOLVED_OXYGEN, None, "%sat"),
+        (BATTERY, 10**30, "mv"),
+    ],
+)
+def test_unknown_unit_wins_over_an_invalid_value(
+    metric_key: str, value: object, source_unit: str
+) -> None:
+    # Precedence is pinned: the unit is resolved before the value is judged, so an observation
+    # with both defects gets exactly one reason, `unit_unsupported` (P2-06 quarantine counts).
+    assert_rejected(QuarantineReason.UNIT_UNSUPPORTED, metric_key, value, source_unit)
+
+
 def test_metric_absent_from_the_selected_mapping_is_unit_unsupported() -> None:
     # A test-only catalog metric that `unit-mapping@1` does not list: no unit is in the table.
     unlisted = metric(TEMPERATURE).model_copy(update={"metric_key": "water.chlorophyll"})
@@ -288,7 +315,8 @@ def test_nan_and_infinity_are_value_invalid(
     [(key, unit) for key, units in sorted(LOCKED_UNITS.items()) for unit in sorted(units)],
 )
 @pytest.mark.parametrize(
-    "value", [MAX_EXACT_INTEGER, -MAX_EXACT_INTEGER, MAX_EXACT_INTEGER + 1, 10**30, -(10**30)]
+    "value",
+    [MAX_EXACT_INTEGER, -MAX_EXACT_INTEGER, MAX_EXACT_INTEGER + 1, 10**30, -(10**30), 10**400],
 )
 def test_integers_at_or_beyond_max_exact_integer_are_value_invalid(
     metric_key: str, source_unit: str, value: int
@@ -472,20 +500,42 @@ def test_unknown_version_is_checked_against_the_injected_registry() -> None:
 
 # --- purity ----------------------------------------------------------------------------------
 
-FORBIDDEN_IMPORTS = frozenset(
-    {"os", "io", "pathlib", "socket", "subprocess", "time", "random", "requests", "httpx"}
+ALLOWED_STDLIB_IMPORTS = frozenset(
+    {
+        "__future__",
+        "collections",
+        "dataclasses",
+        "datetime",
+        "enum",
+        "functools",
+        "math",
+        "numbers",
+        "types",
+        "typing",
+        "pydantic",
+    }
 )
 FORBIDDEN_NAMES = frozenset({"open", "print", "input", "now", "utcnow", "today", "monotonic"})
 
 
+def _import_allowed(module: str) -> bool:
+    return module.split(".")[0] in ALLOWED_STDLIB_IMPORTS or module.startswith(
+        "limnopulse_api.domain."
+    )
+
+
 def test_unit_module_is_pure() -> None:
+    """No I/O and no clock: every import comes from a small pure allowlist or the domain."""
     tree = ast.parse(inspect.getsource(telemetry_units))
     for node in ast.walk(tree):
         if isinstance(node, ast.Import):
             for alias in node.names:
-                assert alias.name.split(".")[0] not in FORBIDDEN_IMPORTS, alias.name
+                assert _import_allowed(alias.name), alias.name
         elif isinstance(node, ast.ImportFrom):
-            assert (node.module or "").split(".")[0] not in FORBIDDEN_IMPORTS, node.module
+            if node.level:
+                assert node.level == 1, "relative import escapes limnopulse_api.domain"
+            else:
+                assert _import_allowed(node.module or ""), node.module
         elif isinstance(node, ast.Name):
             assert node.id not in FORBIDDEN_NAMES, node.id
         elif isinstance(node, ast.Attribute):

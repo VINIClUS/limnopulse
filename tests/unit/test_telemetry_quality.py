@@ -17,6 +17,8 @@ from limnopulse_api.domain.telemetry_quality import (
 from limnopulse_api.domain import telemetry_quality
 from limnopulse_api.domain.metric_catalog import metric_catalog, metric_definition
 from limnopulse_api.domain.telemetry_v2 import (
+    MAX_TELEMETRY_TIME,
+    MIN_TELEMETRY_TIME,
     P2_WRITTEN_QUALITY_STATES,
     QUALITY_POLICY_VERSION,
     MetricDefinition,
@@ -88,6 +90,8 @@ def test_registry_is_keyed_by_version_and_pins_the_locked_thresholds() -> None:
     assert isinstance(QUALITY_POLICIES, Mapping)
     assert QUALITY_POLICY_VERSION == "quality-policy@1"
     assert set(QUALITY_POLICIES) == {"quality-policy@1"}
+    with pytest.raises(TypeError):
+        QUALITY_POLICIES["quality-policy@2"] = QUALITY_POLICIES["quality-policy@1"]  # type: ignore[index]
     policy = QUALITY_POLICIES["quality-policy@1"]
     assert isinstance(policy, QualityPolicy)
     assert policy == QualityPolicy(
@@ -399,16 +403,35 @@ def test_unknown_version_is_checked_against_the_injected_registry() -> None:
         (-timedelta(microseconds=1500), -2),
         (-FIVE_MINUTES, -300_000),
         (-(FIVE_MINUTES + MICRO), -300_001),
-        # Large deltas where float `total_seconds() * 1000` rounds to the wrong millisecond.
-        (timedelta(microseconds=8_626_555_501_451_999), 8_626_555_501_451),
-        (timedelta(microseconds=8_701_726_501_526_000), 8_701_726_501_526),
-        (-timedelta(microseconds=8_701_726_501_526_000), -8_701_726_501_526),
     ],
 )
 def test_delay_ms_is_floor_of_microsecond_difference(delta: timedelta, expected_ms: int) -> None:
     result = delay_ms(OBSERVED, OBSERVED + delta)
     assert type(result) is int
     assert result == expected_ms
+
+
+@pytest.mark.parametrize(
+    ("observed", "delta", "expected_ms"),
+    [
+        # Large deltas where float `total_seconds() * 1000` rounds to the wrong millisecond;
+        # every instant stays inside [MIN_TELEMETRY_TIME, MAX_TELEMETRY_TIME).
+        (MIN_TELEMETRY_TIME, timedelta(microseconds=8_626_555_501_451_999), 8_626_555_501_451),
+        (MIN_TELEMETRY_TIME, timedelta(microseconds=8_701_726_501_526_000), 8_701_726_501_526),
+        (
+            datetime(2261, 12, 31, tzinfo=UTC),
+            -timedelta(microseconds=8_701_726_501_526_000),
+            -8_701_726_501_526,
+        ),
+    ],
+)
+def test_delay_ms_is_exact_for_large_deltas(
+    observed: datetime, delta: timedelta, expected_ms: int
+) -> None:
+    received = observed + delta
+    assert MIN_TELEMETRY_TIME <= min(observed, received)
+    assert max(observed, received) < MAX_TELEMETRY_TIME
+    assert delay_ms(observed, received) == expected_ms
 
 
 def test_delay_ms_is_exact_over_the_whole_telemetry_time_range() -> None:
@@ -464,16 +487,35 @@ def test_classification_reproduces_every_contract_vector_quality() -> None:
 # --- determinism (D4) -----------------------------------------------------------------------
 
 FORBIDDEN_CLOCK_NAMES = frozenset({"now", "utcnow", "today", "monotonic"})
-FORBIDDEN_IMPORTS = frozenset(
-    {"os", "io", "pathlib", "socket", "subprocess", "time", "random", "requests", "httpx"}
+ALLOWED_STDLIB_IMPORTS = frozenset(
+    {
+        "__future__",
+        "collections",
+        "dataclasses",
+        "datetime",
+        "enum",
+        "functools",
+        "math",
+        "numbers",
+        "types",
+        "typing",
+        "pydantic",
+    }
 )
+
+
+def _import_allowed(module: str) -> bool:
+    return module.split(".")[0] in ALLOWED_STDLIB_IMPORTS or module.startswith(
+        "limnopulse_api.domain."
+    )
 
 
 def test_quality_module_never_reads_the_clock_or_does_io() -> None:
     """D4: no clock reads and no I/O.
 
-    Deliberately strict: any identifier named like a clock accessor, any `time` import and
-    any `time.<attr>` reference fail, so the module cannot even alias a clock source.
+    Every import comes from a small pure allowlist or `limnopulse_api.domain`, so a clock
+    helper cannot be borrowed from an adapter or service. Deliberately strict on top: any
+    identifier named like a clock accessor and any `time.<attr>` reference fail.
     """
     tree = ast.parse(inspect.getsource(telemetry_quality))
     for node in ast.walk(tree):
@@ -486,8 +528,32 @@ def test_quality_module_never_reads_the_clock_or_does_io() -> None:
                 pytest.fail(f"time.{node.attr} referenced")
         elif isinstance(node, ast.Import):
             for alias in node.names:
-                assert alias.name.split(".")[0] not in FORBIDDEN_IMPORTS, alias.name
+                assert _import_allowed(alias.name), alias.name
         elif isinstance(node, ast.ImportFrom):
-            assert (node.module or "").split(".")[0] not in FORBIDDEN_IMPORTS, node.module
+            if node.level:
+                assert node.level == 1, "relative import escapes limnopulse_api.domain"
+            else:
+                assert _import_allowed(node.module or ""), node.module
             for alias in node.names:
                 assert alias.name not in FORBIDDEN_CLOCK_NAMES | {"time"}, alias.name
+
+
+def test_far_future_observation_is_classified_without_reading_the_clock() -> None:
+    # A clamp-to-now (e.g. `min(received_at, <clock>)`) would invent delay or skew flags here.
+    observed = datetime(2200, 1, 1, tzinfo=UTC)
+    quality = classify_quality(
+        metric(),
+        25.0,
+        observed_at=observed,
+        received_at=observed + timedelta(seconds=2),
+        replay=False,
+    )
+    assert quality == expected()
+    assert delay_ms(observed, observed + timedelta(seconds=2)) == 2000
+    early = datetime(1970, 1, 1, tzinfo=UTC)
+    assert (
+        classify_quality(
+            metric(), 25.0, observed_at=early, received_at=early + FIVE_MINUTES, replay=False
+        )
+        == expected()
+    )
