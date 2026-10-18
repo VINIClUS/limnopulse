@@ -24,7 +24,7 @@ Every dependency boundary is a merge to `main`. P2 ships **dark** (D16): no depl
 
 **Epic:** #22 (roadmap #14). **Planning baseline:** `main@2918532` (M1 complete; `make verify-python` 2120 passed / 8 skipped; `go test -race ./...` green).
 
-**Revision:** r5.
+**Revision:** r6.
 - r2 applied the findings of five independent audits (three local agents and two cloud sessions, one of which ran real InfluxDB 2.7.11 experiments) and the first Codex review of PR #76.
 - r3 applies the second Codex review:
   - `source_type` and `seq` handling in the `/v1` projection;
@@ -44,6 +44,10 @@ Every dependency boundary is a merge to `main`. P2 ships **dark** (D16): no depl
   - escaping wording;
   - projection verification status;
   - query bound closure.
+- r6 applies the fifth Codex review:
+  - deterministic aggregation order in `EvaluateSamples`;
+  - a presence-aware `seq` winner in the projection;
+  - microsecond canonical time precision.
 
 ## Global Constraints
 
@@ -310,6 +314,10 @@ General rules:
 - All models are frozen Pydantic v2 models with `extra="forbid"`.
 - Every datetime must be timezone-aware and is normalized to UTC; a naive datetime is rejected.
 - Every telemetry datetime (`observed_at`, `received_at`, `ingested_at`) must lie in `[MIN_TELEMETRY_TIME, MAX_TELEMETRY_TIME)`, which InfluxDB's signed 64-bit nanosecond time can represent. The mapper and parsers quarantine an out-of-range `ts` as `observed_at_invalid`.
+- **Canonical precision is microseconds.**
+  - Python `datetime` holds µs, and `_time` is µs × 1000.
+  - A source `ts` whose fractional seconds have non-zero digits beyond the sixth (e.g. `…00.123456789Z`) is quarantined as `observed_at_invalid` (detail `sub-microsecond precision unsupported`). It is never silently truncated: Telegraf stores such a value at full nanosecond precision, so truncation would fork the legacy point, and two readings within one µs would collapse to one `event_id`.
+  - Nine-digit values with trailing zeros (`….123456000Z`) are accepted.
 - IDs use the M1 validators: `SafeId` for tenant, `DeviceId` for device, and the canonical prefixes `site`, `ast`, `cmp`, `prb`, `dep`, `di` and `obs`.
 - Collections are tuples.
 
@@ -614,7 +622,8 @@ from(bucket: B) |> range(<same bounds as legacy>)
   |> <two branches, then union():
        metrics: map → {legacy shape, _field: legacy name(metric_key), _value: value (float; rssi → int(v: value))}
        seq:     group by (legacy series key, _time) → sort(ingested_at_ns, event_id) → last() →
-                drop sequence == -1 → map → {legacy shape, _field: "seq", _value: sequence (int, never float)}>
+                (filter sequence != -1 FIRST, so absent sequences rank lowest exactly as in build_legacy_points)
+                → map → {legacy shape, _field: "seq", _value: sequence (int, never float)}>
   |> group(columns: ["_start","_stop","_measurement","tenant_id","pond_id","device_id","source","schema_version","topic","_field"])
   |> <legacy tail: pivot/sort/limit | sort(_time) → last() → regroup without _field → pivot | summary>
 ```
@@ -664,7 +673,7 @@ from(bucket: <b>)
 
 **Rows to samples:**
 - Rows with `component_id != DefaultComponentIDForLegacyDevice(tenant, device_id)` are dropped.
-- The remaining rows become `alertevaluator.Sample{Time, DeviceID, Value, Seq}` and pass through the unchanged `EvaluateSamples`. A `sequence` of `-1` (`ABSENT_SEQUENCE`) gives `Seq = 0`, like a legacy missing `seq`.
+- The remaining rows become `alertevaluator.Sample{Time, DeviceID, Value, Seq}` and pass through `EvaluateSamples`. Its semantics are unchanged except for the deterministic-order fix below. A `sequence` of `-1` (`ABSENT_SEQUENCE`) gives `Seq = 0`, like a legacy missing `seq`.
 
 **Parity** means identical `WindowResult` values for the legacy reader on `water_quality` and the v2 reader on `observation_numeric`:
 - Scenarios: `legacy_sample`, `sub_second`, `delayed_replay`, `relocation`, `unit_converted` and `multi_point_series`.
@@ -681,7 +690,7 @@ from(bucket: <b>)
 | P2-02 | `domain/telemetry_units.py`, `domain/telemetry_quality.py` | Pure functions only; no I/O |
 | P2-03 | `adapters/influxdb_v2_writer.py`, `services/telemetry_v2_writes.py` | No settings, `main.py` or `/v1` files |
 | P2-04 | `adapters/influxdb_v2_reader.py`, `services/telemetry_v2.py`, `api/v2/routers/observations.py`, `api/v2/routers/metric_definitions.py`, `api/v2/schemas/observations.py`, `api/v2/schemas/metric_definitions.py`, `api/v2/telemetry_dependencies.py` | Routers unmounted; no edit to `api/v2/router.py`, `api/v2/dependencies.py` or `main.py` |
-| P2-05 | `internal/alertevaluator/influx/{query_v2,client_v2,legacy_ids}.go` and their tests, `internal/alertevaluator/config.go`, `config_test.go`, `cmd/alert-evaluator/main.go`, `main_test.go`, `docs/alert-evaluator-phase-3b.md` (telemetry-source section) | No Python; no change to `EvaluateSamples`, `state_machine.go` or the legacy `query.go`/`client.go` behavior |
+| P2-05 | `internal/alertevaluator/influx/{query_v2,client_v2,legacy_ids}.go` and their tests, `internal/alertevaluator/config.go`, `config_test.go`, `cmd/alert-evaluator/main.go`, `main_test.go`, `internal/alertevaluator/quality.go` + `quality_test.go` (deterministic summation order only), `docs/alert-evaluator-phase-3b.md` (telemetry-source section) | No Python; no semantic change to `EvaluateSamples` beyond deterministic order; no change to `state_machine.go` or the legacy `query.go`/`client.go` behavior |
 | P2-06 | `services/telemetry_normalizer.py`, `domain/legacy_telemetry_mapping.py`, `services/telemetry_pipeline.py` | No InfluxDB I/O; no settings |
 | P2-07 | `adapters/influxdb_v1_projection.py` | No change to `/v1` routers, services, schemas, `repositories/telemetry.py` or `adapters/influxdb.py` |
 | P2-08 | `core/config.py`, `main.py`, `api/router.py`, `api/v2/router.py`, `scripts/dev/ingest_reading_v2.py`, `.env.example`, `README.md`, `docs/architecture.md` (new section only; pinned header unchanged), `tests/api/test_v2_composition.py`, `tests/api/test_app_runtime.py` | Integration hotspot owner; no feature logic |
@@ -966,8 +975,8 @@ Each task also owns the new test files named in its section.
 
 **Files:**
 - Create: `internal/alertevaluator/influx/query_v2.go`, `internal/alertevaluator/influx/client_v2.go`, `internal/alertevaluator/influx/legacy_ids.go`
-- Modify: `internal/alertevaluator/config.go`, `cmd/alert-evaluator/main.go`, `docs/alert-evaluator-phase-3b.md` (telemetry-source section)
-- Test: `internal/alertevaluator/influx/query_v2_test.go`, `internal/alertevaluator/influx/legacy_ids_test.go`, `internal/alertevaluator/influx/parity_integration_test.go` (`TestInfluxIntegration*`, using the P2-01 Go helpers), `internal/alertevaluator/config_test.go`, `cmd/alert-evaluator/main_test.go`
+- Modify: `internal/alertevaluator/config.go`, `cmd/alert-evaluator/main.go`, `internal/alertevaluator/quality.go` (deterministic summation order only), `docs/alert-evaluator-phase-3b.md` (telemetry-source section)
+- Test: `internal/alertevaluator/influx/query_v2_test.go`, `internal/alertevaluator/influx/legacy_ids_test.go`, `internal/alertevaluator/influx/parity_integration_test.go` (`TestInfluxIntegration*`, using the P2-01 Go helpers), `internal/alertevaluator/config_test.go`, `internal/alertevaluator/quality_test.go`, `cmd/alert-evaluator/main_test.go`
 
 **Interfaces:**
 - `V2WindowReader{Bucket string; Querier Querier}` implements `alertevaluator.WindowReader`.
@@ -984,6 +993,7 @@ Each task also owns the new test files named in its section.
   - Row parsing for float/int `value` and `sequence`, including the `-1` sentinel → `Seq = 0`.
   - Non-default components dropped; NaN dropped.
   - Config default, env, flag and invalid value; `main` reader selection.
+  - `quality_test.go`: `EvaluateSamples` over the same multi-bucket, multi-device sample set returns a bit-identical `Value` across 200 repeated evaluations and across shuffled input orders, for `mean` and `last`. Every existing quality test stays green.
 - [ ] **Step 2: Write failing parity integration tests** (`TestInfluxIntegrationParity*`).
   - For the parity scenarios × aggregation (`min`/`max`/`mean`/`last`) × {pond-wide, device-scoped}, seed both the legacy and v2 lines. Assert identical `WindowResult` from the legacy reader and `V2WindowReader`.
   - `out_of_range` asserts the D15 divergence.
@@ -998,7 +1008,7 @@ Each task also owns the new test files named in its section.
 - [ ] The Go IDs and metric map equal the Python vectors.
 - [ ] Parity is proven on real InfluxDB, with order independence (ADR-006/007).
 - [ ] Native probes are excluded from `/v1` rules.
-- [ ] `EvaluateSamples` and the state machine are untouched; the completeness delay is cited as the existing `AllowedLateness`.
+- [ ] `EvaluateSamples` sums in a deterministic order: `mean` iterates buckets in ascending index and devices in ascending ID; `last` iterates devices in ascending ID. Repeated evaluation of the same samples is bit-identical, and no other semantic change is made. This fixes the existing Go map-iteration order (Codex P1), which otherwise makes float parity flaky. The state machine is untouched, and the completeness delay is cited as the existing `AllowedLateness`.
 
 **Rollback:** `ALERT_EVALUATOR_TELEMETRY_SOURCE=legacy` (default).
 
@@ -1046,7 +1056,7 @@ Each task also owns the new test files named in its section.
 
 - [ ] **Step 1: Write failing mapper tests.**
   - `examples/telemetry/reading.local.json` yields exactly seven observations with sequence 1.
-  - A missing, naive, unparseable or out-of-range (`[MIN_TELEMETRY_TIME, MAX_TELEMETRY_TIME)`) `ts` quarantines the reading. Bad values quarantine per field. A bad `seq` quarantines only `seq`, and the observations are still emitted with `sequence=None`. `null` is skipped.
+  - A missing, naive, unparseable, out-of-range (`[MIN_TELEMETRY_TIME, MAX_TELEMETRY_TIME)`) or sub-microsecond-precision (`…123456789Z`) `ts` quarantines the reading. `…123456000Z` is accepted. Bad values quarantine per field. A bad `seq` quarantines only `seq`, and the observations are still emitted with `sequence=None`. `null` is skipped.
   - Payload tenant/pond/asset claims are ignored, so the output is identical with and without them.
 - [ ] **Step 2: Write failing normalizer tests.**
   - **Fixtures:** build `InMemoryM1Repositories` directly. Seed legacy Device/Component/Asset/Deployment rows with the `domain/legacy_projection.py` builders and the repository `create_*`/`start_deployment`/`end_deployment` methods. `DeploymentService` rejects moves of legacy default Components, and the scenario facade uses `asyncio.run`. Native probes use `M1AcceptanceScenario` constructed over the same repositories in synchronous setup.
