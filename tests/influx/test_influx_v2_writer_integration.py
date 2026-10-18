@@ -12,10 +12,9 @@ from pathlib import Path
 import pytest
 from influxdb_client import InfluxDBClient
 from influxdb_client.client.write_api import SYNCHRONOUS
-from limnopulse_api.adapters.influxdb_v2_writer import InfluxObservationWriter
-from limnopulse_api.services.telemetry_v2_writes import ObservationWriteService
 
 from limnopulse_api.adapters.influxdb import InfluxTelemetryRepository
+from limnopulse_api.adapters.influxdb_v2_writer import InfluxObservationWriter
 from limnopulse_api.core.errors import TelemetryWriteError
 from limnopulse_api.domain.assets import Asset, AssetType, AssetWithPondProfile, PondProfile
 from limnopulse_api.domain.telemetry_v2 import (
@@ -31,6 +30,7 @@ from limnopulse_api.domain.telemetry_v2_schema import (
     flux_string_literal,
     observation_tags,
 )
+from limnopulse_api.services.telemetry_v2_writes import ObservationWriteService
 from tests.support.influx_harness import influx_clients, influx_settings, write_lines
 from tests.support.telemetry_v2_vectors import TelemetryScenario, load_vectors, scenario
 

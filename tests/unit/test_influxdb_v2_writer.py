@@ -9,7 +9,6 @@ import pytest
 from influxdb_client import WritePrecision
 from influxdb_client.client.write_api import WriteApi
 from influxdb_client.rest import ApiException
-from limnopulse_api.adapters.influxdb_v2_writer import InfluxObservationWriter
 from urllib3.exceptions import (
     ConnectTimeoutError,
     HTTPError,
@@ -19,6 +18,7 @@ from urllib3.exceptions import (
     ReadTimeoutError,
 )
 
+from limnopulse_api.adapters.influxdb_v2_writer import InfluxObservationWriter
 from limnopulse_api.core.errors import TelemetryWriteError
 from limnopulse_api.domain.telemetry_v2_schema import LegacyPoint, build_legacy_points
 from limnopulse_api.repositories.telemetry_v2 import LegacyObservationWriter, ObservationWriter
@@ -249,15 +249,16 @@ async def test_client_errors_including_partial_write_are_permanent(
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("status", [400, 422])
+@pytest.mark.parametrize("method", WRITE_METHODS)
+@pytest.mark.parametrize("status", [400, 401, 403, 404, 413, 422])
 async def test_permanent_errors_log_a_schema_conflict_without_payload_values(
-    caplog: pytest.LogCaptureFixture, status: int
+    caplog: pytest.LogCaptureFixture, method: str, status: int
 ) -> None:
     caplog.set_level(logging.DEBUG)
     writer = make_writer(FakeWriteApi({1: _api_exception(status)}))
 
-    with pytest.raises(TelemetryWriteError):
-        await _write(writer, "observations")
+    with pytest.raises(TelemetryWriteError) as raised:
+        await _write(writer, method)
 
     entries = [
         record
@@ -265,9 +266,36 @@ async def test_permanent_errors_log_a_schema_conflict_without_payload_values(
         if record.levelno >= logging.WARNING and "schema" in record.getMessage().lower()
     ]
     assert entries, "a 4xx write must emit a schema-conflict log entry"
-    observation = scenario("legacy_sample").observations[0]
-    for forbidden in (PAYLOAD_MARKER, observation.event_id, "25.1", "3.82", "-67"):
+    for forbidden in (PAYLOAD_MARKER, "25.1", "3.82", "-67"):
         assert forbidden not in caplog.text
+    assert PAYLOAD_MARKER not in str(raised.value)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("status", [429, 503])
+async def test_retryable_errors_leak_no_payload_values(
+    caplog: pytest.LogCaptureFixture, status: int
+) -> None:
+    caplog.set_level(logging.DEBUG)
+    writer = make_writer(FakeWriteApi({1: _api_exception(status)}))
+
+    with pytest.raises(TelemetryWriteError) as raised:
+        await _write(writer, "observations")
+
+    assert PAYLOAD_MARKER not in caplog.text
+    assert PAYLOAD_MARKER not in str(raised.value)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("error", [ValueError("bad value"), TypeError("bug")], ids=repr)
+async def test_unmapped_exceptions_are_never_classified_retryable(error: BaseException) -> None:
+    """Only ApiException, urllib3 HTTPError and OSError are classified; a bug must not loop."""
+    writer = make_writer(FakeWriteApi({1: error}))
+
+    with pytest.raises(Exception) as raised:
+        await _write(writer, "observations")
+
+    assert not (isinstance(raised.value, TelemetryWriteError) and raised.value.retryable)
 
 
 def _transport_errors() -> list[BaseException]:

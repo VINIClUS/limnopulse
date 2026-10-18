@@ -5,20 +5,23 @@ from collections.abc import Sequence
 from datetime import UTC, datetime
 
 import pytest
-from limnopulse_api.services.telemetry_v2_writes import (
-    ObservationWriteService,
-    TelemetryWriteOutcome,
-)
-
 from limnopulse_api.core.errors import TelemetryWriteError
 from limnopulse_api.domain.assets import Asset, AssetType, AssetWithPondProfile, PondProfile
-from limnopulse_api.domain.telemetry_v2 import MAX_OBSERVATIONS_PER_BATCH, CanonicalObservation
+from limnopulse_api.domain.telemetry_v2 import (
+    MAX_OBSERVATIONS_PER_BATCH,
+    CanonicalObservation,
+    SourceType,
+)
 from limnopulse_api.domain.telemetry_v2_schema import (
     LegacyPoint,
     build_legacy_points,
     encode_legacy_line,
 )
 from limnopulse_api.repositories.v2_contracts import SiteAssetReader
+from limnopulse_api.services.telemetry_v2_writes import (
+    ObservationWriteService,
+    TelemetryWriteOutcome,
+)
 from tests.support.telemetry_v2_vectors import TelemetryScenario, scenario
 
 CREATED = datetime(2026, 1, 1, tzinfo=UTC)
@@ -370,7 +373,10 @@ async def test_missing_asset_is_excluded_and_counted_not_raised() -> None:
 
 
 @pytest.mark.asyncio
-async def test_metric_without_legacy_field_is_excluded_and_counted() -> None:
+async def test_uncatalogued_metric_without_legacy_field_is_excluded_and_counted() -> None:
+    """Every `metric-catalog@1` metric has a legacy field, so this D7 clause is reachable only
+    with a synthetic, uncatalogued key (built with `model_copy`, which skips validation). v2 is
+    off because the v2 encoder rightly rejects an uncatalogued metric."""
     item = scenario("legacy_sample")
     no_legacy_field = with_metric(item.observations[0], "water.chlorophyll")
     observations = [*item.observations, no_legacy_field]
@@ -380,6 +386,39 @@ async def test_metric_without_legacy_field_is_excluded_and_counted() -> None:
 
     assert outcome_tuple(outcome) == (0, 1, 1)
     assert [encode_legacy_line(p) for p in harness.legacy_writer.written] == list(item.legacy_lines)
+
+
+def with_source_type(o: CanonicalObservation, source_type: SourceType) -> CanonicalObservation:
+    return o.model_copy(update={"source": o.source.model_copy(update={"source_type": source_type})})
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("source_type", [SourceType.HTTPS, SourceType.MQTT, SourceType.EDGE])
+async def test_legacy_identity_is_telegraf_whatever_the_source_type(
+    source_type: SourceType,
+) -> None:
+    """D8: a legacy default Component dual-writes the stored Telegraf identity on any transport."""
+    item = scenario("legacy_sample")
+    observations = [with_source_type(o, source_type) for o in item.observations]
+    harness = Harness(site_assets=assets_for(item))
+
+    outcome = await harness.service.write(observations)
+
+    assert outcome_tuple(outcome) == (7, 1, 0)
+    assert [encode_legacy_line(p) for p in harness.legacy_writer.written] == list(item.legacy_lines)
+
+
+@pytest.mark.asyncio
+async def test_native_probe_is_excluded_even_over_the_legacy_transport() -> None:
+    """D7 eligibility depends on the Component, never on `source_type`."""
+    item = scenario("two_probes_same_metric")
+    observations = [with_source_type(o, SourceType.LEGACY_MQTT) for o in item.observations]
+    harness = Harness(site_assets=assets_for(item))
+
+    outcome = await harness.service.write(observations)
+
+    assert outcome_tuple(outcome) == (2, 0, 2)
+    assert harness.legacy_writer.written == []
 
 
 @pytest.mark.asyncio
@@ -485,6 +524,24 @@ async def test_legacy_failure_after_v2_success_raises(retryable: bool) -> None:
 
     assert raised.value.retryable is retryable
     assert harness.events == ["v2", "legacy"]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("failing", ["v2", "legacy"])
+async def test_any_writer_failure_surfaces_as_telemetry_write_error(failing: str) -> None:
+    """D9: any failure raises TelemetryWriteError, even one a writer did not classify."""
+    item = scenario("legacy_sample")
+    error = OSError("socket closed")
+    harness = Harness(
+        site_assets=assets_for(item),
+        v2_error=error if failing == "v2" else None,
+        legacy_error=error if failing == "legacy" else None,
+    )
+
+    with pytest.raises(TelemetryWriteError):
+        await harness.service.write(item.observations)
+
+    assert harness.events == (["v2"] if failing == "v2" else ["v2", "legacy"])
 
 
 # --- batch limit ------------------------------------------------------------------------------
