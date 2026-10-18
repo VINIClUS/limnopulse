@@ -20,6 +20,7 @@ import (
 	"github.com/aws/aws-sdk-go-v2/credentials"
 	"github.com/aws/aws-sdk-go-v2/service/dynamodb"
 	influxdb2 "github.com/influxdata/influxdb-client-go/v2"
+	influxapi "github.com/influxdata/influxdb-client-go/v2/api"
 )
 
 func main() {
@@ -121,16 +122,7 @@ func runEvaluator(ctx context.Context, args []string) int {
 	})
 	influxClient := influxdb2.NewClient(config.InfluxDBURL, config.InfluxDBToken)
 	defer influxClient.Close()
-	runner := alertevaluator.Runner{
-		Store: dynamoadapter.Store{
-			Table: config.DynamoDBTable, Client: dynamoClient,
-			TelegramDeliveryEnabled: config.TelegramDeliveryEnabled,
-		},
-		Windows: influxadapter.WindowReader{
-			Bucket:  config.InfluxDBBucket,
-			Querier: influxadapter.ClientQuerier{API: influxClient.QueryAPI(config.InfluxDBOrg)},
-		},
-	}
+	runner := newRunner(config, dynamoClient, influxClient.QueryAPI(config.InfluxDBOrg))
 	summary := runner.Run(ctx, config)
 	metrics, metricsErr := telemetry.New(context.Background(), config.OTLPEndpoint)
 	if metricsErr != nil {
@@ -145,6 +137,24 @@ func runEvaluator(ctx context.Context, args []string) int {
 	}
 	writeJSON(summary)
 	return summary.ExitCode
+}
+
+func newRunner(config alertevaluator.RunConfig, dynamoClient *dynamodb.Client, queryAPI influxapi.QueryAPI) alertevaluator.Runner {
+	return alertevaluator.Runner{
+		Store: dynamoadapter.Store{
+			Table: config.DynamoDBTable, Client: dynamoClient,
+			TelegramDeliveryEnabled: config.TelegramDeliveryEnabled,
+		},
+		Windows: windowReaderFor(config, queryAPI),
+	}
+}
+
+// windowReaderFor selects the window reader for config.TelemetrySource.
+func windowReaderFor(config alertevaluator.RunConfig, queryAPI influxapi.QueryAPI) alertevaluator.WindowReader {
+	if config.TelemetrySource == alertevaluator.TelemetrySourceV2 {
+		return influxadapter.V2WindowReader{Bucket: config.InfluxDBBucket, Querier: influxadapter.ClientV2Querier{API: queryAPI}}
+	}
+	return influxadapter.WindowReader{Bucket: config.InfluxDBBucket, Querier: influxadapter.ClientQuerier{API: queryAPI}}
 }
 
 type stringList []string

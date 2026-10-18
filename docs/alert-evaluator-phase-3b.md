@@ -99,6 +99,36 @@ every minute. Temporary overlap is still safe: DynamoDB leases, fencing epochs,
 deterministic identities and conditional transactions protect duplicate
 invocations.
 
+## Telemetry source
+
+`ALERT_EVALUATOR_TELEMETRY_SOURCE` (or `--telemetry-source`) selects the
+window reader. The value must be exactly `legacy` or `v2`; anything else,
+including an empty value, is a configuration error. The default is `legacy`,
+so staging and production need no new setting.
+
+- `legacy` reads the `water_quality` measurement. Its Flux and behavior are
+  unchanged.
+- `v2` reads `observation_numeric` for the same `/v1` rules (P2 plan D12). The rule's pond
+  maps to `asset_id_for_legacy_pond` and its legacy metric to `metric_key`.
+  Only rows from the device's legacy default Component are kept, so native v2
+  probes never reach `/v1` rules; they reach alerts only through AlertRuleV2,
+  which is deferred. Only `quality_state == "valid"` points count. An
+  out-of-range value is therefore visible to the legacy reader but excluded
+  by `v2`; this divergence is intentional (D15). An absent sequence (`-1`) is read
+  as 0, like a legacy point without `seq`.
+
+Coverage, staleness and aggregation are shared by both readers. The
+completeness delay is the existing `AllowedLateness` setting
+(`ALERT_EVALUATOR_ALLOWED_LATENESS`, `--allowed-lateness`). Alert events keep
+the legacy metric names. A query failure on either reader is recorded as
+`query_error`.
+
+Enable `v2` only where a producer writes every legacy device to
+`observation_numeric` and the keyed divergence check reports zero missing or
+different tuples over the longer of the longest rule window and the legacy read
+window (D16). Production enablement is a P3 exit step. To roll back, set the value
+to `legacy` or remove it.
+
 ## Results and observability
 
 Every invocation writes one JSON summary to stdout. Exit codes are:
