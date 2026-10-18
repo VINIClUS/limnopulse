@@ -399,3 +399,52 @@ def test_mapping_is_deterministic_and_does_not_mutate_the_payload() -> None:
 
     assert tuple(first.observations) == tuple(second.observations)
     assert json.dumps(payload, sort_keys=True) == before
+
+
+# Regression (post-approval review): the excerpt never raises and is strict JSON ----------------
+
+
+def _strict_json(text: str) -> object:
+    def reject(token: str) -> object:
+        raise ValueError(f"non-standard JSON token {token}")
+
+    return json.loads(text, parse_constant=reject)
+
+
+@pytest.mark.parametrize(
+    "payload",
+    [
+        {"ts": "\ud800"},
+        {"ts": "bad", "note": "\ud800"},
+        {"ts": 10**5000},
+        {"ts": "bad", 1: "x", (1, 2): {"a": [1, {2: 3}]}},
+    ],
+    ids=["surrogate-ts", "surrogate-ignored-key", "huge-int-ts", "non-string-keys"],
+)
+def test_reading_quarantine_survives_hostile_payload_values(payload: dict[Any, Any]) -> None:
+    record = assert_reading_quarantined(map_legacy_reading(context(), payload))
+
+    assert record.truncated is False
+    _strict_json(record.source_excerpt_json)
+
+
+@pytest.mark.parametrize(
+    ("changes", "metric_keys"),
+    [
+        ({"ph": "\ud800"}, ("water.ph", "ph")),
+        ({"ph": math.nan}, ("water.ph", "ph")),
+        ({"ph": math.inf}, ("water.ph", "ph")),
+        ({"seq": 10**5000}, None),
+    ],
+    ids=["surrogate-value", "nan-value", "inf-value", "huge-int-seq"],
+)
+def test_field_quarantine_excerpt_is_strict_json_for_hostile_values(
+    changes: dict[str, Any], metric_keys: tuple[str, ...] | None
+) -> None:
+    record = only_quarantine(map_legacy_reading(context(), example() | changes))
+
+    assert record.reason is QuarantineReason.VALUE_INVALID
+    if metric_keys is not None:
+        assert record.metric_key in metric_keys
+    _strict_json(record.source_excerpt_json)
+    assert len(record.source_excerpt_json.encode("utf-8")) <= MAX_QUARANTINE_EXCERPT_BYTES

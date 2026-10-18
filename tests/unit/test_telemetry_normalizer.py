@@ -1096,3 +1096,55 @@ async def test_empty_batch_is_a_no_op(world: World) -> None:
     assert result.accepted == ()
     assert result.quarantined == ()
     assert spy.calls == []
+
+
+# Regression (post-approval review) --------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_quarantine_excerpt_survives_unencodable_metadata_and_huge_values(
+    world: World,
+) -> None:
+    surrogate = observation(
+        component_id=world.second_component, source_metadata={"firmware_version": "\ud800"}
+    )
+    huge = observation(value=10**5000)
+
+    result = await normalizer(world.repos).normalize(context(), [surrogate, huge])
+
+    assert [q.reason for q in result.quarantined] == [
+        QuarantineReason.COMPONENT_NOT_OWNED,
+        QuarantineReason.VALUE_INVALID,
+    ]
+    for record in result.quarantined:
+        assert len(record.source_excerpt_json.encode("utf-8")) <= MAX_QUARANTINE_EXCERPT_BYTES
+        json.loads(record.source_excerpt_json)
+
+
+class CrossTenantComponents:
+    """A misbehaving reader that ignores the tenant argument."""
+
+    def __init__(self, component: DeviceComponent) -> None:
+        self.component = component
+
+    async def get_component(self, tenant_id: str, component_id: str) -> DeviceComponent | None:
+        return self.component
+
+
+@pytest.mark.asyncio
+async def test_component_of_another_tenant_is_rejected_even_if_the_reader_returns_it(
+    world: World,
+) -> None:
+    foreign = await world.repos.get_component(OTHER_TENANT, world.other_tenant_component)
+    assert foreign is not None
+    subject = TelemetryNormalizer(
+        components=CrossTenantComponents(foreign.model_copy(update={"device_id": DEVICE})),
+        deployments=world.repos,
+        clock=lambda: INGESTED,
+    )
+
+    record = only_quarantined(
+        await subject.normalize(context(), [observation(component_id=foreign.component_id)])
+    )
+
+    assert record.reason is QuarantineReason.COMPONENT_NOT_OWNED

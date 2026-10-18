@@ -108,7 +108,7 @@ class TelemetryNormalizer:
 
 
 class _NormalizationCall:
-    """State of one `normalize` call: pinned versions and its lookup caches."""
+    """State of one `normalize` call: pinned versions, lookup caches and one `ingested_at`."""
 
     def __init__(
         self,
@@ -126,7 +126,11 @@ class _NormalizationCall:
     async def normalize_one(self, source: SourceObservation) -> CanonicalObservation:
         context, versions, normalizer = self.context, self.versions, self.normalizer
         component = await self._component(source.component_id)
-        if component is None or component.device_id != context.device_id:
+        if (
+            component is None
+            or component.tenant_id != context.tenant_id
+            or component.device_id != context.device_id
+        ):
             raise _Quarantine(
                 QuarantineReason.COMPONENT_NOT_OWNED,
                 "component is not owned by the trusted tenant and device",

@@ -37,12 +37,39 @@ class LegacyMappingResult:
     quarantined: tuple[QuarantinedObservation, ...]
 
 
+_MAX_EXCERPT_DEPTH = 32
+_MAX_EXCERPT_INTEGER_BITS = 256
+
+
+def _excerptable(value: object, depth: int = 0) -> object:
+    """A strict-JSON-safe copy: string keys, finite numbers, bounded depth and integer size."""
+    if depth > _MAX_EXCERPT_DEPTH:
+        return "<nested too deeply>"
+    if value is None or isinstance(value, bool | str):
+        return value
+    if isinstance(value, int):
+        if value.bit_length() > _MAX_EXCERPT_INTEGER_BITS:
+            return f"<integer of {value.bit_length()} bits>"
+        return value
+    if isinstance(value, float):
+        return value if math.isfinite(value) else repr(value)
+    if isinstance(value, Mapping):
+        return {str(key): _excerptable(item, depth + 1) for key, item in value.items()}
+    if isinstance(value, list | tuple):
+        return [_excerptable(item, depth + 1) for item in value]
+    return str(value)
+
+
 def bounded_excerpt(source: object) -> tuple[str, bool]:
-    """JSON of `source`, cut to `MAX_QUARANTINE_EXCERPT_BYTES` UTF-8 bytes; flags truncation."""
-    text = json.dumps(source, ensure_ascii=False, sort_keys=True, default=str)
-    encoded = text.encode("utf-8")
+    """JSON of `source`, cut to `MAX_QUARANTINE_EXCERPT_BYTES` UTF-8 bytes; flags truncation.
+
+    Never raises for any payload value: non-JSON values are stringified, non-finite floats
+    become strings, and lone surrogates are escaped so the text is always encodable.
+    """
+    text = json.dumps(_excerptable(source), ensure_ascii=False, sort_keys=True, allow_nan=False)
+    encoded = text.encode("utf-8", errors="backslashreplace")
     if len(encoded) <= MAX_QUARANTINE_EXCERPT_BYTES:
-        return text, False
+        return encoded.decode("utf-8"), False
     # A cut inside a multi-byte character drops that character, never exceeding the bound.
     return encoded[:MAX_QUARANTINE_EXCERPT_BYTES].decode("utf-8", errors="ignore"), True
 
@@ -91,8 +118,11 @@ def map_legacy_reading(
 
     try:
         observed_at = _TIMESTAMP.validate_python(payload.get("ts"))
-    except ValidationError as exc:
-        detail = "; ".join(str(error["msg"]) for error in exc.errors())
+    except ValueError as exc:  # pydantic ValidationError, or an oversized integer input
+        if isinstance(exc, ValidationError):
+            detail = "; ".join(str(error["msg"]) for error in exc.errors())
+        else:
+            detail = "ts must be an ISO-8601 timestamp string"
         record = quarantine(QuarantineReason.OBSERVED_AT_INVALID, detail, dict(payload))
         return LegacyMappingResult(observations=(), quarantined=(record,))
 
