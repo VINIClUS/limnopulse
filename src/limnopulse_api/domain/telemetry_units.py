@@ -25,7 +25,12 @@ _IDENTITY: UnitConverter = float
 
 
 def _fahrenheit_to_celsius(value: float) -> float:
-    return (value - 32) * 5 / 9
+    scaled = (value - 32) * 5
+    if math.isinf(scaled):
+        # Only |value| above ~3.6e307 overflows the literal `(x - 32) * 5 / 9`; divide first
+        # there, and keep the literal evaluation order (bit-for-bit) everywhere else.
+        return (value - 32) / 9 * 5
+    return scaled / 9
 
 
 def _kelvin_to_celsius(value: float) -> float:

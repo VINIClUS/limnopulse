@@ -9,14 +9,14 @@ from decimal import Decimal
 from fractions import Fraction
 
 import pytest
+
+from limnopulse_api.domain import telemetry_units
+from limnopulse_api.domain.metric_catalog import metric_catalog, metric_definition
 from limnopulse_api.domain.telemetry_units import (
     UNIT_MAPPINGS,
     UnitConversionError,
     convert_to_canonical,
 )
-
-from limnopulse_api.domain import telemetry_units
-from limnopulse_api.domain.metric_catalog import metric_catalog, metric_definition
 from limnopulse_api.domain.telemetry_v2 import (
     MAX_EXACT_INTEGER,
     UNIT_MAPPING_VERSION,
@@ -343,6 +343,24 @@ def test_large_finite_floats_of_float_metrics_are_converted_not_rejected(
 ) -> None:
     result = convert_to_canonical(metric(metric_key), value, source_unit)
     assert bits(result) == bits(value)
+
+
+@pytest.mark.parametrize("value", [1e308, -1e308, 1.7976931348623157e308, -1.7e308, 3.7e307])
+def test_huge_finite_fahrenheit_converts_without_intermediate_overflow(value: float) -> None:
+    # Regression (PR #80 review): `(x - 32) * 5` overflows although the result is finite.
+    result = convert_to_canonical(metric(TEMPERATURE), value, "degF")
+    assert math.isfinite(result)
+    assert_close(result, (value - 32) / 9 * 5)
+
+
+@pytest.mark.parametrize(
+    "value", [77, 78.8, -40.0, 98.6, 33.3, 0.1, -459.67, 1234.5678, 3.5e307, -3.5e307]
+)
+def test_fahrenheit_keeps_the_literal_evaluation_order(value: float) -> None:
+    # Bit parity with the locked `(x - 32) * 5 / 9` wherever it does not overflow.
+    assert bits(convert_to_canonical(metric(TEMPERATURE), value, "degF")) == bits(
+        (value - 32) * 5 / 9
+    )
 
 
 def test_non_finite_conversion_result_is_value_invalid() -> None:

@@ -7,15 +7,15 @@ from collections.abc import Mapping
 from datetime import UTC, datetime, timedelta, timezone
 
 import pytest
+
+from limnopulse_api.domain import telemetry_quality
+from limnopulse_api.domain.metric_catalog import metric_catalog, metric_definition
 from limnopulse_api.domain.telemetry_quality import (
     QUALITY_POLICIES,
     QualityPolicy,
     classify_quality,
     delay_ms,
 )
-
-from limnopulse_api.domain import telemetry_quality
-from limnopulse_api.domain.metric_catalog import metric_catalog, metric_definition
 from limnopulse_api.domain.telemetry_v2 import (
     MAX_TELEMETRY_TIME,
     MIN_TELEMETRY_TIME,
