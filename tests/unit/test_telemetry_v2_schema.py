@@ -35,6 +35,7 @@ from limnopulse_api.domain.telemetry_v2_schema import (
     encode_legacy_line,
     encode_observation_line,
     flux_string_literal,
+    is_legacy_eligible,
     observation_tags,
     validate_observation_tags,
 )
@@ -849,3 +850,45 @@ def test_out_of_int64_rssi_is_ineligible_not_raised(value) -> None:
     (point,) = build_legacy_points(items, LEGACY_POND_BY_ASSET)
     assert dict(point.fields) == {"ph": 7.2}
     encode_legacy_line(point)
+
+
+# --- orchestrator PR audit regressions (pre-authorized) -------------------------------------
+
+
+def test_full_tie_keeps_the_last_observation_like_influxdb() -> None:
+    ingested = OBSERVED + timedelta(seconds=5)
+    first = observation("water.ph", 7.0, sequence=1, ingested_at=ingested)
+    second = observation("water.ph", 8.0, sequence=2, ingested_at=ingested)
+    assert first.event_id == second.event_id
+
+    (point,) = build_legacy_points([first, second], LEGACY_POND_BY_ASSET)
+    assert dict(point.fields) == {"ph": 8.0, "seq": 2}
+    (point,) = build_legacy_points([second, first], LEGACY_POND_BY_ASSET)
+    assert dict(point.fields) == {"ph": 7.0, "seq": 1}
+
+
+@pytest.mark.parametrize(
+    ("item", "eligible"),
+    [
+        (observation("water.ph", 7.2), True),
+        (observation("device.rssi", -67.0), True),
+        (observation("water.ph", 7.2, component_id=NATIVE_COMPONENT), False),
+        (observation("water.ph", 7.2, asset_id="ast_" + "e" * 32), False),
+        (replace_measurement(observation(), metric_key="water.chlorophyll"), False),
+        (observation("device.rssi", -67.5), False),
+        (observation("device.rssi", float(2**63)), False),
+    ],
+)
+def test_is_legacy_eligible_mirrors_build_legacy_points(item, eligible) -> None:
+    assert is_legacy_eligible(item, LEGACY_POND_BY_ASSET) is eligible
+    assert bool(build_legacy_points([item], LEGACY_POND_BY_ASSET)) is eligible
+
+
+def test_legacy_exclusions_are_countable_from_eligibility() -> None:
+    items = legacy_sample() + [
+        observation("water.ph", 7.2, component_id=NATIVE_COMPONENT),
+        observation("device.rssi", -67.5, observed_at=OBSERVED + timedelta(minutes=1)),
+    ]
+    excluded = len(items) - sum(is_legacy_eligible(item, LEGACY_POND_BY_ASSET) for item in items)
+    assert excluded == 2
+    assert len(build_legacy_points(items, LEGACY_POND_BY_ASSET)) == 1

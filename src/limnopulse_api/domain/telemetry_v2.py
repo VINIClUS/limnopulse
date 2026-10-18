@@ -10,7 +10,6 @@ from collections import Counter
 from collections.abc import Mapping
 from datetime import UTC, datetime
 from enum import StrEnum
-from types import MappingProxyType
 from typing import Annotated, Literal
 from uuid import NAMESPACE_URL, uuid5
 
@@ -128,9 +127,10 @@ class QuarantineReason(StrEnum):
 
 _PROVENANCE_ORDER = {item: index for index, item in enumerate(QualityProvenance)}
 _OUT_OF_RANGE = "telemetry timestamp outside [1970-01-01, 2262-01-01) UTC"
-# Accepted text form: ISO-8601 date and time with "T"/"t" or space, optional fraction, offset.
+# Telegraf parity: Go layout `2006-01-02T15:04:05Z07:00` (uppercase T, optional `.`/`,` fraction,
+# `Z` or `+HH:MM`), so v2 never accepts a reading the legacy path rejects.
 _ISO_TIMESTAMP = re.compile(
-    r"\d{4}-\d{2}-\d{2}[Tt ]\d{2}:\d{2}:\d{2}(?:[.,](?P<fraction>\d+))?(?:[Zz]|[+-]\d{2}:?\d{2})?"
+    r"\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:[.,](?P<fraction>\d+))?(?:Z|[+-]\d{2}:\d{2})"
 )
 
 
@@ -184,13 +184,32 @@ def _require_printable(value: str) -> str:
     return value
 
 
+class ReadOnlyDict(dict[str, str]):
+    """A `dict` that refuses mutation yet survives `copy.deepcopy` and `pickle`."""
+
+    def _refuse(self, *args: object, **kwargs: object) -> None:
+        raise TypeError("source_metadata is read-only")
+
+    __setitem__ = __delitem__ = __ior__ = _refuse
+    clear = pop = popitem = setdefault = update = _refuse
+
+    def __reduce__(self) -> tuple[type["ReadOnlyDict"], tuple[dict[str, str]]]:
+        return (type(self), (dict(self),))
+
+    def __copy__(self) -> "ReadOnlyDict":
+        return self
+
+    def __deepcopy__(self, memo: dict[int, object]) -> "ReadOnlyDict":
+        return self
+
+
 def _require_metadata(value: dict[str, str]) -> Mapping[str, str]:
     unknown = set(value) - SOURCE_METADATA_ALLOWLIST
     if unknown:
         raise ValueError(f"source_metadata keys not allowed: {sorted(unknown)}")
     if any(len(item) > MAX_SOURCE_METADATA_VALUE_LENGTH for item in value.values()):
         raise ValueError("source_metadata values must be at most 64 characters")
-    return MappingProxyType(dict(value))
+    return ReadOnlyDict(value)
 
 
 def _require_point_state(value: QualityState) -> QualityState:
@@ -219,6 +238,7 @@ UnitCode = Annotated[str, Field(min_length=1, max_length=16), AfterValidator(_re
 SourceEventId = Annotated[
     str, Field(min_length=1, max_length=128), AfterValidator(_require_printable)
 ]
+VersionTag = Annotated[str, Field(min_length=1), AfterValidator(_require_printable)]
 ConnectorVersion = Annotated[str, Field(max_length=64)]
 # Read-only after validation (frozen models must not be mutated); serialized as a plain dict.
 SourceMetadata = Annotated[
@@ -241,9 +261,9 @@ class MetricDefinition(_TelemetryModel):
 
 
 class NormalizationVersions(_TelemetryModel):
-    catalog_version: str = METRIC_CATALOG_VERSION
-    unit_mapping_version: str = UNIT_MAPPING_VERSION
-    quality_policy_version: str = QUALITY_POLICY_VERSION
+    catalog_version: VersionTag = METRIC_CATALOG_VERSION
+    unit_mapping_version: VersionTag = UNIT_MAPPING_VERSION
+    quality_policy_version: VersionTag = QUALITY_POLICY_VERSION
 
 
 class TrustedSourceContext(_TelemetryModel):
@@ -379,7 +399,7 @@ class QuarantinedObservation(_TelemetryModel):
     source_event_id: Annotated[str, Field(max_length=128)] | None
     detail: Annotated[str, Field(max_length=256)]
     source_excerpt_json: Annotated[str, AfterValidator(_require_excerpt_bytes)]
-    truncated: bool
+    truncated: StrictBool
 
 
 class StoredObservation(_TelemetryModel):

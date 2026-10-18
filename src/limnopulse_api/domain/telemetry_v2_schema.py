@@ -257,6 +257,29 @@ def _rank(o: CanonicalObservation) -> tuple[datetime, str]:
     return (o.delivery.ingested_at, o.event_id)
 
 
+def _legacy_field(o: CanonicalObservation, legacy_pond_by_asset: Mapping[str, str]) -> str | None:
+    resolved = o.resolved
+    if resolved.component_id != default_component_id_for_legacy_device(
+        resolved.tenant_id, resolved.device_id
+    ):
+        return None
+    if resolved.asset_id not in legacy_pond_by_asset:
+        return None
+    definition = metric_definition(o.observation.metric_key)
+    if definition is None or definition.legacy_field is None:
+        return None
+    if definition.legacy_field in LEGACY_INTEGER_FIELDS and not _encodable_integer(
+        o.observation.value
+    ):
+        return None
+    return definition.legacy_field
+
+
+def is_legacy_eligible(o: CanonicalObservation, legacy_pond_by_asset: Mapping[str, str]) -> bool:
+    """D7 eligibility plus legacy integer encodability; callers count the exclusions."""
+    return _legacy_field(o, legacy_pond_by_asset) is not None
+
+
 def build_legacy_points(
     observations: Iterable[CanonicalObservation], legacy_pond_by_asset: Mapping[str, str]
 ) -> tuple[LegacyPoint, ...]:
@@ -268,30 +291,21 @@ def build_legacy_points(
     """
     groups: dict[tuple[str, str, str, datetime], list[tuple[str, CanonicalObservation]]] = {}
     for o in observations:
+        legacy_field = _legacy_field(o, legacy_pond_by_asset)
+        if legacy_field is None:
+            continue
         resolved = o.resolved
-        if resolved.component_id != default_component_id_for_legacy_device(
-            resolved.tenant_id, resolved.device_id
-        ):
-            continue
-        pond_id = legacy_pond_by_asset.get(resolved.asset_id)
-        if pond_id is None:
-            continue
-        definition = metric_definition(o.observation.metric_key)
-        if definition is None or definition.legacy_field is None:
-            continue
-        if definition.legacy_field in LEGACY_INTEGER_FIELDS and not _encodable_integer(
-            o.observation.value
-        ):
-            continue
+        pond_id = legacy_pond_by_asset[resolved.asset_id]
         key = (resolved.tenant_id, pond_id, resolved.device_id, o.observation.observed_at)
-        groups.setdefault(key, []).append((definition.legacy_field, o))
+        groups.setdefault(key, []).append((legacy_field, o))
 
     points = []
     for (tenant_id, pond_id, device_id, observed_at), members in groups.items():
         winners: dict[str, CanonicalObservation] = {}
         for legacy_field, o in members:
             current = winners.get(legacy_field)
-            if current is None or _rank(o) > _rank(current):
+            # `>=`: on a full tie the later entry wins, as InfluxDB keeps the last write.
+            if current is None or _rank(o) >= _rank(current):
                 winners[legacy_field] = o
         fields: dict[str, float | int] = {}
         for legacy_field, o in winners.items():
@@ -301,7 +315,7 @@ def build_legacy_points(
             )
         sequenced = [o for _, o in members if o.observation.sequence is not None]
         if sequenced:
-            fields["seq"] = max(sequenced, key=_rank).observation.sequence
+            fields["seq"] = max(reversed(sequenced), key=_rank).observation.sequence
         points.append(
             LegacyPoint(
                 tenant_id=tenant_id,

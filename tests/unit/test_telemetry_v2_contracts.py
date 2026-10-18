@@ -1,5 +1,7 @@
+import copy
 import dataclasses
 import math
+import pickle
 from datetime import UTC, datetime, timedelta, timezone
 from uuid import NAMESPACE_URL, uuid5
 
@@ -1133,6 +1135,11 @@ def test_delivery_and_replay_flags_are_strict_booleans(flag) -> None:
         "2026-07-09t12:00:00.123456789Z",
         "2026-07-09 12:00:00.123456789Z",
         "2026-07-09T12:00:00,123456789Z",
+        "2026-07-09t12:00:00.123456Z",
+        "2026-07-09 12:00:00.123456Z",
+        "2026-07-09T12:00:00.123456z",
+        "2026-07-09T12:00:00.123456+0000",
+        "2026-07-09T12:00:00.123456",
     ],
 )
 def test_timestamp_strings_must_be_iso_without_sub_microsecond_digits(observed_at) -> None:
@@ -1142,7 +1149,7 @@ def test_timestamp_strings_must_be_iso_without_sub_microsecond_digits(observed_a
 
 @pytest.mark.parametrize(
     "observed_at",
-    ["2026-07-09t12:00:00.123456Z", "2026-07-09 12:00:00.123456000+00:00"],
+    ["2026-07-09T12:00:00,123456Z", "2026-07-09T12:00:00.123456000+00:00"],
 )
 def test_iso_timestamp_variants_with_microsecond_precision_are_accepted(observed_at) -> None:
     assert source_observation(observed_at=observed_at).observed_at == OBSERVED + timedelta(
@@ -1170,3 +1177,50 @@ def test_default_source_metadata_is_read_only() -> None:
     )
     with pytest.raises(TypeError):
         observation_without_metadata.source_metadata["location"] = "north"  # type: ignore[index]
+
+
+# --- orchestrator PR audit regressions (pre-authorized) -------------------------------------
+
+
+def test_source_metadata_survives_deepcopy_pickle_and_deep_model_copy() -> None:
+    observation = canonical(source_metadata={"firmware_version": "1.2.3"})
+    source = source_observation(source_metadata={"firmware_version": "1.2.3"})
+    result = NormalizationResult(accepted=(observation,), quarantined=())
+    for item in (observation, source, result):
+        assert copy.deepcopy(item) == item
+        assert pickle.loads(pickle.dumps(item)) == item
+        assert item.model_copy(deep=True) == item
+    restored = pickle.loads(pickle.dumps(observation))
+    with pytest.raises(TypeError):
+        restored.source_metadata["location"] = "north"  # type: ignore[index]
+    for mutate in (
+        lambda m: m.pop("firmware_version"),
+        lambda m: m.update({"location": "north"}),
+        lambda m: m.setdefault("location", "north"),
+        lambda m: m.clear(),
+        lambda m: m.popitem(),
+        lambda m: m.__delitem__("firmware_version"),
+        lambda m: m.__ior__({"location": "north"}),
+    ):
+        with pytest.raises(TypeError):
+            mutate(observation.source_metadata)
+    assert dict(observation.source_metadata) == {"firmware_version": "1.2.3"}
+
+
+@pytest.mark.parametrize(
+    "overrides",
+    [
+        {"catalog_version": ""},
+        {"unit_mapping_version": "unit\nmapping@1"},
+        {"quality_policy_version": "quality policy@1\t"},
+    ],
+)
+def test_normalization_versions_must_be_non_empty_printable(overrides) -> None:
+    with pytest.raises(ValidationError):
+        NormalizationVersions(**overrides)
+
+
+@pytest.mark.parametrize("truncated", ["yes", 0, 1])
+def test_quarantine_truncated_is_a_strict_boolean(truncated) -> None:
+    with pytest.raises(ValidationError):
+        quarantined(truncated=truncated)
