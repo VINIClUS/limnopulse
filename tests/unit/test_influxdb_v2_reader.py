@@ -576,3 +576,34 @@ async def test_latest_rows_parse_one_item_per_component_and_metric() -> None:
 
     assert result == [stored_for(first), stored_for(second)]
     assert len({(item.component_id, item.metric_key) for item in result}) == 2
+
+
+@pytest.mark.asyncio
+async def test_unit_is_resolved_under_the_stored_catalog_version() -> None:
+    observation = scenario("legacy_sample").observations[0]
+    unknown_version = {**row_for(observation), "catalog_version": "metric-catalog@999"}
+    api = FakeQueryApi([table_of(unknown_version)])
+
+    with pytest.raises(TelemetryQueryError):
+        await run_query(api)
+
+
+@pytest.mark.asyncio
+async def test_unit_comes_from_the_stored_catalog_version(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    observation = scenario("legacy_sample").observations[0]
+    seen: list[tuple[str, str]] = []
+    real = influxdb_v2_reader.metric_definition
+
+    def recording(metric_key: str, **kwargs: str):
+        seen.append((metric_key, kwargs.get("version", "")))
+        return real(metric_key, **kwargs)
+
+    monkeypatch.setattr(influxdb_v2_reader, "metric_definition", recording, raising=True)
+    api = FakeQueryApi([table_of(row_for(observation))])
+
+    (item,) = await run_query(api)
+
+    assert item.canonical_unit == observation.observation.canonical_unit
+    assert (observation.observation.metric_key, observation.mapping.catalog_version) in seen

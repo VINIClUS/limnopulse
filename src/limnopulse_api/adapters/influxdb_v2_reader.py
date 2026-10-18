@@ -156,9 +156,11 @@ def _sequence(value: object) -> int | None:
 
 def _stored_observation(values: Mapping[str, Any]) -> StoredObservation:
     metric_key = values["metric_key"]
-    definition = metric_definition(metric_key)
+    # The unit is resolved under the catalog version the point was normalized with (ADR-005).
+    catalog_version = values["catalog_version"]
+    definition = metric_definition(metric_key, version=catalog_version)
     if definition is None:
-        raise ValueError(f"stored metric_key {metric_key!r} is not in the metric catalog")
+        raise ValueError(f"stored metric_key {metric_key!r} is not in {catalog_version}")
     return StoredObservation(
         event_id=values["event_id"],
         observed_at=values["_time"],
