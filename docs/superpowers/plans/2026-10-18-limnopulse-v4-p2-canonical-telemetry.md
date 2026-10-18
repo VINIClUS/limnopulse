@@ -24,7 +24,7 @@ Every dependency boundary is a merge to `main`. P2 ships **dark** (D16): no depl
 
 **Epic:** #22 (roadmap #14). **Planning baseline:** `main@2918532` (M1 complete; `make verify-python` 2120 passed / 8 skipped; `go test -race ./...` green).
 
-**Revision:** r4.
+**Revision:** r5.
 - r2 applied the findings of five independent audits (three local agents and two cloud sessions, one of which ran real InfluxDB 2.7.11 experiments) and the first Codex review of PR #76.
 - r3 applies the second Codex review:
   - `source_type` and `seq` handling in the `/v1` projection;
@@ -38,6 +38,12 @@ Every dependency boundary is a merge to `main`. P2 ships **dark** (D16): no depl
   - provenance determinism wording;
   - query timestamp bounds;
   - an integer-typed `seq` in the projection.
+- r5 is clarifications only, from the issue-consistency pass:
+  - module placement;
+  - mapper `seq` behavior;
+  - escaping wording;
+  - projection verification status;
+  - query bound closure.
 
 ## Global Constraints
 
@@ -574,7 +580,7 @@ GET /v2/tenants/{tenant_id}/observations/latest
   - exactly one of `asset_id`, `component_id` or `device_id`, otherwise 422;
   - `metric_key` (repeatable, each value in the catalog, otherwise 422);
   - `quality_state` (repeatable, point states only, otherwise 422);
-  - `start` and `stop`, both timezone-aware ISO-8601. Each supplied bound must lie in `[MIN_TELEMETRY_TIME, MAX_TELEMETRY_TIME]`; this is validated **before** any default is derived, otherwise 422. Endpoint tests cover both extremes and `stop=0001-01-01T00:00:00Z`. They default to `stop = now` and `start = stop − 1 h`. The window is half-open `[start, stop)` by `observed_at`. `stop` must be after `start`, and the range is at most 31 days, otherwise 422;
+  - `start` and `stop`, both timezone-aware ISO-8601. Each supplied bound must lie in the **closed** range `[MIN_TELEMETRY_TIME, MAX_TELEMETRY_TIME]`, validated **before** any default is derived, otherwise 422. The range is closed because the query window itself is half-open, so `stop = MAX_TELEMETRY_TIME` still excludes it. Endpoint tests cover both extremes and `stop=0001-01-01T00:00:00Z`. They default to `stop = now` and `start = stop − 1 h`. The window is half-open `[start, stop)` by `observed_at`. `stop` must be after `start`, and the range is at most 31 days, otherwise 422;
   - `limit` from 1 to 1000, default 500.
 - A selector entity missing in the tenant gives 404 with zero reader calls.
 - Ordering: by `observed_at`, `component_id`, `metric_key` ascending, with the limit applied after the global sort. The Flux pattern is pivot → `group()` → sort → `limit`; never `group()` before pivot.
@@ -596,7 +602,7 @@ GET /v2/tenants/{tenant_id}/observations/latest
 
 ### `/v1` projection semantics (P2-07)
 
-`V2ProjectedTelemetryRepository(*, query_api, org, bucket, domain_repository)` implements the existing `TelemetryRepository` over `observation_numeric`. This Flux shape was verified equal to the legacy adapter on InfluxDB 2.7.11:
+`V2ProjectedTelemetryRepository(*, query_api, org, bucket, domain_repository)` implements the existing `TelemetryRepository` over `observation_numeric`. The r2 form of this Flux shape was verified equal to the legacy adapter on InfluxDB 2.7.11. The r3/r4 refinements (per-point pivot, `seq` branch, `_field`-preserving `last()`) are re-verified by P2-07's equivalence tests, which are the authority:
 
 ```text
 from(bucket: B) |> range(<same bounds as legacy>)
@@ -653,7 +659,7 @@ from(bucket: <b>)
 ```
 
 **Escaping and identifiers:**
-- Every literal goes through `fluxString`, plus `$` escaping for the v2 query.
+- Every literal goes through `fluxString`; the v2 query also replaces `${` with `\${`, and a lone `$` is unchanged.
 - `AssetIDForLegacyPond` and `DefaultComponentIDForLegacyDevice` use `uuid.NewSHA1(uuid.NameSpaceURL, …)` with the Python discriminators and return `"<prefix>_" + hex` without dashes. They must equal the Python vectors.
 
 **Rows to samples:**
@@ -713,7 +719,13 @@ Each task also owns the new test files named in its section.
   - from `v2_common`: `SafeId`, `DeviceId`, `ProviderKey`, `CAPABILITY_KEY_PATTERN` and `format_utc_timestamp`;
   - `AlertMetric`;
   - `infra/telegraf/telegraf.conf`.
-- Produces every type, constant, function, protocol, vector and loader in **Locked Cross-Task Contracts**.
+- Produces everything in the spine sections of **Locked Cross-Task Contracts**: Versions and limits, Metric catalog (incl. API), Enumerations, Models, Canonical identity, the InfluxDB schema and line protocol, the legacy dual-write point, Repository protocols, Cross-language vectors and loader. The unit-mapping and quality-policy **registries and functions** belong to P2-02, and P2-00 only freezes their version constants.
+- **Module placement:**
+  - `domain/telemetry_v2.py`: constants, enums, models, `observation_event_id`, `NormalizationResult`.
+  - `domain/metric_catalog.py`: catalog data and API.
+  - `domain/telemetry_v2_schema.py`: measurement/tag/field names, `LegacyPoint`, encoders, guard, `build_legacy_points`, `flux_string_literal`.
+  - `repositories/telemetry_v2.py`: protocols and `ObservationSelector`.
+  - Owned by later tasks: `TelemetryWriteOutcome` (P2-03, `services/telemetry_v2_writes.py`), `LegacyMappingResult` (P2-06, `domain/legacy_telemetry_mapping.py`) and `PipelineOutcome` (P2-06, `services/telemetry_pipeline.py`).
 
 - [ ] **Step 1: Write failing contract tests.**
   - Enum values are frozen.
@@ -967,7 +979,7 @@ Each task also owns the new test files named in its section.
 
 - [ ] **Step 1: Write failing Go unit tests.**
   - ID and metric vectors from `testdata/telemetry_v2/contract_vectors.json`, with the repository-root path resolved via `runtime.Caller`.
-  - Flux fragments, with escaping including `$`.
+  - Flux fragments, with escaping (`${` → `\${`; a lone `$` unchanged; `raw$archive` bucket).
   - An unknown metric and an invalid window are rejected.
   - Row parsing for float/int `value` and `sequence`, including the `-1` sentinel → `Seq = 0`.
   - Non-default components dropped; NaN dropped.
@@ -1005,7 +1017,7 @@ Each task also owns the new test files named in its section.
 **`map_legacy_reading(context: TrustedSourceContext, payload: Mapping[str, Any]) -> LegacyMappingResult(observations, quarantined)`**
 - The Component is `default_component_id_for_legacy_device(context.tenant_id, context.device_id)`.
 - A missing, naive or unparseable `ts` gives one `observed_at_invalid` quarantine for the whole reading, with no observations.
-- `seq` becomes `sequence`. A bool, negative or out-of-range `seq` gives one `value_invalid` quarantine for the reading.
+- `seq` becomes `sequence`. A bool, negative or out-of-range `seq` gives one `value_invalid` quarantine record (for `seq`), and the reading's metric observations are still emitted with `sequence=None`.
 - Each present legacy field becomes a `SourceObservation` with the catalog `metric_key` and the canonical unit as `source_unit`:
   - `null` is skipped;
   - a bool, string, NaN or Infinity value becomes a `value_invalid` quarantine for that field.
@@ -1034,7 +1046,7 @@ Each task also owns the new test files named in its section.
 
 - [ ] **Step 1: Write failing mapper tests.**
   - `examples/telemetry/reading.local.json` yields exactly seven observations with sequence 1.
-  - Missing, naive or unparseable `ts` quarantines; bad values quarantine per field; `null` is skipped.
+  - A missing, naive, unparseable or out-of-range (`[MIN_TELEMETRY_TIME, MAX_TELEMETRY_TIME)`) `ts` quarantines the reading. Bad values quarantine per field. A bad `seq` quarantines only `seq`, and the observations are still emitted with `sequence=None`. `null` is skipped.
   - Payload tenant/pond/asset claims are ignored, so the output is identical with and without them.
 - [ ] **Step 2: Write failing normalizer tests.**
   - **Fixtures:** build `InMemoryM1Repositories` directly. Seed legacy Device/Component/Asset/Deployment rows with the `domain/legacy_projection.py` builders and the repository `create_*`/`start_deployment`/`end_deployment` methods. `DeploymentService` rejects moves of legacy default Components, and the scenario facade uses `asyncio.run`. Native probes use `M1AcceptanceScenario` constructed over the same repositories in synchronous setup.
@@ -1086,13 +1098,14 @@ Each task also owns the new test files named in its section.
   - The asset→pond mapping from `list_ponds`.
   - Legacy grouping before `last()`/pivot/`limit`.
   - The summary sort.
-  - Explicit `int` conversion for `rssi`/`seq`.
+  - The `rssi` `int(v:)` reconstruction and the integer-typed `seq` branch.
   - Summary period validation and `TelemetryQueryError` wrapping; the other methods propagate errors.
 - [ ] **Step 2: Write failing equivalence tests** (real InfluxDB).
   - **Setup:** dual-write through the P2-03 `ObservationWriteService`, with both switches on, into one bucket. Write these scenarios:
     - `legacy_sample`, `sub_second`, `out_of_range`;
     - the `multi_point_series` scenario rebased to the captured `now`: ≥ 30 points, 2 devices, 2 ponds, a `limit` smaller than the rows, a device with mixed `quality_state`, and ≥ 3 devices with values whose float sum depends on order;
     - native probes on a legacy pond Asset;
+    - two observations at the same `(device, observed_at)` with conflicting sequences (the tie-break), and sequences `2**53 + 1` and `2**63 - 1` (integer exactness);
     - another tenant.
   - **Domain-level equality:** for the four methods, `InfluxTelemetryRepository` and `V2ProjectedTelemetryRepository` return equal objects, and every compared result is non-empty.
   - **HTTP-level equality:** two apps, each with its repository injected, return byte-identical JSON for the four `/v1` endpoints.
