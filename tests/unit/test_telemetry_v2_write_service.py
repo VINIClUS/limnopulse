@@ -599,3 +599,20 @@ async def test_batch_over_the_limit_is_rejected_before_any_write(v2: bool, legac
     assert raised.value.retryable is False
     assert harness.events == []
     assert harness.site_assets.lookups == []
+
+
+# --- added after approval (needs re-approval): Codex finding on native-probe lookups --------
+
+
+@pytest.mark.asyncio
+async def test_native_probes_need_no_asset_lookup() -> None:
+    """D7: only legacy default Components dual-write, so native probes never depend on the
+    Asset store; an unavailable store must not block their batch."""
+    item = scenario("two_probes_same_metric")
+    harness = Harness(site_assets=FakeSiteAssets(error=RuntimeError("asset store down")))
+
+    outcome = await harness.service.write(item.observations)
+
+    assert outcome_tuple(outcome) == (2, 0, 2)
+    assert harness.site_assets.lookups == []
+    assert harness.legacy_writer.written == []

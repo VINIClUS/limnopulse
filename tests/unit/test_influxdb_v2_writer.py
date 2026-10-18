@@ -372,3 +372,23 @@ async def test_raised_error_carries_no_response_context(error: BaseException) ->
 
     assert raised.value.__cause__ is None
     assert raised.value.__context__ is None
+
+
+# --- added after approval (needs re-approval): Codex finding on status-zero ApiException -----
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("method", WRITE_METHODS)
+async def test_status_zero_api_exception_is_a_retryable_transport_failure(
+    caplog: pytest.LogCaptureFixture, method: str
+) -> None:
+    """influxdb-client 1.50 rethrows a urllib3 SSLError as ApiException(status=0)."""
+    caplog.set_level(logging.DEBUG)
+    error = ApiException(status=0, reason="SSLError\ncertificate verify failed")
+    writer = make_writer(FakeWriteApi({1: error}))
+
+    with pytest.raises(TelemetryWriteError) as raised:
+        await _write(writer, method)
+
+    assert raised.value.retryable is True
+    assert not any("schema" in record.getMessage().lower() for record in caplog.records)

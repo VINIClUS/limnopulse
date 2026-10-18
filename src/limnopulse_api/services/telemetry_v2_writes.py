@@ -10,6 +10,7 @@ from collections.abc import Awaitable, Sequence
 from dataclasses import dataclass
 
 from limnopulse_api.core.errors import TelemetryWriteError
+from limnopulse_api.domain.ids import default_component_id_for_legacy_device
 from limnopulse_api.domain.telemetry_v2 import MAX_OBSERVATIONS_PER_BATCH, CanonicalObservation
 from limnopulse_api.domain.telemetry_v2_schema import build_legacy_points, is_legacy_eligible
 from limnopulse_api.repositories.telemetry_v2 import LegacyObservationWriter, ObservationWriter
@@ -70,10 +71,18 @@ class ObservationWriteService:
     async def _legacy_pond_by_asset(
         self, observations: Sequence[CanonicalObservation]
     ) -> dict[str, str]:
-        """Resolve each distinct Asset once for this call; a missing Asset or pond is omitted."""
+        """Resolve each distinct Asset once for this call; a missing Asset or pond is omitted.
+
+        Only legacy default Components can be dual-written (D7), so native probes never make
+        legacy dual-write depend on the Asset store.
+        """
         resolved: set[tuple[str, str]] = set()
         legacy_pond_by_asset: dict[str, str] = {}
         for o in observations:
+            if o.resolved.component_id != default_component_id_for_legacy_device(
+                o.resolved.tenant_id, o.resolved.device_id
+            ):
+                continue
             key = (o.resolved.tenant_id, o.resolved.asset_id)
             if key in resolved:
                 continue

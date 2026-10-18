@@ -78,6 +78,10 @@ class InfluxObservationWriter:
 
 def _classify_api_error(exc: ApiException, line_count: int) -> TelemetryWriteError:
     status = exc.status or 0
+    if status == 0:
+        # No HTTP response: influxdb-client reports a urllib3 SSLError (TLS negotiation or
+        # certificate failure) this way, so it is a transport failure.
+        return TelemetryWriteError("InfluxDB write failed before a response", retryable=True)
     if status == _TOO_MANY_REQUESTS or status >= _SERVER_ERROR:
         return TelemetryWriteError(f"InfluxDB write failed with HTTP {status}", retryable=True)
     # A 422 is a partial write (e.g. a field-type conflict): other lines may be stored, and a
