@@ -34,30 +34,33 @@ type V2WindowReader struct {
 
 func (reader V2WindowReader) Evaluate(ctx context.Context, rule alertevaluator.EvaluationRule, spec alertevaluator.WindowSpec) (alertevaluator.WindowResult, error) {
 	query, err := BuildV2Query(reader.Bucket, rule, spec)
-	if err != nil {
-		return alertevaluator.WindowResult{}, err
+	if err == nil {
+		var rows []V2Row
+		if rows, err = reader.Querier.Query(ctx, query); err == nil {
+			return alertevaluator.EvaluateSamples(spec, defaultComponentSamples(rule.TenantID, rows)), nil
+		}
+		err = fmt.Errorf("query InfluxDB v2 window: %w", err)
 	}
-	rows, err := reader.Querier.Query(ctx, query)
-	if err != nil {
-		return alertevaluator.WindowResult{}, fmt.Errorf("query InfluxDB v2 window: %w", err)
-	}
+	return alertevaluator.WindowResult{}, err
+}
+
+// defaultComponentSamples keeps the rows of each device's legacy default
+// Component with a finite value and maps the -1 sequence sentinel to 0.
+func defaultComponentSamples(tenantID string, rows []V2Row) []alertevaluator.Sample {
 	samples := make([]alertevaluator.Sample, 0, len(rows))
 	for _, row := range rows {
-		if row.Time.IsZero() || math.IsNaN(row.Value) || math.IsInf(row.Value, 0) {
+		keep := row.ComponentID == DefaultComponentIDForLegacyDevice(tenantID, row.DeviceID) &&
+			!row.Time.IsZero() && !math.IsNaN(row.Value) && !math.IsInf(row.Value, 0)
+		if !keep {
 			continue
 		}
-		if row.ComponentID != DefaultComponentIDForLegacyDevice(rule.TenantID, row.DeviceID) {
-			continue
+		sample := alertevaluator.Sample{Time: row.Time.UTC(), DeviceID: row.DeviceID, Value: row.Value, Seq: row.Sequence}
+		if sample.Seq == absentSequence {
+			sample.Seq = 0
 		}
-		sequence := row.Sequence
-		if sequence == absentSequence {
-			sequence = 0
-		}
-		samples = append(samples, alertevaluator.Sample{
-			Time: row.Time.UTC(), DeviceID: row.DeviceID, Value: row.Value, Seq: sequence,
-		})
+		samples = append(samples, sample)
 	}
-	return alertevaluator.EvaluateSamples(spec, samples), nil
+	return samples
 }
 
 // BuildV2Query builds the observation_numeric window query for a /v1 rule.
