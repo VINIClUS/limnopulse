@@ -47,6 +47,22 @@ wait_healthy() {
   return 1
 }
 
+# Print the version /health reports (empty when it reports none).
+health_version() {
+  curl -fsS --max-time 2 "${BASE_URL}/health" 2>/dev/null \
+    | sed -n 's/.*"version": *"\([^"]*\)".*/\1/p' || true
+}
+
+# Encode a value as a JSON string literal.
+json_string() {
+  local value="${1//\\/\\\\}"
+  value="${value//\"/\\\"}"
+  value="${value//$'\n'/\\n}"
+  value="${value//$'\r'/\\r}"
+  value="${value//$'\t'/\\t}"
+  printf '"%s"' "${value}"
+}
+
 # True when the PID file names a live influxd process.
 running() {
   local pid
@@ -83,6 +99,11 @@ if running; then
     echo "influxd is not healthy on ${BASE_URL}; see ${LOG_FILE}" >&2
     exit 1
   fi
+  version="$(health_version)"
+  if [[ -n "${version}" && "${version}" != "v2.7.11" ]]; then
+    echo "the reused server on ${BASE_URL} is InfluxDB ${version}, not v2.7.11; stop it first" >&2
+    exit 1
+  fi
 else
   if healthy; then
     echo "another server already answers on ${BASE_URL}; stop it or set INFLUXD_PORT" >&2
@@ -104,7 +125,7 @@ else
     echo "influxd did not start on ${BASE_URL}; see ${LOG_FILE}" >&2
     exit 1
   fi
-  if ! curl -fsS --max-time 2 "${BASE_URL}/health" | grep -q '"v2.7.11"'; then
+  if [[ "$(health_version)" != "v2.7.11" ]]; then
     echo "the server on ${BASE_URL} is not InfluxDB v2.7.11" >&2
     exit 1
   fi
@@ -115,7 +136,7 @@ fi
 RESPONSE="$(mktemp)"
 status="$(curl -sS -o "${RESPONSE}" -w '%{http_code}' -X POST "${BASE_URL}/api/v2/setup" \
   -H 'Content-Type: application/json' \
-  -d "{\"username\":\"limnopulse\",\"password\":\"local-dev-password\",\"org\":\"${ORG}\",\"bucket\":\"limnopulse_dev\",\"token\":\"${TOKEN}\"}")"
+  -d "{\"username\":\"limnopulse\",\"password\":\"local-dev-password\",\"org\":$(json_string "${ORG}"),\"bucket\":\"limnopulse_dev\",\"token\":$(json_string "${TOKEN}")}")"
 if [[ "${status}" == "201" ]]; then
   echo "Onboarded org ${ORG} on ${BASE_URL}"
 elif grep -q '"conflict"' "${RESPONSE}" && grep -q 'onboarding has already been completed' "${RESPONSE}"; then
