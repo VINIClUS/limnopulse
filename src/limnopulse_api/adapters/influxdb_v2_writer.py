@@ -12,6 +12,7 @@ from typing import Any
 
 from anyio import to_thread
 from influxdb_client import WritePrecision
+from influxdb_client.client.write_api import WriteType
 from influxdb_client.rest import ApiException
 from urllib3.exceptions import HTTPError
 
@@ -36,6 +37,11 @@ class InfluxObservationWriter:
     ) -> None:
         if max_lines_per_request < 1:
             raise ValueError("max_lines_per_request must be positive")
+        # A batching or asynchronous WriteApi returns before the server answers and reports
+        # errors only to a callback, so a failed write would be acknowledged as written.
+        write_options = getattr(write_api, "_write_options", None)
+        if write_options is not None and write_options.write_type is not WriteType.synchronous:
+            raise ValueError("write_api must use synchronous write options")
         self.write_api = write_api
         self.bucket = bucket
         self.org = org
@@ -50,14 +56,19 @@ class InfluxObservationWriter:
     async def _write(self, lines: list[str]) -> None:
         for start in range(0, len(lines), self.max_lines_per_request):
             chunk = lines[start : start + self.max_lines_per_request]
+            error: TelemetryWriteError | None = None
             try:
                 await to_thread.run_sync(self._write_chunk, chunk)
             except ApiException as exc:
-                raise _classify_api_error(exc, len(chunk)) from None
+                error = _classify_api_error(exc, len(chunk))
             except (HTTPError, OSError) as exc:
-                raise TelemetryWriteError(
+                error = TelemetryWriteError(
                     f"InfluxDB write failed in transport: {type(exc).__name__}", retryable=True
-                ) from None
+                )
+            # Raised outside the handler so no exception context (which echoes the response
+            # body and therefore payload values) is attached.
+            if error is not None:
+                raise error
 
     def _write_chunk(self, chunk: list[str]) -> None:
         self.write_api.write(

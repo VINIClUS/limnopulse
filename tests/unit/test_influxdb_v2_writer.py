@@ -7,7 +7,7 @@ from datetime import UTC, datetime, timedelta
 
 import pytest
 from influxdb_client import WritePrecision
-from influxdb_client.client.write_api import WriteApi
+from influxdb_client.client.write_api import WriteApi, WriteOptions, WriteType
 from influxdb_client.rest import ApiException
 from urllib3.exceptions import (
     ConnectTimeoutError,
@@ -335,3 +335,40 @@ async def test_a_failing_later_chunk_is_never_swallowed(status: int, retryable: 
 
     assert raised.value.retryable is retryable
     assert len(write_api.calls) >= 2
+
+
+# --- added after approval (needs re-approval): review finding on non-synchronous write APIs --
+
+
+class _OptionsWriteApi(FakeWriteApi):
+    def __init__(self, write_type: WriteType) -> None:
+        super().__init__()
+        self._write_options = WriteOptions(write_type=write_type)
+
+
+@pytest.mark.parametrize("write_type", [WriteType.batching, WriteType.asynchronous])
+def test_non_synchronous_write_api_is_rejected(write_type: WriteType) -> None:
+    """A batching/asynchronous WriteApi reports failures only to a callback: never swallow."""
+    with pytest.raises(ValueError):
+        make_writer(_OptionsWriteApi(write_type))
+
+
+@pytest.mark.asyncio
+async def test_synchronous_write_api_is_accepted() -> None:
+    write_api = _OptionsWriteApi(WriteType.synchronous)
+
+    await make_writer(write_api).write_legacy_points(legacy_points("legacy_sample"))
+
+    assert write_api.lines == list(scenario("legacy_sample").legacy_lines)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("error", [_api_exception(422), _api_exception(503), OSError("reset")])
+async def test_raised_error_carries_no_response_context(error: BaseException) -> None:
+    writer = make_writer(FakeWriteApi({1: error}))
+
+    with pytest.raises(TelemetryWriteError) as raised:
+        await _write(writer, "observations")
+
+    assert raised.value.__cause__ is None
+    assert raised.value.__context__ is None
