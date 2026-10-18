@@ -24,7 +24,7 @@ Every dependency boundary is a merge to `main`. P2 ships **dark** (D16): no depl
 
 **Epic:** #22 (roadmap #14). **Planning baseline:** `main@2918532` (M1 complete; `make verify-python` 2120 passed / 8 skipped; `go test -race ./...` green).
 
-**Revision:** r3.
+**Revision:** r4.
 - r2 applied the findings of five independent audits (three local agents and two cloud sessions, one of which ran real InfluxDB 2.7.11 experiments) and the first Codex review of PR #76.
 - r3 applies the second Codex review:
   - `source_type` and `seq` handling in the `/v1` projection;
@@ -32,6 +32,12 @@ Every dependency boundary is a merge to `main`. P2 ships **dark** (D16): no depl
   - InfluxDB timestamp bounds;
   - pinned versions carried on replay;
   - sentinel encoding for optional fields.
+- r4 applies the third Codex review:
+  - a constant Telegraf identity for legacy dual-write, so the source never forks legacy series;
+  - `${`-only Flux escaping;
+  - provenance determinism wording;
+  - query timestamp bounds;
+  - an integer-typed `seq` in the projection.
 
 ## Global Constraints
 
@@ -68,7 +74,7 @@ Every dependency boundary is a merge to `main`. P2 ships **dark** (D16): no depl
 - **Coverage.** Sonar runs only the default suites, so new production code must reach ≥80% line coverage from unit tests alone. `tests/**` and `scripts/dev/**` are excluded from coverage.
 
 ### Safety
-- **Flux literals.** Every Flux literal built from a runtime value goes through the escaping helper: JSON escaping, then `$` → `\$` to defeat `${…}` interpolation. Every ID is validated before a query is built.
+- **Flux literals.** Every Flux literal built from a runtime value goes through the escaping helper: JSON escaping, then `${` → `\${` to defeat interpolation (`\${` is the only Flux escape for `$`; a lone `$` stays as is, so a bucket such as `raw$archive` keeps working). Every ID is validated before a query is built.
 - **Issue #6.** Presence-aware `Evaluation.Value` stays canonical in #6 and out of P2 scope. The P2 Go reader reports values only through the unchanged `WindowResult`.
 
 ### Evidence
@@ -87,11 +93,11 @@ Epic #22 requires the metric/unit and dual-write contracts to be frozen before d
 | D1 | Metric catalog | One global, versioned catalog `metric-catalog@1` with exactly the seven legacy metrics below, display names included. P2 accepts no tenant-defined metric keys. |
 | D2 | Unit mapping | Versioned `unit-mapping@1` with explicit per-metric source units. An unknown unit is quarantined, never guessed. |
 | D3 | Quality states | In P2 the normalizer writes `quality_state` = `valid` or `out_of_range` only. Clock skew, delay and replay are **flags** (V4 §10.3 "skew is flagged"; ADR-006 "emit a quality flag"). `suspect`, `uncalibrated`, `calibration_unknown` and `impossible_jump` are reserved point states for P6; P6 must decide their thresholds before writing them. `stale` and `missing` are read/evaluation states and are never written. Duplicate and sequence logic need per-Component state and are deferred to P3/P6 (D13). |
-| D4 | Determinism | `quality_state` and provenance are a pure function of the canonical value and the pinned versions. Flags are a pure function of `observed_at`, `received_at` and the replay marker. Neither reads wall-clock time. |
-| D5 | Identity and series key | `event_id = observation_event_id(tenant, component, metric, observed_at)`. The InfluxDB series key contains only identity and resolved-ownership tags (`tenant_id`, `site_id`, `asset_id`, `deployment_id`, `device_id`, `component_id`, `probe_id`, `metric_key`, `schema_version`). All of these are fixed by the identity plus the immutable Deployment history. `quality_state` and `source_type` are **fields** (spec delta), so re-classification, replay or redelivery overwrites the same point (last writer wins per field) and never forks a series. `TrustedSourceContext.received_at` is the first-receipt time and MUST be carried unchanged on replay and redelivery. No per-observation DynamoDB receipt is written. |
+| D4 | Determinism | `quality_state` is a pure function of the canonical value and the pinned versions. Flags and provenance are a pure function of the canonical value, the pinned versions, `observed_at`, `received_at` and the replay marker. None of them reads wall-clock time. |
+| D5 | Identity and series key | `event_id = observation_event_id(tenant, component, metric, observed_at)`. The InfluxDB series key contains only identity and resolved-ownership tags (`tenant_id`, `site_id`, `asset_id`, `deployment_id`, `device_id`, `component_id`, `probe_id`, `metric_key`, `schema_version`). All of these are fixed by the identity plus the immutable Deployment history. `quality_state` and `source_type` are **fields** (spec delta), so re-classification, replay or redelivery overwrites the same point (last writer wins per field) and never forks a series. A replay or redelivery MUST carry the first-receipt `TrustedSourceContext` unchanged, except for `replay` and `mapping_versions`: `received_at`, `source_type`, `integration_id` and `integration_type` keep their first-receipt values. No per-observation DynamoDB receipt is written. |
 | D6 | Bucket | `observation_numeric` lives in the existing `INFLUXDB_BUCKET_RAW` bucket. No per-tenant or per-plan bucket. The runbook records that the bucket's retention must be at least the legacy read window before the `/v1` projection switch. |
 | D7 | Legacy dual-write eligibility | Dual-write only when all three hold: the observation's Component is `default_component_id_for_legacy_device(tenant_id, device_id)`; the resolved Asset exists and carries `PondProfile.legacy_pond_id`; and the metric has a `legacy_field`. Ineligible observations, including a missing Asset, are excluded from legacy and counted, not raised. Native v2 probes never appear in `water_quality`. |
-| D8 | Legacy series identity | Dual-written legacy points use the **stored Telegraf identity**: measurement `water_quality`; tags `device_id`, `pond_id`, `schema_version="1"`, `source` (`mqtt` for `SourceType.LEGACY_MQTT`, otherwise the `SourceType` value) and `tenant_id`; plus `topic="limnopulse/v1/devices/<device_id>/readings"` when the source type is `legacy_mqtt` (the Telegraf `mqtt_consumer` default `topic_tag`). `_time` is the exact `observed_at`: Telegraf does not apply agent `precision` to service inputs. A P2-00 test parses `infra/telegraf/telegraf.conf` and fails if the measurement, static tags, topic pattern or `topic_tag` change. |
+| D8 | Legacy series identity | Dual-written legacy points **always** use the stored Telegraf identity, whatever the canonical `source_type`: measurement `water_quality`; tags `device_id`, `pond_id`, `schema_version="1"`, `source="mqtt"`, `tenant_id` and `topic="limnopulse/v1/devices/<device_id>/readings"` (the Telegraf `mqtt_consumer` default `topic_tag`). The legacy measurement is a `/v1` compatibility projection and no reader uses `source`/`topic`. Its series key is therefore a function of `(tenant, pond, device)` only, so a redelivery, a correction or a transport change never forks a legacy series, and Telegraf coexistence never double-counts. `_time` is the exact `observed_at`: Telegraf does not apply agent `precision` to service inputs. A P2-00 test parses `infra/telegraf/telegraf.conf` and fails if the measurement, static tags, topic pattern or `topic_tag` change. |
 | D9 | Write switches | `TELEMETRY_V2_WRITE_ENABLED` and `TELEMETRY_LEGACY_DUAL_WRITE_ENABLED` are independent and default to `false`. The write path writes v2 first, then legacy. Any failure raises `TelemetryWriteError` and nothing is reported as written; the caller must not acknowledge and must redeliver (ack contract, P2-06). Idempotent identity makes redelivery safe. An InfluxDB 422 is a **partial write** (other lines may be stored) and maps to `retryable=False`. |
 | D10 | `/v1` projection | `V1_TELEMETRY_READ_SOURCE=legacy\|v2` (default `legacy`) swaps the implementation behind the existing `TelemetryRepository` protocol. The v2 projection: reads only the seven legacy metrics; reads only legacy default Components (D7 mirror); reads only the Asset for the legacy pond; includes every quality state (legacy has none); and reproduces legacy series tables and their per-table `sort`/`limit`/`last()` semantics. For data dual-written from legacy default Components, the four `/v1` shapes are byte-identical, sub-second times included. |
 | D11 | `/v2` telemetry API | `API_V2_TELEMETRY_ENABLED` (default `false`, valid only with `API_V2_ENABLED=true`) mounts exactly `GET metric-definitions`, `GET observations` and `GET observations/latest`. `API_V2_ENABLED` alone still mounts only the 13 M1 paths. `observations/latest` is a latest-by-`observed_at` data view, not a health or freshness view (ADR-006). |
@@ -407,23 +413,23 @@ The identity deliberately excludes mapping versions, quality, `received_at`, `in
 - IDs must match their validators, `metric_key` must be in the catalog, and `schema_version` must equal `"2"`.
 - Event IDs, `source_event_id`, firmware, integration IDs, quality, source type and metadata are never tags.
 
-**Flux literal helper:** `flux_string_literal` returns `json.dumps(value)` with `$` replaced by `\$`. P2-03, P2-04 and P2-07 use it. Go code applies the same rule in its v2 query.
+**Flux literal helper:** `flux_string_literal` returns `json.dumps(value)` with every `${` replaced by `\${`. A lone `$` is left unchanged, and tests cover both `${x}` and `raw$archive`. P2-03, P2-04 and P2-07 use it. Go code applies the same rule in its v2 query.
 
 ### Legacy `water_quality` dual-write point
 
 ```text
-water_quality,device_id=<d>,pond_id=<p>,schema_version=1,source=<mqtt|source_type>,tenant_id=<t>[,topic=limnopulse/v1/devices/<d>/readings] <fields> <observed_at ns, exact>
+water_quality,device_id=<d>,pond_id=<p>,schema_version=1,source=mqtt,tenant_id=<t>,topic=limnopulse/v1/devices/<d>/readings <fields> <observed_at ns, exact>
 ```
 
 - `LegacyPoint` is a frozen dataclass with:
-  - `tenant_id`, `pond_id`, `device_id`, `source`, `topic: str | None` and `observed_at`;
+  - `tenant_id`, `pond_id`, `device_id` and `observed_at` (`source="mqtt"` and the topic are derived constants, D8);
   - `fields: Mapping[str, float | int]`, keyed by legacy field name or `seq`.
 - Field types:
   - the six float metrics are written as floats;
   - `rssi` and `seq` are written as integers (`-67i`, `1i`), matching the Telegraf schema.
 - Fields are written in sorted key order.
 - `build_legacy_points`:
-  - groups eligible observations by `(tenant, pond, device, source, topic, exact observed_at)`;
+  - groups eligible observations by `(tenant, pond, device, exact observed_at)`;
   - resolves a conflicting field by latest `ingested_at`, then greater `event_id`;
   - takes `seq` from the winning observation (a `None` sequence ranks lowest, and `seq` is omitted when all are `None`).
 - P2-03 performs the Asset lookups and calls this pure function.
@@ -568,7 +574,7 @@ GET /v2/tenants/{tenant_id}/observations/latest
   - exactly one of `asset_id`, `component_id` or `device_id`, otherwise 422;
   - `metric_key` (repeatable, each value in the catalog, otherwise 422);
   - `quality_state` (repeatable, point states only, otherwise 422);
-  - `start` and `stop`, both timezone-aware ISO-8601. They default to `stop = now` and `start = stop − 1 h`. The window is half-open `[start, stop)` by `observed_at`. `stop` must be after `start`, and the range is at most 31 days, otherwise 422;
+  - `start` and `stop`, both timezone-aware ISO-8601. Each supplied bound must lie in `[MIN_TELEMETRY_TIME, MAX_TELEMETRY_TIME]`; this is validated **before** any default is derived, otherwise 422. Endpoint tests cover both extremes and `stop=0001-01-01T00:00:00Z`. They default to `stop = now` and `start = stop − 1 h`. The window is half-open `[start, stop)` by `observed_at`. `stop` must be after `start`, and the range is at most 31 days, otherwise 422;
   - `limit` from 1 to 1000, default 500.
 - A selector entity missing in the tenant gives 404 with zero reader calls.
 - Ordering: by `observed_at`, `component_id`, `metric_key` ascending, with the limit applied after the global sort. The Flux pattern is pivot → `group()` → sort → `limit`; never `group()` before pivot.
@@ -597,32 +603,35 @@ from(bucket: B) |> range(<same bounds as legacy>)
   |> filter(_measurement == "observation_numeric") |> filter(tenant_id == T) |> filter(asset_id <in pond assets>)
   |> filter(fn: (r) => contains(value: r["component_id"], set: <legacy default component ids>))
   |> filter(fn: (r) => contains(value: r["metric_key"], set: <7 keys>))
-  |> filter(fn: (r) => contains(value: r["_field"], set: ["value","sequence","source_type","ingested_at_ns","event_id"]))
+  |> filter(fn: (r) => contains(value: r["_field"], set: ["value","sequence","ingested_at_ns","event_id"]))
   |> pivot(rowKey: ["_time", <all tags>], columnKey: ["_field"], valueColumn: "_value")     // one row per point
   |> <two branches, then union():
-       metrics: map → {legacy shape, _field: legacy name(metric_key), _value: float(value)}
+       metrics: map → {legacy shape, _field: legacy name(metric_key), _value: value (float; rssi → int(v: value))}
        seq:     group by (legacy series key, _time) → sort(ingested_at_ns, event_id) → last() →
-                drop sequence == -1 → map → {legacy shape, _field: "seq", _value: float(sequence)}>
-  |> group(columns: ["_start","_stop","_measurement","tenant_id","pond_id","device_id","source","schema_version","_field"])
+                drop sequence == -1 → map → {legacy shape, _field: "seq", _value: sequence (int, never float)}>
+  |> group(columns: ["_start","_stop","_measurement","tenant_id","pond_id","device_id","source","schema_version","topic","_field"])
   |> <legacy tail: pivot/sort/limit | sort(_time) → last() → regroup without _field → pivot | summary>
 ```
 
 `legacy shape` means:
 - `_measurement`: `"water_quality"`.
 - `pond_id`: taken from the asset.
-- `source`: `"mqtt"` when `source_type == "legacy_mqtt"`, otherwise the `source_type` value. `source_type` is a field (D5), so it is pivoted per point before mapping.
+- `source`: always `"mqtt"` and `topic`: always `limnopulse/v1/devices/<device_id>/readings`, both constants (D8), so the projection needs no `source_type`.
 - `schema_version`: `"1"`.
 
 - **Component set.** It is `{default_component_id_for_legacy_device(t, d.device_id) for d in domain_repository.list_devices(t)}`. Native v2 Components are never visible through `/v1`.
 - **`seq` tie-break.** `seq` for a legacy `(series, _time)` group is the sequence of the point with the greatest `ingested_at_ns`, then the greatest `event_id`. This is the same rule as `build_legacy_points`, and a test covers conflicting sequences at the same time.
-- **Legacy series tables.** Group by the legacy series key plus `_field` before any `last()`, `sort` or `limit`. Legacy `limit(n)` and `sort` apply **per series table**, which means per device and source, not globally. Legacy `last()` runs per field table.
+- **Legacy series tables.** Group by the legacy series key plus `_field` before any `last()`, `sort` or `limit`. Legacy `limit(n)` and `sort` apply **per series table**, which means per device (source and topic are constant per device, D8), not globally. Legacy `last()` runs per field table.
 - **Latest.**
   - Keep `_field` in the group key through `sort(_time)` → `last()`. Grouping without `_field` would collapse all metrics into one row.
   - Then regroup by the legacy series key **without** `_field`, and only then pivot to the legacy row key.
   - The chain `map → group → sort → last() → pivot` panics in 2.7.11 without the regroup.
 - **Summary.** Keep the legacy period/interval table (24h→5m, 7d/30d→1h) and the `do_mg_l`, `ph` and `temp_c` series with mean/min/max/count. Sort by `device_id, _time` after `group(columns: ["_field"])` and before aggregation. This reproduces legacy float summation order, so `mean` is byte-identical. Errors are wrapped in `TelemetryQueryError`.
 - **Error propagation.** The other methods propagate errors exactly like the legacy adapter.
-- **Integer fields.** `rssi` and `seq` are converted explicitly to `int` after checking `float.is_integer()`. There is no reliance on Pydantic lax coercion.
+- **Integer fields.**
+  - The `seq` branch keeps the integer type end to end (`_value: r.sequence`, never converted to float), so sequences up to `MAX_SEQUENCE` stay exact; a boundary test covers `2**53 + 1` and `2**63 - 1`.
+  - `rssi` is reconstructed with `int(v: r.value)`. Python checks `float.is_integer()` for `rssi`.
+  - There is no reliance on Pydantic lax coercion.
 - **No time flooring.** Legacy dual-write stores exact time.
 
 ### Go evaluator v2 reader (P2-05)
@@ -718,7 +727,7 @@ Each task also owns the new test files named in its section.
   - `encode_observation_line` output equals each scenario's golden lines byte-for-byte: sorted tags/fields, escaping, `repr` floats, integer suffixes and range, integer-nanosecond time.
   - The optional `probe_id` tag is omitted when absent. Optional fields are always written, with sentinels `sequence=-1i`, `source_event_id=""` and `integration_id=""`. JSON fields over 512 bytes, non-finite values and datetimes outside `[MIN_TELEMETRY_TIME, MAX_TELEMETRY_TIME)` are rejected.
   - The guard rejects unknown or missing tags, invalid IDs, unknown metrics, `quality_state`/`source_type`/event IDs/metadata as tags, and a wrong `schema_version`.
-  - `build_legacy_points` + `encode_legacy_line` honor D7, D8 and the grouping/tie-break rules, with exact sub-second time, the `topic` tag for `legacy_mqtt` only, and `rssi`/`seq` as integers.
+  - `build_legacy_points` + `encode_legacy_line` honor D7, D8 and the grouping/tie-break rules, with exact sub-second time, constant `source=mqtt` and `topic` tags for every source type, and `rssi`/`seq` as integers.
   - `flux_string_literal` escapes quotes, backslashes, newlines and `${`.
 - [ ] **Step 3: Write the failing Telegraf identity test.**
   - It parses `infra/telegraf/telegraf.conf` and asserts measurement `water_quality`, static tags `source="mqtt"`/`schema_version="1"`, topic `limnopulse/v1/devices/+/readings`, `topic_parsing` device tag, and **no** `topic_tag` override.
