@@ -1,7 +1,8 @@
-"""Unit tests for the `/v1` projection over `observation_numeric` (P2-07).
+"""Unit tests for the `/v1` projection over `observation_numeric` (P2-07, plan r7.2).
 
-The fake `query_api` records each Flux string and returns legacy-shaped tables, so the Flux
-shape is checked here and its runtime equivalence in `tests/influx/test_v1_projection_equivalence.py`.
+Flux only reads, with pushdown-friendly filters and no per-row `map`; Python shapes the legacy
+rows. The fake `query_api` records each Flux string and returns canonical-shaped tables, one
+response per call. Runtime equivalence lives in `tests/influx/test_v1_projection_equivalence.py`.
 """
 
 from __future__ import annotations
@@ -9,11 +10,13 @@ from __future__ import annotations
 import inspect
 import json
 import re
-from datetime import UTC, datetime
+import sys
+from datetime import UTC, datetime, timedelta
 from types import SimpleNamespace
 from typing import Any
 
 import pytest
+from pydantic import ConfigDict
 
 from limnopulse_api.adapters.influxdb import InfluxTelemetryRepository
 from limnopulse_api.adapters.influxdb_v1_projection import V2ProjectedTelemetryRepository
@@ -23,27 +26,28 @@ from limnopulse_api.domain.ids import (
     default_component_id_for_legacy_device,
 )
 from limnopulse_api.domain.metric_catalog import metric_catalog
-from limnopulse_api.domain.telemetry_v2_schema import flux_string_literal
+from limnopulse_api.domain.telemetry import LatestMetrics, MetricStatistics, TelemetryReading
+from limnopulse_api.domain.v2_common import format_utc_timestamp
 from limnopulse_api.repositories.telemetry import TelemetryRepository
 
 TENANT = "tnt_1"
 POND = "pond_1"
+ASSET = asset_id_for_legacy_pond(TENANT, POND)
+UNKNOWN_ASSET = "ast_00000000000000000000000000000000"
 LEGACY_METRIC_KEYS = {d.metric_key for d in metric_catalog() if d.legacy_field is not None}
 SUMMARY_METRIC_KEYS = {"water.dissolved_oxygen", "water.ph", "water.temperature"}
-POINT_FIELDS = {"value", "sequence", "ingested_at_ns", "event_id"}
-LEGACY_SERIES_KEY = {
-    "_start",
-    "_stop",
-    "_measurement",
-    "tenant_id",
-    "pond_id",
-    "device_id",
-    "source",
-    "schema_version",
-    "topic",
-}
+SERIES_KEY = {"tenant_id", "asset_id", "device_id"}
 T0 = datetime(2026, 1, 1, 12, 0, tzinfo=UTC)
 T1 = datetime(2026, 1, 1, 12, 5, tzinfo=UTC)
+T2 = datetime(2026, 1, 1, 12, 10, 0, 750000, tzinfo=UTC)
+METHODS = (
+    "query_readings",
+    "query_latest_metrics",
+    "query_latest_metrics_for_tenant",
+    "query_summary",
+)
+POND_METHODS = ("query_readings", "query_latest_metrics", "query_summary")
+ROW_METHODS = ("query_readings", "query_latest_metrics", "query_latest_metrics_for_tenant")
 
 
 # --- fakes ------------------------------------------------------------------------------------
@@ -60,8 +64,10 @@ class FakeTable:
 
 
 class FakeQueryApi:
-    def __init__(self, tables: list[FakeTable] | None = None, error: Exception | None = None):
-        self.tables = tables or []
+    """Returns `responses[i]` for the i-th call (then empty), or raises `error`."""
+
+    def __init__(self, *responses: list[FakeTable], error: Exception | None = None) -> None:
+        self.responses = list(responses)
         self.error = error
         self.calls: list[dict[str, str]] = []
 
@@ -69,7 +75,8 @@ class FakeQueryApi:
         self.calls.append({"query": query, "org": org})
         if self.error is not None:
             raise self.error
-        return self.tables
+        index = len(self.calls) - 1
+        return self.responses[index] if index < len(self.responses) else []
 
 
 class FakeDomainRepository:
@@ -131,81 +138,110 @@ async def call(repository: Any, method: str, **overrides: Any) -> Any:
     return await getattr(repository, method)(**kwargs)
 
 
-async def flux_for(method: str, domain: FakeDomainRepository | None = None, **overrides) -> str:
-    query_api = FakeQueryApi()
+def value_row(time: datetime, device: str = "dev_a", asset: str = ASSET, **metrics) -> FakeRecord:
+    """A pivoted readings row: one column per metric key."""
+    return FakeRecord(
+        {"_time": time, "tenant_id": TENANT, "asset_id": asset, "device_id": device, **metrics}
+    )
+
+
+def last_row(
+    time: datetime, metric: str, value: float, device: str = "dev_a", asset: str = ASSET
+) -> FakeRecord:
+    """A per-(series, metric) `last()` row."""
+    return FakeRecord(
+        {
+            "_time": time,
+            "tenant_id": TENANT,
+            "asset_id": asset,
+            "device_id": device,
+            "metric_key": metric,
+            "_field": "value",
+            "_value": value,
+        }
+    )
+
+
+def seq_row(time: datetime, sequence: Any, device: str = "dev_a", asset: str = ASSET) -> FakeRecord:
+    """A `seq` winner row."""
+    return FakeRecord(
+        {
+            "_time": time,
+            "tenant_id": TENANT,
+            "asset_id": asset,
+            "device_id": device,
+            "sequence": sequence,
+            "ingested_at_ns": 1,
+            "event_id": "obs_x",
+        }
+    )
+
+
+def one_row(method: str) -> tuple[list[FakeTable], ...]:
+    """A first response with one row, so a row method also runs its `seq` query."""
+    if method == "query_readings":
+        return ([FakeTable([value_row(T0, **{"water.ph": 7.0})])],)
+    if method in ROW_METHODS:
+        return ([FakeTable([last_row(T0, "water.ph", 7.0)])],)
+    return ()
+
+
+async def queries_for(
+    method: str,
+    domain: FakeDomainRepository | None = None,
+    responses: tuple[list[FakeTable], ...] | None = None,
+    **overrides: Any,
+) -> list[str]:
+    query_api = FakeQueryApi(*(one_row(method) if responses is None else responses))
     await call(projection(query_api, domain), method, **overrides)
-    assert len(query_api.calls) == 1
-    assert query_api.calls[0]["org"] == "limnopulse"
-    return query_api.calls[0]["query"]
+    assert query_api.calls
+    assert {item["org"] for item in query_api.calls} == {"limnopulse"}
+    return [item["query"] for item in query_api.calls]
 
 
 def compact(query: str) -> str:
     return re.sub(r"\s+", "", query)
 
 
-def _string_list(raw: str) -> list[str]:
-    return json.loads(f"[{raw}]")
-
-
-def contains_set(query: str, column: str) -> set[str]:
-    """The literal set of the `contains(value: r[column], ...)` filter (or `==` filter)."""
+def or_filter_values(query: str, column: str) -> set[str]:
+    """Values of the first filter on `column`: one `==` clause per value, joined with `or`."""
     flat = compact(query)
-    sets = re.findall(rf'contains\(value:r(?:\["{column}"\]|\.{column}),set:\[([^\]]*)\]\)', flat)
-    equals = re.findall(rf'r(?:\["{column}"\]|\.{column})==("(?:[^"\\]|\\.)*")', flat)
-    assert sets or equals, f"no filter on {column}"
-    values: set[str] = set()
-    for raw in sets:
-        values |= set(_string_list(raw))
-    for raw in equals:
-        values.add(json.loads(raw))
-    return values
+    clause = rf'r\["{column}"\]=="(?:[^"\\]|\\.)*"'
+    match = re.search(rf"filter\(fn:\(r\)=>({clause}(?:or{clause})*)\)", flat)
+    assert match is not None, f"no or-filter on {column}"
+    return {json.loads(raw) for raw in re.findall(r'==("(?:[^"\\]|\\.)*")', match.group(1))}
 
 
-def first_filter_set(query: str, column: str) -> set[str]:
-    """The literal set of the first filter on `column` (the point filter before the pivot)."""
-    flat = compact(query)
-    pattern = re.compile(
-        rf'contains\(value:r(?:\["{column}"\]|\.{column}),set:\[([^\]]*)\]\)'
-        rf'|r(?:\["{column}"\]|\.{column})==("(?:[^"\\]|\\.)*")'
-    )
-    match = pattern.search(flat)
-    assert match is not None, f"no filter on {column}"
-    if match.group(1) is not None:
-        return set(_string_list(match.group(1)))
-    return {json.loads(match.group(2))}
-
-
-def group_calls(query: str) -> list[tuple[int, set[str]]]:
+def group_columns(query: str) -> list[set[str]]:
     flat = compact(query)
     return [
-        (match.start(), set(_string_list(match.group(1))))
-        for match in re.finditer(r"group\(columns:\[([^\]]*)\]\)", flat)
+        set(json.loads(f"[{raw}]")) for raw in re.findall(r"group\(columns:\[([^\]]*)\]\)", flat)
     ]
 
 
-def legacy_group_position(query: str, columns: set[str]) -> int:
-    """The position of the last `group(columns: ...)` with exactly these columns."""
-    positions = [position for position, group in group_calls(query) if group == columns]
-    assert positions, f"no group(columns: {sorted(columns)})"
-    return positions[-1]
-
-
-def ordered(flat: str, start: int, needles: list[str]) -> None:
-    """Each needle occurs after `start`, in order."""
-    position = start
+def ordered(flat: str, needles: list[str]) -> None:
+    position = 0
     for needle in needles:
         found = flat.find(needle, position)
         assert found != -1, f"{needle!r} missing after offset {position}"
         position = found + len(needle)
 
 
-METHODS = (
-    "query_readings",
-    "query_latest_metrics",
-    "query_latest_metrics_for_tenant",
-    "query_summary",
-)
-POND_METHODS = ("query_readings", "query_latest_metrics", "query_summary")
+def _range(query: str) -> str:
+    """The balanced `range(...)` call of the query."""
+    flat = compact(query)
+    start = flat.find("range(")
+    assert start != -1
+    depth = 0
+    for index in range(start + len("range"), len(flat)):
+        depth += {"(": 1, ")": -1}.get(flat[index], 0)
+        if depth == 0:
+            return flat[start : index + 1]
+    raise AssertionError("unbalanced range(...)")
+
+
+def _flux_time(value: datetime) -> str:
+    return f'time(v:"{format_utc_timestamp(value)}")'
 
 
 # --- protocol ---------------------------------------------------------------------------------
@@ -229,43 +265,40 @@ def test_implements_the_telemetry_repository_protocol_exactly() -> None:
     assert keyword_only == {"query_api", "org", "bucket", "domain_repository"}
 
 
-# --- Flux filters -----------------------------------------------------------------------------
+# --- pushdown-friendly reads ------------------------------------------------------------------
 
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("method", METHODS)
-async def test_reads_only_observation_numeric_points_of_the_tenant(method: str) -> None:
-    query = await flux_for(method)
-    flat = compact(query)
+async def test_flux_only_reads_with_pushdown_filters_and_no_map(method: str) -> None:
+    queries = await queries_for(method)
 
-    assert 'from(bucket:"limnopulse_raw")' in flat
-    assert first_filter_set(query, "_measurement") == {"observation_numeric"}
-    assert first_filter_set(query, "tenant_id") == {TENANT}
-    assert first_filter_set(query, "_field") == POINT_FIELDS
-    # One row per point: the pivot comes after the point-field filter.
-    field_filter = re.search(r'contains\(value:r(?:\["_field"\]|\._field),set:', flat)
-    assert field_filter is not None
-    assert flat.find("pivot(", field_filter.end()) != -1
-    assert "pivot(" not in flat[: field_filter.start()]
+    assert len(queries) == (2 if method in ROW_METHODS else 1)
+    for query in queries:
+        flat = compact(query)
+        assert flat.startswith(
+            ('from(bucket:"limnopulse_raw")|>range(', 'data=from(bucket:"limnopulse_raw")|>range(')
+        )
+        assert flat.count("from(") == 1
+        for forbidden in ("contains(", "map(", "reduce(", "dict."):
+            assert forbidden not in flat
+        assert or_filter_values(query, "_measurement") == {"observation_numeric"}
+        assert or_filter_values(query, "tenant_id") == {TENANT}
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize(
-    "method", ("query_readings", "query_latest_metrics", "query_latest_metrics_for_tenant")
-)
-async def test_reads_exactly_the_seven_legacy_metrics(method: str) -> None:
-    query = await flux_for(method)
-
-    assert contains_set(query, "metric_key") == LEGACY_METRIC_KEYS
+@pytest.mark.parametrize("method", ROW_METHODS)
+async def test_rows_read_exactly_the_seven_legacy_metrics(method: str) -> None:
+    for query in await queries_for(method):
+        assert or_filter_values(query, "metric_key") == LEGACY_METRIC_KEYS
     assert len(LEGACY_METRIC_KEYS) == 7
 
 
 @pytest.mark.asyncio
 async def test_summary_reads_its_three_legacy_metrics() -> None:
-    query = await flux_for("query_summary")
+    (query,) = await queries_for("query_summary")
 
-    metric_keys = contains_set(query, "metric_key")
-    assert SUMMARY_METRIC_KEYS <= metric_keys <= LEGACY_METRIC_KEYS
+    assert or_filter_values(query, "metric_key") == SUMMARY_METRIC_KEYS
 
 
 @pytest.mark.asyncio
@@ -274,55 +307,57 @@ async def test_component_set_is_the_legacy_default_component_of_every_listed_dev
     method: str,
 ) -> None:
     domain = FakeDomainRepository(devices={"dev_a": "pond_1", "dev_b": "pond_2"})
-    query = await flux_for(method, domain)
 
-    assert contains_set(query, "component_id") == {
-        default_component_id_for_legacy_device(TENANT, "dev_a"),
-        default_component_id_for_legacy_device(TENANT, "dev_b"),
-    }
+    for query in await queries_for(method, domain):
+        assert or_filter_values(query, "component_id") == {
+            default_component_id_for_legacy_device(TENANT, "dev_a"),
+            default_component_id_for_legacy_device(TENANT, "dev_b"),
+        }
     assert ("list_devices", TENANT) in domain.calls
 
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("method", POND_METHODS)
 async def test_pond_scoped_queries_read_only_the_legacy_pond_asset(method: str) -> None:
-    query = await flux_for(method)
-
-    assert contains_set(query, "asset_id") == {asset_id_for_legacy_pond(TENANT, POND)}
-    assert flux_string_literal(POND) in query
-    assert flux_string_literal("pond_2") not in query
+    for query in await queries_for(method):
+        assert or_filter_values(query, "asset_id") == {ASSET}
 
 
 @pytest.mark.asyncio
-async def test_tenant_latest_reads_the_assets_of_listed_ponds_and_names_their_ponds() -> None:
+async def test_tenant_latest_reads_the_assets_of_listed_ponds() -> None:
     domain = FakeDomainRepository(ponds=("pond_1", "pond_2", "pond_3"))
-    query = await flux_for("query_latest_metrics_for_tenant", domain)
 
-    assets = {pond: asset_id_for_legacy_pond(TENANT, pond) for pond in domain.ponds}
-    assert contains_set(query, "asset_id") == set(assets.values())
+    for query in await queries_for("query_latest_metrics_for_tenant", domain):
+        assert or_filter_values(query, "asset_id") == {
+            asset_id_for_legacy_pond(TENANT, pond) for pond in domain.ponds
+        }
     assert ("list_ponds", TENANT) in domain.calls
-    flat = compact(query)
-    for pond, asset in assets.items():
-        assert flux_string_literal(pond) in flat
-        assert flux_string_literal(asset) in flat
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize(
-    "method", ("query_readings", "query_latest_metrics", "query_latest_metrics_for_tenant")
-)
-async def test_rows_carry_the_constant_legacy_shape(method: str) -> None:
-    flat = compact(await flux_for(method))
+async def test_tenant_latest_skips_listed_ponds_that_are_not_safe_ids() -> None:
+    domain = FakeDomainRepository(ponds=("pond_1", "pond 2", 'pond"3', "pond${x}", "x" * 129))
+    query_api = FakeQueryApi(*one_row("query_latest_metrics_for_tenant"))
 
-    assert re.search(r'_measurement:"water_quality"|key:"_measurement",value:"water_quality"', flat)
-    assert re.search(r'source:"mqtt"|key:"source",value:"mqtt"', flat)
-    assert re.search(r'schema_version:"1"|key:"schema_version",value:"1"', flat)
-    device = r'r(?:\.device_id|\["device_id"\])'
-    assert re.search(
-        rf'"limnopulse/v1/devices/"\+{device}\+"/readings"'
-        rf'|"limnopulse/v1/devices/\$\{{{device}\}}/readings"',
-        flat,
+    latest = await call(projection(query_api, domain), "query_latest_metrics_for_tenant")
+
+    assert [item.pond_id for item in latest] == ["pond_1"]
+    assert len(query_api.calls) == 2
+    for item in query_api.calls:
+        assert or_filter_values(item["query"], "asset_id") == {ASSET}
+
+
+@pytest.mark.asyncio
+async def test_tenant_latest_with_no_safe_pond_queries_nothing() -> None:
+    query_api = FakeQueryApi()
+
+    latest = await call(
+        projection(query_api, FakeDomainRepository(ponds=("pond 2",))),
+        "query_latest_metrics_for_tenant",
     )
+
+    assert latest == []
+    assert query_api.calls == []
 
 
 @pytest.mark.asyncio
@@ -332,12 +367,14 @@ async def test_rows_carry_the_constant_legacy_shape(method: str) -> None:
     [("raw${x}", '"raw\\${x}"'), ("raw$archive", '"raw$archive"')],
 )
 async def test_bucket_literal_is_escaped(method: str, bucket: str, literal: str) -> None:
-    query_api = FakeQueryApi()
+    query_api = FakeQueryApi(*one_row(method))
     await call(projection(query_api, bucket=bucket), method)
 
-    flat = compact(query_api.calls[0]["query"])
-    assert f"from(bucket:{literal})" in flat
-    assert "${x}" not in flat.replace("\\${x}", "")
+    assert query_api.calls
+    for item in query_api.calls:
+        flat = compact(item["query"])
+        assert f"from(bucket:{literal})|>range(" in flat
+        assert "${x}" not in flat.replace("\\${x}", "")
 
 
 @pytest.mark.asyncio
@@ -364,34 +401,7 @@ async def test_invalid_pond_id_is_rejected_before_any_query(method: str, pond_id
     assert query_api.calls == []
 
 
-@pytest.mark.asyncio
-async def test_listed_pond_ids_never_reach_flux_unescaped() -> None:
-    query_api = FakeQueryApi()
-    domain = FakeDomainRepository(ponds=("pond_1", "pond${x}"))
-
-    try:
-        await call(projection(query_api, domain), "query_latest_metrics_for_tenant")
-    except ValueError:
-        assert query_api.calls == []
-        return
-    flat = compact(query_api.calls[0]["query"])
-    assert "${x}" not in flat.replace("\\${x}", "")
-
-
 # --- range bounds -----------------------------------------------------------------------------
-
-
-def _range(query: str) -> str:
-    """The balanced `range(...)` call of the query."""
-    flat = compact(query)
-    start = flat.find("range(")
-    assert start != -1
-    depth = 0
-    for index in range(start + len("range"), len(flat)):
-        depth += {"(": 1, ")": -1}.get(flat[index], 0)
-        if depth == 0:
-            return flat[start : index + 1]
-    raise AssertionError("unbalanced range(...)")
 
 
 @pytest.mark.asyncio
@@ -405,12 +415,12 @@ def _range(query: str) -> str:
     ],
 )
 async def test_readings_range_bounds_are_the_legacy_bounds(start: str, stop: str | None) -> None:
-    query_api = FakeQueryApi()
     legacy_api = FakeQueryApi()
-    await call(projection(query_api), "query_readings", start=start, stop=stop)
     await call(legacy(legacy_api), "query_readings", start=start, stop=stop)
 
-    assert _range(query_api.calls[0]["query"]) == _range(legacy_api.calls[0]["query"])
+    queries = await queries_for("query_readings", start=start, stop=stop)
+
+    assert _range(queries[0]) == _range(legacy_api.calls[0]["query"])
 
 
 @pytest.mark.asyncio
@@ -431,7 +441,9 @@ async def test_latest_reads_the_legacy_24h_window(method: str) -> None:
     legacy_api = FakeQueryApi()
     await call(legacy(legacy_api), method)
 
-    assert _range(await flux_for(method)) == _range(legacy_api.calls[0]["query"])
+    queries = await queries_for(method)
+
+    assert _range(queries[0]) == _range(legacy_api.calls[0]["query"])
 
 
 @pytest.mark.asyncio
@@ -440,204 +452,336 @@ async def test_summary_reads_the_legacy_period_window(period: str) -> None:
     legacy_api = FakeQueryApi()
     await call(legacy(legacy_api), "query_summary", period=period)
 
-    assert _range(await flux_for("query_summary", period=period)) == _range(
-        legacy_api.calls[0]["query"]
-    )
+    (query,) = await queries_for("query_summary", period=period)
+
+    assert _range(query) == _range(legacy_api.calls[0]["query"])
 
 
-# --- legacy series tables and tails -----------------------------------------------------------
+# --- query shapes -----------------------------------------------------------------------------
 
 
 @pytest.mark.asyncio
-async def test_readings_group_by_series_and_field_before_pivot_sort_and_limit() -> None:
-    query = await flux_for("query_readings", limit=7)
-    flat = compact(query)
-    start = legacy_group_position(query, LEGACY_SERIES_KEY | {"_field"})
+async def test_readings_pivot_each_legacy_series_then_sort_and_limit_it() -> None:
+    queries = await queries_for("query_readings", limit=7)
 
     ordered(
-        flat,
-        start,
+        compact(queries[0]),
         [
-            (
-                'pivot(rowKey:["_time","tenant_id","pond_id","device_id"],columnKey:["_field"],'
-                'valueColumn:"_value")'
-            ),
-            'sort(columns:["_time"])',
-            "limit(n:7)",
+            '|>filter(fn:(r)=>r["_field"]=="value")',
+            "|>group(columns:[",
+            '|>pivot(rowKey:["_time"],columnKey:["metric_key"],valueColumn:"_value")',
+            '|>sort(columns:["_time"])',
+            "|>limit(n:7)",
         ],
     )
-    assert "limit(" not in flat[:start]
-    assert 'sort(columns:["_time"])' not in flat[:start]
-    # Legacy sort/limit run per series table: nothing regroups the tail.
-    assert "group()" not in flat[start:]
-    assert [position for position, _ in group_calls(query) if position > start] == []
+    assert group_columns(queries[0]) == [SERIES_KEY]
 
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("method", ("query_latest_metrics", "query_latest_metrics_for_tenant"))
-async def test_latest_keeps_field_tables_through_last_then_pivots_to_the_legacy_row(
-    method: str,
-) -> None:
-    query = await flux_for(method)
-    flat = compact(query)
-    start = legacy_group_position(query, LEGACY_SERIES_KEY | {"_field"})
+async def test_latest_takes_storage_last_per_series_and_metric(method: str) -> None:
+    queries = await queries_for(method)
+    flat = compact(queries[0])
 
-    needles = [
-        'sort(columns:["_time"])',
-        "last()",
-        'pivot(rowKey:["_time","tenant_id","pond_id"],columnKey:["_field"],valueColumn:"_value")',
-        'sort(columns:["_time"],desc:true)',
+    assert flat.endswith('|>filter(fn:(r)=>r["_field"]=="value")|>last()')
+    assert group_columns(queries[0]) == []
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("method", ROW_METHODS)
+async def test_seq_winner_drops_absent_sequences_then_ranks_per_series(method: str) -> None:
+    queries = await queries_for(method)
+    flat = compact(queries[1])
+
+    assert or_filter_values(queries[1], "_field") == {"sequence", "ingested_at_ns", "event_id"}
+    ordered(
+        flat,
+        [
+            '|>pivot(rowKey:["_time"],columnKey:["_field"],valueColumn:"_value")',
+            '|>filter(fn:(r)=>r["sequence"]!=-1)',
+            "|>group(columns:[",
+            '|>sort(columns:["_time","ingested_at_ns","event_id"],desc:true)',
+            '|>unique(column:"_time")',
+        ],
+    )
+    # One table per legacy series, never one per timestamp.
+    assert group_columns(queries[1]) == [SERIES_KEY]
+    assert "float(" not in flat and "int(" not in flat
+
+
+@pytest.mark.asyncio
+async def test_seq_query_spans_only_the_returned_rows() -> None:
+    rows = [
+        value_row(T1, **{"water.ph": 7.1}),
+        value_row(T2, device="dev_b", **{"water.ph": 7.2}),
+        value_row(T0, **{"water.ph": 7.0}),
     ]
-    if method == "query_latest_metrics":
-        needles.append("limit(n:1)")
-    ordered(flat, start, needles)
-    # last() never runs on tables that have lost `_field` (it would collapse the metrics).
-    last_position = flat.find("last()", start)
-    for position, columns in group_calls(query):
-        if start < position < last_position:
-            assert "_field" in columns
-    if method == "query_latest_metrics_for_tenant":
-        assert "limit(" not in flat[start:]
+    queries = await queries_for("query_readings", responses=([FakeTable(rows)],))
+
+    stop = T2 + timedelta(microseconds=1)
+    assert _range(queries[1]) == f"range(start:{_flux_time(T0)},stop:{_flux_time(stop)})"
+
+
+@pytest.mark.asyncio
+async def test_latest_seq_query_spans_only_the_newest_points() -> None:
+    lasts = [
+        last_row(T0, "water.temperature", 25.0),
+        last_row(T1, "water.ph", 7.1),
+        last_row(T2, "water.ph", 7.2, device="dev_b"),
+    ]
+    queries = await queries_for("query_latest_metrics", responses=([FakeTable(lasts)],))
+
+    stop = T2 + timedelta(microseconds=1)
+    assert _range(queries[1]) == f"range(start:{_flux_time(T1)},stop:{_flux_time(stop)})"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("method", ROW_METHODS)
+async def test_no_rows_means_no_seq_query(method: str) -> None:
+    query_api = FakeQueryApi()
+
+    await call(projection(query_api), method)
+
+    assert len(query_api.calls) == 1
 
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize(("period", "interval"), [("24h", "5m"), ("7d", "1h"), ("30d", "1h")])
-async def test_summary_sorts_by_device_then_time_after_field_group(
-    period: str, interval: str
-) -> None:
-    query = await flux_for("query_summary", period=period)
+async def test_summary_aggregates_in_storage_by_metric(period: str, interval: str) -> None:
+    (query,) = await queries_for("query_summary", period=period)
     flat = compact(query)
-    start = legacy_group_position(query, {"_field"})
 
-    ordered(flat, start, ['sort(columns:["device_id","_time"])', f"every:{interval}"])
-    for result in ("series", "mean", "min", "max", "count"):
-        assert f'yield(name:"{result}")' in flat[start:]
-    # `mean` is rebuilt with `reduce` (legacy sums per series), so only these are pinned.
-    for function in ("min()", "max()", "count()"):
-        assert function in flat[start:]
+    ordered(flat, ['|>filter(fn:(r)=>r["_field"]=="value")', '|>group(columns:["metric_key"])'])
+    assert (
+        f'data|>aggregateWindow(every:{interval},fn:mean,createEmpty:false)|>yield(name:"series")'
+        in flat
+    )
+    for result in ("mean", "min", "max", "count"):
+        assert f'data|>{result}()|>yield(name:"{result}")' in flat
+    # Aggregated server-side: raw rows are never transferred.
+    assert "pivot(" not in flat
     assert "limit(" not in flat
 
 
-# --- integer fields ---------------------------------------------------------------------------
+# --- Python shaping ---------------------------------------------------------------------------
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize(
-    "method", ("query_readings", "query_latest_metrics", "query_latest_metrics_for_tenant")
-)
-async def test_rssi_is_rebuilt_with_int_and_seq_keeps_its_integer_type(method: str) -> None:
-    flat = compact(await flux_for(method))
+async def test_readings_rename_metrics_and_merge_seq_winners() -> None:
+    values = [
+        value_row(
+            T0,
+            **{
+                "water.temperature": 25.1,
+                "water.ph": 7.2,
+                "water.dissolved_oxygen": 6.4,
+                "water.turbidity": 3.1,
+                "water.salinity": 11.8,
+                "device.battery_voltage": 3.82,
+                "device.rssi": -67.0,
+            },
+        ),
+        value_row(T1, **{"water.ph": 7.3, "device.rssi": None}),
+        value_row(T2, **{"water.ph": 7.4}),
+    ]
+    # A winner outside the returned rows is ignored.
+    seqs = [seq_row(T0, 2**63 - 1), seq_row(T2, 3), seq_row(T1 + timedelta(seconds=1), 9)]
+    query_api = FakeQueryApi([FakeTable(values)], [FakeTable(seqs)])
 
-    assert re.search(r'int\(v:r(?:\.value|\["value"\])\)', flat)
-    assert re.search(r'_value:r(?:\.sequence|\["sequence"\])[,}]', flat)
-    assert not re.search(r'(?:float|int|uint)\(v:r(?:\.sequence|\["sequence"\])\)', flat)
-    assert '"seq"' in flat
-    assert '"rssi"' in flat
+    readings = await call(projection(query_api), "query_readings")
+
+    identity = {"tenant_id": TENANT, "pond_id": POND, "device_id": "dev_a"}
+    assert [r.model_dump(exclude_none=True) for r in readings] == [
+        {
+            "measured_at": T0,
+            **identity,
+            "temp_c": 25.1,
+            "ph": 7.2,
+            "do_mg_l": 6.4,
+            "turbidity_ntu": 3.1,
+            "salinity_ppt": 11.8,
+            "battery_v": 3.82,
+            "rssi": -67,
+            "seq": 2**63 - 1,
+        },
+        {"measured_at": T1, **identity, "ph": 7.3},
+        {"measured_at": T2, **identity, "ph": 7.4, "seq": 3},
+    ]
+    assert type(readings[0].rssi) is int
+    assert type(readings[0].seq) is int
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize(
-    "method", ("query_readings", "query_latest_metrics", "query_latest_metrics_for_tenant")
-)
-async def test_seq_branch_drops_absent_sequences_before_ranking_points(method: str) -> None:
-    query = await flux_for(method)
-    flat = compact(query)
+async def test_readings_come_in_legacy_series_order_then_time() -> None:
+    values = [
+        value_row(T1, device="dev_b", **{"water.ph": 7.0}),
+        value_row(T0, device="dev_b", **{"water.ph": 7.1}),
+        value_row(T2, device="dev_a", **{"water.ph": 7.2}),
+        value_row(T0, device="dev_c", asset=UNKNOWN_ASSET, **{"water.ph": 1.0}),
+    ]
 
-    sequence = r'r(?:\.sequence|\["sequence"\])'
-    absent = re.search(rf"{sequence}(?:!=-1|>=0|>-1)", flat)
-    assert absent is not None
-    rank = flat.find('sort(columns:["ingested_at_ns","event_id"])')
-    assert rank > absent.start()
-    assert flat.find("last(", rank) != -1
-    # The ranking groups are legacy (series, _time) groups, formed after the per-point pivot.
-    pivot = flat.find("pivot(")
-    seq_groups = [columns for position, columns in group_calls(query) if pivot < position < rank]
-    assert seq_groups
-    assert {"_time", "tenant_id", "device_id"} <= seq_groups[-1]
-    assert seq_groups[-1] & {"asset_id", "pond_id"}
-    assert not seq_groups[-1] & {"metric_key", "_field"}
+    readings = await call(projection(FakeQueryApi([FakeTable(values)])), "query_readings")
+
+    assert [(r.device_id, r.measured_at) for r in readings] == [
+        ("dev_a", T2),
+        ("dev_b", T0),
+        ("dev_b", T1),
+    ]
 
 
-# --- decoding (same Python semantics as the legacy adapter) -----------------------------------
+@pytest.mark.asyncio
+async def test_integer_fields_are_built_as_int_without_lax_coercion(monkeypatch) -> None:
+    module = sys.modules[V2ProjectedTelemetryRepository.__module__]
+
+    class StrictReading(TelemetryReading):
+        model_config = ConfigDict(frozen=True, strict=True)
+
+    class StrictLatest(LatestMetrics):
+        model_config = ConfigDict(frozen=True, strict=True)
+
+    monkeypatch.setattr(module, "TelemetryReading", StrictReading)
+    monkeypatch.setattr(module, "LatestMetrics", StrictLatest)
+    values = [value_row(T0, **{"water.ph": 7.0, "device.rssi": -67.0})]
+    lasts = [last_row(T0, "device.rssi", -70.0)]
+
+    (reading,) = await call(
+        projection(FakeQueryApi([FakeTable(values)], [FakeTable([seq_row(T0, 5)])])),
+        "query_readings",
+    )
+    latest = await call(projection(FakeQueryApi([FakeTable(lasts)])), "query_latest_metrics")
+
+    assert (reading.rssi, reading.seq, latest.rssi) == (-67, 5, -70)
 
 
-def _row(time: datetime, pond_id: str = POND, device_id: str = "dev_a", **fields) -> FakeRecord:
-    return FakeRecord(
-        {"_time": time, "tenant_id": TENANT, "pond_id": pond_id, "device_id": device_id, **fields}
+@pytest.mark.asyncio
+async def test_a_non_integral_rssi_is_not_visible() -> None:
+    values = [value_row(T0, **{"water.ph": 7.0, "device.rssi": -67.5})]
+
+    (reading,) = await call(projection(FakeQueryApi([FakeTable(values)])), "query_readings")
+
+    assert reading.rssi is None
+    assert reading.ph == 7.0
+
+
+@pytest.mark.asyncio
+async def test_a_non_integer_sequence_is_never_coerced() -> None:
+    values = [value_row(T0, **{"water.ph": 7.0})]
+    query_api = FakeQueryApi([FakeTable(values)], [FakeTable([seq_row(T0, 3.0)])])
+
+    with pytest.raises(TypeError):
+        await call(projection(query_api), "query_readings")
+
+
+@pytest.mark.asyncio
+async def test_latest_keeps_only_the_fields_of_the_newest_point() -> None:
+    lasts = [
+        last_row(T0, "water.temperature", 25.0),
+        last_row(T1, "water.ph", 7.1),
+        last_row(T1, "device.rssi", -70.0),
+    ]
+    query_api = FakeQueryApi([FakeTable(lasts)], [FakeTable([seq_row(T1, 4)])])
+
+    latest = await call(projection(query_api), "query_latest_metrics")
+
+    assert latest == LatestMetrics(
+        measured_at=T1, tenant_id=TENANT, pond_id=POND, ph=7.1, rssi=-70, seq=4
+    )
+    assert type(latest.rssi) is int
+
+
+@pytest.mark.asyncio
+async def test_latest_drops_a_seq_that_is_not_at_the_newest_point() -> None:
+    query_api = FakeQueryApi(
+        [FakeTable([last_row(T1, "water.ph", 7.1)])], [FakeTable([seq_row(T0, 4)])]
     )
 
+    latest = await call(projection(query_api), "query_latest_metrics")
 
-@pytest.mark.asyncio
-async def test_readings_decode_like_legacy() -> None:
-    tables = [
-        FakeTable([_row(T0, temp_c=25.1, ph=7.2, rssi=-67, seq=2**63 - 1, battery_v=None)]),
-        FakeTable([_row(T1, device_id="dev_b", do_mg_l=6.4, turbidity_ntu=3.1)]),
-    ]
-    expected = await call(legacy(FakeQueryApi(tables)), "query_readings")
-    actual = await call(projection(FakeQueryApi(tables)), "query_readings")
-
-    assert actual == expected
-    assert [reading.device_id for reading in actual] == ["dev_a", "dev_b"]
-    assert actual[0].seq == 2**63 - 1
-    assert actual[0].battery_v is None
+    assert latest == LatestMetrics(measured_at=T1, tenant_id=TENANT, pond_id=POND, ph=7.1)
 
 
 @pytest.mark.asyncio
-async def test_latest_decodes_the_newest_row_like_legacy() -> None:
-    tables = [
-        FakeTable([_row(T0, device_id="dev_a", temp_c=25.0)]),
-        FakeTable([_row(T1, device_id="dev_b", temp_c=26.0, seq=3)]),
-        FakeTable([_row(T1, device_id="dev_c", temp_c=27.0)]),
+async def test_latest_picks_the_newest_series_and_the_first_on_a_tie() -> None:
+    lasts = [
+        last_row(T1, "water.ph", 7.2, device="dev_c"),
+        last_row(T1, "water.ph", 7.1, device="dev_b"),
+        last_row(T0, "water.ph", 7.0, device="dev_a"),
     ]
-    expected = await call(legacy(FakeQueryApi(tables)), "query_latest_metrics")
-    actual = await call(projection(FakeQueryApi(tables)), "query_latest_metrics")
 
-    assert actual == expected
-    assert actual.temp_c == 26.0
+    latest = await call(projection(FakeQueryApi([FakeTable(lasts)])), "query_latest_metrics")
+
+    # dev_b and dev_c tie at T1; legacy keeps the first series table (device order).
+    assert latest == LatestMetrics(measured_at=T1, tenant_id=TENANT, pond_id=POND, ph=7.1)
 
 
 @pytest.mark.asyncio
-async def test_tenant_latest_decodes_the_newest_row_per_pond_like_legacy() -> None:
-    tables = [
-        FakeTable([_row(T0, pond_id="pond_2", temp_c=24.0)]),
-        FakeTable([_row(T1, pond_id="pond_1", temp_c=25.0)]),
-        FakeTable([_row(T1, pond_id="pond_2", temp_c=26.0)]),
-        FakeTable([FakeRecord({"_time": T1, "tenant_id": TENANT, "temp_c": 1.0})]),
-    ]
-    expected = await call(legacy(FakeQueryApi(tables)), "query_latest_metrics_for_tenant")
-    actual = await call(projection(FakeQueryApi(tables)), "query_latest_metrics_for_tenant")
+async def test_latest_without_data_is_the_empty_legacy_shape() -> None:
+    latest = await call(projection(FakeQueryApi()), "query_latest_metrics")
 
-    assert actual == expected
-    assert [(item.pond_id, item.temp_c) for item in actual] == [("pond_1", 25.0), ("pond_2", 26.0)]
+    assert latest == LatestMetrics(tenant_id=TENANT, pond_id=POND)
 
 
 @pytest.mark.asyncio
-async def test_summary_decodes_like_legacy() -> None:
-    def record(result: str, field: str, value: Any, time: datetime = T1) -> FakeRecord:
-        return FakeRecord({"result": result, "_field": field, "_value": value, "_time": time})
+async def test_tenant_latest_is_the_newest_point_per_pond_sorted_by_pond() -> None:
+    asset_2 = asset_id_for_legacy_pond(TENANT, "pond_2")
+    lasts = [
+        last_row(T0, "water.ph", 7.0, device="dev_b", asset=asset_2),
+        last_row(T1, "water.ph", 7.1, device="dev_c", asset=asset_2),
+        last_row(T0, "water.ph", 6.9, device="dev_a"),
+        last_row(T2, "water.ph", 1.0, asset=UNKNOWN_ASSET),
+    ]
+
+    latest = await call(
+        projection(FakeQueryApi([FakeTable(lasts)])), "query_latest_metrics_for_tenant"
+    )
+
+    assert latest == [
+        LatestMetrics(measured_at=T0, tenant_id=TENANT, pond_id="pond_1", ph=6.9),
+        LatestMetrics(measured_at=T1, tenant_id=TENANT, pond_id="pond_2", ph=7.1),
+    ]
+
+
+@pytest.mark.asyncio
+async def test_summary_maps_metric_keys_to_the_legacy_fields() -> None:
+    def record(result: str, metric: str, value: Any, time: datetime = T1) -> FakeRecord:
+        return FakeRecord({"result": result, "metric_key": metric, "_value": value, "_time": time})
 
     tables = [
-        FakeTable([record("series", "temp_c", 25.5, T0), record("series", "ph", 7.1, T1)]),
-        FakeTable([record("series", "do_mg_l", None, T1), record("series", "seq", 3, T1)]),
-        FakeTable([record("mean", "temp_c", 25.5), record("count", "temp_c", 2)]),
-        FakeTable([record("min", "ph", 7.0), record("max", "ph", 7.2)]),
+        FakeTable(
+            [
+                record("series", "water.temperature", 25.5, T0),
+                record("series", "water.ph", 7.1, T1),
+                record("series", "water.dissolved_oxygen", None, T1),
+            ]
+        ),
+        FakeTable([record("mean", "water.temperature", 25.5), record("count", "water.ph", 2)]),
+        FakeTable([record("min", "water.ph", 7.0), record("max", "water.ph", 7.2)]),
+        FakeTable([record("max", "device.rssi", -60.0), record("mean", "water.turbidity", 1.0)]),
     ]
-    expected = await call(legacy(FakeQueryApi(tables)), "query_summary", period="7d")
-    actual = await call(projection(FakeQueryApi(tables)), "query_summary", period="7d")
 
-    assert actual == expected
-    assert actual.interval == "1h"
-    assert [point.measured_at for point in actual.series] == [T0, T1]
+    summary = await call(projection(FakeQueryApi(tables)), "query_summary", period="7d")
+
+    assert summary.interval == "1h"
+    assert [(p.measured_at, p.temp_c, p.ph, p.do_mg_l) for p in summary.series] == [
+        (T0, 25.5, None, None),
+        (T1, None, 7.1, None),
+    ]
+    assert summary.statistics == {
+        "do_mg_l": MetricStatistics(),
+        "ph": MetricStatistics(min=7.0, max=7.2, count=2),
+        "temp_c": MetricStatistics(mean=25.5),
+    }
 
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("method", METHODS)
 async def test_a_tenant_without_legacy_devices_reads_empty_like_legacy(method: str) -> None:
-    domain = FakeDomainRepository(devices={})
+    query_api = FakeQueryApi()
     expected = await call(legacy(FakeQueryApi()), method)
-    actual = await call(projection(FakeQueryApi(), domain), method)
+    actual = await call(projection(query_api, FakeDomainRepository(devices={})), method)
 
     assert actual == expected
+    assert query_api.calls == []
 
 
 # --- errors -----------------------------------------------------------------------------------
@@ -691,9 +835,7 @@ async def test_invalid_period_raises_exactly_like_legacy(period: str) -> None:
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize(
-    "method", ("query_readings", "query_latest_metrics", "query_latest_metrics_for_tenant")
-)
+@pytest.mark.parametrize("method", ROW_METHODS)
 async def test_other_methods_propagate_query_failures_unwrapped(method: str) -> None:
     error = RuntimeError("influx down")
 
@@ -702,3 +844,21 @@ async def test_other_methods_propagate_query_failures_unwrapped(method: str) -> 
 
     assert raised.value is error
     assert not isinstance(raised.value, TelemetryQueryError)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("method", ROW_METHODS)
+async def test_a_failing_seq_query_propagates_unwrapped(method: str) -> None:
+    error = RuntimeError("influx down")
+
+    class FailsSecond(FakeQueryApi):
+        def query(self, query: str, org: str):
+            if self.calls:
+                self.calls.append({"query": query, "org": org})
+                raise error
+            return super().query(query, org)
+
+    with pytest.raises(RuntimeError) as raised:
+        await call(projection(FailsSecond(*one_row(method))), method)
+
+    assert raised.value is error

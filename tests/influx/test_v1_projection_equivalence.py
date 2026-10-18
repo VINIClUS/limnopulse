@@ -4,12 +4,16 @@ Every scenario is dual-written through the P2-03 `ObservationWriteService` (both
 into one bucket, so the legacy `InfluxTelemetryRepository` reads `water_quality` and
 `V2ProjectedTelemetryRepository` reads `observation_numeric` from the same writes. Data is seeded
 relative to a `now` captured once per test; every compared result is asserted non-empty first.
+
+Readings and latest are byte-identical. Summaries are identical except their float means, which
+match within `rel_tol=1e-12` (plan r7.2): storage sums partials per (series, shard group) in
+series-key order, and the v2 series keys differ from the legacy ones by design.
 """
 
 from __future__ import annotations
 
-import itertools
-from collections.abc import Iterable, Iterator
+import math
+from collections.abc import Iterator
 from contextlib import contextmanager
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
@@ -49,14 +53,17 @@ PONDS = ("pond_local_001", "pond_north", "pond_south", "pond_sum", "pond_tie")
 FLOAT_FIELDS = ("temp_c", "ph", "do_mg_l", "turbidity_ntu", "salinity_ppt", "battery_v")
 INTEGER_FIELDS = ("rssi", "seq")
 SUM_DEVICES = ("sum-device-1", "sum-device-2", "sum-device-3")
+SHARD_POND = "pond_shard"
+SHARD_DEVICES = ("shard-device-1", "shard-device-2")
+# Hours before `now` for the shard pond: 9 days apart, so the points lie in different 7-day
+# shard groups (the default for a bucket without retention); none is inside the last 24 h.
+SHARD_HOURS = (26.5, 50.5, 9 * 24 + 0.5, 9 * 24 + 1.5)
+SHARD_GROUP = timedelta(days=7)
 TIE_DEVICE = "tie-device-001"
 NATIVE_COMPONENT = "cmp_0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f"
 SEQ_2_53_PLUS_1 = 2**53 + 1
 SEQ_MAX = 2**63 - 1
-# Two samples per device in one 5-minute window. Legacy InfluxDB sums each series in time
-# order and then adds the series sums in device order. For these values that total differs,
-# in sum and in mean, from a single-pass sum over every interleaving that keeps each device's
-# time order (device-major included); `seed` asserts it.
+# Two samples per device in one 5-minute window of a pond with three devices.
 SUM_VALUES = {
     "sum-device-1": (26.5, 25.3),
     "sum-device-2": (28.0, 26.8),
@@ -253,6 +260,25 @@ def _sum_observations(base: datetime) -> list[CanonicalObservation]:
     return observations
 
 
+def _shard_observations(now: datetime) -> list[CanonicalObservation]:
+    observations = []
+    for index, device_id in enumerate(SHARD_DEVICES):
+        for position, hours in enumerate(SHARD_HOURS):
+            for metric_key, base in (("water.temperature", 24.1), ("water.ph", 7.01)):
+                observations.append(
+                    make_observation(
+                        tenant_id=TENANT,
+                        pond_id=SHARD_POND,
+                        device_id=device_id,
+                        metric_key=metric_key,
+                        value=base + 0.1 * position + 0.07 * index,
+                        observed_at=now - timedelta(hours=hours),
+                        sequence=position,
+                    )
+                )
+    return observations
+
+
 def _tie_observations(base: datetime) -> tuple[list[CanonicalObservation], dict]:
     def tie(metric_key: str, value: float, at: datetime, sequence, ingested: datetime):
         return make_observation(
@@ -394,7 +420,7 @@ def seed(bucket: str, now: datetime) -> Seeded:
     sum_observations = _sum_observations(sum_base)
     tie_observations, expected_tie_seq = _tie_observations(now - timedelta(minutes=12))
 
-    _assert_summation_is_order_dependent()
+    shard_observations = _shard_observations(now)
     devices = {
         TENANT: {
             "local-device-001": "pond_local_001",
@@ -402,6 +428,7 @@ def seed(bucket: str, now: datetime) -> Seeded:
             "series-device-b": "pond_south",
             **{device_id: "pond_sum" for device_id in SUM_DEVICES},
             TIE_DEVICE: "pond_tie",
+            **{device_id: SHARD_POND for device_id in SHARD_DEVICES},
         },
         OTHER_TENANT: {"local-device-001": "pond_local_001"},
     }
@@ -416,6 +443,11 @@ def seed(bucket: str, now: datetime) -> Seeded:
         for o in batch:
             assert now - timedelta(hours=1) <= o.observation.observed_at < now
     assert len(series.observations) >= 2 * 30
+    # The shard pond spans two shard groups, in completed hours outside the last 24 h.
+    shard_groups = {_shard_group(o.observation.observed_at) for o in shard_observations}
+    assert len(shard_groups) >= 2
+    assert all(o.observation.observed_at < now - timedelta(hours=25) for o in shard_observations)
+    batches.append(tuple(shard_observations))
     site_assets = _site_assets(devices)
     settings = influx_settings()
     with influx_clients(bucket) as (_query_api, write_api):
@@ -447,32 +479,39 @@ def _five_minute_floor(value: datetime) -> datetime:
     return value.replace(minute=value.minute - value.minute % 5, second=0, microsecond=0)
 
 
-def _float_sum(values: Iterable[float]) -> float:
-    total = 0.0
-    for value in values:
-        total += value
-    return total
+def _shard_group(value: datetime) -> int:
+    return (value - datetime(1970, 1, 1, tzinfo=UTC)) // SHARD_GROUP
 
 
-def _legacy_series_total() -> float:
-    """Each series summed in time order, then the series sums added in device order."""
-    return _float_sum(_float_sum(values) for values in SUM_VALUES.values())
+def _means_match(actual: float | None, expected: float | None) -> bool:
+    if actual is None or expected is None:
+        return actual is expected
+    return math.isclose(actual, expected, rel_tol=1e-12, abs_tol=0.0)
 
 
-def _assert_summation_is_order_dependent() -> None:
-    series = list(SUM_VALUES.values())
-    count = sum(len(values) for values in series)
-    legacy_total = _legacy_series_total()
-    # Every interleaving of the devices that keeps each device's own time order.
-    slots = [index for index, values in enumerate(series) for _ in values]
-    for order in set(itertools.permutations(slots)):
-        positions = [0] * len(series)
-        interleaved = []
-        for device in order:
-            interleaved.append(series[device][positions[device]])
-            positions[device] += 1
-        assert _float_sum(interleaved) != legacy_total, interleaved
-        assert _float_sum(interleaved) / count != legacy_total / count, interleaved
+def assert_summaries_match(actual: Any, expected: Any, context: Any = None) -> None:
+    """Exact on everything but the float means; the means within `rel_tol=1e-12` (r7.2)."""
+    if isinstance(actual, MetricsSummary):
+        actual, expected = actual.model_dump(), expected.model_dump()
+    assert actual.keys() == expected.keys(), context
+    for key in ("tenant_id", "pond_id", "period", "interval"):
+        assert actual[key] == expected[key], context
+    assert [p["measured_at"] for p in actual["series"]] == [
+        p["measured_at"] for p in expected["series"]
+    ], context
+    for got, want in zip(actual["series"], expected["series"], strict=True):
+        assert got.keys() == want.keys(), context
+        for metric in ("do_mg_l", "ph", "temp_c"):
+            assert _means_match(got[metric], want[metric]), (context, got, want)
+    assert actual["statistics"].keys() == expected["statistics"].keys(), context
+    for metric, want in expected["statistics"].items():
+        got = actual["statistics"][metric]
+        assert (got["min"], got["max"], got["count"]) == (
+            want["min"],
+            want["max"],
+            want["count"],
+        ), (context, metric)
+        assert _means_match(got["mean"], want["mean"]), (context, metric, got, want)
 
 
 def _run(awaitable):
@@ -517,6 +556,9 @@ def _reading_calls(seeded: Seeded) -> list[dict[str, Any]]:
         {"pond_id": "pond_north", "start": "-2h", "stop": None, "limit": 7},
         {"pond_id": "pond_sum", "start": "-2h", "stop": None, "limit": 1},
         {"pond_id": "pond_tie", "start": "-2h", "stop": None, "limit": 3},
+        # A 30-day range across shard groups.
+        {"pond_id": SHARD_POND, "start": "-30d", "stop": None, "limit": 1000},
+        {"pond_id": SHARD_POND, "start": "-30d", "stop": None, "limit": 2},
         # A relative start with an absolute stop.
         {
             "pond_id": "pond_north",
@@ -623,21 +665,30 @@ async def test_summaries_are_equal_to_legacy_for_every_period(
                     tenant_id=TENANT, pond_id=pond_id, period=period
                 )
                 _assert_nonempty(expected)
-                assert actual == expected, (pond_id, period)
-                assert actual.model_dump_json() == expected.model_dump_json()
+                assert_summaries_match(actual, expected, (pond_id, period))
 
 
 @pytest.mark.asyncio
-async def test_summary_mean_keeps_legacy_float_summation_order(
+async def test_summary_across_shard_groups_matches_legacy(
     influx_bucket: str, seeded: Seeded
 ) -> None:
     with repositories(influx_bucket, seeded.devices) as (legacy, projected, _recording, _domain):
-        expected = await legacy.query_summary(tenant_id=TENANT, pond_id="pond_sum", period="24h")
-        actual = await projected.query_summary(tenant_id=TENANT, pond_id="pond_sum", period="24h")
-    assert expected.statistics["temp_c"].mean == _legacy_series_total() / 6
-    assert actual.statistics["temp_c"].mean == expected.statistics["temp_c"].mean
-    assert [point.temp_c for point in actual.series] == [point.temp_c for point in expected.series]
-    assert len(actual.series) == 1
+        results = {}
+        for period in ("7d", "30d"):
+            expected = await legacy.query_summary(
+                tenant_id=TENANT, pond_id=SHARD_POND, period=period
+            )
+            actual = await projected.query_summary(
+                tenant_id=TENANT, pond_id=SHARD_POND, period=period
+            )
+            _assert_nonempty(expected)
+            assert_summaries_match(actual, expected, period)
+            results[period] = actual
+    points_per_metric = len(SHARD_DEVICES) * len(SHARD_HOURS)
+    # 30d reads both shard groups; 7d only the two recent hours of each device.
+    assert results["30d"].statistics["temp_c"].count == points_per_metric
+    assert results["7d"].statistics["temp_c"].count == len(SHARD_DEVICES) * 2
+    assert len(results["30d"].series) == len(SHARD_HOURS)
 
 
 # --- exclusions, tie-break and integers -------------------------------------------------------
@@ -696,8 +747,14 @@ async def test_seq_tie_break_and_integer_boundaries(influx_bucket: str, seeded: 
         actual = await projected.query_readings(
             tenant_id=TENANT, pond_id="pond_tie", start="-2h", stop=None, limit=1000
         )
+        before_latest = len(recording.records)
         latest = await projected.query_latest_metrics(tenant_id=TENANT, pond_id="pond_tie")
         legacy_latest = await legacy.query_latest_metrics(tenant_id=TENANT, pond_id="pond_tie")
+        raw_latest_seqs = [
+            values["sequence"]
+            for values in recording.records[before_latest:]
+            if "sequence" in values
+        ]
 
     assert {reading.measured_at: reading.seq for reading in actual} == seeded.expected_tie_seq
     assert {reading.measured_at: reading.seq for reading in expected} == seeded.expected_tie_seq
@@ -708,34 +765,39 @@ async def test_seq_tie_break_and_integer_boundaries(influx_bucket: str, seeded: 
     assert latest.seq == SEQ_MAX and type(latest.seq) is int
     assert latest.rssi == -71 and type(latest.rssi) is int
     # The Flux result itself carries integers: no reliance on Pydantic lax coercion.
-    raw_seqs = [values["seq"] for values in recording.records if values.get("seq") is not None]
+    raw_seqs = [values["sequence"] for values in recording.records if "sequence" in values]
     assert SEQ_2_53_PLUS_1 in raw_seqs and SEQ_MAX in raw_seqs
+    assert all(type(value) is int for value in raw_seqs)
+    assert SEQ_MAX in raw_latest_seqs
 
 
 @pytest.mark.asyncio
-async def test_projected_records_keep_legacy_field_types(
-    influx_bucket: str, seeded: Seeded
-) -> None:
+async def test_projected_values_keep_legacy_field_types(influx_bucket: str, seeded: Seeded) -> None:
     with repositories(influx_bucket, seeded.devices) as (_legacy, projected, recording, _domain):
+        results: list[Any] = []
         for pond_id in PONDS:
-            await projected.query_readings(
+            results += await projected.query_readings(
                 tenant_id=TENANT, pond_id=pond_id, start="-2h", stop=None, limit=1000
             )
-            await projected.query_latest_metrics(tenant_id=TENANT, pond_id=pond_id)
-        await projected.query_latest_metrics_for_tenant(tenant_id=TENANT)
+            results.append(await projected.query_latest_metrics(tenant_id=TENANT, pond_id=pond_id))
+        results += await projected.query_latest_metrics_for_tenant(tenant_id=TENANT)
 
     seen = {field: 0 for field in FLOAT_FIELDS + INTEGER_FIELDS}
-    for values in recording.records:
-        assert values["_measurement"] == "water_quality"
-        assert values.get("source", "mqtt") == "mqtt"
+    for result in results:
         for field in seen:
-            value = values.get(field)
+            value = getattr(result, field)
             if value is None:
                 continue
             seen[field] += 1
             expected_type = int if field in INTEGER_FIELDS else float
             assert type(value) is expected_type, (field, value)
     assert all(seen.values()), seen
+    # Raw Flux: canonical values are floats and sequences integers; no `water_quality` rows.
+    assert recording.records
+    for values in recording.records:
+        assert values.get("_measurement") in (None, "observation_numeric")
+        if "sequence" in values:
+            assert type(values["sequence"]) is int
 
 
 @pytest.mark.asyncio
@@ -777,6 +839,10 @@ def _http_paths(seeded: Seeded) -> list[tuple[str, dict[str, Any]]]:
         paths.append((f"{base}/metrics/latest", {}))
         for period in PERIODS:
             paths.append((f"{base}/metrics/summary", {"period": period}))
+    for period in ("7d", "30d"):
+        paths.append(
+            (f"/v1/tenants/{TENANT}/ponds/{SHARD_POND}/metrics/summary", {"period": period})
+        )
     for call in _reading_calls(seeded):
         params = {"start": call["start"], "limit": call["limit"]}
         if call["stop"] is not None:
@@ -785,7 +851,7 @@ def _http_paths(seeded: Seeded) -> list[tuple[str, dict[str, Any]]]:
     return paths
 
 
-def test_v1_http_responses_are_byte_identical(influx_bucket: str, seeded: Seeded) -> None:
+def test_v1_http_responses_match_legacy(influx_bucket: str, seeded: Seeded) -> None:
     with repositories(influx_bucket, seeded.devices) as (legacy, projected, _recording, domain):
         legacy_app = _app(domain, legacy)
         projected_app = _app(domain, projected)
@@ -804,4 +870,7 @@ def test_v1_http_responses_are_byte_identical(influx_bucket: str, seeded: Seeded
                 if "measured_at" in body:
                     assert body["measured_at"] is not None, path
                 assert actual.status_code == expected.status_code, path
-                assert actual.content == expected.content, path
+                if path.endswith("/metrics/summary"):
+                    assert_summaries_match(actual.json(), body, path)
+                else:
+                    assert actual.content == expected.content, path
