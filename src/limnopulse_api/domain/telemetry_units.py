@@ -57,8 +57,12 @@ UNIT_MAPPINGS: Mapping[str, UnitTable] = MappingProxyType(
 )
 
 
-class UnitConversionError(ValueError):
-    """A source value that cannot become a canonical value; `reason` drives quarantine."""
+class UnitConversionError(Exception):
+    """A source value that cannot become a canonical value; `reason` drives quarantine.
+
+    Not a `ValueError`, so a quarantine handler can never swallow the unknown-version
+    `ValueError`, which signals a programming error rather than bad data.
+    """
 
     def __init__(self, reason: QuarantineReason, detail: str) -> None:
         super().__init__(f"{reason}: {detail}")
