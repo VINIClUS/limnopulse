@@ -644,7 +644,7 @@ summary:  data = source(-period, 3 metrics) |> filter(_field == "value") |> grou
 2. Readings, latest and `seq` use one `from()` per query: two yields sharing one source lose the pushdown. The summary keeps the legacy single-source, multi-yield shape.
 3. No per-row `map`. A vectorized `map` emits its columns in a varying order, so a later `pivot` panics non-deterministically (`column _start:time is not of type string`). A row-based `map` is deterministic but too slow (~0.06 ms per row).
 4. The `seq` winner is ranked per legacy series with `sort(desc) |> unique(column: "_time")`, never with one table per timestamp (`group(..., "_time")`).
-5. The `seq` query only spans the rows the first query returned, so its cost follows `limit`, not the read range.
+5. The `seq` query only spans the rows the first query returned (from the earliest to the latest returned `_time`). Its cost usually follows `limit`, not the read range; devices with disjoint returned spans widen the window.
 6. The summary groups by `metric_key` and applies `aggregateWindow(fn: mean)`, `mean()`, `min()`, `max()` and `count()`, like legacy. The filters and the group are pushed down (`ReadGroup`); the aggregates run in the Flux engine; raw rows never reach the client. The cost profile is the same as legacy.
 
 **Python shaping.**
@@ -667,6 +667,10 @@ summary:  data = source(-period, 3 metrics) |> filter(_field == "value") |> grou
 - **Error propagation.** The other methods, including the `seq` query, propagate errors exactly like the legacy adapter.
 - **Integer fields.** `seq` stays an integer end to end, so sequences up to `MAX_SEQUENCE` stay exact; a boundary test covers `2**53 + 1` and `2**63 - 1`.
 - **No time flooring.** Legacy dual-write stores exact time.
+- **Outside the equivalence domain (known limitations).**
+  - One legacy point stored as two v2 series. This happens when a redelivery or correction resolves to a different `deployment_id`, after a Deployment was ended with a backdated `ended_at`, which breaks the D5 premise that the ownership tags are fixed. Legacy keeps the last write. The projection's readings and latest pick one series by series-key order, and its summary counts both.
+  - The `seq` winner ranks by `ingested_at`, while legacy keeps the last write when batches land out of `ingested_at` order.
+  - The runbook (P2-09) lists both next to the D10 absent-sequence case.
 - **Version sensitivity.** These shapes and the parity rule follow storage behavior of the pinned InfluxDB 2.7.11. The equivalence suite on the pinned CI image is the guard for future upgrades.
 
 ### Go evaluator v2 reader (P2-05)
