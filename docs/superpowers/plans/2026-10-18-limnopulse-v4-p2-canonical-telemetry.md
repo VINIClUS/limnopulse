@@ -1,34 +1,75 @@
 # LimnoPulse V4 Phase 2 — Canonical Telemetry and Dual Schema Implementation Plan
 
-> **For agentic workers:** Execute one task per worktree/session. Every task is test-first: write the failing tests, audit them for usefulness, and only then implement. Steps use checkbox (`- [ ]`) syntax for tracking.
+> **For agentic workers:** Execute one task per worktree/session. Every task is test-first: write the failing tests, get them audited and approved, and only then implement. Steps use checkbox (`- [ ]`) syntax for tracking.
 
 **Goal:** Introduce transport-independent metric observations, the InfluxDB `observation_numeric` schema, controlled dual writes and a `/v1` read projection with proven equivalence. Track event, receive and ingest time separately. Never let a device payload carry tenant, site, asset or deployment authority.
 
-**Architecture:** A short serial contract spine freezes the catalog, envelope, Influx schema, line protocol and repository protocols with executable fixtures. Two Wave 0 tasks run in parallel: the spine and a real-InfluxDB integration harness. Independent vertical slices follow: units and quality, the writer, reads/API and the Go evaluator. Then come the normalizer and the `/v1` projection, one composition owner, and a release gate. Every dependency boundary is a merge to `main`.
+**Architecture:**
+- **Contract spine.** A short serial spine freezes, as executable fixtures:
+  - the catalog and envelope;
+  - the Influx schema and line protocol, including legacy dual-write grouping;
+  - the repository protocols.
+- **Wave 0.** A real-InfluxDB integration harness runs in parallel with the spine.
+- **Independent vertical slices:** units/quality, the writer, reads/API and the Go evaluator.
+- **Then, in order:** the normalizer/pipeline and the `/v1` projection; one composition owner; a release gate.
 
-**Tech Stack:** Python 3.12+, FastAPI, Pydantic v2, `influxdb-client` 1.50 (already locked), pytest/pytest-asyncio, uv; Go 1.26 from `go.mod` with `influxdb-client-go/v2` v2.14.0 and `google/uuid` v1.6.0 (already required); InfluxDB 2.7.11 for integration tests; GitHub Actions.
+Every dependency boundary is a merge to `main`. P2 ships **dark** (D16): no deployed service produces canonical telemetry until P3.
 
-**Spec:** `docs/superpowers/specs/2026-08-16-limnopulse-platform-redesign-tech-spec-v4.md` (§§7.2, 7.3, 8, 10, 16, 19.2, 20.7, 23.2, 24 Phase 2, 25) and `docs/superpowers/specs/2026-08-25-limnopulse-v4-parallel-execution-design.md`. ADR gates: ADR-005, ADR-006, ADR-007.
+**Tech Stack:**
+- Python 3.12+, FastAPI, Pydantic v2, `influxdb-client` 1.50 (already locked), pytest/pytest-asyncio 1.4 (strict mode), uv.
+- Go 1.26 from `go.mod`, with `influxdb-client-go/v2` v2.14.0 and `google/uuid` v1.6.0 (already required).
+- InfluxDB 2.7.11 for integration tests; GitHub Actions.
 
-**Epic:** #22 (roadmap #14). **Planning baseline:** `main@2918532` (M1 complete; `make verify-python` 2120 passed / 8 skipped, `go test -race ./...` green).
+**Spec:** `docs/superpowers/specs/2026-08-16-limnopulse-platform-redesign-tech-spec-v4.md` (§§7.2, 7.3, 8, 10, 16, 19.2, 20.7, 22.2, 23.2, 24 Phase 2, 25, 26) and `docs/superpowers/specs/2026-08-25-limnopulse-v4-parallel-execution-design.md`. ADR gates: ADR-005, ADR-006, ADR-007.
+
+**Epic:** #22 (roadmap #14). **Planning baseline:** `main@2918532` (M1 complete; `make verify-python` 2120 passed / 8 skipped; `go test -race ./...` green).
+
+**Revision:** r2. This revision applies the findings of five independent audits (three local agents and two cloud sessions, one of which ran real InfluxDB 2.7.11 experiments) and the Codex review of PR #76.
 
 ## Global Constraints
 
-- Every worktree starts from `origin/main` only after all blocking task PRs are merged. Branch names are `agent/v4-p2-<nn>-<short-name>`. One executable issue maps to one worktree, one session and one PR.
-- Preserve every `/v1` path, request, response, status code, role gate and the byte-identical `tests/contracts/openapi/v1.json` golden. The legacy `water_quality` measurement, Telegraf path and `InfluxTelemetryRepository` keep working unchanged.
-- Every new behavior ships behind a default-off switch (see **Rollout switches**). With all P2 switches off, the running application is behaviorally identical to `main@2918532`.
-- The client and the device never supply authoritative tenant, site, asset or deployment ownership. `tenant_id` comes from the authenticated path/membership boundary or from trusted integration context, never from a telemetry payload.
-- No DynamoDB `Scan`, no new GSI, no new DynamoDB table. Deployment at event time uses the M1 `DeploymentRepository.get_deployment_at` bounded Component-history query.
-- M1 protocols in `repositories/v2_contracts.py` are frozen by `tests/unit/test_v2_repository_protocols.py`. P2 adds new protocols in `repositories/telemetry_v2.py` and never edits M1 protocol signatures.
-- The M1 acceptance gate forbids `redis`, `aws_iot`, `thing_name`, `certificate_arn` and `shadow_name` (case-insensitive substrings) in every `domain/*.py` and `api/v2/**` file. P2 domain/API code uses opaque `ProviderKey` strings and the `SourceType` transport classes below; it never names AWS IoT or Redis.
-- Redis/Valkey is not used by P2 for correctness, deduplication or identity.
-- No new runtime or dev dependency, and no lockfile change (`uv lock --check` and `go.mod` stay unchanged). `testdata/telemetry_v2/` holds the cross-language vectors.
-- Test basenames are unique repository-wide: `tests/` has no `__init__.py`, so pytest imports test modules by basename. Shared test helpers live under `tests/support/` and are imported as `tests.support.<module>`.
-- Integration tests that need a real InfluxDB live in `tests/influx/` (Python) or are named `TestInfluxIntegration*` (Go). They skip unless `RUN_INFLUX_INTEGRATION=1`. Default `make verify-python` and `make verify-go` never need InfluxDB.
-- Sonar runs only the default (non-integration) suites. New production code must therefore reach ≥80% line coverage from unit tests alone; integration tests prove semantics, not coverage.
-- Go files under `cmd/alert-evaluator` and `internal/alertevaluator` must not contain the substrings `.Scan(`, `dynamodb.ScanInput`, `service/sqs`, `service/ses`, `api.telegram.org`, `telegram-bot-api` (`tests/unit/test_phase3b_boundaries.py`, test files included). Parse Influx results with the client's own iterator or `encoding/csv` `Read`, never `bufio.Scanner`.
-- Issue `#6` (presence-aware `Evaluation.Value`) stays canonical and out of P2 scope. The P2 Go reader reports values only through the existing `WindowResult` and never relies on zero meaning "no data".
-- Every PR records the exact commands and observed results: the failing-test run, the passing run, `make verify-python`, `make verify-go`, `git diff --check`, `uv run --locked --extra dev python scripts/dev/export_v1_openapi.py --check`, and `make verify-influx` when the task adds integration tests.
+### Process and compatibility
+- **Branching.** Every worktree starts from `origin/main` only after all blocking task PRs are merged. Branch names are `agent/v4-p2-<nn>-<short-name>`. One executable issue maps to one worktree, one session and one PR.
+- **`/v1` stays unchanged.**
+  - Preserve every `/v1` path, request, response, status code and role gate.
+  - Keep `tests/contracts/openapi/v1.json` byte-identical.
+  - The legacy `water_quality` measurement, the Telegraf path and `InfluxTelemetryRepository` keep working unchanged.
+- **Default-off switches.** Every new behavior ships behind a default-off switch (see **Rollout switches**). With all P2 switches off, the running application behaves exactly like `main@2918532`.
+- **Tenant authority.** Neither the client nor the device supplies authoritative tenant, site, asset or deployment ownership. `tenant_id` comes from the authenticated path/membership boundary or from trusted integration context, never from a telemetry payload.
+
+### Storage
+- No DynamoDB `Scan`, no new GSI, no new table. Deployment at event time uses the M1 `DeploymentRepository.get_deployment_at` bounded Component-history query.
+
+### M1 guards
+- **Protocols.** M1 protocols in `repositories/v2_contracts.py` are frozen by `tests/unit/test_v2_repository_protocols.py`. P2 adds new protocols in `repositories/telemetry_v2.py`.
+- **Forbidden words.** The M1 acceptance gate forbids `redis`, `aws_iot`, `thing_name`, `certificate_arn` and `shadow_name` (case-insensitive substrings) in every `domain/*.py` and `api/v2/**` file, comments included. P2 domain/API code uses opaque `ProviderKey` strings and the `SourceType` transport classes.
+- **Legacy-ingestion guard.** `tests/unit/test_local_ingestion_config.py` forbids `postgres`, `postgresql`, `psycopg`, `sqlalchemy`, `firestore` and `firebase` in `src/` and `scripts/`. It also applies secret regexes to `scripts/dev`, `README.md` and `.env.example`.
+- **Go substrings.** Go files under `cmd/alert-evaluator` and `internal/alertevaluator`, test files included, must not contain `.Scan(`, `dynamodb.ScanInput`, `service/sqs`, `service/ses`, `api.telegram.org` or `telegram-bot-api` (`tests/unit/test_phase3b_boundaries.py`). Parse Influx results with the client's iterator or `encoding/csv` `Read`, never `bufio.Scanner`.
+
+### Dependencies and tests
+- **No new dependencies.** No new runtime or dev dependency and no lockfile change. `urllib3` is already a transitive dependency and may be imported for exception types.
+- **Unique test basenames.** `tests/` has no `__init__.py`. Shared helpers live under `tests/support/`, imported as `tests.support.<module>`, and are owned by P2-00/P2-01 only. Waves 1–4 create no file under `tests/support/`.
+- **Async tests.** pytest-asyncio runs in strict mode: async tests need `@pytest.mark.asyncio` and async fixtures need `@pytest_asyncio.fixture`.
+- **InfluxDB integration tests.**
+  - Location: Python tests live in `tests/influx/`; Go tests are named `TestInfluxIntegration*`.
+  - Skipping: they skip unless `RUN_INFLUX_INTEGRATION=1`. Default `make verify-python` and `make verify-go` never need InfluxDB.
+  - **Coverage of query strings:** every Flux query string a task introduces must be executed by at least one integration test. InfluxDB 2.7.11 panics on some syntactically valid chains, so string-shape tests are not enough.
+  - **Time windows:**
+    - Integration tests use absolute `range` bounds.
+    - Relative-window code paths (`/v1` latest/summary, `/v2` latest) are tested with data seeded relative to a `now` captured once per test.
+    - Every comparison asserts the result is non-empty before comparing.
+- **Coverage.** Sonar runs only the default suites, so new production code must reach ≥80% line coverage from unit tests alone. `tests/**` and `scripts/dev/**` are excluded from coverage.
+
+### Safety
+- **Flux literals.** Every Flux literal built from a runtime value goes through the escaping helper: JSON escaping, then `$` → `\$` to defeat `${…}` interpolation. Every ID is validated before a query is built.
+- **Issue #6.** Presence-aware `Evaluation.Value` stays canonical in #6 and out of P2 scope. The P2 Go reader reports values only through the unchanged `WindowResult`.
+
+### Evidence
+Every PR records the exact commands and observed results:
+- the approved failing-test run and the passing run;
+- `make verify-python`, `make verify-go` and `git diff --check`;
+- `uv run --locked --extra dev python scripts/dev/export_v1_openapi.py --check`;
+- `make verify-influx`, once P2-01 is merged, when the task adds integration tests.
 
 ## Entry Decisions (frozen by this plan)
 
@@ -36,21 +77,36 @@ Epic #22 requires the metric/unit and dual-write contracts to be frozen before d
 
 | # | Decision | Answer |
 |---|---|---|
-| D1 | Metric catalog | One global, versioned catalog `metric-catalog@1` with exactly the seven legacy metrics below. P2 accepts no tenant-defined metric keys. |
+| D1 | Metric catalog | One global, versioned catalog `metric-catalog@1` with exactly the seven legacy metrics below, display names included. P2 accepts no tenant-defined metric keys. |
 | D2 | Unit mapping | Versioned `unit-mapping@1` with explicit per-metric source units. An unknown unit is quarantined, never guessed. |
-| D3 | Written quality states | The P2 normalizer writes only `valid`, `suspect` or `out_of_range` as the point `quality_state` tag. `uncalibrated`, `calibration_unknown` and `impossible_jump` are reserved point states for P6 (no calibration records or rate limits exist yet). `stale` and `missing` are read/evaluation states and are never written. `duplicate` and `delayed` are flags, not point states, so timeliness never changes a point's series identity or excludes a correct value from quality-gated alerts. |
-| D4 | Quality determinism | Classification is a pure function of the envelope (`observed_at`, `received_at`, value, replay marker) and the pinned versions. It never reads wall-clock time, so a replay of the same envelope reproduces the same tags. |
-| D5 | Canonical identity | One point per `(tenant_id, component_id, metric_key, observed_at)`. A later write with the same identity overwrites fields in place (last-writer-wins); this is the deduplication mechanism. No per-observation DynamoDB receipt is written. |
-| D6 | Bucket | `observation_numeric` lives in the existing `INFLUXDB_BUCKET_RAW` bucket. No per-tenant or per-plan bucket. Retention durations remain an operational decision recorded in the runbook. |
-| D7 | Legacy dual-write eligibility | Dual-write only when the observation's Component is the deterministic default Component of its Device (`default_component_id_for_legacy_device(tenant_id, device_id)`), the resolved Asset carries a `PondProfile.legacy_pond_id`, and the metric has a `legacy_field`. Native v2 probes never appear in `water_quality`. |
-| D8 | Legacy series identity | Dual-written legacy points use the Telegraf series identity: measurement `water_quality`, tags `tenant_id`, `pond_id`, `device_id`, `source`, `schema_version="1"`, and time floored to the whole second (Telegraf `precision="1s"`). `source` is `mqtt` for `SourceType.LEGACY_MQTT`, otherwise the `SourceType` value. A reading written by both Telegraf and the normalizer therefore stays one legacy point. |
-| D9 | Write switches | `TELEMETRY_V2_WRITE_ENABLED` and `TELEMETRY_LEGACY_DUAL_WRITE_ENABLED` are independent and default `false`. The write path writes v2 first, then legacy. Any failure raises `TelemetryWriteError` and nothing is reported as written, so the caller retries; idempotent identity makes the retry safe. |
-| D10 | `/v1` projection | `V1_TELEMETRY_READ_SOURCE=legacy\|v2` (default `legacy`) swaps the implementation behind the existing `TelemetryRepository` protocol. The v2-backed projection reads only the seven legacy metrics of the Asset for the legacy pond, includes every quality state (legacy has no quality), floors time to the whole second, and returns the four `/v1` shapes byte-identically for samples whose observation times are distinct whole seconds per device. |
-| D11 | `/v2` telemetry API | `API_V2_TELEMETRY_ENABLED` (default `false`, valid only together with `API_V2_ENABLED=true`) mounts exactly `GET metric-definitions`, `GET observations` and `GET observations/latest`. `API_V2_ENABLED` alone still mounts only the 13 M1 paths. |
-| D12 | Alert evaluator | `ALERT_EVALUATOR_TELEMETRY_SOURCE=legacy\|v2` (default `legacy`). With `v2`, `/v1` rules (pond, optional device, legacy metric) read `observation_numeric` through a new `WindowReader`. That reader maps the pond to `asset_id_for_legacy_pond`, the metric to `metric_key`, and requires `quality_state == "valid"` (V4 §16.3 default policy). Coverage, staleness and aggregation stay in the unchanged Go `EvaluateSamples`. Alert events keep legacy metric names. |
-| D13 | Trusted mapping in P2 | P2 has no public ingress. The normalizer receives a `TrustedSourceContext` (tenant, device, optional integration, source type, receive time) built by trusted code: tests, the P2 dev CLI, and later the P3 worker. External-identity-to-DeviceIntegration resolution, queues, DLQ persistence and connector health are P3. P2 returns quarantine outcomes for P3 to persist. |
-| D14 | Measurement capability | P2 does not require `ProbeProfile.measurement_metric_keys` to list a metric (legacy default Components carry none). Capability-gated acceptance belongs to P3 trusted mapping and P6. |
-| D15 | Out-of-range values | An out-of-range value is written (to v2 and, when eligible, to legacy) with `quality_state=out_of_range` and provenance `plausible_range`. Legacy reads still show it, as today. v2 quality-gated alert reads exclude it. This divergence from legacy alert behavior is intentional and documented in the runbook. |
+| D3 | Quality states | In P2 the normalizer writes `quality_state` = `valid` or `out_of_range` only. Clock skew, delay and replay are **flags** (V4 §10.3 "skew is flagged"; ADR-006 "emit a quality flag"). `suspect`, `uncalibrated`, `calibration_unknown` and `impossible_jump` are reserved point states for P6; P6 must decide their thresholds before writing them. `stale` and `missing` are read/evaluation states and are never written. Duplicate and sequence logic need per-Component state and are deferred to P3/P6 (D13). |
+| D4 | Determinism | `quality_state` and provenance are a pure function of the canonical value and the pinned versions. Flags are a pure function of `observed_at`, `received_at` and the replay marker. Neither reads wall-clock time. |
+| D5 | Identity and series key | `event_id = observation_event_id(tenant, component, metric, observed_at)`. The InfluxDB series key contains only identity and resolved-ownership tags (`tenant_id`, `site_id`, `asset_id`, `deployment_id`, `device_id`, `component_id`, `probe_id`, `metric_key`, `schema_version`). All of these are fixed by the identity plus the immutable Deployment history. `quality_state` and `source_type` are **fields** (spec delta), so re-classification, replay or redelivery overwrites the same point (last writer wins per field) and never forks a series. `TrustedSourceContext.received_at` is the first-receipt time and MUST be carried unchanged on replay and redelivery. No per-observation DynamoDB receipt is written. |
+| D6 | Bucket | `observation_numeric` lives in the existing `INFLUXDB_BUCKET_RAW` bucket. No per-tenant or per-plan bucket. The runbook records that the bucket's retention must be at least the legacy read window before the `/v1` projection switch. |
+| D7 | Legacy dual-write eligibility | Dual-write only when all three hold: the observation's Component is `default_component_id_for_legacy_device(tenant_id, device_id)`; the resolved Asset exists and carries `PondProfile.legacy_pond_id`; and the metric has a `legacy_field`. Ineligible observations, including a missing Asset, are excluded from legacy and counted, not raised. Native v2 probes never appear in `water_quality`. |
+| D8 | Legacy series identity | Dual-written legacy points use the **stored Telegraf identity**: measurement `water_quality`; tags `device_id`, `pond_id`, `schema_version="1"`, `source` (`mqtt` for `SourceType.LEGACY_MQTT`, otherwise the `SourceType` value) and `tenant_id`; plus `topic="limnopulse/v1/devices/<device_id>/readings"` when the source type is `legacy_mqtt` (the Telegraf `mqtt_consumer` default `topic_tag`). `_time` is the exact `observed_at`: Telegraf does not apply agent `precision` to service inputs. A P2-00 test parses `infra/telegraf/telegraf.conf` and fails if the measurement, static tags, topic pattern or `topic_tag` change. |
+| D9 | Write switches | `TELEMETRY_V2_WRITE_ENABLED` and `TELEMETRY_LEGACY_DUAL_WRITE_ENABLED` are independent and default to `false`. The write path writes v2 first, then legacy. Any failure raises `TelemetryWriteError` and nothing is reported as written; the caller must not acknowledge and must redeliver (ack contract, P2-06). Idempotent identity makes redelivery safe. An InfluxDB 422 is a **partial write** (other lines may be stored) and maps to `retryable=False`. |
+| D10 | `/v1` projection | `V1_TELEMETRY_READ_SOURCE=legacy\|v2` (default `legacy`) swaps the implementation behind the existing `TelemetryRepository` protocol. The v2 projection: reads only the seven legacy metrics; reads only legacy default Components (D7 mirror); reads only the Asset for the legacy pond; includes every quality state (legacy has none); and reproduces legacy series tables and their per-table `sort`/`limit`/`last()` semantics. For data dual-written from legacy default Components, the four `/v1` shapes are byte-identical, sub-second times included. |
+| D11 | `/v2` telemetry API | `API_V2_TELEMETRY_ENABLED` (default `false`, valid only with `API_V2_ENABLED=true`) mounts exactly `GET metric-definitions`, `GET observations` and `GET observations/latest`. `API_V2_ENABLED` alone still mounts only the 13 M1 paths. `observations/latest` is a latest-by-`observed_at` data view, not a health or freshness view (ADR-006). |
+| D12 | Alert evaluator | `ALERT_EVALUATOR_TELEMETRY_SOURCE=legacy\|v2` (default `legacy`). With `v2`, `/v1` rules (pond, optional device, legacy metric) read `observation_numeric` through a new `WindowReader`. The reader: maps the pond to `asset_id_for_legacy_pond` and the metric to `metric_key`; keeps only legacy default Components (rows whose `component_id != DefaultComponentIDForLegacyDevice(tenant, device)` are dropped before `EvaluateSamples`); and keeps only `quality_state == "valid"` (V4 §16.3 default). Coverage, staleness, aggregation and the completeness delay (`AllowedLateness`/`LatestCompleteSlot`) stay unchanged. Alert events keep legacy metric names. Native probes reach alerts only through AlertRuleV2 (D17). |
+| D13 | Trusted mapping and phase split | P2 has no public ingress. The normalizer receives a `TrustedSourceContext` built by trusted code: tests, the P2 dev CLI, and later the P3 worker. P2 delivers the bounded `QuarantinedObservation` record, the no-fallback rule and the ack contract. Moved to **P3/P6 entry gates of #15/#17**, and blocking production canonical writes (D16): quarantine/DLQ persistence, connector-health marking, device/component last-seen, operator reconciliation (§10.2), external-identity-to-DeviceIntegration resolution, sequence gap/regression state, durable queue redrive, and emission of the §23.2 metrics. |
+| D14 | Measurement capability | P2 does not require `ProbeProfile.measurement_metric_keys` to list a metric, because legacy default Components carry none. `probe` and `hybrid` Components measure; an `actuator` Component is quarantined. Capability-gated acceptance belongs to P3 trusted mapping and P6. |
+| D15 | Out-of-range values | An out-of-range value is written (to v2 and, when eligible, to legacy) with `quality_state=out_of_range` and provenance `plausible_range`. Legacy reads still show it, as today. v2 quality-gated alert reads exclude it. This divergence is intentional, tested in P2-05, and documented in the runbook. |
+| D16 | P2 ships dark | No deployed service calls the pipeline in P2; only `scripts/dev/ingest_reading_v2.py` does, and Telegraf keeps writing only `water_quality`. `ALERT_EVALUATOR_TELEMETRY_SOURCE=v2` and `V1_TELEMETRY_READ_SOURCE=v2` may be enabled only where a producer writes every legacy device to `observation_numeric` and the keyed divergence check reports zero missing or different `(pond, device, metric, _time, value)` tuples over max(longest rule window, legacy read window). Production enablement is a P3 exit step. |
+| D17 | AlertRuleV2 deferred | `/v2/alert-rules`, §16.2 selectors, §16.3 declared quality policies and §7.3 `metric_key` rules are deferred to a separate backlog issue, to start after P3/P6. They need health condition keys and non-null confidence. P2 delivers only the `/v1`-rule v2 read adapter (§24 Phase 2 "move the v2 alert adapter first", §16.4). |
+| D18 | ADR phase split recorded | P2-09 appends a "Phase split" section to ADR-006 and ADR-007 that names what P2 proves and what P3 must prove before production canonical writes. The orchestrator records the same entry gates on Epic #15. |
+
+### Spec deltas (V4 §10 → this plan)
+
+| V4 text | P2 contract | Reason |
+|---|---|---|
+| `event_id: "evt_..."` | `obs_<32 hex>` deterministic uuid5 | Canonical-ID convention (`ids.py`); deterministic identity (§10.4). |
+| `source.integration_type: "aws_iot"` | `integration_type: ProviderKey` (opaque) plus `source_type: SourceType` | M1 gate forbids AWS names in `domain/*.py`; transport class is separate from provider. |
+| Envelope has no mapping versions | `mapping{catalog_version, unit_mapping_version, quality_policy_version}` | ADR-005 requires persisted mapping versions. |
+| §10.6 tags include `quality_state`, `source_type` | Both are fields | D5 identity: re-classification and redelivery must not fork series (Codex P1). |
+| §10.6 field list | Adds `event_id`, `quality_state`, `source_type`, three version fields and `quality_provenance_json` | Provenance and versions must persist (ADR-005). |
+| §10.5 `delayed`, `duplicate` states | Flags | Timeliness must not exclude correct values from quality-gated alerts or change series. |
+| §10.5 `suspect` written on skew | Skew is a flag; `suspect` is reserved | §10.3 says skew "is flagged"; avoids legacy/v2 alert divergence on device clock drift. |
 
 ## Execution Graph and Merge Gates
 
@@ -60,13 +116,16 @@ flowchart TD
     A --> D["P2-03 Influx writer + dual-write"]
     A --> E["P2-04 observation reads + /v2 API"]
     A --> F["P2-05 Go v2 window reader"]
+    A --> G["P2-06 normalizer + pipeline"]
+    A --> H["P2-07 /v1 projection"]
     B["P2-01 Influx harness + CI"] --> D
     B --> E
     B --> F
-    C --> G["P2-06 normalizer"]
-    D --> H["P2-07 /v1 projection"]
     B --> H
-    D --> I["P2-08 composition + flags"]
+    C --> G
+    D --> G
+    D --> H
+    D --> I["P2-08 composition + flags + dev CLI"]
     E --> I
     G --> I
     H --> I
@@ -76,13 +135,24 @@ flowchart TD
 
 | Wave | Tasks allowed in parallel | Start condition |
 |---:|---|---|
-| 0 | P2-00, P2-01 | This plan merged and the GitHub graph accepted |
-| 1 | P2-02, P2-03, P2-04, P2-05 | P2-00 and P2-01 merged and green |
-| 2 | P2-06, P2-07 | P2-02 (for P2-06) and P2-03 (for P2-07) merged and green |
+| 0 | P2-00, P2-01 | This plan (PR #76) merged |
+| 1 | P2-02 (needs P2-00); P2-03, P2-04, P2-05 (need P2-00 and P2-01) | Their blockers merged and green |
+| 2 | P2-06 (needs P2-02, P2-03); P2-07 (needs P2-01, P2-03) | Their blockers merged and green |
 | 3 | P2-08 only | P2-03, P2-04, P2-06, P2-07 merged and green |
 | 4 | P2-09 only | P2-05 and P2-08 merged and green |
 
-P2-02 does not need the InfluxDB harness and may start as soon as P2-00 merges. P2-07 depends on the P2-03 writer so that its equivalence fixtures use the production write path. P2-05 depends only on the spine's vectors and the harness, so it can merge any time before P2-09.
+| Task | Issue | Blocked by | Blocks |
+|---|---|---|---|
+| P2-00 | #66 | plan | P2-02, P2-03, P2-04, P2-05, P2-06, P2-07 |
+| P2-01 | #67 | plan | P2-03, P2-04, P2-05, P2-07 |
+| P2-02 | #68 | P2-00 | P2-06 |
+| P2-03 | #69 | P2-00, P2-01 | P2-06, P2-07, P2-08 |
+| P2-04 | #70 | P2-00, P2-01 | P2-08 |
+| P2-05 | #71 | P2-00, P2-01 | P2-09 |
+| P2-06 | #72 | P2-00, P2-02, P2-03 | P2-08 |
+| P2-07 | #73 | P2-00, P2-01, P2-03 | P2-08 |
+| P2-08 | #74 | P2-03, P2-04, P2-06, P2-07 | P2-09 |
+| P2-09 | #75 | P2-05, P2-08 (others transitively) | Epic #22 |
 
 ## Locked Cross-Task Contracts
 
@@ -96,28 +166,43 @@ QUALITY_POLICY_VERSION = "quality-policy@1"
 MAX_OBSERVATIONS_PER_BATCH = 1000
 MAX_QUALITY_JSON_FIELD_BYTES = 512
 MAX_QUARANTINE_EXCERPT_BYTES = 2048
+MAX_SEQUENCE = 2**63 - 1             # signed 64-bit line-protocol integer
+MAX_EXACT_INTEGER = 2**53            # |int| >= this is value_invalid (exact float)
 SOURCE_METADATA_ALLOWLIST = frozenset({"firmware_version"})  # values ≤ 64 chars, never tagged
+LEGACY_MQTT_TOPIC_TEMPLATE = "limnopulse/v1/devices/{device_id}/readings"
 ```
 
 ### Metric catalog `metric-catalog@1`
 
-Metric keys match M1 `CAPABILITY_KEY_PATTERN`. `legacy_field` values are exactly the values of `domain/alerts.py::AlertMetric` and of Go `allowedMetrics`. The plausible range is inclusive.
+- Metric keys match M1 `CAPABILITY_KEY_PATTERN`.
+- `legacy_field` values are exactly the values of `domain/alerts.py::AlertMetric` and of Go `allowedMetrics`.
+- The plausible range is inclusive.
+- Catalog order is the table order.
 
-| metric_key | canonical_unit | value_type | plausible range | legacy_field | legacy Influx field type |
-|---|---|---|---|---|---|
-| `water.temperature` | `degC` | float | [-5, 60] | `temp_c` | float |
-| `water.ph` | `pH` | float | [0, 14] | `ph` | float |
-| `water.dissolved_oxygen` | `mg/L` | float | [0, 50] | `do_mg_l` | float |
-| `water.turbidity` | `NTU` | float | [0, 4000] | `turbidity_ntu` | float |
-| `water.salinity` | `ppt` | float | [0, 70] | `salinity_ppt` | float |
-| `device.battery_voltage` | `V` | float | [0, 60] | `battery_v` | float |
-| `device.rssi` | `dBm` | integer | [-150, 0] | `rssi` | integer |
+| metric_key | display_name | canonical_unit | value_type | plausible range | legacy_field | legacy Influx type |
+|---|---|---|---|---|---|---|
+| `water.temperature` | `Water temperature` | `degC` | float | [-5, 60] | `temp_c` | float |
+| `water.ph` | `pH` | `pH` | float | [0, 14] | `ph` | float |
+| `water.dissolved_oxygen` | `Dissolved oxygen` | `mg/L` | float | [0, 50] | `do_mg_l` | float |
+| `water.turbidity` | `Turbidity` | `NTU` | float | [0, 4000] | `turbidity_ntu` | float |
+| `water.salinity` | `Salinity` | `ppt` | float | [0, 70] | `salinity_ppt` | float |
+| `device.battery_voltage` | `Battery voltage` | `V` | float | [0, 60] | `battery_v` | float |
+| `device.rssi` | `Signal strength (RSSI)` | `dBm` | integer | [-150, 0] | `rssi` | integer |
 
-The legacy `seq` field is not a metric. It maps to `observation.sequence` (integer ≥ 0) and back to the legacy integer field `seq`.
+The legacy `seq` field is not a metric. It maps to `observation.sequence` (integer, `0 ≤ seq ≤ MAX_SEQUENCE`) and back to the legacy integer field `seq`.
+
+**Catalog API (`domain/metric_catalog.py`):**
+- `METRIC_CATALOGS: Mapping[str, tuple[MetricDefinition, ...]]` contains `{"metric-catalog@1": (...)}`.
+- `metric_catalog(version=METRIC_CATALOG_VERSION, *, catalogs=METRIC_CATALOGS) -> tuple[MetricDefinition, ...]`.
+- `metric_definition(metric_key, *, version=METRIC_CATALOG_VERSION, catalogs=METRIC_CATALOGS) -> MetricDefinition | None`.
+- `metric_for_legacy_field(field, *, version=..., catalogs=...) -> MetricDefinition | None`.
+- An unknown version raises `ValueError`. The `catalogs` parameter exists so tests can inject a test-only `@2`.
 
 ### Unit mapping `unit-mapping@1`
 
-Unit codes are case-sensitive. A source unit outside this table is quarantined with `unit_unsupported`. Identity conversions return the input value unchanged (bit-for-bit); non-identity conversions are compared with `math.isclose(rel_tol=1e-12, abs_tol=1e-12)`.
+- Unit codes are case-sensitive.
+- A source unit outside this table is quarantined with `unit_unsupported`.
+- `convert_to_canonical` returns `float(value)` for identity conversions (bit-exact for floats). Non-identity conversions are compared with `math.isclose(rel_tol=1e-12, abs_tol=1e-12)`.
 
 | metric_key | accepted source unit → canonical |
 |---|---|
@@ -129,23 +214,30 @@ Unit codes are case-sensitive. A source unit outside this table is quarantined w
 | `device.battery_voltage` | `V` → x; `mV` → x / 1000 |
 | `device.rssi` | `dBm` → x (must be integral after conversion, else `value_invalid`) |
 
-Booleans, strings, NaN and ±Infinity are `value_invalid`. Percent-saturation dissolved oxygen is intentionally unsupported: converting it needs temperature and salinity.
+- **Invalid values:** booleans, strings, NaN, ±Infinity and integers with `abs ≥ MAX_EXACT_INTEGER` are `value_invalid`.
+- **Intentionally unsupported:** percent-saturation dissolved oxygen, which needs temperature and salinity.
+- **Registry:** `UNIT_MAPPINGS: Mapping[str, ...]` is keyed by version. `convert_to_canonical(..., unit_mappings=UNIT_MAPPINGS)` lets tests inject `@2`.
 
 ### Quality policy `quality-policy@1`
 
-`delay = received_at − observed_at`. The thresholds are versioned constants:
+Definitions:
+- `delay = received_at − observed_at`
+- `delay_ms = (received_us − observed_us) // 1000` (floor division, including negative values)
+- `QUALITY_POLICIES: Mapping[str, QualityPolicy]` is keyed by version and injectable.
 
 | Condition | Effect | Provenance entry |
 |---|---|---|
-| always | — | `schema_validation`, `unit_mapping` (first two entries, in this order) |
+| always | — | `schema_validation`, `unit_mapping` (first two, in this order) |
 | canonical value < min or > max | state `out_of_range` | `plausible_range` |
-| `observed_at − received_at > 300 s` | state `suspect`, flag `clock_skew_future` | `clock_skew` |
-| `delay > 30 days` | state `suspect`, flag `clock_skew_past_extreme` | `clock_skew` |
-| `delay > 300 s` | flag `delayed` (state unchanged) | `timeliness` |
-| `TrustedSourceContext.replay` | flag `replay` (state unchanged) | `replay` |
+| `observed_at − received_at > 300 s` | flag `clock_skew_future` | `clock_skew` |
+| `delay > 30 days` | flag `clock_skew_past_extreme` | `clock_skew` |
+| `delay > 300 s` | flag `delayed` | `timeliness` |
+| `TrustedSourceContext.replay` | flag `replay` | `replay` |
 
-- Precedence: `out_of_range` > `suspect` > `valid`.
-- Flags are unique and sorted by value. Provenance entries are unique, in table order.
+Rules:
+- The state is `out_of_range` when the value is outside the range, otherwise `valid`.
+- Flags are unique and sorted by value.
+- Provenance entries are unique and in table order.
 - `delivery.delayed` is true exactly when the `delayed` flag is present; `delivery.replay` is true exactly when the `replay` flag is present.
 - `confidence` is always `null` in P2.
 
@@ -168,12 +260,17 @@ class QualityState(StrEnum):          # V4 §10.5, all ten values
     DUPLICATE = "duplicate"; DELAYED = "delayed"; IMPOSSIBLE_JUMP = "impossible_jump"; MISSING = "missing"
 
 POINT_QUALITY_STATES = frozenset({VALID, SUSPECT, OUT_OF_RANGE, IMPOSSIBLE_JUMP, UNCALIBRATED, CALIBRATION_UNKNOWN})
-P2_WRITTEN_QUALITY_STATES = frozenset({VALID, SUSPECT, OUT_OF_RANGE})
+P2_WRITTEN_QUALITY_STATES = frozenset({VALID, OUT_OF_RANGE})
 
 class QualityFlag(StrEnum):
     DELAYED = "delayed"; CLOCK_SKEW_FUTURE = "clock_skew_future"
     CLOCK_SKEW_PAST_EXTREME = "clock_skew_past_extreme"; REPLAY = "replay"
-    DUPLICATE = "duplicate"; SEQUENCE_GAP = "sequence_gap"; SEQUENCE_REGRESSION = "sequence_regression"  # reserved
+    DUPLICATE = "duplicate"; SEQUENCE_GAP = "sequence_gap"; SEQUENCE_REGRESSION = "sequence_regression"  # last three reserved
+
+class QualityProvenance(StrEnum):
+    SCHEMA_VALIDATION = "schema_validation"; UNIT_MAPPING = "unit_mapping"
+    PLAUSIBLE_RANGE = "plausible_range"; CLOCK_SKEW = "clock_skew"
+    TIMELINESS = "timeliness"; REPLAY = "replay"
 
 class QuarantineReason(StrEnum):
     METRIC_UNKNOWN = "metric_unknown"; UNIT_UNSUPPORTED = "unit_unsupported"
@@ -186,33 +283,44 @@ These values are frozen by a P2-00 test, in the same way as `test_frozen_enum_va
 
 ### Models (`domain/telemetry_v2.py`)
 
-All models are frozen Pydantic v2 models with `extra="forbid"`. Every datetime must be timezone-aware and is normalized to UTC; a naive datetime is rejected. IDs use the M1 validators: `SafeId` for tenant, `DeviceId` for device, canonical prefixes `site`, `ast`, `cmp`, `prb`, `dep`, `di`, `obs`.
+General rules:
+- All models are frozen Pydantic v2 models with `extra="forbid"`.
+- Every datetime must be timezone-aware and is normalized to UTC; a naive datetime is rejected.
+- IDs use the M1 validators: `SafeId` for tenant, `DeviceId` for device, and the canonical prefixes `site`, `ast`, `cmp`, `prb`, `dep`, `di` and `obs`.
+- Collections are tuples.
 
 ```text
-MetricDefinition      metric_key, display_name, canonical_unit, value_type, plausible_min, plausible_max,
-                      legacy_field | None
-TrustedSourceContext  tenant_id, device_id, integration_id (di_) | None, integration_type: ProviderKey,
-                      source_type: SourceType, connector_version (≤64) | None, received_at, replay=False
-SourceObservation     component_id (cmp_), metric_key (≤64), value: StrictInt | StrictFloat, source_unit (1–16),
-                      observed_at, sequence ≥ 0 | None, source_event_id (1–128 printable) | None,
-                      source_metadata: dict[str, str] keys ⊆ SOURCE_METADATA_ALLOWLIST
-                      — has NO tenant/site/asset/deployment/device field; extra fields are rejected
-CanonicalObservation  schema_version: Literal[2], event_id (obs_), source_event_id | None,
-                      source{integration_id, integration_type, source_type, connector_version, received_at},
-                      resolved{tenant_id, site_id, asset_id, deployment_id, device_id, component_id, probe_id | None},
-                      observation{metric_key, value: finite float, value_type, source_unit, canonical_unit,
-                                  observed_at, sequence | None},
-                      delivery{ingested_at, delayed, replay},
-                      quality{state ∈ POINT_QUALITY_STATES, flags (sorted unique), confidence: None, provenance (non-empty)},
-                      mapping{catalog_version, unit_mapping_version, quality_policy_version},
-                      source_metadata
-                      validators: event_id == observation_event_id(...); delivery flags mirror quality flags
-QuarantinedObservation reason, tenant_id, device_id, component_id | None, metric_key | None, observed_at | None,
-                      received_at, source_event_id | None, detail (≤256), source_excerpt_json (≤2048 bytes), truncated
-StoredObservation     observed_at, received_at, ingested_at, metric_key, value, canonical_unit, site_id, asset_id,
-                      device_id, component_id, probe_id | None, deployment_id, quality_state, quality_flags,
-                      sequence | None, source_type
-NormalizationResult   accepted: tuple[CanonicalObservation, ...], quarantined: tuple[QuarantinedObservation, ...]
+MetricDefinition        metric_key, display_name, canonical_unit, value_type, plausible_min, plausible_max,
+                        legacy_field | None
+TrustedSourceContext    tenant_id, device_id, integration_id (di_) | None, integration_type: ProviderKey,
+                        source_type: SourceType, connector_version (≤64) | None, received_at, replay=False
+SourceObservation       component_id (cmp_), metric_key (≤64), value: StrictInt | StrictFloat (finite),
+                        source_unit (1–16), observed_at, sequence: 0..MAX_SEQUENCE | None,
+                        source_event_id (1–128 printable) | None,
+                        source_metadata: dict[str, str] keys ⊆ SOURCE_METADATA_ALLOWLIST
+                        — has NO tenant/site/asset/deployment/device field; extra fields are rejected
+ObservationSource       integration_id, integration_type, source_type, connector_version, received_at
+ObservationResolution   tenant_id, site_id, asset_id, deployment_id, device_id, component_id, probe_id | None
+ObservationMeasurement  metric_key, value: finite float, value_type, source_unit, canonical_unit,
+                        observed_at, sequence | None
+ObservationDelivery     ingested_at, delayed: bool, replay: bool
+ObservationQuality      state ∈ POINT_QUALITY_STATES, flags: tuple[QualityFlag, ...] (sorted unique),
+                        confidence: None, provenance: tuple[QualityProvenance, ...] (non-empty, unique, table order)
+NormalizationVersions   catalog_version=METRIC_CATALOG_VERSION, unit_mapping_version=UNIT_MAPPING_VERSION,
+                        quality_policy_version=QUALITY_POLICY_VERSION
+CanonicalObservation    schema_version: Literal[2], event_id (obs_), source_event_id | None,
+                        source: ObservationSource, resolved: ObservationResolution,
+                        observation: ObservationMeasurement, delivery: ObservationDelivery,
+                        quality: ObservationQuality, mapping: NormalizationVersions, source_metadata
+                        validators: event_id == observation_event_id(...); delivery flags mirror quality flags
+QuarantinedObservation  reason, tenant_id, device_id, component_id | None, metric_key | None, observed_at | None,
+                        received_at, source_event_id | None, detail (≤256), source_excerpt_json (≤2048 bytes), truncated
+StoredObservation       event_id, observed_at, received_at, ingested_at, metric_key, value, canonical_unit,
+                        site_id, asset_id, device_id, component_id, probe_id | None, deployment_id,
+                        quality_state, quality_flags, quality_provenance, sequence | None, source_type
+NormalizationResult     accepted: tuple[CanonicalObservation, ...], quarantined: tuple[QuarantinedObservation, ...],
+                        counts() -> Mapping[str, int]   # closed keys: accepted, quarantined.<reason>, flag.<flag>,
+                                                          # state.<state>; no tenant/device labels (§23.2 emission is P3)
 ```
 
 ### Canonical identity
@@ -226,33 +334,81 @@ def observation_event_id(tenant_id: str, component_id: str, metric_key: str, obs
     return f"obs_{uuid5(NAMESPACE_URL, discriminator).hex}"
 ```
 
-Mapping versions, quality, `received_at`, `ingested_at` and `source_event_id` are deliberately excluded from the identity. A replay under a later catalog version therefore keeps the same identity (ADR-005).
+The identity deliberately excludes mapping versions, quality, `received_at`, `ingested_at` and `source_event_id`. A replay under a later catalog version therefore keeps the same identity (ADR-005), and D5 keeps it in the same series.
 
-### InfluxDB `observation_numeric` schema and canonical line protocol
+### InfluxDB `observation_numeric` schema and canonical line protocol (`domain/telemetry_v2_schema.py`)
 
-- Measurement: `observation_numeric`. Bucket: `INFLUXDB_BUCKET_RAW`. `_time` = `observed_at` in nanoseconds, computed as integer microseconds × 1000 from the UTC datetime (never via a float `timestamp()`).
-- Tags, the closed allowlist, in sorted key order: `asset_id`, `component_id`, `deployment_id`, `device_id`, `metric_key`, `probe_id` (only when present), `quality_state`, `schema_version` (`"2"`), `site_id`, `source_type`, `tenant_id`.
-- Fields, in sorted key order: `catalog_version` (string), `delay_ms` (integer, may be negative), `event_id` (string), `ingested_at_ns` (integer), `integration_id` (string, only when present), `quality_flags_json` (string, compact sorted JSON array, ≤ 512 bytes), `quality_policy_version` (string), `quality_provenance_json` (string, compact JSON array, ≤ 512 bytes), `received_at_ns` (integer), `sequence` (integer, only when present), `source_event_id` (string, only when present), `source_unit` (string), `unit_mapping_version` (string), `value` (float, always float, even for integer metrics).
-- Formatting:
-  - a float uses `repr(float(v))` (`25.0`, `4.82`, `1e-05`); an integer uses `<n>i`.
-  - string field values escape `\` and `"`; tag keys/values and the measurement escape `,`, `=` and space per Influx line protocol.
-  - one point per line, with no trailing newline in the encoder output.
-- Cardinality guard (`validate_observation_tags`):
-  - rejects any tag key outside the allowlist and any missing required tag;
-  - IDs must match their validators;
-  - `metric_key` must be in the catalog, `source_type` a `SourceType`, `quality_state` a point state, and `schema_version == "2"`;
-  - event IDs, `source_event_id`, firmware, integration IDs and metadata are never tags.
+**Names:**
+- `OBSERVATION_MEASUREMENT = "observation_numeric"`, `LEGACY_MEASUREMENT = "water_quality"`.
+- `OBSERVATION_TAG_KEYS`, `OBSERVATION_REQUIRED_TAG_KEYS`, `OBSERVATION_FIELD_KEYS`, `LEGACY_TAG_KEYS`, `LEGACY_INTEGER_FIELDS = frozenset({"rssi", "seq"})`.
+
+**Functions:**
+- `observation_tags(o) -> dict[str, str]`
+- `validate_observation_tags(tags: Mapping[str, str]) -> None` (raises `ValueError`)
+- `encode_observation_line(o) -> str`
+- `build_legacy_points(observations, legacy_pond_by_asset: Mapping[str, str]) -> tuple[LegacyPoint, ...]`
+- `encode_legacy_line(p) -> str`
+- `flux_string_literal(value: str) -> str`
+
+**Time and storage:** Bucket `INFLUXDB_BUCKET_RAW`. `_time` = `observed_at` in nanoseconds, computed as integer microseconds × 1000 (never via a float `timestamp()`).
+
+**Tags** form a closed allowlist; they are written in sorted key order:
+- `asset_id`, `component_id`, `deployment_id`, `device_id`, `metric_key`
+- `probe_id` (only when present)
+- `schema_version` (`"2"`), `site_id`, `tenant_id`
+
+**Fields**, in sorted key order:
+
+| Field | Type | Notes |
+|---|---|---|
+| `catalog_version` | string | |
+| `delay_ms` | integer | |
+| `event_id` | string | |
+| `ingested_at_ns` | integer | |
+| `integration_id` | string | only when present |
+| `quality_flags_json` | string | compact sorted JSON array, ≤ 512 bytes |
+| `quality_policy_version` | string | |
+| `quality_provenance_json` | string | compact JSON array, ≤ 512 bytes |
+| `quality_state` | string | |
+| `received_at_ns` | integer | |
+| `sequence` | integer | only when present |
+| `source_event_id` | string | only when present |
+| `source_type` | string | |
+| `source_unit` | string | |
+| `unit_mapping_version` | string | |
+| `value` | float | always float, even for integer metrics; avoids field-type conflicts |
+
+**Formatting:**
+- A float uses `repr(float(v))` (`25.0`, `4.82`, `1e-05`); the encoder raises on non-finite values (defense in depth).
+- An integer is written as `<n>i` and must lie in the signed 64-bit range.
+- String field values escape `\` and `"`. Tag keys/values and the measurement escape `,`, `=` and space.
+- One point per line; the encoder output has no trailing newline.
+
+**Cardinality guard** (`validate_observation_tags`):
+- It rejects any key outside the allowlist and any missing required tag.
+- IDs must match their validators, `metric_key` must be in the catalog, and `schema_version` must equal `"2"`.
+- Event IDs, `source_event_id`, firmware, integration IDs, quality, source type and metadata are never tags.
+
+**Flux literal helper:** `flux_string_literal` returns `json.dumps(value)` with `$` replaced by `\$`. P2-03, P2-04 and P2-07 use it. Go code applies the same rule in its v2 query.
 
 ### Legacy `water_quality` dual-write point
 
 ```text
-water_quality,device_id=<d>,pond_id=<p>,schema_version=1,source=<mqtt|source_type>,tenant_id=<t> <fields> <floor(observed_at, 1s) in ns>
+water_quality,device_id=<d>,pond_id=<p>,schema_version=1,source=<mqtt|source_type>,tenant_id=<t>[,topic=limnopulse/v1/devices/<d>/readings] <fields> <observed_at ns, exact>
 ```
 
-- `LegacyPoint` is a frozen dataclass with `tenant_id`, `pond_id`, `device_id`, `source` and `observed_at`, plus `fields: Mapping[str, float | int]` keyed by legacy field name or `seq`.
-- The six float metrics are written as floats. `rssi` and `seq` are written as integers (`-67i`, `1i`), matching the Telegraf schema to avoid field-type conflicts.
+- `LegacyPoint` is a frozen dataclass with:
+  - `tenant_id`, `pond_id`, `device_id`, `source`, `topic: str | None` and `observed_at`;
+  - `fields: Mapping[str, float | int]`, keyed by legacy field name or `seq`.
+- Field types:
+  - the six float metrics are written as floats;
+  - `rssi` and `seq` are written as integers (`-67i`, `1i`), matching the Telegraf schema.
 - Fields are written in sorted key order.
-- Eligible observations that share `(tenant, pond, device, floored second)` are grouped into one line. When grouped values conflict, the observation with the latest `observed_at` wins, then the higher `sequence`; `seq` is the winning observation's sequence.
+- `build_legacy_points`:
+  - groups eligible observations by `(tenant, pond, device, source, topic, exact observed_at)`;
+  - resolves a conflicting field by latest `ingested_at`, then greater `event_id`;
+  - takes `seq` from the winning observation (a `None` sequence ranks lowest, and `seq` is omitted when all are `None`).
+- P2-03 performs the Asset lookups and calls this pure function.
 
 ### Repository protocols (`repositories/telemetry_v2.py`)
 
@@ -280,57 +436,96 @@ class ObservationReader(Protocol):
 
     async def query_latest_observations(
         self, *, tenant_id: str, selector: ObservationSelector,
-        metric_keys: frozenset[str] | None, lookback: timedelta,
+        metric_keys: frozenset[str] | None, lookback: timedelta, now: datetime,
     ) -> list[StoredObservation]: ...
 ```
 
-A P2-00 test freezes the method names, parameter names/kinds and annotations, like `test_v2_repository_protocols.py`.
+- A P2-00 test freezes the method names, parameter names/kinds and annotations, like `test_v2_repository_protocols.py`.
+- Windows are half-open: `[start, stop)` and `[now − lookback, now)`, by `observed_at`.
+- `core/errors.py` gains `TelemetryWriteError(LimnopulseError)` with a keyword-only `retryable: bool` attribute.
 
-`core/errors.py` gains `TelemetryWriteError(LimnopulseError)` with a keyword-only `retryable: bool` attribute.
+### Cross-language vectors and loader
 
-### Cross-language vectors (`testdata/telemetry_v2/contract_vectors.json`)
+`scripts/dev/export_telemetry_v2_vectors.py [--check]` generates `testdata/telemetry_v2/contract_vectors.json` deterministically from the Python contract. `--check` exits 1 on drift. The script has no `--output` flag; its test monkeypatches the module-level output path to a `tmp_path` copy.
 
-`scripts/dev/export_telemetry_v2_vectors.py [--check]` generates the file deterministically from the Python contract; `--check` exits 1 on drift. It contains:
+The file contains:
+- the versions;
+- the measurement names, tag keys and field keys;
+- the catalog rows, including display names;
+- deterministic ID vectors for at least five inputs each: `asset_id_for_legacy_pond`, `default_component_id_for_legacy_device` and `observation_event_id`. The inputs include `tnt_local_001`/`pond_local_001`/`local-device-001`.
 
-- versions;
-- measurement names, tag keys and field keys;
-- the catalog rows;
-- deterministic ID vectors: `asset_id_for_legacy_pond` and `default_component_id_for_legacy_device` for at least five inputs each, including `tnt_local_001`/`pond_local_001`/`local-device-001`;
-- `observation_event_id` vectors.
+It also contains named **scenarios** with literal IDs. Each scenario states:
+- its tenant, ponds, devices, components and source type;
+- its canonical observations (JSON);
+- the exact `observation_numeric` lines;
+- the exact `water_quality` lines and their count.
 
-It also contains named scenarios. Each scenario holds its canonical observations as JSON, the exact expected `observation_numeric` lines and the exact expected `water_quality` lines:
+Scenarios:
 
-- `legacy_sample`: `examples/telemetry/reading.local.json` for `local-device-001` in `tnt_local_001`/`pond_local_001`. Seven v2 lines and one legacy line.
-- `two_probes_same_metric`: two probe Components of one native v2 Device, both `water.dissolved_oxygen`, at the same `observed_at`. Two v2 lines and no legacy line.
-- `out_of_range`: a legacy default Component with `water.dissolved_oxygen = 75.0`, state `out_of_range`. One v2 line and one legacy line.
-- `delayed_replay`: flags `delayed` and `replay`.
-- `relocation`: one legacy default Component, before and after a West→East move, with distinct deployment and asset IDs.
-- `unit_converted`: source `degF`, canonical `degC`.
+| Scenario | Content | v2 lines | Legacy lines |
+|---|---|---|---|
+| `legacy_sample` | `examples/telemetry/reading.local.json` for `local-device-001` in `tnt_local_001`/`pond_local_001`, `legacy_mqtt` | 7 | 1 (with `topic`) |
+| `sub_second` | Same as `legacy_sample`, at `…:00.750Z` | 7 | 1 (exact time) |
+| `two_probes_same_metric` | Two probe Components of one native v2 Device, both `water.dissolved_oxygen`, at the same `observed_at`, deployed to a **legacy pond Asset** | 2 | 0 |
+| `out_of_range` | Legacy default Component, `water.dissolved_oxygen = 75.0` | 1 (`out_of_range`) | 1 |
+| `delayed_replay` | Flags `delayed` and `replay` | 1+ | 1 |
+| `relocation` | One legacy default Component before and after a move from `pond_west` to `pond_east`; assets from `asset_id_for_legacy_pond`, distinct deployments | 2+ | 2 |
+| `unit_converted` | Source `degF`, canonical `degC` | 1 | 1 |
+| `multi_point_series` | ≥ 30 points at 1-minute cadence, 2 devices, 2 legacy ponds | — | — |
 
-Go and Python tests seed real InfluxDB from these lines. Evaluator parity is therefore measured on bytes the production encoder emits.
+The static scenarios are for byte-level encoder, seeding and parity tests. Relative-window tests rebase them to a captured `now` through the production encoder.
+
+`tests/support/telemetry_v2_vectors.py` (owned by P2-00) provides `load_vectors()` and `scenario(name) -> TelemetryScenario`, which exposes the observations, `v2_lines` and `legacy_lines`, plus `rebased(now)`.
 
 ### Rollout switches
 
 | Setting / env | Default | Owner | Effect |
 |---|---|---|---|
-| `TELEMETRY_V2_WRITE_ENABLED` | `false` | P2-08 | Write `observation_numeric` points. |
+| `TELEMETRY_V2_WRITE_ENABLED` | `false` | P2-08 | Write `observation_numeric` points (consumed by the dev CLI in P2; P3 worker later). |
 | `TELEMETRY_LEGACY_DUAL_WRITE_ENABLED` | `false` | P2-08 | Write eligible `water_quality` points from the normalizer path. |
 | `API_V2_TELEMETRY_ENABLED` | `false` | P2-08 | Mount the three `/v2` telemetry routes; requires `API_V2_ENABLED=true` (validation error otherwise). |
-| `V1_TELEMETRY_READ_SOURCE` | `legacy` | P2-08 | `legacy` or `v2` implementation behind the `/v1` `TelemetryRepository`. |
-| `ALERT_EVALUATOR_TELEMETRY_SOURCE` | `legacy` | P2-05 | Go `WindowReader` selection (`legacy` or `v2`); also `--telemetry-source`. |
+| `V1_TELEMETRY_READ_SOURCE` | `legacy` | P2-08 | `legacy` or `v2` implementation behind the `/v1` `TelemetryRepository` (D16 precondition). |
+| `ALERT_EVALUATOR_TELEMETRY_SOURCE` | `legacy` | P2-05 | Go `WindowReader` selection (`legacy` or `v2`); also `--telemetry-source` (D16 precondition). |
 
-App-state names created by P2-08: `app.state.observation_writer`, `app.state.observation_reader`, `app.state.observation_write_service`. `app.state.telemetry_repository` keeps its name and becomes the projection-selected implementation. Every new name is added to the lifespan skip-list so tests can inject fakes.
+P2-08 creates these app-state names:
+- `app.state.observation_reader`;
+- `app.state.observation_writer` (None unless a write switch is on);
+- `app.state.observation_write_service`.
+
+`app.state.telemetry_repository` keeps its name and becomes the projection-selected implementation. Every new name is added to the lifespan skip-list.
 
 ### InfluxDB integration harness contract (P2-01)
 
-- Env: `RUN_INFLUX_INTEGRATION=1`, plus `INFLUX_INTEGRATION_URL` (default `http://127.0.0.1:8086`), `INFLUX_INTEGRATION_TOKEN` (default `local-dev-token`) and `INFLUX_INTEGRATION_ORG` (default `limnopulse`).
-- Python: `tests/support/influx_harness.py` provides the fixture factory `influx_bucket` (a unique bucket per test, deleted afterwards) and `influx_clients(bucket)`, which yields a `query_api`/`write_api` pair bound to it.
-- Go: integration tests create and delete their own bucket through `influxdb2.Client.BucketsAPI()` using the same env names.
-- `scripts/dev/run_local_influxd.sh` runs InfluxDB 2.7.11 without Docker. It downloads `influxdb2-2.7.11_linux_amd64.tar.gz`, checks SHA-256 `8d7872013cad3524fb728ca8483d0adc30125ad1af262ab826dcf5d1801159cf` and unpacks into `${XDG_CACHE_HOME:-$HOME/.cache}/limnopulse/influxd`. It starts on a loopback port and runs idempotent setup with the default org and token. It is for local and session use only.
-- CI:
-  - `.github/workflows/verify.yml` gains job `influx`, running `make verify-influx` against a service container `influxdb:2.7.11-alpine` initialized with the defaults above.
-  - `make verify-influx` runs `uv sync --locked --extra dev`, then `RUN_INFLUX_INTEGRATION=1 uv run --locked --no-sync python -m pytest -q tests/influx`, then `RUN_INFLUX_INTEGRATION=1 go test -race -run 'TestInfluxIntegration' ./...`.
-  - The aggregate `make verify` is unchanged.
+**Environment variables:**
+- `RUN_INFLUX_INTEGRATION=1`
+- `INFLUX_INTEGRATION_URL` (default `http://127.0.0.1:8086`)
+- `INFLUX_INTEGRATION_TOKEN` (default `local-dev-token`)
+- `INFLUX_INTEGRATION_ORG` (default `limnopulse`)
+
+**Python:**
+- `tests/support/influx_harness.py` never skips on import. It provides:
+  - the `influx_bucket` fixture factory, which calls `pytest.skip` unless `RUN_INFLUX_INTEGRATION=1` and otherwise creates a uniquely named bucket with no retention rule, deleted at teardown;
+  - `influx_clients(bucket)`, which yields a `query_api`/`write_api` pair;
+  - `write_lines(bucket, lines)`.
+- `tests/influx/conftest.py` (P2-01) re-exports the fixtures and marks every `tests/influx` item skipped without the env.
+
+**Go:**
+- P2-01 owns `internal/alertevaluator/influx/integration_harness_test.go`, which provides `newIntegrationBucket(t) (client, bucket)` and `writeLines(t, …)` and creates/deletes buckets through `BucketsAPI()`.
+- It also provides `TestInfluxIntegrationHarnessSmoke`.
+
+**`scripts/dev/run_local_influxd.sh`** runs InfluxDB 2.7.11 without Docker:
+- downloads `influxdb2-2.7.11_linux_amd64.tar.gz`, checks SHA-256 `8d7872013cad3524fb728ca8483d0adc30125ad1af262ab826dcf5d1801159cf`, and unpacks into `${XDG_CACHE_HOME:-$HOME/.cache}/limnopulse/influxd`. The tarball has no `influx` CLI;
+- starts on a loopback port and waits for `/health`;
+- runs setup through `curl -X POST /api/v2/setup`. A `conflict` "onboarding has already been completed" response counts as success.
+
+**CI:**
+- `.github/workflows/verify.yml` gains job `influx`, running exactly `make verify-influx`.
+- The job uses service container `influxdb:2.7.11-alpine`, initialized with the defaults above. Readiness comes from service `options: --health-cmd "influx ping"`, not an extra `run:` step.
+- `make verify-influx` runs:
+  - `$(UV) sync --locked --extra dev`
+  - `RUN_INFLUX_INTEGRATION=1 $(UV) run --locked --no-sync python -m pytest -q tests/influx`
+  - `RUN_INFLUX_INTEGRATION=1 go test -race -run 'TestInfluxIntegration' ./...`
+- `verify-influx` joins `.PHONY`. The aggregate `make verify` is unchanged; `test_ci_contract.py` keeps it as a separate expectation.
 
 ### `/v2` telemetry API (P2-04, mounted by P2-08)
 
@@ -340,27 +535,64 @@ GET /v2/tenants/{tenant_id}/observations
 GET /v2/tenants/{tenant_id}/observations/latest
 ```
 
-- **Roles and errors**: `READ_ROLES`. 403 `tenant access denied` comes before any lookup. 503 on `TelemetryQueryError`. Every request model has `extra="forbid"`.
-- **`metric-definitions`** returns `{"items": [...]}` in catalog order. Each item carries `metric_key`, `display_name`, `canonical_unit`, `value_type`, `plausible_min`, `plausible_max`, `legacy_field` and `catalog_version`.
-- **`observations`** query parameters:
+**Roles and errors:**
+- Roles: `READ_ROLES`.
+- 403 `tenant access denied` comes before any lookup; 503 on `TelemetryQueryError`.
+- Request models use `extra="forbid"`.
+- `now` comes from an injected clock.
+
+**Schema names:** every response/request model name is prefixed `V2` (for example `V2ObservationResponse`, `V2MetricDefinitionResponse`), and a test proves the names are disjoint from the `/v1` component names. Otherwise FastAPI would rename a colliding v1 component and drift the `/v1` golden when the flag is on.
+
+**`metric-definitions`** returns `{"items": [...]}` in catalog order. Each item carries `metric_key`, `display_name`, `canonical_unit`, `value_type`, `plausible_min`, `plausible_max`, `legacy_field` and `catalog_version`.
+
+**`observations`** returns `{"items": [...]}`.
+- Query parameters:
   - exactly one of `asset_id`, `component_id` or `device_id`, otherwise 422;
-  - `metric_key` (repeatable, every value in the catalog, otherwise 422);
-  - `quality_state` (repeatable, point states only);
-  - `start` and `stop`, both timezone-aware ISO-8601. They default to `stop = now` and `start = stop − 1 h`. `stop` must be after `start`, and the range is at most 31 days, otherwise 422;
+  - `metric_key` (repeatable, each value in the catalog, otherwise 422);
+  - `quality_state` (repeatable, point states only, otherwise 422);
+  - `start` and `stop`, both timezone-aware ISO-8601. They default to `stop = now` and `start = stop − 1 h`. The window is half-open `[start, stop)` by `observed_at`. `stop` must be after `start`, and the range is at most 31 days, otherwise 422;
   - `limit` from 1 to 1000, default 500.
-  - The selector entity must exist in the tenant (M1 readers), otherwise 404 with no Influx call.
-  - Results are ordered by `observed_at`, `component_id`, `metric_key` ascending, and the limit is applied after the global sort.
-- **`observations/latest`** takes the same selector and optional `metric_key`, with a 24 h lookback. It returns one item per `(component_id, metric_key)`, ordered by `component_id`, `metric_key`.
-- **Item fields**: `observed_at`, `received_at`, `ingested_at`, `metric_key`, `value`, `unit`, `site_id`, `asset_id`, `device_id`, `component_id`, `probe_id`, `deployment_id`, `quality` `{state, flags}`, `sequence`, `source_type`. `integration_id`, `source_event_id` and metadata are not exposed.
+- A selector entity missing in the tenant gives 404 with zero reader calls.
+- Ordering: by `observed_at`, `component_id`, `metric_key` ascending, with the limit applied after the global sort. The Flux pattern is pivot → `group()` → sort → `limit`; never `group()` before pivot.
+
+**`observations/latest`** returns `{"items": [...]}`.
+- It takes the same selector and an optional `metric_key`, over the window `[now − 24 h, now)`.
+- It returns one item per `(component_id, metric_key)`: the latest by `observed_at`, ordered by `component_id`, `metric_key`.
+- The Flux pattern is pivot → `group(component_id, metric_key)` → `sort(_time)` → `last(column: "_time")` → `group()` → sort.
+- It is **not** a health or freshness view. Online/health status is P6 and uses `received_at`/`ingested_at`.
+
+**Item fields:**
+- identity and time: `event_id`, `observed_at`, `received_at`, `ingested_at`;
+- measurement: `metric_key`, `value`, `unit`;
+- ownership: `site_id`, `asset_id`, `device_id`, `component_id`, `probe_id`, `deployment_id`;
+- quality: `quality: {state, flags, provenance}`;
+- delivery: `sequence`, `source_type`.
+
+`integration_id`, `source_event_id` and metadata are not exposed.
 
 ### `/v1` projection semantics (P2-07)
 
-`V2ProjectedTelemetryRepository(query_api, org, bucket, domain_repository)` implements the existing `TelemetryRepository` protocol over `observation_numeric`:
+`V2ProjectedTelemetryRepository(*, query_api, org, bucket, domain_repository)` implements the existing `TelemetryRepository` over `observation_numeric`. This Flux shape was verified equal to the legacy adapter on InfluxDB 2.7.11:
 
-- **Filters**: `tenant_id`, `asset_id = asset_id_for_legacy_pond(tenant_id, pond_id)` (for the tenant-wide method, the set derived from `domain_repository.list_ponds(tenant_id)`), and `metric_key` limited to the seven catalog metrics. Every quality state is included. `_time` is floored to the second. Metric keys and `sequence` map back to legacy field names and `seq`.
-- **Rows** keep the legacy row keys: readings use `(_time, tenant_id, pond_id, device_id)`. Latest per pond has no device in the row key. Latest per tenant keeps the newest row per `pond_id` within 24 h, sorted by pond.
-- **Summary** keeps the legacy period/interval table, the `do_mg_l`, `ph` and `temp_c` series and statistics, and wraps errors in `TelemetryQueryError`. The other methods propagate errors exactly as the legacy adapter does.
-- **Equivalence**: for the same samples dual-written by P2-03, each of the four methods returns objects equal to `InfluxTelemetryRepository`'s. The four `/v1` HTTP responses are byte-identical. Samples have distinct whole-second times per device.
+```text
+from(bucket: B) |> range(<same bounds as legacy>)
+  |> filter(_measurement == "observation_numeric") |> filter(tenant_id == T) |> filter(asset_id <in pond assets>)
+  |> filter(fn: (r) => contains(value: r["component_id"], set: <legacy default component ids>))
+  |> filter(fn: (r) => contains(value: r["metric_key"], set: <7 keys>))
+  |> filter(fn: (r) => r["_field"] == "value" or r["_field"] == "sequence")
+  |> map(... legacy shape: _measurement "water_quality", pond_id from asset, source mapped, _field legacy name / "seq",
+         _value float ...)
+  |> group(columns: ["_start","_stop","_measurement","tenant_id","pond_id","device_id","source","schema_version"])
+  |> <legacy tail: pivot/sort/limit | sort(_time) → last() → regroup → pivot | summary>
+```
+
+- **Component set.** It is `{default_component_id_for_legacy_device(t, d.device_id) for d in domain_repository.list_devices(t)}`. Native v2 Components are never visible through `/v1`.
+- **Legacy series tables.** Group by the legacy series key before any `last()`, pivot, `sort` or `limit`. Legacy `limit(n)` and `sort` apply **per series table**, which means per device and source, not globally.
+- **Latest.** Sort by `_time` before `last()` (`last()` follows table order), then re-group with the legacy key immediately after `last()`. The chain `map → group → sort → last() → pivot` panics in 2.7.11 without the regroup.
+- **Summary.** Keep the legacy period/interval table (24h→5m, 7d/30d→1h) and the `do_mg_l`, `ph` and `temp_c` series with mean/min/max/count. Sort by `device_id, _time` after `group(columns: ["_field"])` and before aggregation. This reproduces legacy float summation order, so `mean` is byte-identical. Errors are wrapped in `TelemetryQueryError`.
+- **Error propagation.** The other methods propagate errors exactly like the legacy adapter.
+- **Integer fields.** `rssi` and `seq` are converted explicitly to `int` after checking `float.is_integer()`. There is no reliance on Pydantic lax coercion.
+- **No time flooring.** Legacy dual-write stores exact time.
 
 ### Go evaluator v2 reader (P2-05)
 
@@ -369,36 +601,45 @@ from(bucket: <b>)
   |> range(start: time(v: <Start>), stop: time(v: <End>))
   |> filter(fn: (r) => r["_measurement"] == "observation_numeric")
   |> filter(fn: (r) => r["tenant_id"] == <tenant>)
-  |> filter(fn: (r) => r["asset_id"] == <assetIDForLegacyPond(tenant, pond)>)
+  |> filter(fn: (r) => r["asset_id"] == <AssetIDForLegacyPond(tenant, pond)>)
   [|> filter(fn: (r) => r["device_id"] == <device>)]
-  |> filter(fn: (r) => r["metric_key"] == <metricKeyForLegacyMetric(metric)>)
-  |> filter(fn: (r) => r["quality_state"] == "valid")
-  |> filter(fn: (r) => r["_field"] == "value" or r["_field"] == "sequence")
+  |> filter(fn: (r) => r["metric_key"] == <MetricKeyForLegacyMetric(metric)>)
+  |> filter(fn: (r) => r["_field"] == "value" or r["_field"] == "sequence" or r["_field"] == "quality_state")
   |> pivot(rowKey: ["_time", "device_id", "component_id"], columnKey: ["_field"], valueColumn: "_value")
+  |> filter(fn: (r) => r["quality_state"] == "valid")
   |> keep(columns: ["_time", "device_id", "component_id", "value", "sequence"])
+  |> group()
   |> sort(columns: ["_time", "device_id", "component_id"])
 ```
 
-- Every literal goes through the existing `fluxString`.
-- Rows become `alertevaluator.Sample{Time, DeviceID, Value, Seq}` and flow through the unchanged `EvaluateSamples`.
-- `assetIDForLegacyPond` uses `uuid.NewSHA1(uuid.NameSpaceURL, []byte("limnopulse/v4/legacy-pond/"+tenant+"/"+pond))` and returns `"ast_" + hex without dashes`. It must equal the Python vectors.
-- Parity means identical `WindowResult` values for the legacy reader on `water_quality` and the v2 reader on `observation_numeric`, seeded from the same scenario lines.
-- Two probes of the same metric on one device are deduplicated per `(device, bucket)` by the existing rule (latest time, then higher `Seq`, then the deterministic sort order). This is documented as the `/v1`-rule semantics.
+**Escaping and identifiers:**
+- Every literal goes through `fluxString`, plus `$` escaping for the v2 query.
+- `AssetIDForLegacyPond` and `DefaultComponentIDForLegacyDevice` use `uuid.NewSHA1(uuid.NameSpaceURL, …)` with the Python discriminators and return `"<prefix>_" + hex` without dashes. They must equal the Python vectors.
+
+**Rows to samples:**
+- Rows with `component_id != DefaultComponentIDForLegacyDevice(tenant, device_id)` are dropped.
+- The remaining rows become `alertevaluator.Sample{Time, DeviceID, Value, Seq}` and pass through the unchanged `EvaluateSamples`. A missing `sequence` gives `Seq = 0`, like a legacy missing `seq`.
+
+**Parity** means identical `WindowResult` values for the legacy reader on `water_quality` and the v2 reader on `observation_numeric`:
+- Scenarios: `legacy_sample`, `sub_second`, `delayed_replay`, `relocation`, `unit_converted` and `multi_point_series`.
+- `out_of_range` asserts the documented divergence.
+- `two_probes_same_metric` asserts that a `/v1` rule sees no data from native probes.
+- Query errors take the same `query_error` path as legacy.
 
 ## File Ownership Map
 
 | Task | Exclusive responsibility | Restriction |
 |---|---|---|
-| P2-00 | `domain/telemetry_v2.py`, `domain/metric_catalog.py`, `domain/telemetry_v2_schema.py`, `repositories/telemetry_v2.py`, `TelemetryWriteError` in `core/errors.py`, `testdata/telemetry_v2/`, `scripts/dev/export_telemetry_v2_vectors.py` | No adapters, services, routers, settings or Go code |
-| P2-01 | `tests/support/influx_harness.py`, `tests/influx/test_influx_harness_smoke.py`, `scripts/dev/run_local_influxd.sh`, `Makefile` (`verify-influx` only), `.github/workflows/verify.yml` (`influx` job only), `tests/unit/test_ci_contract.py`, `docs/verification.md` | No runtime code |
+| P2-00 | `domain/telemetry_v2.py`, `domain/metric_catalog.py`, `domain/telemetry_v2_schema.py`, `repositories/telemetry_v2.py`, `TelemetryWriteError` in `core/errors.py`, `testdata/telemetry_v2/`, `scripts/dev/export_telemetry_v2_vectors.py`, `tests/support/telemetry_v2_vectors.py` | No adapters, services, routers, settings or Go code |
+| P2-01 | `tests/support/influx_harness.py`, `tests/influx/conftest.py`, `tests/influx/test_influx_harness_smoke.py`, `internal/alertevaluator/influx/integration_harness_test.go`, `scripts/dev/run_local_influxd.sh`, `Makefile` (`verify-influx` only), `.github/workflows/verify.yml` (`influx` job only), `tests/unit/test_ci_contract.py`, `docs/verification.md` | No runtime code |
 | P2-02 | `domain/telemetry_units.py`, `domain/telemetry_quality.py` | Pure functions only; no I/O |
 | P2-03 | `adapters/influxdb_v2_writer.py`, `services/telemetry_v2_writes.py` | No settings, `main.py` or `/v1` files |
 | P2-04 | `adapters/influxdb_v2_reader.py`, `services/telemetry_v2.py`, `api/v2/routers/observations.py`, `api/v2/routers/metric_definitions.py`, `api/v2/schemas/observations.py`, `api/v2/schemas/metric_definitions.py`, `api/v2/telemetry_dependencies.py` | Routers unmounted; no edit to `api/v2/router.py`, `api/v2/dependencies.py` or `main.py` |
-| P2-05 | `internal/alertevaluator/influx/{query_v2,client_v2,legacy_ids}.go` and their tests, `internal/alertevaluator/config.go`, `config_test.go`, `cmd/alert-evaluator/main.go` | No Python; no change to `EvaluateSamples` or `state_machine.go` |
-| P2-06 | `services/telemetry_normalizer.py`, `domain/legacy_telemetry_mapping.py` | No Influx I/O |
-| P2-07 | `adapters/influxdb_v1_projection.py` | No change to `/v1` routers, services, schemas or `adapters/influxdb.py` |
-| P2-08 | `core/config.py`, `main.py`, `api/router.py`, `api/v2/router.py`, `services/telemetry_pipeline.py`, `scripts/dev/ingest_reading_v2.py`, `.env.example`, `README.md`, `docs/architecture.md` (new section only), `tests/api/test_v2_composition.py`, `tests/api/test_app_runtime.py` | Integration hotspot owner; no feature logic |
-| P2-09 | `tests/contracts/test_p2_acceptance_gate.py`, `tests/influx/test_p2_acceptance_influx.py`, `docs/p2-telemetry-rollout-runbook.md`, README link | No production feature code |
+| P2-05 | `internal/alertevaluator/influx/{query_v2,client_v2,legacy_ids}.go` and their tests, `internal/alertevaluator/config.go`, `config_test.go`, `cmd/alert-evaluator/main.go`, `main_test.go`, `docs/alert-evaluator-phase-3b.md` (telemetry-source section) | No Python; no change to `EvaluateSamples`, `state_machine.go` or the legacy `query.go`/`client.go` behavior |
+| P2-06 | `services/telemetry_normalizer.py`, `domain/legacy_telemetry_mapping.py`, `services/telemetry_pipeline.py` | No InfluxDB I/O; no settings |
+| P2-07 | `adapters/influxdb_v1_projection.py` | No change to `/v1` routers, services, schemas, `repositories/telemetry.py` or `adapters/influxdb.py` |
+| P2-08 | `core/config.py`, `main.py`, `api/router.py`, `api/v2/router.py`, `scripts/dev/ingest_reading_v2.py`, `.env.example`, `README.md`, `docs/architecture.md` (new section only; pinned header unchanged), `tests/api/test_v2_composition.py`, `tests/api/test_app_runtime.py` | Integration hotspot owner; no feature logic |
+| P2-09 | `tests/contracts/test_p2_acceptance_gate.py`, `tests/influx/test_p2_acceptance_influx.py`, `docs/p2-telemetry-rollout-runbook.md`, `docs/adr/ADR-006-*.md` and `docs/adr/ADR-007-*.md` (append "Phase split" only), README runbook link | No production feature code |
 
 Each task also owns the new test files named in its section.
 
@@ -406,71 +647,116 @@ Each task also owns the new test files named in its section.
 
 ### Task 1: P2-00 — Freeze the canonical telemetry contract spine
 
-**Branch:** `agent/v4-p2-00-telemetry-contract-spine` · **Blocked by:** this plan merged · **Blocks:** P2-02 through P2-09
+**Branch:** `agent/v4-p2-00-telemetry-contract-spine` · **Blocked by:** plan merged · **Blocks:** P2-02, P2-03, P2-04, P2-05, P2-06, P2-07
 
 **Files:**
-- Create: `src/limnopulse_api/domain/telemetry_v2.py`, `src/limnopulse_api/domain/metric_catalog.py`, `src/limnopulse_api/domain/telemetry_v2_schema.py`, `src/limnopulse_api/repositories/telemetry_v2.py`, `scripts/dev/export_telemetry_v2_vectors.py`, `testdata/telemetry_v2/contract_vectors.json`
-- Modify: `src/limnopulse_api/core/errors.py` (add `TelemetryWriteError`)
-- Test: `tests/unit/test_telemetry_v2_contracts.py`, `tests/unit/test_metric_catalog.py`, `tests/unit/test_telemetry_v2_schema.py`, `tests/unit/test_telemetry_v2_protocols.py`, `tests/unit/test_telemetry_v2_vectors.py`
+- Create:
+  - `src/limnopulse_api/domain/telemetry_v2.py`
+  - `src/limnopulse_api/domain/metric_catalog.py`
+  - `src/limnopulse_api/domain/telemetry_v2_schema.py`
+  - `src/limnopulse_api/repositories/telemetry_v2.py`
+  - `scripts/dev/export_telemetry_v2_vectors.py`
+  - `testdata/telemetry_v2/contract_vectors.json`
+  - `tests/support/telemetry_v2_vectors.py`
+- Modify: `src/limnopulse_api/core/errors.py`
+- Test:
+  - `tests/unit/test_telemetry_v2_contracts.py`
+  - `tests/unit/test_metric_catalog.py`
+  - `tests/unit/test_telemetry_v2_schema.py`
+  - `tests/unit/test_telemetry_v2_protocols.py`
+  - `tests/unit/test_telemetry_v2_vectors.py`
+  - `tests/unit/test_telegraf_legacy_identity.py`
 
-**Interfaces:** Consumes the M1 `ids.py` validators and deterministic legacy IDs, plus `v2_common.SafeId`, `DeviceId`, `ProviderKey` and `format_utc_timestamp`. Produces every type, constant, encoder, guard, protocol and vector in **Locked Cross-Task Contracts**.
+**Interfaces:**
+- Consumes:
+  - from M1: the `ids.py` validators and deterministic legacy IDs;
+  - from `v2_common`: `SafeId`, `DeviceId`, `ProviderKey`, `CAPABILITY_KEY_PATTERN` and `format_utc_timestamp`;
+  - `AlertMetric`;
+  - `infra/telegraf/telegraf.conf`.
+- Produces every type, constant, function, protocol, vector and loader in **Locked Cross-Task Contracts**.
 
 - [ ] **Step 1: Write failing contract tests.**
-  - enum values frozen;
-  - catalog equals the table, `{m.legacy_field} == {v.value for v in AlertMetric}`, keys match `CAPABILITY_KEY_PATTERN`;
-  - models reject naive datetimes, extra fields, NaN/Infinity, booleans as values, bad ID prefixes and non-allowlisted metadata;
-  - `SourceObservation` has no `tenant_id`/`site_id`/`asset_id`/`deployment_id`/`device_id` field;
-  - `CanonicalObservation` rejects a mismatched `event_id` and inconsistent delivery/flag mirrors;
-  - `observation_event_id` is stable and excludes versions, quality and times other than `observed_at`.
+  - Enum values are frozen.
+  - The catalog equals the table, display names included; `{m.legacy_field} == {v.value for v in AlertMetric}`; keys match `CAPABILITY_KEY_PATTERN`; an unknown version raises.
+  - Models reject naive datetimes, extra fields, NaN/Infinity, booleans as values, a sequence above `MAX_SEQUENCE`, bad ID prefixes and non-allowlisted metadata.
+  - `SourceObservation` has no tenant/site/asset/deployment/device field.
+  - `CanonicalObservation` rejects a mismatched `event_id` and inconsistent delivery/flag mirrors.
+  - `observation_event_id` is stable and independent of versions, quality and non-`observed_at` times.
+  - `NormalizationResult.counts()` keys are closed.
 - [ ] **Step 2: Write failing schema tests.**
-  - `encode_observation_line` output equals each scenario's golden lines byte-for-byte: sorted tags/fields, escaping, `repr` floats, integer suffixes, integer-nanosecond time;
-  - optional `probe_id`, `integration_id`, `sequence` and `source_event_id` are omitted when absent;
-  - JSON fields over 512 bytes are rejected;
-  - the guard rejects unknown tag keys, missing tags, invalid IDs, unknown metrics, `stale`/`missing`/`delayed`/`duplicate` as states, and any attempt to tag an event ID or metadata;
-  - `encode_legacy_line` floors time to the second, writes `rssi`/`seq` as integers and sets `source`/`schema_version` per D8.
-- [ ] **Step 3: Write failing protocol and vector tests.**
-  - protocol method sets, signatures and annotations are frozen;
-  - `export_telemetry_v2_vectors.py --check` passes on the committed file and fails on a mutated copy (use a temp path);
-  - ID vectors equal `ids.py` outputs.
-- [ ] **Step 4: Run** `uv run --locked --extra dev pytest -q tests/unit/test_telemetry_v2_contracts.py tests/unit/test_metric_catalog.py tests/unit/test_telemetry_v2_schema.py tests/unit/test_telemetry_v2_protocols.py tests/unit/test_telemetry_v2_vectors.py`. **Expected:** FAIL (modules missing). Commit the tests alone: `test(p2-00): ...`.
-- [ ] **Step 5: Audit the tests** (see **Execution Protocol**), fix the findings, then implement the modules, generate the vectors and make the tests pass.
-- [ ] **Step 6: Run the shared gates.** `make verify-python`, `make verify-go`, `git diff --check`, `uv run --locked --extra dev python scripts/dev/export_v1_openapi.py --check`. `tests/contracts/test_m1_acceptance_gate.py` must still pass; it scans the new domain files for forbidden words.
+  - `encode_observation_line` output equals each scenario's golden lines byte-for-byte: sorted tags/fields, escaping, `repr` floats, integer suffixes and range, integer-nanosecond time.
+  - Optional tags/fields are omitted when absent; JSON fields over 512 bytes are rejected; non-finite values are rejected.
+  - The guard rejects unknown or missing tags, invalid IDs, unknown metrics, `quality_state`/`source_type`/event IDs/metadata as tags, and a wrong `schema_version`.
+  - `build_legacy_points` + `encode_legacy_line` honor D7, D8 and the grouping/tie-break rules, with exact sub-second time, the `topic` tag for `legacy_mqtt` only, and `rssi`/`seq` as integers.
+  - `flux_string_literal` escapes quotes, backslashes, newlines and `${`.
+- [ ] **Step 3: Write the failing Telegraf identity test.**
+  - It parses `infra/telegraf/telegraf.conf` and asserts measurement `water_quality`, static tags `source="mqtt"`/`schema_version="1"`, topic `limnopulse/v1/devices/+/readings`, `topic_parsing` device tag, and **no** `topic_tag` override.
+  - It also asserts that D8's encoder reproduces that identity.
+- [ ] **Step 4: Write failing protocol, vector and loader tests.**
+  - Signatures are frozen.
+  - `export_telemetry_v2_vectors.py --check` passes on the committed file and fails on a mutated copy (monkeypatched output path).
+  - The ID vectors equal `ids.py`.
+  - The loader round-trips every scenario.
+  - `rebased(now)` keeps relative spacing and recomputes `event_id`.
+- [ ] **Step 5: Run and record red.** Run every test file above and record the failure. Commit the tests alone (`test(p2-00): …`), then follow the **Execution Protocol** test gate.
+- [ ] **Step 6: Implement.** After approval, implement, generate the vectors and make the tests pass.
+- [ ] **Step 7: Run the shared gates.** `make verify-python`, `make verify-go`, `git diff --check`, the `/v1` OpenAPI `--check` and `export_telemetry_v2_vectors.py --check`. `tests/contracts/test_m1_acceptance_gate.py` must stay green; it scans the new domain files for forbidden words.
 
 **Acceptance criteria:**
 - [ ] Every Locked Contract name, value and signature exists exactly as written, frozen by tests.
 - [ ] The golden lines are byte-stable and regenerated only by the export script.
+- [ ] The legacy identity is tied to `telegraf.conf` by a test.
 - [ ] No adapter, service, router, setting or Go file changes.
-- [ ] `/v1` golden unchanged; no forbidden words in domain files.
+- [ ] The `/v1` golden is unchanged.
 
-**Rollback:** Revert the commit. Nothing consumes the spine at runtime.
+**Rollback:** Revert. Nothing consumes the spine at runtime.
 
 ---
 
 ### Task 2: P2-01 — Real-InfluxDB integration harness and CI gate
 
-**Branch:** `agent/v4-p2-01-influx-integration-harness` · **Blocked by:** this plan merged · **Blocks:** P2-03, P2-04, P2-05, P2-07, P2-09
+**Branch:** `agent/v4-p2-01-influx-integration-harness` · **Blocked by:** plan merged · **Blocks:** P2-03, P2-04, P2-05, P2-07
 
 **Files:**
-- Create: `tests/support/influx_harness.py`, `tests/influx/test_influx_harness_smoke.py`, `scripts/dev/run_local_influxd.sh`
-- Modify: `Makefile` (add `verify-influx`; keep `verify` unchanged), `.github/workflows/verify.yml` (add job `influx`), `tests/unit/test_ci_contract.py`, `docs/verification.md`
+- Create:
+  - `tests/support/influx_harness.py`
+  - `tests/influx/conftest.py`
+  - `tests/influx/test_influx_harness_smoke.py`
+  - `internal/alertevaluator/influx/integration_harness_test.go`
+  - `scripts/dev/run_local_influxd.sh`
+- Modify:
+  - `Makefile`
+  - `.github/workflows/verify.yml`
+  - `tests/unit/test_ci_contract.py`
+  - `docs/verification.md`
 - Test: `tests/unit/test_influx_harness_contract.py`
 
 **Interfaces:** Produces the harness contract above. Consumes nothing from P2-00.
 
 - [ ] **Step 1: Write failing tests.**
-  - `test_ci_contract.py` expects the jobs `{python, go, opentofu, compose, frontend, influx}`, the exact `verify-influx` recipe via `make -n`, a SHA-pinned action set, no `secrets.`, and the service image `influxdb:2.7.11-alpine`;
-  - `test_influx_harness_contract.py` asserts the env names and defaults, that the fixture skips without `RUN_INFLUX_INTEGRATION=1`, that `run_local_influxd.sh` pins version 2.7.11 and the SHA-256 and binds loopback only, and that `docs/verification.md` documents the job and the local script;
-  - the smoke test writes one point into an isolated bucket, reads it back with Flux, and asserts the bucket is deleted at teardown.
-- [ ] **Step 2: Run the failing tests** and commit them alone.
-- [ ] **Step 3: Audit, then implement** the harness, script, Make target, CI job and docs.
-- [ ] **Step 4: Prove it.** Run `scripts/dev/run_local_influxd.sh` and then `make verify-influx` locally; record the output. Push and confirm the CI `influx` job is green.
+  - `test_ci_contract.py` covers:
+    - the job set `{python, go, opentofu, compose, frontend, influx}`, with each job running exactly `make <target>`;
+    - the exact `verify-influx` recipe via `make -n`, with `verify-influx` in `.PHONY` and outside the `verify` aggregate;
+    - the SHA-pinned action set and no `secrets.`;
+    - the service image `influxdb:2.7.11-alpine` with a health-cmd.
+  - `test_influx_harness_contract.py` covers:
+    - the env names and defaults;
+    - the harness module importable without skipping;
+    - the fixture skipping without the env (a `pytester` test);
+    - the script pins (version, SHA-256, loopback, curl setup, conflict-as-success);
+    - the docs phrases.
+  - The Python smoke test writes one point and reads it back with Flux in an isolated bucket, and the bucket is deleted at teardown.
+  - The Go smoke test (`TestInfluxIntegrationHarnessSmoke`) does the same through `BucketsAPI`.
+- [ ] **Step 2: Run red, commit, test gate.** Run the failing tests and commit them alone, then go through the test gate.
+- [ ] **Step 3: Implement** after approval.
+- [ ] **Step 4: Prove it.** Run `scripts/dev/run_local_influxd.sh` and `make verify-influx` locally and record the output. Push, then confirm the CI `influx` job is green.
 - [ ] **Step 5: Run the shared gates.**
 
 **Acceptance criteria:**
-- [ ] `make verify-influx` is green locally (no Docker needed) and in CI.
+- [ ] `make verify-influx` is green locally (no Docker) and in CI, including the Go smoke test.
 - [ ] Default suites skip `tests/influx` cleanly.
-- [ ] Bucket isolation and cleanup are proven.
-- [ ] No credentials are needed: the dev token exists only in the local service container.
+- [ ] Bucket isolation and teardown are proven.
+- [ ] No credentials: the dev token exists only in the throwaway service container.
 
 **Rollback:** Remove the job and target. No runtime effect.
 
@@ -484,76 +770,85 @@ Each task also owns the new test files named in its section.
 - Create: `src/limnopulse_api/domain/telemetry_units.py`, `src/limnopulse_api/domain/telemetry_quality.py`
 - Test: `tests/unit/test_telemetry_units.py`, `tests/unit/test_telemetry_quality.py`
 
-**Interfaces:** Produces two functions:
-- `convert_to_canonical(metric: MetricDefinition, value: int | float, source_unit: str, *, unit_mapping_version: str = UNIT_MAPPING_VERSION) -> float`, which raises `UnitConversionError(reason: QuarantineReason, detail: str)`;
-- `classify_quality(metric: MetricDefinition, canonical_value: float, *, observed_at: datetime, received_at: datetime, replay: bool, quality_policy_version: str = QUALITY_POLICY_VERSION) -> ObservationQuality`.
+**Interfaces:**
+- `UNIT_MAPPINGS`
+- `convert_to_canonical(metric: MetricDefinition, value: int | float, source_unit: str, *, unit_mapping_version: str = UNIT_MAPPING_VERSION, unit_mappings=UNIT_MAPPINGS) -> float`, which raises `UnitConversionError(reason: QuarantineReason, detail: str)`.
+- `QualityPolicy` and `QUALITY_POLICIES`
+- `classify_quality(metric, canonical_value, *, observed_at, received_at, replay, quality_policy_version=QUALITY_POLICY_VERSION, policies=QUALITY_POLICIES) -> ObservationQuality`
+- `delay_ms(observed_at, received_at) -> int`
+- An unknown version raises `ValueError`.
 
-An unknown version raises `ValueError`.
-
-- [ ] **Step 1: Write failing unit tests.**
-  - every row of the unit table, with identity conversions bit-exact;
-  - unknown unit → `unit_unsupported`;
-  - non-integral `device.rssi` and booleans/NaN/Infinity → `value_invalid`.
+- [ ] **Step 1: Write failing unit-conversion tests.**
+  - Every row of the unit table, with identity conversions returning a bit-exact `float(value)`.
+  - An unknown unit gives `unit_unsupported`.
+  - Booleans, NaN, Infinity, `|int| ≥ 2**53` and non-integral `device.rssi` give `value_invalid`.
+  - An injected test-only `unit-mapping@2` changes the result only when it is selected.
 - [ ] **Step 2: Write failing quality tests.**
-  - inclusive range boundaries (min, max, just outside);
-  - threshold boundaries at exactly 300 s, 300 s + 1 µs, 30 days and 30 days + 1 µs;
-  - precedence, sorted unique flags, provenance order and content;
-  - replay flag; `confidence is None`;
-  - determinism: equal inputs give equal output, and no wall-clock read (monkeypatch `datetime` to fail).
-- [ ] **Step 3: Run the failing tests**, commit them alone, audit, then implement.
+  - Inclusive range boundaries.
+  - Exact threshold boundaries: 300 s vs 300 s + 1 µs for both delay and future skew; 30 days vs 30 days + 1 µs.
+  - Skew and delay never change the state.
+  - Sorted unique flags; exact provenance order.
+  - Replay flag; `confidence is None`; `delay_ms` floor for negative values.
+  - Determinism, proven by an AST test that the module never references `now`, `utcnow`, `today`, `time.time` or `monotonic`.
+  - An injected test-only `quality-policy@2` is honored only when selected.
+- [ ] **Step 3: Run red, commit, test gate,** then implement after approval.
 - [ ] **Step 4: Run the shared gates.**
 
 **Acceptance criteria:**
-- [ ] Exactly the locked tables and thresholds, versioned.
-- [ ] Pure and deterministic; no I/O.
+- [ ] Exactly the locked tables and thresholds, versioned and injectable.
+- [ ] Pure and deterministic.
 - [ ] An out-of-range value is never `valid`, and its provenance includes `plausible_range`.
+- [ ] Only `valid` and `out_of_range` are produced.
 
-**Rollback:** Revert. No runtime consumer until P2-08.
+**Rollback:** Revert.
 
 ---
 
 ### Task 4: P2-03 — InfluxDB v2 writer and dual-write service
 
-**Branch:** `agent/v4-p2-03-influx-v2-writer` · **Blocked by:** P2-00, P2-01 · **Blocks:** P2-07, P2-08
+**Branch:** `agent/v4-p2-03-influx-v2-writer` · **Blocked by:** P2-00, P2-01 · **Blocks:** P2-06, P2-07, P2-08
 
 **Files:**
 - Create: `src/limnopulse_api/adapters/influxdb_v2_writer.py`, `src/limnopulse_api/services/telemetry_v2_writes.py`
 - Test: `tests/unit/test_influxdb_v2_writer.py`, `tests/unit/test_telemetry_v2_write_service.py`, `tests/influx/test_influx_v2_writer_integration.py`
 
 **Interfaces:**
-- `InfluxObservationWriter(*, write_api, bucket, org, max_lines_per_request=5000)` implements `ObservationWriter` and `LegacyObservationWriter`. It encodes with the P2-00 encoders, writes with `WritePrecision.NS` through `anyio.to_thread.run_sync`, and chunks requests. Error mapping:
-  - `ApiException` with status 429 or ≥ 500 → `TelemetryWriteError(retryable=True)`;
-  - other 4xx → `TelemetryWriteError(retryable=False)`;
-  - connection, timeout and protocol errors → `TelemetryWriteError(retryable=True)`.
-- `ObservationWriteService(*, writer, legacy_writer, site_assets: SiteAssetReader, v2_write_enabled: bool, legacy_dual_write_enabled: bool)`:
-  - `async write(observations) -> TelemetryWriteOutcome(v2_points: int, legacy_points: int)`;
-  - writes v2 first, then legacy;
-  - applies D7 eligibility (Asset lookups cached per call) and D8 grouping;
-  - rejects batches larger than `MAX_OBSERVATIONS_PER_BATCH`.
+- **`InfluxObservationWriter(*, write_api, bucket, org, max_lines_per_request=5000)`** implements `ObservationWriter` and `LegacyObservationWriter`.
+  - It encodes with the P2-00 encoders, writes with `WritePrecision.NS` through `anyio.to_thread.run_sync`, and chunks requests.
+  - Error mapping:
+    - `ApiException` with status 429 or ≥ 500 → `TelemetryWriteError(retryable=True)`;
+    - 422 (partial write, for example a field-type conflict) and other 4xx → `retryable=False`, with a schema-conflict log entry that contains no payload values;
+    - `urllib3.exceptions.HTTPError` (connection refused, connect/read timeout) and `OSError` → `retryable=True`.
+- **`ObservationWriteService(*, writer, legacy_writer, site_assets: SiteAssetReader, v2_write_enabled: bool, legacy_dual_write_enabled: bool)`.**
+  - `async write(observations) -> TelemetryWriteOutcome(v2_points: int, legacy_points: int, legacy_excluded: int)`.
+  - Writes v2 first, then legacy.
+  - Resolves `legacy_pond_by_asset` through Asset lookups, cached per call; a missing Asset is excluded and counted.
+  - Calls `build_legacy_points`.
+  - Rejects batches over `MAX_OBSERVATIONS_PER_BATCH`.
 
-- [ ] **Step 1: Write failing unit tests.**
-  - the fake `write_api` receives exactly the golden lines for each scenario;
-  - chunking;
-  - every error-class mapping;
-  - all four switch combinations;
-  - D7 exclusions: native probe, asset without legacy pond, non-legacy metric;
-  - D8 grouping and conflict tie-break;
-  - a v2 failure means no legacy write is attempted;
-  - a legacy failure after v2 success raises and reports nothing as written;
-  - an Asset lookup failure raises retryable.
+- [ ] **Step 1: Write failing unit tests** (fake `write_api`).
+  - The exact golden lines are written per scenario.
+  - Chunking.
+  - Every error-class mapping, including 422.
+  - All four switch combinations.
+  - D7 exclusions: native probe, Asset without a legacy pond, missing Asset, non-legacy metric.
+  - A v2 failure means no legacy write is attempted.
+  - A legacy failure after v2 success raises and reports nothing as written.
+  - An Asset-lookup exception is retryable.
 - [ ] **Step 2: Write failing integration tests** (real InfluxDB).
-  - writing the same scenario twice, and in shuffled order, yields an identical stored point set;
-  - a dual-written legacy point and a Telegraf-shaped line for the same reading collapse to one legacy series/time (one row in the legacy adapter's readings);
-  - a stopped/unreachable URL raises `TelemetryWriteError(retryable=True)`.
-- [ ] **Step 3: Run the failing tests**, commit them alone, audit, then implement.
+  - Writing the same scenario twice and in shuffled order yields an identical stored point set.
+  - Re-writing the same identity with a **different quality classification** (a value corrected to out-of-range) and a **different `received_at`** yields exactly one point per identity, with the last write's fields.
+  - A dual-written legacy point plus a Telegraf-shaped line for the same reading yield one point, and one row through `InfluxTelemetryRepository.query_readings`. The Telegraf-shaped line is built from the parsed `telegraf.conf` plus Telegraf defaults (`topic`), whole-second and sub-second.
+  - A closed loopback port raises `TelemetryWriteError(retryable=True)`.
+- [ ] **Step 3: Run red, commit, test gate,** then implement after approval.
 - [ ] **Step 4: Run** `make verify-influx` (local `run_local_influxd.sh`) **and the shared gates.**
 
 **Acceptance criteria:**
-- [ ] Byte-exact lines.
+- [ ] The written lines are byte-exact.
 - [ ] Independent switches.
-- [ ] A failure is never swallowed.
-- [ ] Idempotent duplicate/out-of-order writes are proven on real InfluxDB.
-- [ ] Legacy series identity matches Telegraf.
+- [ ] A failure is never swallowed; a 422 partial write is classified as permanent.
+- [ ] Idempotency on real InfluxDB, including re-classification and redelivery.
+- [ ] The legacy identity equals Telegraf's stored identity.
 
 **Rollback:** Both switches off (default). Never delete written points as rollback.
 
@@ -575,30 +870,38 @@ An unknown version raises `ValueError`.
 - Test: `tests/unit/test_influxdb_v2_reader.py`, `tests/unit/test_telemetry_v2_read_service.py`, `tests/api/test_v2_observations.py`, `tests/influx/test_influx_v2_reader_integration.py`
 
 **Interfaces:**
-- `InfluxObservationReader(*, query_api, org, bucket)` implements `ObservationReader`. Every literal is escaped with `json.dumps`. It pivots fields per point, groups, sorts and limits globally, and parses rows into `StoredObservation`.
-- `ObservationReadService(*, reader, site_assets: SiteAssetReader, devices: DeviceReader, components: ComponentReader)` checks selector ownership (404 via `NotFoundError`) before any Influx call.
-- `observations.router` and `metric_definitions.router` follow the M1 conventions: `V2JsonSafeRoute`, `require_tenant_role(*READ_ROLES)` and the error responses. `telemetry_dependencies.py` provides `ObservationReaderDep` from `app.state.observation_reader` (503 when missing).
+- `InfluxObservationReader(*, query_api, org, bucket)` implements `ObservationReader` using the locked Flux patterns and `flux_string_literal`.
+- `ObservationReadService(*, reader, site_assets: SiteAssetReader, devices: DeviceReader, components: ComponentReader, clock: Callable[[], datetime])` checks selector ownership (404 via `NotFoundError`) before any InfluxDB call.
+- `observations.router` and `metric_definitions.router` follow the M1 conventions: `V2JsonSafeRoute`, `require_tenant_role(*READ_ROLES)` and the error responses.
+- `telemetry_dependencies.py` provides:
+  - `ObservationReaderDep`, read from `app.state.observation_reader` (503 when missing);
+  - a clock dependency.
 
 - [ ] **Step 1: Write failing reader unit tests** (fake `query_api`).
-  - Flux contains the measurement, tenant, selector, metric and quality filters, all escaped;
-  - injection attempts are inert;
-  - parsing of every field, including absent optional fields;
-  - global sort and limit; latest is one item per `(component, metric)`.
-- [ ] **Step 2: Write failing service and API tests** (isolated app including the unmounted routers).
-  - the 403/404/422/503 matrix;
-  - exactly-one-selector rule;
-  - 31-day range limit; naive timestamps rejected; unknown `metric_key` rejected;
-  - cross-tenant selector → 404 with zero reader calls;
-  - two probes of the same metric return two series distinguished by `component_id`/`probe_id`;
-  - metric-definitions equal the catalog.
-- [ ] **Step 3: Write failing integration tests.** Seed the `two_probes_same_metric`, `legacy_sample` and `relocation` scenario lines into real InfluxDB, then assert the read results, ordering and latest semantics.
-- [ ] **Step 4: Run the failing tests**, commit them alone, audit, then implement.
-- [ ] **Step 5: Run** `make verify-influx` **and the shared gates.** The `/v1` golden and `test_v2_composition.py` stay unchanged, because nothing is mounted.
+  - The filters, all escaped.
+  - Injection attempts, including `${`, are inert.
+  - Parsing of every field, including absent optional fields.
+  - Global sort and limit; latest is one item per `(component, metric)`.
+- [ ] **Step 2: Write failing service and API tests** (isolated app with the unmounted routers).
+  - The 403/404/422/503 matrix.
+  - The exactly-one-selector rule; the 31-day range limit; naive timestamps rejected; unknown `metric_key` rejected.
+  - A cross-tenant selector gives 404 with zero reader calls.
+  - `{"items": [...]}` shapes.
+  - `V2`-prefixed schema names, disjoint from the `/v1` component names.
+  - Metric-definitions equal the catalog.
+- [ ] **Step 3: Write failing integration tests.**
+  - Seed the `two_probes_same_metric`, `legacy_sample` and `relocation` vector lines (absolute windows): assert two distinguishable probe series, ordering, the half-open bounds and the global limit.
+  - Seed the `multi_point_series` scenario rebased to `now`, then assert latest semantics.
+  - A replay (older `observed_at`, newer `received_at`) never becomes latest.
+  - A future-skewed point (`observed_at > now`) is never returned by latest.
+- [ ] **Step 4: Run red, commit, test gate,** then implement after approval.
+- [ ] **Step 5: Run** `make verify-influx` **and the shared gates.** The `/v1` golden and `test_v2_composition.py` stay unchanged.
 
 **Acceptance criteria:**
-- [ ] The API contract above is exact.
-- [ ] No Influx call precedes tenant and ownership checks.
+- [ ] Exact API contract.
+- [ ] No InfluxDB call precedes the tenant and ownership checks.
 - [ ] Two probes are distinguishable.
+- [ ] `latest` is not a health view.
 - [ ] Routers stay unmounted.
 
 **Rollback:** Keep the routers unmounted (`API_V2_TELEMETRY_ENABLED=false`).
@@ -611,87 +914,118 @@ An unknown version raises `ValueError`.
 
 **Files:**
 - Create: `internal/alertevaluator/influx/query_v2.go`, `internal/alertevaluator/influx/client_v2.go`, `internal/alertevaluator/influx/legacy_ids.go`
-- Modify: `internal/alertevaluator/config.go`, `cmd/alert-evaluator/main.go`
-- Test: `internal/alertevaluator/influx/query_v2_test.go`, `internal/alertevaluator/influx/legacy_ids_test.go`, `internal/alertevaluator/influx/parity_integration_test.go` (`TestInfluxIntegration*`), `internal/alertevaluator/config_test.go`, `cmd/alert-evaluator/main_test.go`
+- Modify: `internal/alertevaluator/config.go`, `cmd/alert-evaluator/main.go`, `docs/alert-evaluator-phase-3b.md` (telemetry-source section)
+- Test: `internal/alertevaluator/influx/query_v2_test.go`, `internal/alertevaluator/influx/legacy_ids_test.go`, `internal/alertevaluator/influx/parity_integration_test.go` (`TestInfluxIntegration*`, using the P2-01 Go helpers), `internal/alertevaluator/config_test.go`, `cmd/alert-evaluator/main_test.go`
 
 **Interfaces:**
 - `V2WindowReader{Bucket string; Querier Querier}` implements `alertevaluator.WindowReader`.
 - `BuildV2Query(bucket, rule, spec) (string, error)`.
-- `ClientV2Querier{API api.QueryAPI}` parses the `value` and `sequence` columns.
-- `AssetIDForLegacyPond(tenantID, pondID string) string` and `MetricKeyForLegacyMetric(metric string) (string, bool)`.
-- `RunConfig.TelemetrySource` (`legacy` or `v2`, default `legacy`), set via `ALERT_EVALUATOR_TELEMETRY_SOURCE` or `--telemetry-source`; an invalid value is a configuration error.
-- `main.go` selects the `WindowReader` by source.
+- `ClientV2Querier{API api.QueryAPI}`, unit-testable via `api.NewQueryTableResult(io.NopCloser(...))`.
+- `AssetIDForLegacyPond(tenantID, pondID string) string`, `DefaultComponentIDForLegacyDevice(tenantID, deviceID string) string` and `MetricKeyForLegacyMetric(metric string) (string, bool)`.
+- `RunConfig.TelemetrySource`: `legacy` or `v2`, default `legacy`, set via `ALERT_EVALUATOR_TELEMETRY_SOURCE` or `--telemetry-source`. An invalid value is a configuration error; the staging/prod validation rules are unchanged.
+- `main.go` selects the reader.
 
 - [ ] **Step 1: Write failing Go unit tests.**
-  - ID and metric vectors read from `testdata/telemetry_v2/contract_vectors.json` (path relative to the repository root via `runtime.Caller`);
-  - Flux fragments with escaping;
-  - unknown metric and invalid window rejected;
-  - row parsing for float and integer columns;
-  - NaN dropped;
-  - config default, env, flag and invalid value.
+  - ID and metric vectors from `testdata/telemetry_v2/contract_vectors.json`, with the repository-root path resolved via `runtime.Caller`.
+  - Flux fragments, with escaping including `$`.
+  - An unknown metric and an invalid window are rejected.
+  - Row parsing for float/int `value` and `sequence`, and for a missing sequence.
+  - Non-default components dropped; NaN dropped.
+  - Config default, env, flag and invalid value; `main` reader selection.
 - [ ] **Step 2: Write failing parity integration tests** (`TestInfluxIntegrationParity*`).
-  - For each scenario and aggregation (`min`, `max`, `mean`, `last`), and for both pond-wide and device-scoped rules, seed the legacy and v2 lines. Assert the legacy `WindowReader` and `V2WindowReader` return identical `WindowResult`.
-  - Out-of-range points are excluded only in v2 (documented divergence).
+  - For the parity scenarios × aggregation (`min`/`max`/`mean`/`last`) × {pond-wide, device-scoped}, seed both the legacy and v2 lines. Assert identical `WindowResult` from the legacy reader and `V2WindowReader`.
+  - `out_of_range` asserts the D15 divergence.
+  - `two_probes_same_metric` asserts no samples for a `/v1` rule.
   - Shuffled write order gives an identical result.
-- [ ] **Step 3: Run the failing tests**, commit them alone, audit, then implement.
+  - A query error gives an identical `query_error` outcome.
+- [ ] **Step 3: Run red, commit, test gate,** then implement after approval.
 - [ ] **Step 4: Run** `make verify-go`, `make verify-influx`, `make verify-python` (boundary tests read Go code) **and** `git diff --check`.
 
 **Acceptance criteria:**
-- [ ] The default behavior is byte-identical; with `legacy`, the evaluator issues the same Flux as before.
-- [ ] Python/Go ID and metric vectors match.
-- [ ] Parity is proven on real InfluxDB.
-- [ ] `EvaluateSamples` and the state machine are untouched.
-- [ ] Boundary substrings are absent.
+- [ ] With the default `legacy`, the Flux and behavior are identical to `main`.
+- [ ] The Go IDs and metric map equal the Python vectors.
+- [ ] Parity is proven on real InfluxDB, with order independence (ADR-006/007).
+- [ ] Native probes are excluded from `/v1` rules.
+- [ ] `EvaluateSamples` and the state machine are untouched; the completeness delay is cited as the existing `AllowedLateness`.
 
 **Rollback:** `ALERT_EVALUATOR_TELEMETRY_SOURCE=legacy` (default).
 
 ---
 
-### Task 7: P2-06 — Telemetry normalizer and legacy reading mapper
+### Task 7: P2-06 — Telemetry normalizer, legacy mapper and ack-safe pipeline
 
-**Branch:** `agent/v4-p2-06-normalizer` · **Blocked by:** P2-00, P2-02 · **Blocks:** P2-08
+**Branch:** `agent/v4-p2-06-normalizer-pipeline` · **Blocked by:** P2-00, P2-02, P2-03 · **Blocks:** P2-08
 
 **Files:**
-- Create: `src/limnopulse_api/services/telemetry_normalizer.py`, `src/limnopulse_api/domain/legacy_telemetry_mapping.py`
-- Test: `tests/unit/test_telemetry_normalizer.py`, `tests/unit/test_legacy_telemetry_mapping.py`
+- Create: `src/limnopulse_api/services/telemetry_normalizer.py`, `src/limnopulse_api/domain/legacy_telemetry_mapping.py`, `src/limnopulse_api/services/telemetry_pipeline.py`
+- Test: `tests/unit/test_telemetry_normalizer.py`, `tests/unit/test_legacy_telemetry_mapping.py`, `tests/unit/test_telemetry_pipeline.py`
 
 **Interfaces:**
-- `map_legacy_reading(context: TrustedSourceContext, payload: Mapping[str, Any]) -> tuple[SourceObservation, ...]`:
-  - Component = `default_component_id_for_legacy_device(context.tenant_id, context.device_id)`;
-  - `ts` is required and must be timezone-aware, otherwise `ValueError`;
-  - `seq` becomes `sequence`;
-  - each present legacy field becomes a `SourceObservation` with the catalog `metric_key` and canonical `source_unit`;
-  - unknown keys, including `tenant_id`, `pond_id`, `asset_id` and `site_id`, are ignored and never influence resolution.
-- `TelemetryNormalizer(*, components: ComponentReader, deployments: DeploymentRepository, clock: Callable[[], datetime])`, with `async normalize(context, observations, *, versions: NormalizationVersions | None = None) -> NormalizationResult`. It processes each observation in order:
-  1. Component ownership (tenant and `context.device_id`) → `component_not_owned`; an actuator → `component_not_measuring`.
+
+**`map_legacy_reading(context: TrustedSourceContext, payload: Mapping[str, Any]) -> LegacyMappingResult(observations, quarantined)`**
+- The Component is `default_component_id_for_legacy_device(context.tenant_id, context.device_id)`.
+- A missing, naive or unparseable `ts` gives one `observed_at_invalid` quarantine for the whole reading, with no observations.
+- `seq` becomes `sequence`. A bool, negative or out-of-range `seq` gives one `value_invalid` quarantine for the reading.
+- Each present legacy field becomes a `SourceObservation` with the catalog `metric_key` and the canonical unit as `source_unit`:
+  - `null` is skipped;
+  - a bool, string, NaN or Infinity value becomes a `value_invalid` quarantine for that field.
+- Unknown keys, including `tenant_id`, `pond_id`, `asset_id`, `site_id` and `deployment_id`, are ignored and never influence anything.
+
+**`TelemetryNormalizer(*, components: ComponentReader, deployments: DeploymentRepository, clock, catalogs=METRIC_CATALOGS, unit_mappings=UNIT_MAPPINGS, policies=QUALITY_POLICIES)`**
+- `async normalize(context, observations, *, versions: NormalizationVersions | None = None) -> NormalizationResult`.
+- It processes each observation in order:
+  1. Component ownership (tenant and `context.device_id`) → `component_not_owned`; an `actuator` Component → `component_not_measuring`.
   2. Catalog metric for the pinned version → `metric_unknown`.
   3. Unit conversion → `unit_unsupported` / `value_invalid`.
-  4. `get_deployment_at(tenant, component, observed_at)` → `deployment_unresolved`. It never falls back to the current Deployment.
-  5. Quality classification, then build the `CanonicalObservation`: `probe_id` from the Component's probe profile; `ingested_at` from the injected clock; the pinned mapping versions; source fields from the context.
-- Lookups are cached per call. A batch is at most `MAX_OBSERVATIONS_PER_BATCH`. The quarantine excerpt is bounded and truncated with a flag.
+  4. `get_deployment_at(tenant, component, observed_at)` → `deployment_unresolved`. It never calls `get_current_deployment` or falls back.
+  5. Quality classification, then build the `CanonicalObservation`:
+     - `probe_id` from the Component's probe profile;
+     - site and asset from the Deployment;
+     - `ingested_at` from the clock;
+     - the pinned versions;
+     - source fields from the context, with `received_at` unchanged.
+- Lookups are cached per call. A batch is at most `MAX_OBSERVATIONS_PER_BATCH`. The excerpt is bounded and truncated with a flag.
 
-- [ ] **Step 1: Write failing tests**, using `tests.contracts.m1_fakes.InMemoryM1Repositories` and `M1AcceptanceScenario`:
-  - deployment at event time before and after a relocation, including the exact boundary instant (half-open);
-  - no deployment → quarantine with no fallback;
-  - wrong-tenant or wrong-device Component → quarantine;
-  - payload tenant/pond/asset claims are ignored;
-  - unit conversion with the original `source_unit` kept;
-  - out-of-range with provenance; delayed and replay flags;
-  - `ingested_at` comes from the clock;
-  - two probes of the same metric get distinct identities;
-  - re-normalizing with pinned `metric-catalog@1` reproduces the envelope except `ingested_at`; an unknown version raises;
-  - the batch bound and quarantine truncation;
-  - the legacy mapper on `examples/telemetry/reading.local.json` yields exactly seven observations plus the sequence.
-- [ ] **Step 2: Run the failing tests**, commit them alone, audit, then implement.
-- [ ] **Step 3: Run the shared gates.**
+**`TelemetryPipeline(*, normalizer, write_service)`**
+- `async ingest(context, observations) -> PipelineOutcome(written: TelemetryWriteOutcome, quarantined: tuple[QuarantinedObservation, ...], counts)`.
+- `async ingest_legacy_reading(context, payload) -> PipelineOutcome`, which includes the mapper quarantines.
+- **Ack contract:** a caller acknowledges a message only after `ingest*` returns. `TelemetryWriteError` propagates, meaning no acknowledgement and redelivery. Quarantined records must be persisted by the caller before acknowledging (P3).
+
+- [ ] **Step 1: Write failing mapper tests.**
+  - `examples/telemetry/reading.local.json` yields exactly seven observations with sequence 1.
+  - Missing, naive or unparseable `ts` quarantines; bad values quarantine per field; `null` is skipped.
+  - Payload tenant/pond/asset claims are ignored, so the output is identical with and without them.
+- [ ] **Step 2: Write failing normalizer tests.**
+  - **Fixtures:** build `InMemoryM1Repositories` directly. Seed legacy Device/Component/Asset/Deployment rows with the `domain/legacy_projection.py` builders and the repository `create_*`/`start_deployment`/`end_deployment` methods. `DeploymentService` rejects moves of legacy default Components, and the scenario facade uses `asyncio.run`. Native probes use `M1AcceptanceScenario` constructed over the same repositories in synchronous setup.
+  - **Deployment resolution:**
+    - the Deployment at event time is used before and after a West→East relocation, including the exact half-open boundary instant;
+    - after the move, a replay (`replay=True`) with an earlier `observed_at` resolves to the old Deployment and has the same `event_id`;
+    - no Deployment gives `deployment_unresolved`, even while a current Deployment exists.
+  - **Ownership:** wrong-tenant or wrong-device Component; actuator vs hybrid.
+  - **Values and quality:**
+    - unit conversion keeps the original `source_unit`;
+    - out-of-range with provenance; delayed and replay flags;
+    - `ingested_at` comes from the clock.
+  - **Identity:** two probes of the same metric get distinct identities.
+  - **Versions and limits:**
+    - with an injected test-only `metric-catalog@2`/`unit-mapping@2`, the default normalization stamps `@2`;
+    - a replay pinned to `@1` reproduces the `@1` value, quality and versions with an equal `event_id`;
+    - an unknown version raises;
+    - the batch bound and quarantine truncation.
+- [ ] **Step 3: Write failing pipeline tests.**
+  - With an in-memory at-least-once queue fake and a fault-injecting `ObservationWriteService` (v2 fails; legacy fails after v2; mid-chunk failure), the message is never acknowledged.
+  - After redelivery with faults cleared, the stored point set equals the no-fault baseline.
+  - The outcome counts match.
+- [ ] **Step 4: Run red, commit, test gate,** then implement after approval.
+- [ ] **Step 5: Run the shared gates.**
 
 **Acceptance criteria:**
-- [ ] ADR-006 event-time resolution and the no-fallback rule are proven.
+- [ ] ADR-006 event-time resolution, the no-fallback rule and the bounded quarantine record.
 - [ ] No device-supplied tenant authority.
-- [ ] Versions are stamped.
-- [ ] The normalizer is deterministic apart from `ingested_at`.
+- [ ] ADR-005: replay after a catalog revision preserves the mapping version and identity.
+- [ ] Ack contract: nothing is acknowledged after a failed write, and redelivery recovers without loss.
 
-**Rollback:** Revert. No runtime consumer until P2-08.
+**Rollback:** Revert. No runtime consumer until P2-08's dev CLI.
 
 ---
 
@@ -705,23 +1039,29 @@ An unknown version raises `ValueError`.
 
 **Interfaces:** `V2ProjectedTelemetryRepository(*, query_api, org, bucket, domain_repository)` implements `TelemetryRepository` with the projection semantics above.
 
-- [ ] **Step 1: Write failing unit tests** (fake `query_api`).
-  - Flux filters and escaping;
-  - the legacy-field mapping;
-  - floored time;
-  - tenant-wide asset→pond mapping from `list_ponds`;
-  - summary period validation and `TelemetryQueryError` wrapping; the other methods propagate errors.
+- [ ] **Step 1: Write failing unit tests** (fake `query_api` and fake domain repository).
+  - Flux filters and escaping.
+  - The legacy-default component set from `list_devices`.
+  - The asset→pond mapping from `list_ponds`.
+  - Legacy grouping before `last()`/pivot/`limit`.
+  - The summary sort.
+  - Explicit `int` conversion for `rssi`/`seq`.
+  - Summary period validation and `TelemetryQueryError` wrapping; the other methods propagate errors.
 - [ ] **Step 2: Write failing equivalence tests** (real InfluxDB).
-  - Dual-write the `legacy_sample`, `out_of_range` and multi-time scenarios through the P2-03 `ObservationWriteService` with both switches on.
-  - For each of the four methods, the legacy adapter result equals the projection result.
-  - Build two apps (each with its repository injected): the four `/v1` HTTP responses are byte-identical.
-  - Native v2 probes and other tenants are absent from `/v1`.
-- [ ] **Step 3: Run the failing tests**, commit them alone, audit, then implement.
+  - **Setup:** dual-write through the P2-03 `ObservationWriteService`, with both switches on, into one bucket. Write these scenarios:
+    - `legacy_sample`, `sub_second`, `out_of_range`;
+    - the `multi_point_series` scenario rebased to the captured `now`: ≥ 30 points, 2 devices, 2 ponds, a `limit` smaller than the rows, a device with mixed `quality_state`, and ≥ 3 devices with values whose float sum depends on order;
+    - native probes on a legacy pond Asset;
+    - another tenant.
+  - **Domain-level equality:** for the four methods, `InfluxTelemetryRepository` and `V2ProjectedTelemetryRepository` return equal objects, and every compared result is non-empty.
+  - **HTTP-level equality:** two apps, each with its repository injected, return byte-identical JSON for the four `/v1` endpoints.
+  - **Exclusions:** native probes and the other tenant are absent.
+- [ ] **Step 3: Run red, commit, test gate,** then implement after approval.
 - [ ] **Step 4: Run** `make verify-influx` **and the shared gates.**
 
 **Acceptance criteria:**
 - [ ] Byte and semantic `/v1` equivalence is proven on real InfluxDB.
-- [ ] Unchanged `/v1` files.
+- [ ] No `/v1` file changes.
 - [ ] Error semantics identical.
 
 **Rollback:** `V1_TELEMETRY_READ_SOURCE=legacy` (default).
@@ -733,38 +1073,59 @@ An unknown version raises `ValueError`.
 **Branch:** `agent/v4-p2-08-telemetry-composition` · **Blocked by:** P2-03, P2-04, P2-06, P2-07 · **Blocks:** P2-09
 
 **Files:**
-- Create: `src/limnopulse_api/services/telemetry_pipeline.py`, `scripts/dev/ingest_reading_v2.py`
+- Create: `scripts/dev/ingest_reading_v2.py`
 - Modify:
-  - `src/limnopulse_api/core/config.py`, `src/limnopulse_api/main.py`
-  - `src/limnopulse_api/api/router.py`, `src/limnopulse_api/api/v2/router.py`
-  - `.env.example`, `README.md`, `docs/architecture.md` (new P2 section only; keep the pinned header)
-  - `tests/api/test_v2_composition.py`, `tests/api/test_app_runtime.py`
-- Test: `tests/unit/test_p2_configuration.py`, `tests/api/test_v2_telemetry_composition.py`, `tests/unit/test_telemetry_pipeline.py`, `tests/unit/test_ingest_reading_v2_cli.py`
+  - `src/limnopulse_api/core/config.py`
+  - `src/limnopulse_api/main.py`
+  - `src/limnopulse_api/api/router.py`
+  - `src/limnopulse_api/api/v2/router.py`
+  - `.env.example`
+  - `README.md`: rewrite the "There are no `/v2` telemetry…" sentence and add a P2 section
+  - `docs/architecture.md`: new section only; keep `**Version:** 1.4` and `**Updated:** 2026-08-25`
+  - `tests/api/test_v2_composition.py`: add the new env vars to its autouse `delenv`
+  - `tests/api/test_app_runtime.py`
+- Test: `tests/unit/test_p2_configuration.py`, `tests/api/test_v2_telemetry_composition.py`, `tests/unit/test_ingest_reading_v2_cli.py`
 
 **Interfaces:**
-- **Settings**: the four Python switches, plus the validator rejecting `API_V2_TELEMETRY_ENABLED` without `API_V2_ENABLED`.
-- **Lifespan**: creates the reader and writer from the existing `InfluxDBClient`, using `write_api(write_options=SYNCHRONOUS)` only when a write switch is on. It wires `observation_write_service`, picks the `/v1` `telemetry_repository` implementation, and extends the skip-list.
-- **Routing**: `build_v2_router(enable_telemetry=...)` mounts the telemetry routers only when enabled.
-- **`TelemetryPipeline(normalizer, write_service)`**: `async ingest_legacy_reading(*, context, payload) -> PipelineOutcome(written, quarantined)`.
-- **`scripts/dev/ingest_reading_v2.py --tenant --device [--file] [--received-at]`** builds a `TrustedSourceContext(source_type=legacy_mqtt, integration_type="legacy_mqtt")` and resolves through the DynamoDB-backed M1 repositories. Exit codes: 0 when written, 2 when anything is quarantined, 1 on error.
+- **Settings:** the four Python switches, plus the validator that rejects `API_V2_TELEMETRY_ENABLED` without `API_V2_ENABLED`.
+- **Lifespan:**
+  - creates the reader from the existing `InfluxDBClient`;
+  - creates the writer through `write_api(write_options=SYNCHRONOUS)` only when a write switch is on;
+  - creates `observation_write_service`;
+  - picks the `/v1` `telemetry_repository` implementation;
+  - extends the skip-list.
+- **Routing:** `build_v2_router(enable_telemetry: bool = False)` and `build_api_router(..., enable_v2_telemetry: bool = False)`, both defaulting off.
+- **Dev CLI:** `scripts/dev/ingest_reading_v2.py --tenant --device [--file examples/telemetry/reading.local.json] [--observed-at now|ISO] [--received-at ISO]`.
+  - It builds `TrustedSourceContext(source_type=legacy_mqtt, integration_type="legacy_mqtt")` from CLI arguments only.
+  - `--observed-at now` rewrites `ts` for rehearsals, so a Deployment created at seed time covers it.
+  - It uses the DynamoDB-backed M1 repositories, the configured InfluxDB and the two write switches, and calls `TelemetryPipeline.ingest_legacy_reading`.
+  - Exit codes: 0 when everything is written, 2 when anything is quarantined, 1 on error.
+  - It prints a JSON summary of counts with no secrets.
 
 - [ ] **Step 1: Write failing configuration and composition tests.**
-  - With every switch off: `/v1` golden identical; `/v2` (when `API_V2_ENABLED`) has exactly the 13 M1 paths; no telemetry fragment appears; no write API is created.
-  - `API_V2_TELEMETRY_ENABLED` adds exactly the three operations, with tenant routes going 53 → 56 and all requiring membership.
-  - `V1_TELEMETRY_READ_SOURCE=v2` swaps the implementation, and the `/v1` responses keep the same schema.
-  - The validator error.
-  - `.env.example` documents every switch, with defaults.
-- [ ] **Step 2: Write failing pipeline and CLI tests** (fakes): written, quarantined and error exit codes; the context never takes tenant from the payload.
-- [ ] **Step 3: Run the failing tests**, commit them alone, audit, then implement.
-- [ ] **Step 4: Run the shared gates,** plus a local rehearsal: `run_local_influxd.sh`, DynamoDB local (or the M1 in-memory fakes if Docker is unavailable), then the CLI with both write switches on.
+  - **Everything off:**
+    - the `/v1` golden is identical;
+    - with `API_V2_ENABLED` alone, `/v2` has exactly the 13 M1 paths and no `observation` fragment;
+    - no write API is created.
+  - **`API_V2_TELEMETRY_ENABLED`:** exactly three more operations (tenant routes 53 → 56), all requiring membership, and the `/v1` golden is still identical.
+  - **`V1_TELEMETRY_READ_SOURCE=v2`:** swaps the implementation.
+  - **Validator and `.env.example`:** the validator rejects the invalid combination, and `.env.example` documents every switch with its default.
+- [ ] **Step 2: Write failing CLI tests** (fakes): written, quarantined and error exit codes; `--observed-at now`; the tenant never comes from the payload.
+- [ ] **Step 3: Run red, commit, test gate,** then implement after approval.
+- [ ] **Step 4: Run the shared gates and a local rehearsal.**
+  - Start `run_local_influxd.sh` and DynamoDB local.
+  - Run `scripts/dev/init_dynamodb.py`, then `seed_local.py`, then the M1 migration apply.
+  - Run the CLI with both write switches on and `--observed-at now`.
+  - Read back through `/v1` (both modes) and `/v2`.
+  - If DynamoDB local cannot run in the session, record the rehearsal as **not run** in the PR, with the reason.
 
 **Acceptance criteria:**
 - [ ] Defaults equal `main@2918532` behavior.
-- [ ] Every switch works independently.
-- [ ] Route counts are exact.
-- [ ] README and architecture document the flags and the dev path.
+- [ ] Each switch works independently, and the invalid combination is rejected.
+- [ ] Exact route sets.
+- [ ] README and architecture document the switches, the dev CLI, D16 (ships dark) and the rollback.
 
-**Rollback:** Switch flags off. No data deletion.
+**Rollback:** Switch flags off; restart. No data deletion.
 
 ---
 
@@ -774,28 +1135,44 @@ An unknown version raises `ValueError`.
 
 **Files:**
 - Create: `tests/contracts/test_p2_acceptance_gate.py`, `tests/influx/test_p2_acceptance_influx.py`, `docs/p2-telemetry-rollout-runbook.md`
-- Modify: `README.md` (runbook link)
+- Modify: `docs/adr/ADR-006-telemetry-has-three-timestamps.md`, `docs/adr/ADR-007-influx-v2-dual-write-migration.md` (append a "Phase split" section; `test_architecture_inventory.py` must stay green), `README.md` (runbook link)
 
 **Gate invariants:**
-1. The same legacy sample is visible identically through `/v1` in both read modes (four endpoints, byte-identical JSON).
-2. `/v2` serves two probes of the same metric.
+1. The same legacy sample, including sub-second, is visible identically through `/v1` in both read modes: four endpoints, byte-identical JSON, non-empty (real InfluxDB).
+2. `/v2` serves two probes of the same metric as distinct series, and they are absent from `/v1`.
 3. No device-supplied tenant authority.
-4. Duplicate, replay and out-of-order writes are idempotent (real InfluxDB).
-5. Deployment is resolved at event time across relocation; an unresolved deployment is quarantined without fallback.
-6. Unit conversion and the persisted mapping versions are proven.
-7. Cardinality: stored tag keys equal the allowlist (`schema.tagKeys` on real InfluxDB), and no event/source IDs or metadata appear in tags.
-8. Out-of-range values carry persisted provenance.
-9. Write failures are retryable and never acknowledged.
-10. The flag matrix keeps the `/v1` golden and exact route sets.
-11. The runbook names the Go parity command (`make verify-influx`) as a release-gate step, and the release gate lists every ADR-005/006/007 gate with its proving test.
+4. Duplicate, replay, re-classified and shuffled writes are idempotent: one stored point per identity (real InfluxDB).
+5. The Deployment is resolved at event time across relocation, including replay after a move. An unresolved Deployment is quarantined, with no fallback.
+6. Unit conversion is applied; `source_unit` and the catalog/unit/quality versions are persisted on stored points.
+7. **Cardinality:**
+   - `schema.tagKeys(bucket:, predicate:, start: <before the oldest seed>)`, minus keys starting with `_`, equals the allowlist;
+   - `schema.fieldKeys` contains no tag key;
+   - no event ID, source event ID, integration ID, quality, source type or metadata is a tag value.
+8. Out-of-range values are stored with `quality_state=out_of_range` and the `plausible_range` provenance.
+9. **InfluxDB outage after acceptance.** A queue fake drives real InfluxDB behind a `write_api` wrapper that fails the first N calls. The pipeline never acknowledges, and redelivery recovers the exact v2 and legacy point set.
+10. The flag matrix (every combination of the four Python switches with `API_V2_ENABLED`) keeps the `/v1` golden and exact route sets.
+11. The runbook states the D16 precondition. Its release gate lists `make verify-influx` (Go parity included) and maps every ADR-005/006/007 gate to its proving test, or to **DEFERRED → #15** with the reason.
 
-**Runbook sections:** flags table; release gate (commands); rollout sequence (v2 write → verify → legacy dual-write → `/v2` reads → evaluator `v2` in one environment → `/v1` projection only after the legacy window is covered); divergence checks (Flux snippets comparing counts per pond/metric); rollback (flags only; never delete points); retention note (D6); known out-of-scope items (P3 ingress/DLQ/connector health, P6 calibration states, #6).
+**Runbook sections:**
+- flags table;
+- release gate (commands);
+- **D16 precondition:** rehearsal only in P2; production enablement is a P3 exit step;
+- **rollout sequence:** v2 write → keyed divergence check → legacy dual-write (only after the P3 redrive test) → `/v2` reads → evaluator `v2` in one environment → `/v1` projection only after the retention and legacy window is covered;
+- **keyed divergence checks** (Flux snippets): per `(pond, device, metric, _time)`, the value and `seq` match; latest per pond matches; summary aggregates match. Counts alone are not sufficient;
+- stop-dual-write criteria (§10.6);
+- rollback (flags only; never delete points);
+- retention note (D6);
+- known out-of-scope items: the D13 list, D17 AlertRuleV2, P6 calibration states and #6.
 
 - [ ] **Step 1: Write the failing gate tests.**
-- [ ] **Step 2: Audit them.**
-- [ ] **Step 3: Write the runbook and run the gate**, including `make verify-influx` and the full suites.
+- [ ] **Step 2: Run red, commit, test gate.**
+- [ ] **Step 3: Write the runbook and the ADR phase-split appendices, then run the full gate** locally (`run_local_influxd.sh`) and in CI.
 
-**Acceptance criteria:** All gates green in CI (`python`, `go`, `influx` and the other required checks).
+**Acceptance criteria:**
+- [ ] All 11 invariants are green in CI (`python`, `go`, `influx`) and locally.
+- [ ] The runbook's commands are exactly those the gate uses.
+- [ ] The ADR appendices record the phase split.
+- [ ] The Epic #22 exit criteria map to passing tests.
 
 **Rollback:** Documentation and tests only.
 
@@ -803,42 +1180,77 @@ An unknown version raises `ValueError`.
 
 | Requirement | Proving task/test |
 |---|---|
-| ADR-005 unit conversion | P2-02 `test_telemetry_units.py`; P2-06 normalizer; P2-09 gate 6 |
-| ADR-005 two probes for one metric | P2-04 API and integration; P2-09 gate 2 |
+| ADR-005 unit conversion | P2-02; P2-06; P2-09 gate 6 |
+| ADR-005 two probes for one metric | P2-04 API/integration; P2-09 gate 2 |
 | ADR-005 trusted tenant mapping | P2-00 `SourceObservation` shape; P2-06 mapper/normalizer; P2-09 gate 3 |
 | ADR-005 `/v1` pivot equivalence | P2-07 equivalence; P2-09 gate 1 |
 | ADR-005 bounded tag cardinality | P2-00 guard; P2-09 gate 7 |
 | ADR-005 out-of-range never valid, with provenance | P2-02; P2-09 gate 8 |
-| ADR-005 mapping versions persisted; replay keeps identity | P2-00 identity; P2-06 pinned versions; P2-03 fields |
-| ADR-006 delayed/duplicated/replayed/out-of-order | P2-02 flags; P2-03 integration; P2-09 gate 4 |
-| ADR-006 deployment at event time; no fallback; quarantine | P2-06; P2-09 gate 5 (connector-health marking is P3, D13) |
-| ADR-006 event-time alert windows, order-independent | P2-05 parity (shuffled writes) |
+| ADR-005 mapping versions persisted; replay after revision keeps version and identity | P2-00 identity; P2-06 injected `@2` replay; P2-03 fields |
+| ADR-006 delayed/duplicated/replayed/out-of-order | P2-02 flags; P2-03 integration (re-classification, redelivery); P2-09 gate 4 |
+| ADR-006 clock-skew flag | P2-02 |
+| ADR-006 deployment at event time; no fallback | P2-06; P2-09 gate 5 |
+| ADR-006 quarantine persistence + connector health | **DEFERRED → #15** (D13); P2 delivers the bounded record |
+| ADR-006 current health uses receive/ingest time | `observations/latest` is not a health view (D11, P2-04 tests); health is **DEFERRED → #17** |
+| ADR-006 event-time alert windows, completeness delay, order independence | P2-05 parity (shuffled writes) + existing `AllowedLateness` |
 | ADR-007 duplicate/ordering/conversion/cardinality/evaluator parity/visibility before enabling v2 reads | P2-03, P2-05, P2-07, P2-09 |
-| ADR-007 Influx outage leaves telemetry retryable | P2-03 error mapping + unreachable-URL integration; P2-09 gate 9 (queue redrive itself is P3) |
+| ADR-007 outage after durable acceptance: no ack, recovery without loss | P2-06 queue-fake pipeline test; P2-09 gate 9; durable SQS redrive **DEFERRED → #15** (D13) and blocks production dual write (D16) |
 | ADR-007 each write path disabled independently | P2-03 switches; P2-08 flags |
 
 ## Execution Protocol (multi-session, tests first)
 
-Each task runs in its own Claude Code session and branch, launched by the orchestrator session that owns Epic #22.
+Each task runs in its own Claude Code session on its branch. The orchestrator session that owns Epic #22 launches and supervises it.
 
-1. **Start.** Fetch and branch from the current `origin/main`. Read this plan section, the task issue and every consumed contract on `main`.
-2. **Red.** Write only the focused tests. Run them and record the failure output. Commit with `test(p2-nn): ...`.
-3. **Test audit (gate).** At least two independent reviewer agents check each test for:
-   - an acceptance criterion it proves;
-   - a realistic bug it would catch, judged by mutation-style reasoning;
-   - tautologies;
-   - over-mocking of the unit under test;
-   - missing boundaries.
+1. **Start.** Fetch `origin/main` and branch from it. Read this plan section, the task issue and every consumed contract on `main`.
+2. **Red.** Write only the focused tests. Run them and record the red output: command, exit code, failure summary. Commit with `test(p2-nn): …` and push the branch.
+3. **Test audit gate.**
+   - **Reviewers.** Two fresh reviewer subagents, given only the issue, this plan section and the test diff, each produce a table: test id → acceptance criterion → mutant it kills → verdict (useful / weak / redundant / wrong).
+   - **Mutants.** For encoders, guards, thresholds, D7/D8 and parity, the session applies at least three mutants locally and records the failing test ids.
+   - **Hand-off.** The session fixes the findings, pushes, and ends its turn with `TESTS READY <sha>`, the red-run evidence and both tables. It also comments that summary on the task issue.
+   - **Approval.** The orchestrator runs its own independent audit and replies `TESTS APPROVED <sha>` or lists the required changes. It records the approval as an issue comment.
+   - **Freeze.** Tests are frozen at the approved sha. Any later change to an approved test needs re-approval. The PR body includes `git diff --stat <sha>..HEAD -- tests '**/*_test.go'` and links the approval.
+4. **Green.** Implement the minimum production code needed to pass. Run the focused tests, `make verify-python`, `make verify-go`, `git diff --check` and the `/v1` OpenAPI `--check`. Run `make verify-influx` (local `run_local_influxd.sh`) when integration tests exist.
+5. **Review.** Two independent reviewer subagents audit the full diff against this plan: one for correctness and the other for behavior/contract. Fix every finding with a regression test.
+6. **PR.** Open one PR that closes the task issue. Its body records the fail-then-pass evidence, the approval link, every gate command and its result, and the head sha. Subscribe to PR activity. Address automated reviews (Codex, Sonar) with fixes or reasoned replies. End the turn with `PR READY #<n> <sha>`.
+7. **Merge.**
+   - **Preconditions.** Bring the branch up to date with `origin/main` (merge or `update-branch`) and let CI rerun. The orchestrator squash-merges only when all of these hold on a head that contains current `origin/main`:
+     - `python`, `go`, `opentofu`, `compose`, `frontend`, `sonar` and the Trivy checks pass, plus `influx` once #67 has merged;
+     - every review thread is resolved;
+     - the PR is mergeable.
+   - **Record.** The orchestrator records the merge sha on the issue and the Epic.
+   - **Unblocking.** Dependent tasks start only after the merge.
 
-   Fix the findings. Push the tests-only branch and report `TESTS READY` with the audit summary. The orchestrator runs its own audit and replies with approval or required changes. No production code is written before approval.
-4. **Green.** Implement the minimum production code to pass. Then run the focused tests, `make verify-python`, `make verify-go`, `git diff --check`, the `/v1` OpenAPI `--check`, and `make verify-influx` (local `run_local_influxd.sh`) when integration tests exist.
-5. **Review.** Independent correctness and behavior audits run on the full diff against this plan. Fix every finding with a regression test.
-6. **PR.** Open one PR that closes the task issue. Its body records the fail-then-pass evidence and every gate command and result. Respond to automated reviews (Codex, Sonar) with fixes or reasoned replies.
-7. **Merge.** The orchestrator squash-merges only when CI is green on the current head, no review thread is open, and the PR is mergeable. Dependent tasks start only after the merge.
+Recommended owner action (not done by agents): add the required status checks above, with strict up-to-date branches and required thread resolution, to the default-branch ruleset.
 
 ## Self-Review
 
-- **Coverage:** every Phase 2 work item (catalog, units, envelope, Influx v2 measurement, dual-write, v2 reads, legacy pivot, three timestamps, quality state), every Phase 2 test (duplicate/replay/out-of-order, event-time deployment, unit conversion, cardinality, v1 equivalence, alert parity) and every ADR-005/006/007 gate maps to a task in the acceptance matrix. Connector-health marking and queue/DLQ persistence are explicitly P3 (D13).
-- **Type consistency:** the producer/consumer names (`CanonicalObservation`, `LegacyPoint`, `ObservationSelector`, `StoredObservation`, `NormalizationResult`, `TelemetryWriteError`, `ObservationWriteService`, `V2ProjectedTelemetryRepository`, `V2WindowReader`) are defined once, in P2-00 or in the owning task.
-- **Collision check:** same-wave tasks own disjoint files; hotspots (`main.py`, routers, config, `.env.example`, README) belong to P2-08 only; CI and Makefile belong to P2-01 only.
-- **No placeholders:** every task names its files, interfaces, failing tests, commands, acceptance criteria and rollback.
+- **Coverage:**
+  - Every Phase 2 work item maps to a task: catalog, units, envelope, InfluxDB v2 measurement, dual-write, v2 reads, legacy pivot, three timestamps and quality state.
+  - Every Phase 2 test maps to a task: duplicate/replay/out-of-order, event-time deployment, unit conversion, cardinality, `/v1` equivalence and alert parity.
+  - Every ADR-005/006/007 gate either maps to a test or is explicitly **DEFERRED** with an owner (D13, D16, D18).
+  - The AlertRuleV2 deferral is recorded (D17).
+- **Audit trail:** r2 resolves these findings:
+  - D5 series identity: `quality_state`/`source_type` moved to fields;
+  - the Telegraf `topic` tag and exact time;
+  - native probes in the `/v1` projection and in `/v1` rules;
+  - per-table `limit`/`last()` and summary order;
+  - Flux engine panics and relative windows;
+  - the ack/outage proof;
+  - injectable `@2` registries;
+  - the quarantine boundary in the mapper;
+  - the `MAX_SEQUENCE` bound;
+  - display names;
+  - harness skip placement and `tests/support` ownership;
+  - Flux `${` escaping;
+  - V2 schema names;
+  - the pipeline moved to P2-06 to slim P2-08;
+  - symmetric dependencies;
+  - a concrete test gate and merge rule.
+- **Type consistency:**
+  - **Defined once, in P2-00:** `CanonicalObservation`, `ObservationQuality`, `NormalizationVersions`, `LegacyPoint`, `build_legacy_points`, `ObservationSelector`, `StoredObservation`, `NormalizationResult`, `TelemetryWriteError`.
+  - **Defined once, in their owning task:** `ObservationWriteService` (P2-03), `TelemetryPipeline` (P2-06), `V2ProjectedTelemetryRepository` (P2-07), `V2WindowReader` (P2-05).
+- **Collision check:**
+  - Same-wave tasks own disjoint files.
+  - `tests/support/` belongs to P2-00/P2-01 only.
+  - Hotspots belong to P2-08 only.
+  - CI and the Makefile belong to P2-01 only.
