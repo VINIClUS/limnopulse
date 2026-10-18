@@ -24,7 +24,14 @@ Every dependency boundary is a merge to `main`. P2 ships **dark** (D16): no depl
 
 **Epic:** #22 (roadmap #14). **Planning baseline:** `main@2918532` (M1 complete; `make verify-python` 2120 passed / 8 skipped; `go test -race ./...` green).
 
-**Revision:** r2. This revision applies the findings of five independent audits (three local agents and two cloud sessions, one of which ran real InfluxDB 2.7.11 experiments) and the Codex review of PR #76.
+**Revision:** r3.
+- r2 applied the findings of five independent audits (three local agents and two cloud sessions, one of which ran real InfluxDB 2.7.11 experiments) and the first Codex review of PR #76.
+- r3 applies the second Codex review:
+  - `source_type` and `seq` handling in the `/v1` projection;
+  - field-preserving `last()`;
+  - InfluxDB timestamp bounds;
+  - pinned versions carried on replay;
+  - sentinel encoding for optional fields.
 
 ## Global Constraints
 
@@ -168,6 +175,10 @@ MAX_QUALITY_JSON_FIELD_BYTES = 512
 MAX_QUARANTINE_EXCERPT_BYTES = 2048
 MAX_SEQUENCE = 2**63 - 1             # signed 64-bit line-protocol integer
 MAX_EXACT_INTEGER = 2**53            # |int| >= this is value_invalid (exact float)
+MIN_TELEMETRY_TIME = datetime(1970, 1, 1, tzinfo=UTC)          # inclusive
+MAX_TELEMETRY_TIME = datetime(2262, 1, 1, tzinfo=UTC)          # exclusive; int64-ns line-protocol safe
+ABSENT_SEQUENCE = -1                 # field sentinel: optional fields are always written (D5)
+ABSENT_STRING = ""                   # field sentinel for source_event_id / integration_id
 SOURCE_METADATA_ALLOWLIST = frozenset({"firmware_version"})  # values ≤ 64 chars, never tagged
 LEGACY_MQTT_TOPIC_TEMPLATE = "limnopulse/v1/devices/{device_id}/readings"
 ```
@@ -286,6 +297,7 @@ These values are frozen by a P2-00 test, in the same way as `test_frozen_enum_va
 General rules:
 - All models are frozen Pydantic v2 models with `extra="forbid"`.
 - Every datetime must be timezone-aware and is normalized to UTC; a naive datetime is rejected.
+- Every telemetry datetime (`observed_at`, `received_at`, `ingested_at`) must lie in `[MIN_TELEMETRY_TIME, MAX_TELEMETRY_TIME)`, which InfluxDB's signed 64-bit nanosecond time can represent. The mapper and parsers quarantine an out-of-range `ts` as `observed_at_invalid`.
 - IDs use the M1 validators: `SafeId` for tenant, `DeviceId` for device, and the canonical prefixes `site`, `ast`, `cmp`, `prb`, `dep`, `di` and `obs`.
 - Collections are tuples.
 
@@ -293,7 +305,11 @@ General rules:
 MetricDefinition        metric_key, display_name, canonical_unit, value_type, plausible_min, plausible_max,
                         legacy_field | None
 TrustedSourceContext    tenant_id, device_id, integration_id (di_) | None, integration_type: ProviderKey,
-                        source_type: SourceType, connector_version (≤64) | None, received_at, replay=False
+                        source_type: SourceType, connector_version (≤64) | None, received_at, replay=False,
+                        mapping_versions: NormalizationVersions | None = None
+                        — a replay producer sets mapping_versions to the versions recorded when the event
+                          was first normalized (the queued event in P3, or the stored point's version fields),
+                          so a replay after a catalog/unit revision reproduces the original mapping (ADR-005)
 SourceObservation       component_id (cmp_), metric_key (≤64), value: StrictInt | StrictFloat (finite),
                         source_unit (1–16), observed_at, sequence: 0..MAX_SEQUENCE | None,
                         source_event_id (1–128 printable) | None,
@@ -365,18 +381,20 @@ The identity deliberately excludes mapping versions, quality, `received_at`, `in
 | `delay_ms` | integer | |
 | `event_id` | string | |
 | `ingested_at_ns` | integer | |
-| `integration_id` | string | only when present |
+| `integration_id` | string | always written; `""` (`ABSENT_STRING`) when absent |
 | `quality_flags_json` | string | compact sorted JSON array, ≤ 512 bytes |
 | `quality_policy_version` | string | |
 | `quality_provenance_json` | string | compact JSON array, ≤ 512 bytes |
 | `quality_state` | string | |
 | `received_at_ns` | integer | |
-| `sequence` | integer | only when present |
-| `source_event_id` | string | only when present |
+| `sequence` | integer | always written; `-1i` (`ABSENT_SEQUENCE`) when absent |
+| `source_event_id` | string | always written; `""` (`ABSENT_STRING`) when absent |
 | `source_type` | string | |
 | `source_unit` | string | |
 | `unit_mapping_version` | string | |
 | `value` | float | always float, even for integer metrics; avoids field-type conflicts |
+
+**Complete field set.** Every point carries the complete field set, so a rewrite of the same identity replaces every field. InfluxDB merges same-point writes field by field and cannot clear an omitted field, so absence is encoded with sentinels. Readers (P2-04, P2-07, P2-05) decode `sequence == -1` and `""` to `None`/absent. The Go reader maps an absent sequence to `Seq = 0`, like a legacy missing `seq`. A `/v1` projection with an absent `seq` omits it, like legacy.
 
 **Formatting:**
 - A float uses `repr(float(v))` (`25.0`, `4.82`, `1e-05`); the encoder raises on non-finite values (defense in depth).
@@ -579,16 +597,29 @@ from(bucket: B) |> range(<same bounds as legacy>)
   |> filter(_measurement == "observation_numeric") |> filter(tenant_id == T) |> filter(asset_id <in pond assets>)
   |> filter(fn: (r) => contains(value: r["component_id"], set: <legacy default component ids>))
   |> filter(fn: (r) => contains(value: r["metric_key"], set: <7 keys>))
-  |> filter(fn: (r) => r["_field"] == "value" or r["_field"] == "sequence")
-  |> map(... legacy shape: _measurement "water_quality", pond_id from asset, source mapped, _field legacy name / "seq",
-         _value float ...)
-  |> group(columns: ["_start","_stop","_measurement","tenant_id","pond_id","device_id","source","schema_version"])
-  |> <legacy tail: pivot/sort/limit | sort(_time) → last() → regroup → pivot | summary>
+  |> filter(fn: (r) => contains(value: r["_field"], set: ["value","sequence","source_type","ingested_at_ns","event_id"]))
+  |> pivot(rowKey: ["_time", <all tags>], columnKey: ["_field"], valueColumn: "_value")     // one row per point
+  |> <two branches, then union():
+       metrics: map → {legacy shape, _field: legacy name(metric_key), _value: float(value)}
+       seq:     group by (legacy series key, _time) → sort(ingested_at_ns, event_id) → last() →
+                drop sequence == -1 → map → {legacy shape, _field: "seq", _value: float(sequence)}>
+  |> group(columns: ["_start","_stop","_measurement","tenant_id","pond_id","device_id","source","schema_version","_field"])
+  |> <legacy tail: pivot/sort/limit | sort(_time) → last() → regroup without _field → pivot | summary>
 ```
 
+`legacy shape` means:
+- `_measurement`: `"water_quality"`.
+- `pond_id`: taken from the asset.
+- `source`: `"mqtt"` when `source_type == "legacy_mqtt"`, otherwise the `source_type` value. `source_type` is a field (D5), so it is pivoted per point before mapping.
+- `schema_version`: `"1"`.
+
 - **Component set.** It is `{default_component_id_for_legacy_device(t, d.device_id) for d in domain_repository.list_devices(t)}`. Native v2 Components are never visible through `/v1`.
-- **Legacy series tables.** Group by the legacy series key before any `last()`, pivot, `sort` or `limit`. Legacy `limit(n)` and `sort` apply **per series table**, which means per device and source, not globally.
-- **Latest.** Sort by `_time` before `last()` (`last()` follows table order), then re-group with the legacy key immediately after `last()`. The chain `map → group → sort → last() → pivot` panics in 2.7.11 without the regroup.
+- **`seq` tie-break.** `seq` for a legacy `(series, _time)` group is the sequence of the point with the greatest `ingested_at_ns`, then the greatest `event_id`. This is the same rule as `build_legacy_points`, and a test covers conflicting sequences at the same time.
+- **Legacy series tables.** Group by the legacy series key plus `_field` before any `last()`, `sort` or `limit`. Legacy `limit(n)` and `sort` apply **per series table**, which means per device and source, not globally. Legacy `last()` runs per field table.
+- **Latest.**
+  - Keep `_field` in the group key through `sort(_time)` → `last()`. Grouping without `_field` would collapse all metrics into one row.
+  - Then regroup by the legacy series key **without** `_field`, and only then pivot to the legacy row key.
+  - The chain `map → group → sort → last() → pivot` panics in 2.7.11 without the regroup.
 - **Summary.** Keep the legacy period/interval table (24h→5m, 7d/30d→1h) and the `do_mg_l`, `ph` and `temp_c` series with mean/min/max/count. Sort by `device_id, _time` after `group(columns: ["_field"])` and before aggregation. This reproduces legacy float summation order, so `mean` is byte-identical. Errors are wrapped in `TelemetryQueryError`.
 - **Error propagation.** The other methods propagate errors exactly like the legacy adapter.
 - **Integer fields.** `rssi` and `seq` are converted explicitly to `int` after checking `float.is_integer()`. There is no reliance on Pydantic lax coercion.
@@ -618,7 +649,7 @@ from(bucket: <b>)
 
 **Rows to samples:**
 - Rows with `component_id != DefaultComponentIDForLegacyDevice(tenant, device_id)` are dropped.
-- The remaining rows become `alertevaluator.Sample{Time, DeviceID, Value, Seq}` and pass through the unchanged `EvaluateSamples`. A missing `sequence` gives `Seq = 0`, like a legacy missing `seq`.
+- The remaining rows become `alertevaluator.Sample{Time, DeviceID, Value, Seq}` and pass through the unchanged `EvaluateSamples`. A `sequence` of `-1` (`ABSENT_SEQUENCE`) gives `Seq = 0`, like a legacy missing `seq`.
 
 **Parity** means identical `WindowResult` values for the legacy reader on `water_quality` and the v2 reader on `observation_numeric`:
 - Scenarios: `legacy_sample`, `sub_second`, `delayed_replay`, `relocation`, `unit_converted` and `multi_point_series`.
@@ -685,7 +716,7 @@ Each task also owns the new test files named in its section.
   - `NormalizationResult.counts()` keys are closed.
 - [ ] **Step 2: Write failing schema tests.**
   - `encode_observation_line` output equals each scenario's golden lines byte-for-byte: sorted tags/fields, escaping, `repr` floats, integer suffixes and range, integer-nanosecond time.
-  - Optional tags/fields are omitted when absent; JSON fields over 512 bytes are rejected; non-finite values are rejected.
+  - The optional `probe_id` tag is omitted when absent. Optional fields are always written, with sentinels `sequence=-1i`, `source_event_id=""` and `integration_id=""`. JSON fields over 512 bytes, non-finite values and datetimes outside `[MIN_TELEMETRY_TIME, MAX_TELEMETRY_TIME)` are rejected.
   - The guard rejects unknown or missing tags, invalid IDs, unknown metrics, `quality_state`/`source_type`/event IDs/metadata as tags, and a wrong `schema_version`.
   - `build_legacy_points` + `encode_legacy_line` honor D7, D8 and the grouping/tie-break rules, with exact sub-second time, the `topic` tag for `legacy_mqtt` only, and `rssi`/`seq` as integers.
   - `flux_string_literal` escapes quotes, backslashes, newlines and `${`.
@@ -837,7 +868,7 @@ Each task also owns the new test files named in its section.
   - An Asset-lookup exception is retryable.
 - [ ] **Step 2: Write failing integration tests** (real InfluxDB).
   - Writing the same scenario twice and in shuffled order yields an identical stored point set.
-  - Re-writing the same identity with a **different quality classification** (a value corrected to out-of-range) and a **different `received_at`** yields exactly one point per identity, with the last write's fields.
+  - Re-writing the same identity with a **different quality classification** (a value corrected to out-of-range), a **different `received_at`**, and `sequence`/`source_event_id` changed from a value to absent yields exactly one point per identity. Every field equals the last write, so the sentinels replace the stale values.
   - A dual-written legacy point plus a Telegraf-shaped line for the same reading yield one point, and one row through `InfluxTelemetryRepository.query_readings`. The Telegraf-shaped line is built from the parsed `telegraf.conf` plus Telegraf defaults (`topic`), whole-second and sub-second.
   - A closed loopback port raises `TelemetryWriteError(retryable=True)`.
 - [ ] **Step 3: Run red, commit, test gate,** then implement after approval.
@@ -880,7 +911,7 @@ Each task also owns the new test files named in its section.
 - [ ] **Step 1: Write failing reader unit tests** (fake `query_api`).
   - The filters, all escaped.
   - Injection attempts, including `${`, are inert.
-  - Parsing of every field, including absent optional fields.
+  - Parsing of every field, including sentinel decoding (`-1`/`""` → `None`).
   - Global sort and limit; latest is one item per `(component, metric)`.
 - [ ] **Step 2: Write failing service and API tests** (isolated app with the unmounted routers).
   - The 403/404/422/503 matrix.
@@ -929,7 +960,7 @@ Each task also owns the new test files named in its section.
   - ID and metric vectors from `testdata/telemetry_v2/contract_vectors.json`, with the repository-root path resolved via `runtime.Caller`.
   - Flux fragments, with escaping including `$`.
   - An unknown metric and an invalid window are rejected.
-  - Row parsing for float/int `value` and `sequence`, and for a missing sequence.
+  - Row parsing for float/int `value` and `sequence`, including the `-1` sentinel → `Seq = 0`.
   - Non-default components dropped; NaN dropped.
   - Config default, env, flag and invalid value; `main` reader selection.
 - [ ] **Step 2: Write failing parity integration tests** (`TestInfluxIntegrationParity*`).
@@ -971,8 +1002,9 @@ Each task also owns the new test files named in its section.
   - a bool, string, NaN or Infinity value becomes a `value_invalid` quarantine for that field.
 - Unknown keys, including `tenant_id`, `pond_id`, `asset_id`, `site_id` and `deployment_id`, are ignored and never influence anything.
 
-**`TelemetryNormalizer(*, components: ComponentReader, deployments: DeploymentRepository, clock, catalogs=METRIC_CATALOGS, unit_mappings=UNIT_MAPPINGS, policies=QUALITY_POLICIES)`**
-- `async normalize(context, observations, *, versions: NormalizationVersions | None = None) -> NormalizationResult`.
+**`TelemetryNormalizer(*, components: ComponentReader, deployments: DeploymentRepository, clock, catalogs=METRIC_CATALOGS, unit_mappings=UNIT_MAPPINGS, policies=QUALITY_POLICIES, default_versions: NormalizationVersions = NormalizationVersions())`**
+- `async normalize(context, observations) -> NormalizationResult`.
+- The pinned versions are `context.mapping_versions` when set (a replay), otherwise `default_versions`.
 - It processes each observation in order:
   1. Component ownership (tenant and `context.device_id`) → `component_not_owned`; an `actuator` Component → `component_not_measuring`.
   2. Catalog metric for the pinned version → `metric_unknown`.
@@ -1009,7 +1041,7 @@ Each task also owns the new test files named in its section.
   - **Identity:** two probes of the same metric get distinct identities.
   - **Versions and limits:**
     - with an injected test-only `metric-catalog@2`/`unit-mapping@2`, the default normalization stamps `@2`;
-    - a replay pinned to `@1` reproduces the `@1` value, quality and versions with an equal `event_id`;
+    - a replay whose `TrustedSourceContext.mapping_versions` pins `@1` reproduces the `@1` value, quality and versions with an equal `event_id`. This is tested both on `normalize` and end-to-end through `TelemetryPipeline.ingest`;
     - an unknown version raises;
     - the batch bound and quarantine truncation.
 - [ ] **Step 3: Write failing pipeline tests.**
