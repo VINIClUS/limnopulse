@@ -196,11 +196,17 @@ async def test_asset_window_returns_every_point_in_global_order(influx_bucket: s
 
 @pytest.mark.asyncio
 async def test_limit_applies_after_the_global_sort(influx_bucket: str) -> None:
-    observations = noon_observations()
+    probes = scenario("two_probes_same_metric").observations
+    legacy = scenario("legacy_sample").observations[0]
+    # Distinct times whose component order is the reverse of their time order.
+    earlier = variant(probes[1], observed_at=NOON - timedelta(minutes=30), metric_key="water.ph")
+    later = variant(legacy, observed_at=NOON + timedelta(minutes=30), metric_key="water.ph")
+    observations = [*noon_observations(), earlier, later]
     seed(influx_bucket, observations)
     expected = ordered(observations)
+    assert expected[0] == stored_for(earlier) and expected[-1] == stored_for(later)
 
-    for limit in (1, 3, 8):
+    for limit in (1, 3, 8, 11):
         result = await query(influx_bucket, ObservationSelector("asset", POND_ASSET), limit=limit)
         assert result, "seeded data must be readable"
         assert result == expected[:limit]

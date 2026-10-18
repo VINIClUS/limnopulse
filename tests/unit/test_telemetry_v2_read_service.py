@@ -39,34 +39,37 @@ class FakeReader:
 
 
 class FakeEntities:
-    """Tenant-scoped lookups; records every call so dispatch and tenant scoping are visible."""
+    """Three separate tenant-scoped lookups sharing one call log, so dispatch is visible.
+
+    Each role only has its own method: wiring the wrong reader to a selector kind fails.
+    """
 
     def __init__(self) -> None:
         self.calls: list[tuple[str, str, str]] = []
-        self.assets = {(TENANT, ASSET_ID), (OTHER_TENANT, OTHER_ASSET_ID)}
-        self.devices = {(TENANT, DEVICE_ID)}
-        self.components = {(TENANT, COMPONENT_ID)}
+        self.site_assets = _Lookup(
+            self.calls, "get_asset", {(TENANT, ASSET_ID), (OTHER_TENANT, OTHER_ASSET_ID)}
+        )
+        self.devices = _Lookup(self.calls, "get_device", {(TENANT, DEVICE_ID)})
+        self.components = _Lookup(self.calls, "get_component", {(TENANT, COMPONENT_ID)})
 
-    async def get_site(self, tenant_id: str, site_id: str) -> object | None:
-        raise AssertionError("sites are never looked up for a selector")
 
-    async def get_asset(self, tenant_id: str, asset_id: str) -> object | None:
-        self.calls.append(("get_asset", tenant_id, asset_id))
-        if (tenant_id, asset_id) in self.assets:
-            return SimpleNamespace(tenant_id=tenant_id, asset_id=asset_id)
-        return None
+class _Lookup:
+    def __init__(self, calls: list, method: str, known: set[tuple[str, str]]) -> None:
+        self._calls = calls
+        self._method = method
+        self._known = known
 
-    async def get_device(self, tenant_id: str, device_id: str) -> object | None:
-        self.calls.append(("get_device", tenant_id, device_id))
-        if (tenant_id, device_id) in self.devices:
-            return SimpleNamespace(tenant_id=tenant_id, device_id=device_id)
-        return None
+    def __getattr__(self, name: str) -> object:
+        if name != self._method:
+            raise AttributeError(f"{self._method} reader has no {name}")
 
-    async def get_component(self, tenant_id: str, component_id: str) -> object | None:
-        self.calls.append(("get_component", tenant_id, component_id))
-        if (tenant_id, component_id) in self.components:
-            return SimpleNamespace(tenant_id=tenant_id, component_id=component_id)
-        return None
+        async def lookup(tenant_id: str, entity_id: str) -> object | None:
+            self._calls.append((name, tenant_id, entity_id))
+            if (tenant_id, entity_id) in self._known:
+                return SimpleNamespace(tenant_id=tenant_id, entity_id=entity_id)
+            return None
+
+        return lookup
 
 
 class Clock:
@@ -87,9 +90,9 @@ def build(
     clock = clock or Clock(NOW)
     service = ObservationReadService(
         reader=reader,
-        site_assets=entities,
-        devices=entities,
-        components=entities,
+        site_assets=entities.site_assets,
+        devices=entities.devices,
+        components=entities.components,
         clock=clock,
     )
     return service, reader, entities, clock
@@ -144,7 +147,9 @@ MISSING = [
 def test_constructor_is_keyword_only() -> None:
     entities = FakeEntities()
     with pytest.raises(TypeError):
-        ObservationReadService(FakeReader(), entities, entities, entities, Clock(NOW))  # type: ignore[misc]
+        ObservationReadService(
+            FakeReader(), entities.site_assets, entities.devices, entities.components, Clock(NOW)
+        )  # type: ignore[misc]
 
 
 @pytest.mark.asyncio
@@ -283,6 +288,30 @@ async def test_clock_is_read_per_request_not_at_construction() -> None:
 
     assert reader.calls[0][1]["stop"] == later
     assert reader.calls[1][1]["now"] == later
+
+
+@pytest.mark.asyncio
+async def test_lookup_precedes_the_read_on_the_happy_path() -> None:
+    order: list[str] = []
+    service, reader, entities, _ = build()
+    lookup = entities.site_assets.get_asset
+
+    async def recording_lookup(tenant_id: str, entity_id: str) -> object | None:
+        order.append("lookup")
+        return await lookup(tenant_id, entity_id)
+
+    original = reader.query_observations
+
+    async def recording_read(**kwargs: object) -> list:
+        order.append("read")
+        return await original(**kwargs)
+
+    entities.site_assets.get_asset = recording_lookup  # type: ignore[method-assign]
+    reader.query_observations = recording_read  # type: ignore[method-assign]
+
+    await query(service, ObservationSelector("asset", ASSET_ID))
+
+    assert order == ["lookup", "read"]
 
 
 @pytest.mark.asyncio

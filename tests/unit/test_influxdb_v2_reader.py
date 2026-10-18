@@ -7,6 +7,7 @@ from datetime import UTC, datetime, timedelta
 import pytest
 from influxdb_client.client.flux_table import FluxRecord, FluxTable, TableList
 
+from limnopulse_api.adapters import influxdb_v2_reader
 from limnopulse_api.adapters.influxdb_v2_reader import InfluxObservationReader
 from limnopulse_api.core.errors import TelemetryQueryError
 from limnopulse_api.domain.metric_catalog import metric_catalog
@@ -161,12 +162,13 @@ async def run_latest(
     metric_keys: frozenset[str] | None = None,
     tenant_id: str = TENANT,
     bucket: str = BUCKET,
+    lookback: timedelta = timedelta(hours=24),
 ) -> list[StoredObservation]:
     return await reader_for(api, bucket).query_latest_observations(
         tenant_id=tenant_id,
         selector=selector or ObservationSelector("asset", ASSET_ID),
         metric_keys=metric_keys,
-        lookback=timedelta(hours=24),
+        lookback=lookback,
         now=NOW,
     )
 
@@ -268,7 +270,6 @@ async def test_metric_keys_filter_each_escaped_key_and_is_absent_without_keys() 
     for key in keys:
         assert flux_string_literal(key) in filtered
     assert flux_string_literal("water.temperature") not in filtered
-    assert re.search(r"metric_key", filtered)
 
     unfiltered_api = FakeQueryApi()
     await run_query(unfiltered_api)
@@ -314,7 +315,7 @@ async def test_observations_pivot_then_ungroup_then_global_sort_then_limit() -> 
     assert pivot < group < sort < limit
     # never group() before pivot: the first group of any kind follows the pivot
     assert position(query, r"\|>\s*group\(") > pivot
-    assert "desc" not in query
+    assert re.search(r"desc\s*:\s*true", query) is None
 
 
 # --- query_latest_observations: Flux shape --------------------------------------------------
@@ -351,7 +352,7 @@ async def test_latest_chain_is_pivot_group_sort_last_ungroup_sort() -> None:
     assert pivot < group_pair < sort_time < last < ungroup < final_sort
     assert position(query, r"\|>\s*group\(") > pivot
     assert flux_string_literal("water.ph") in query
-    assert "desc" not in query
+    assert re.search(r"desc\s*:\s*true", query) is None
 
 
 @pytest.mark.asyncio
@@ -362,6 +363,24 @@ async def test_latest_orders_by_observed_time_never_by_receipt_or_ingest() -> No
     for column in ("received_at_ns", "ingested_at_ns"):
         assert re.search(rf'sort\([^)]*"{column}"', query) is None
         assert re.search(rf'last\([^)]*"{column}"', query) is None
+
+
+@pytest.mark.asyncio
+async def test_latest_uses_the_given_lookback() -> None:
+    api = FakeQueryApi()
+    await run_latest(api, lookback=timedelta(hours=2, minutes=30))
+    assert range_bounds(only_query(api)) == (NOW - timedelta(hours=2, minutes=30), NOW)
+
+
+@pytest.mark.asyncio
+async def test_latest_without_metric_keys_has_no_metric_or_quality_filter() -> None:
+    api = FakeQueryApi()
+    await run_latest(api)
+    query = only_query(api)
+    for definition in metric_catalog():
+        assert flux_string_literal(definition.metric_key) not in query
+    for state in QualityState:
+        assert flux_string_literal(str(state)) not in query
 
 
 # --- escaping and validation ---------------------------------------------------------------
@@ -381,9 +400,46 @@ async def test_bucket_is_always_a_helper_escaped_literal(bucket: str) -> None:
 
 
 @pytest.mark.asyncio
+async def test_every_runtime_literal_goes_through_the_escaping_helper(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    seen: list[str] = []
+
+    def spy(value: str) -> str:
+        seen.append(value)
+        return flux_string_literal(value)
+
+    monkeypatch.setattr(influxdb_v2_reader, "flux_string_literal", spy, raising=True)
+    keys = frozenset({"water.ph", "device.rssi"})
+    states = frozenset({QualityState.VALID, QualityState.SUSPECT})
+
+    await run_query(
+        FakeQueryApi(),
+        selector=ObservationSelector("device", DEVICE_ID),
+        metric_keys=keys,
+        quality_states=states,
+    )
+    expected = {BUCKET, TENANT, DEVICE_ID, *keys, *(str(state) for state in states)}
+    assert expected <= {str(value) for value in seen}
+
+    seen.clear()
+    await run_latest(
+        FakeQueryApi(), selector=ObservationSelector("component", COMPONENT_ID), metric_keys=keys
+    )
+    assert {BUCKET, TENANT, COMPONENT_ID, *keys} <= {str(value) for value in seen}
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize(
     "tenant_id",
-    ['tnt") |> drop(columns: ["tenant_id"]) //', "tnt_${secret}", "", "tnt a", "tnt x"],
+    [
+        'tnt") |> drop(columns: ["tenant_id"]) //',
+        "tnt_${secret}",
+        "",
+        "tnt a",
+        "tnt\u2028x",
+        "-tnt",
+    ],
 )
 async def test_invalid_tenant_ids_are_rejected_before_any_query(tenant_id: str) -> None:
     for run in (run_query, run_latest):

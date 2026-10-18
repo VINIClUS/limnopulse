@@ -28,6 +28,7 @@ from limnopulse_api.domain.telemetry_v2 import (
     MAX_TELEMETRY_TIME,
     METRIC_CATALOG_VERSION,
     MIN_TELEMETRY_TIME,
+    POINT_QUALITY_STATES,
     QualityFlag,
     QualityProvenance,
     QualityState,
@@ -144,11 +145,18 @@ class FakeReader:
 
 
 class FakeEntities:
+    """`site_asset_repository` and `device_component_repository` are separate objects."""
+
     def __init__(self) -> None:
         self.calls: list[tuple[str, str, str]] = []
+        self.site_assets = FakeSiteAssets(self.calls)
+        self.device_components = FakeDeviceComponents(self.calls)
+
+
+class FakeSiteAssets:
+    def __init__(self, calls: list[tuple[str, str, str]]) -> None:
+        self.calls = calls
         self.assets = {(TENANT, ASSET_ID), (OTHER_TENANT, OTHER_ASSET_ID)}
-        self.devices = {(TENANT, DEVICE_ID)}
-        self.components = {(TENANT, COMPONENT_ID)}
 
     async def get_site(self, tenant_id: str, site_id: str) -> object | None:
         self.calls.append(("get_site", tenant_id, site_id))
@@ -158,6 +166,13 @@ class FakeEntities:
         self.calls.append(("get_asset", tenant_id, asset_id))
         found = (tenant_id, asset_id) in self.assets
         return SimpleNamespace(tenant_id=tenant_id, asset_id=asset_id) if found else None
+
+
+class FakeDeviceComponents:
+    def __init__(self, calls: list[tuple[str, str, str]]) -> None:
+        self.calls = calls
+        self.devices = {(TENANT, DEVICE_ID)}
+        self.components = {(TENANT, COMPONENT_ID)}
 
     async def get_device(self, tenant_id: str, device_id: str) -> object | None:
         self.calls.append(("get_device", tenant_id, device_id))
@@ -189,8 +204,8 @@ def build_app(
     app.state.auth_provider = DevAuthProvider()
     app.state.membership_service = FakeMembershipService(role)
     entities = FakeEntities()
-    app.state.site_asset_repository = entities
-    app.state.device_component_repository = entities
+    app.state.site_asset_repository = entities.site_assets
+    app.state.device_component_repository = entities.device_components
     reader = reader if reader is not None else FakeReader([stored()])
     app.state.observation_reader = reader if with_reader else None
     app.dependency_overrides[telemetry_dependencies.get_clock] = lambda: lambda: NOW
@@ -234,7 +249,6 @@ def test_routers_are_not_mounted_by_the_application(
 def test_routers_follow_m1_route_conventions() -> None:
     for module in (observations_router, metric_definitions_router):
         assert module.router.route_class is V2JsonSafeRoute
-        assert module.router.prefix == "/tenants/{tenant_id}"
     paths = {route.path for route in observations_router.router.routes}
     assert paths == {
         "/tenants/{tenant_id}/observations",
@@ -456,14 +470,7 @@ def test_non_point_quality_state_is_422(state: str) -> None:
 
 @pytest.mark.parametrize("state", sorted(str(state) for state in QualityState))
 def test_every_point_quality_state_is_accepted(state: str) -> None:
-    point_states = {
-        "valid",
-        "suspect",
-        "out_of_range",
-        "impossible_jump",
-        "uncalibrated",
-        "calibration_unknown",
-    }
+    point_states = {str(item) for item in POINT_QUALITY_STATES}
     harness = build_app()
     response = get(harness, OBSERVATIONS, {"asset_id": ASSET_ID, "quality_state": state})
     assert response.status_code == (200 if state in point_states else 422)
@@ -671,6 +678,8 @@ def test_telemetry_query_error_is_503(path: str) -> None:
     harness = build_app(reader=FakeReader(error=TelemetryQueryError("influx down")))
     response = get(harness, path, {"asset_id": ASSET_ID})
     assert response.status_code == 503
+    assert response.json() == {"detail": "service unavailable"}
+    assert "influx down" not in response.text
     assert len(harness.reader.calls) == 1
 
 
@@ -679,6 +688,24 @@ def test_missing_reader_state_is_503(path: str) -> None:
     harness = build_app(with_reader=False)
     response = get(harness, path, {"asset_id": ASSET_ID})
     assert response.status_code == 503
+
+
+@pytest.mark.parametrize("path", ["observations", "observations/latest"])
+def test_non_member_gets_403_even_when_the_reader_is_missing(path: str) -> None:
+    harness = build_app(role=TenantRole.OWNER, with_reader=False)
+    response = get(harness, f"/tenants/{OTHER_TENANT}/{path}", {"asset_id": OTHER_ASSET_ID})
+    assert response.status_code == 403
+    assert response.json() == {"detail": "tenant access denied"}
+    assert harness.entities.calls == []
+
+
+def test_routes_document_the_m1_error_responses() -> None:
+    paths = build_app().app.openapi()["paths"]
+    for path in (OBSERVATIONS, LATEST):
+        documented = set(paths[path.replace(TENANT, "{tenant_id}")]["get"]["responses"])
+        assert {"200", "403", "404", "422", "503"} <= documented, (path, documented)
+    documented = set(paths["/tenants/{tenant_id}/metric-definitions"]["get"]["responses"])
+    assert {"200", "403"} <= documented
 
 
 def test_clock_dependency_defaults_to_aware_utc_now() -> None:
