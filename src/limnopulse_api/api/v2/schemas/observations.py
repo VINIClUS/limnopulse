@@ -25,6 +25,16 @@ DEFAULT_OBSERVATION_LIMIT = 500
 MAX_OBSERVATION_LIMIT = 1000
 _POINT_STATE_VALUES = frozenset(str(state) for state in POINT_QUALITY_STATES)
 _ISO_DATE_TIME = re.compile(r"\d{4}-\d{2}-\d{2}T.+")
+_DIGITS = re.compile(r"\d+")
+
+
+def _require_integer_text(value: object) -> object:
+    """Digits only: lax pydantic would read `1.0` or `1e1` as an integer limit."""
+    if isinstance(value, int) and not isinstance(value, bool):
+        return value
+    if not isinstance(value, str) or _DIGITS.fullmatch(value) is None:
+        raise ValueError("limit must be a whole number")
+    return value
 
 
 def _require_iso_text(value: object) -> object:
@@ -106,7 +116,11 @@ class V2ObservationQuery(_V2SelectorQuery):
     quality_state: list[PointQualityState] | None = None
     start: QueryBound | None = None
     stop: QueryBound | None = None
-    limit: int = Field(default=DEFAULT_OBSERVATION_LIMIT, ge=1, le=MAX_OBSERVATION_LIMIT)
+    limit: Annotated[
+        int,
+        BeforeValidator(_require_integer_text),
+        Field(ge=1, le=MAX_OBSERVATION_LIMIT),
+    ] = DEFAULT_OBSERVATION_LIMIT
 
     def quality_states(self) -> frozenset[QualityState] | None:
         if self.quality_state is None:

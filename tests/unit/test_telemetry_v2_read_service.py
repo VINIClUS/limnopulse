@@ -321,3 +321,15 @@ async def test_reader_errors_propagate() -> None:
         await query(service, ObservationSelector("asset", ASSET_ID))
     with pytest.raises(TelemetryQueryError):
         await latest(service, ObservationSelector("asset", ASSET_ID))
+
+
+@pytest.mark.asyncio
+async def test_default_start_overflow_is_a_window_error_with_zero_reads() -> None:
+    from limnopulse_api.services.telemetry_v2 import ObservationWindowError
+
+    service, reader, _, _ = build()
+    with pytest.raises(ObservationWindowError):
+        await query(
+            service, ObservationSelector("asset", ASSET_ID), stop=datetime(1, 1, 1, tzinfo=UTC)
+        )
+    assert reader.calls == []

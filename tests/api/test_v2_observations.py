@@ -653,6 +653,14 @@ def test_repeated_scalar_parameters_are_422(repeated: list) -> None:
     assert harness.reader.calls == []
 
 
+@pytest.mark.parametrize("limit", ["1.0", "1e1", "+5", " 5"])
+def test_limit_must_be_a_whole_number(limit: str) -> None:
+    harness = build_app()
+    response = get(harness, OBSERVATIONS, {"asset_id": ASSET_ID, "limit": limit})
+    assert response.status_code == 422
+    assert harness.reader.calls == []
+
+
 # --- latest --------------------------------------------------------------------------------
 
 

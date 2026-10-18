@@ -607,3 +607,29 @@ async def test_unit_comes_from_the_stored_catalog_version(
 
     assert item.canonical_unit == observation.observation.canonical_unit
     assert (observation.observation.metric_key, observation.mapping.catalog_version) in seen
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("limit", [0, -1, True])
+async def test_non_positive_limit_is_rejected_before_any_query(limit: int) -> None:
+    api = FakeQueryApi()
+    with pytest.raises(ValueError):
+        await run_query(api, limit=limit)
+    assert api.calls == []
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("stop", [START, START - timedelta(microseconds=1)])
+async def test_empty_or_reversed_window_is_rejected_before_any_query(stop: datetime) -> None:
+    api = FakeQueryApi()
+    with pytest.raises(ValueError):
+        await reader_for(api).query_observations(
+            tenant_id=TENANT,
+            selector=ObservationSelector("asset", ASSET_ID),
+            metric_keys=None,
+            quality_states=None,
+            start=START,
+            stop=stop,
+            limit=10,
+        )
+    assert api.calls == []

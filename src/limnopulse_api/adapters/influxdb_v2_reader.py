@@ -48,6 +48,10 @@ class InfluxObservationReader:
         stop: datetime,
         limit: int,
     ) -> list[StoredObservation]:
+        if isinstance(limit, bool) or not isinstance(limit, int) or limit < 1:
+            raise ValueError("limit must be a positive integer")
+        if stop <= start:
+            raise ValueError("stop must be after start")
         lines = self._pivoted_points(tenant_id, selector, metric_keys, start=start, stop=stop)
         if quality_states is not None:
             # quality_state is a field (D5), so it is compared on the pivoted row.

@@ -48,7 +48,12 @@ class ObservationReadService:
         if stop is None:
             stop = self.clock()
         if start is None:
-            start = stop - DEFAULT_OBSERVATION_WINDOW
+            try:
+                start = stop - DEFAULT_OBSERVATION_WINDOW
+            except OverflowError:
+                raise ObservationWindowError(
+                    "stop is too early to derive a default start"
+                ) from None
         if stop <= start:
             raise ObservationWindowError("stop must be after start")
         if stop - start > MAX_OBSERVATION_RANGE:
