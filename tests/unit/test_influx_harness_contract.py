@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import ast
 import json
 import os
 import re
@@ -65,6 +66,8 @@ class FakeBucketsApi:
             bucket_name = getattr(bucket, "name", bucket_name)
             retention_rules = getattr(bucket, "retention_rules", retention_rules)
         _log("create_bucket", name=bucket_name, retention_rules=_rules(retention_rules))
+        if os.environ.get("HARNESS_FAKE_UNREACHABLE") == "1":
+            raise ConnectionRefusedError("fake InfluxDB is unreachable")
         return FakeBucket(bucket_name, retention_rules)
 
     def delete_bucket(self, bucket):
@@ -118,7 +121,7 @@ class FakeClient:
         return FakeWriteApi(str(write_type))
 
     def ping(self):
-        return True
+        return os.environ.get("HARNESS_FAKE_UNREACHABLE") != "1"
 
     def close(self):
         _log("close")
@@ -166,7 +169,7 @@ def test_clients_and_write_lines(influx_bucket):
     with influx_clients(influx_bucket) as (query_api, write_api):
         assert isinstance(query_api, FakeQueryApi)
         assert isinstance(write_api, FakeWriteApi)
-        assert write_api.write_type.endswith("synchronous")
+        assert write_api.write_type == "WriteType.synchronous"
     write_lines(influx_bucket, ["m,probe=a v=1 1", "m,probe=b v=2 2"])
 '''
 
@@ -257,7 +260,16 @@ def test_fixture_creates_unique_unretained_buckets_and_deletes_each_at_teardown(
     assert [event["name"] for event in created] == [event["bucket"] for event in seen]
     assert len({event["name"] for event in created}) == 3
     for event in created:
-        assert event["retention_rules"] in (None, [])
+        rules = event["retention_rules"]
+        assert rules is None or all(every_seconds == 0 for every_seconds in rules), rules
+
+    # A second process must not reuse the first process's bucket names.
+    _again, events_again = fake_run("-k", "first or second")
+    names_again = {
+        event["name"] for event in events_again[len(events) :] if event["event"] == "create_bucket"
+    }
+    assert len(names_again) == 2
+    assert names_again.isdisjoint(event["name"] for event in created)
 
     deleted = [event["id"] for event in events if event["event"] == "delete_bucket"]
     assert sorted(deleted) == sorted(f"id-{event['name']}" for event in created)
@@ -293,6 +305,18 @@ def test_fixture_honors_url_token_and_org_overrides(
         )
 
 
+def test_fixture_errors_instead_of_skipping_when_opted_in_and_unreachable(
+    fake_run, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv("RUN_INFLUX_INTEGRATION", "1")
+    monkeypatch.setenv("HARNESS_FAKE_UNREACHABLE", "1")
+
+    result, events = fake_run("-k", "first")
+
+    result.assert_outcomes(errors=1)
+    assert not any(event["event"] == "test" for event in events)
+
+
 def test_influx_clients_and_write_lines_target_the_fixture_bucket_synchronously(
     fake_run, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -309,7 +333,7 @@ def test_influx_clients_and_write_lines_target_the_fixture_bucket_synchronously(
         "m,probe=a v=1 1",
         "m,probe=b v=2 2",
     ]
-    assert all(str(event["write_type"]).endswith("synchronous") for event in writes)
+    assert all(event["write_type"] == "WriteType.synchronous" for event in writes)
     assert sum(event["event"] == "client" for event in events) == sum(
         event["event"] == "close" for event in events
     )
@@ -351,11 +375,15 @@ def test_influx_conftest_skips_only_tests_influx_items_without_opt_in(
 
 
 def test_influx_conftest_re_exports_the_harness_fixture() -> None:
-    text = INFLUX_CONFTEST.read_text(encoding="utf-8")
+    tree = ast.parse(INFLUX_CONFTEST.read_text(encoding="utf-8"))
 
-    assert re.search(
-        r"^from tests\.support\.influx_harness import .*\binflux_bucket\b", text, re.MULTILINE
-    )
+    imported = {
+        alias.asname or alias.name
+        for node in tree.body
+        if isinstance(node, ast.ImportFrom) and node.module == "tests.support.influx_harness"
+        for alias in node.names
+    }
+    assert "influx_bucket" in imported
 
 
 def test_default_run_of_tests_influx_skips_everything_cleanly() -> None:
@@ -372,16 +400,16 @@ def test_default_run_of_tests_influx_skips_everything_cleanly() -> None:
 
     assert result.returncode == 0, result.stdout + result.stderr
     summary = result.stdout.strip().splitlines()[-1]
-    assert re.fullmatch(r"\d+ skipped in [0-9.]+s", summary), summary
+    assert re.match(r"\d+ skipped\b", summary), summary
+    for outcome in ("passed", "failed", "error", "xpassed", "xfailed", "deselected"):
+        assert outcome not in summary, summary
 
 
 def test_harness_sources_name_the_contract_environment_and_defaults() -> None:
     for path in (HARNESS, GO_HARNESS):
         text = path.read_text(encoding="utf-8")
-        assert '"RUN_INFLUX_INTEGRATION"' in text, path
-        for name, default in ENV_DEFAULTS.items():
-            assert f'"{name}"' in text, (path, name)
-            assert f'"{default}"' in text, (path, default)
+        for literal in ("RUN_INFLUX_INTEGRATION", *ENV_DEFAULTS, *ENV_DEFAULTS.values()):
+            assert re.search(rf"[\"']{re.escape(literal)}[\"']", text), (path, literal)
 
     go_text = GO_HARNESS.read_text(encoding="utf-8")
     assert "package influx\n" in go_text
@@ -398,7 +426,7 @@ def test_local_runner_pins_the_influxd_release_and_runs_it_on_loopback() -> None
     text = SCRIPT.read_text(encoding="utf-8")
     code = "\n".join(
         line for line in text.splitlines() if not line.lstrip().startswith("#")
-    )
+    ).replace("\\\n", " ")
 
     assert text.startswith("#!/usr/bin/env bash\n")
     assert "set -euo pipefail" in code
@@ -409,7 +437,7 @@ def test_local_runner_pins_the_influxd_release_and_runs_it_on_loopback() -> None
     assert "2.7.11" in code
     assert TARBALL in code
     assert TARBALL_SHA256 in code
-    assert re.search(r"sha256sum\b", code)
+    assert re.search(r"sha256sum\b|shasum -a 256\b", code)
     assert "https://dl.influxdata.com/influxdb/releases/" in code
     assert "${XDG_CACHE_HOME:-$HOME/.cache}/limnopulse/influxd" in code
 
@@ -461,3 +489,135 @@ def test_verification_docs_describe_the_influx_gate() -> None:
         "throwaway",
     ):
         assert phrase in lowered, phrase
+
+
+# PATH shims for the runner's behaviour. The fake curl answers like curl:
+# -o writes the body, -w prints %{http_code}, -f/--fail suppresses the body
+# and exits 22 on HTTP >= 400, --fail-with-body keeps it.
+FAKE_CURL = r"""#!/usr/bin/env bash
+printf 'curl %s\n' "$*" >> "$FAKE_LOG"
+out=""; fmt=""; fail=0; keep_body=0; url=""
+while [ $# -gt 0 ]; do
+  case "$1" in
+    -o|--output) out="$2"; shift ;;
+    -w|--write-out) fmt="$2"; shift ;;
+    -H|--header|-d|--data|--data-raw|--data-binary|-X|--request|-m|--max-time|\
+    --connect-timeout|--retry|--retry-delay|--retry-max-time|-u|--user|-A|--user-agent)
+      shift ;;
+    --fail) fail=1 ;;
+    --fail-with-body) fail=1; keep_body=1 ;;
+    --*) ;;
+    -*) [[ "$1" == *f* ]] && fail=1 ;;
+    *) url="$1" ;;
+  esac
+  shift
+done
+code=404; body=""
+case "$url" in
+  https://dl.influxdata.com/*) code=200; body="this is not the influxdb tarball" ;;
+  http://127.0.0.1:*/health) code=200; body='{"name":"influxdb","status":"pass"}' ;;
+  http://127.0.0.1:*/api/v2/setup) code="$FAKE_SETUP_CODE"; body="$FAKE_SETUP_BODY" ;;
+esac
+if [ "$fail" = 1 ] && [ "$code" -ge 400 ] && [ "$keep_body" = 0 ]; then
+  body=""
+fi
+if [ -n "$out" ]; then printf '%s' "$body" > "$out"; else printf '%s' "$body"; fi
+if [ -n "$fmt" ]; then printf '%s' "${fmt//%\{http_code\}/$code}"; fi
+if [ "$fail" = 1 ] && [ "$code" -ge 400 ]; then exit 22; fi
+exit 0
+"""
+
+FAKE_INFLUXD = """#!/usr/bin/env bash
+printf 'influxd %s\\n' "$*" >> "$FAKE_LOG"
+exit 1
+"""
+
+CONFLICT = '{"code":"conflict","message":"onboarding has already been completed"}'
+
+
+@pytest.fixture
+def runner_env(tmp_path: Path):
+    bin_dir = tmp_path / "bin"
+    bin_dir.mkdir()
+    for name, body in (("curl", FAKE_CURL), ("influxd", FAKE_INFLUXD)):
+        shim = bin_dir / name
+        shim.write_text(body, encoding="utf-8")
+        shim.chmod(0o755)
+    log = tmp_path / "calls.log"
+    log.touch()
+    env = {
+        "PATH": f"{bin_dir}{os.pathsep}{os.environ['PATH']}",
+        "HOME": str(tmp_path / "home"),
+        "XDG_CACHE_HOME": str(tmp_path / "xdg"),
+        "FAKE_LOG": str(log),
+        "INFLUXD_PORT": "18086",
+    }
+    cache = tmp_path / "xdg" / "limnopulse" / "influxd"
+
+    def run(setup_code: int, setup_body: str):
+        result = subprocess.run(
+            ["bash", str(SCRIPT)],
+            cwd=tmp_path,
+            env={**env, "FAKE_SETUP_CODE": str(setup_code), "FAKE_SETUP_BODY": setup_body},
+            check=False,
+            capture_output=True,
+            text=True,
+            timeout=120,
+        )
+        return result, log.read_text(encoding="utf-8").splitlines()
+
+    return cache, run
+
+
+@pytest.fixture
+def live_influxd(runner_env):
+    cache, run = runner_env
+    cache.mkdir(parents=True)
+    process = subprocess.Popen(["sleep", "300"])
+    (cache / "influxd.pid").write_text(f"{process.pid}\n", encoding="utf-8")
+    try:
+        yield run
+    finally:
+        process.kill()
+        process.wait()
+
+
+@pytest.mark.parametrize(
+    ("setup_code", "setup_body"),
+    [(201, '{"user":{},"org":{},"bucket":{},"auth":{}}'), (422, CONFLICT)],
+)
+def test_local_runner_reuses_a_running_influxd_and_accepts_setup_or_conflict(
+    live_influxd, setup_code: int, setup_body: str
+) -> None:
+    result, calls = live_influxd(setup_code, setup_body)
+
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert not any(call.startswith("influxd") for call in calls), calls
+    assert not any("dl.influxdata.com" in call for call in calls), calls
+    assert any("http://127.0.0.1:18086/health" in call for call in calls), calls
+    setup_calls = [call for call in calls if "/api/v2/setup" in call]
+    assert setup_calls, calls
+    assert all("-X POST" in call for call in setup_calls), setup_calls
+    local_urls = re.findall(r"http://127\.0\.0\.1:(\d+)", "\n".join(calls))
+    assert local_urls and set(local_urls) == {"18086"}, calls
+
+
+def test_local_runner_fails_when_setup_fails_for_another_reason(live_influxd) -> None:
+    result, calls = live_influxd(401, '{"code":"unauthorized","message":"unauthorized access"}')
+
+    assert result.returncode != 0, result.stdout + result.stderr
+    assert any("/api/v2/setup" in call for call in calls), calls
+
+
+def test_local_runner_refuses_a_tarball_with_the_wrong_sha256(runner_env) -> None:
+    cache, run = runner_env
+
+    result, calls = run(201, "{}")
+
+    assert result.returncode != 0, result.stdout + result.stderr
+    assert any(f"dl.influxdata.com/influxdb/releases/{TARBALL}" in call for call in calls), calls
+    assert not any(call.startswith("influxd") for call in calls), calls
+    assert not any("/api/v2/setup" in call for call in calls), calls
+    output = (result.stdout + result.stderr).lower()
+    assert "sha256" in output or "checksum" in output, output
+    assert not (cache / "influxd.pid").exists()

@@ -3,6 +3,7 @@ package influx
 import (
 	"context"
 	"fmt"
+	"os"
 	"strings"
 	"testing"
 	"time"
@@ -14,6 +15,7 @@ import (
 const (
 	harnessSmokeMeasurement = "harness_smoke"
 	harnessSmokeLine        = harnessSmokeMeasurement + ",probe=p1 value=21.5 1767268800000000000"
+	harnessSmokeSecondLine  = harnessSmokeMeasurement + ",probe=p2 value=7 1767268800000000000"
 )
 
 var harnessSmokeTime = time.Date(2026, time.January, 1, 12, 0, 0, 0, time.UTC)
@@ -79,8 +81,9 @@ func TestInfluxIntegrationHarnessSmoke(t *testing.T) {
 		if err != nil || found.Id == nil || bucket.Id == nil || *found.Id != *bucket.Id {
 			t.Fatalf("bucket %q is not on the server: %v", bucket.Name, err)
 		}
+		assertNoRetentionRule(t, found)
 
-		writeLines(t, client, bucket, harnessSmokeLine)
+		writeLines(t, client, bucket, harnessSmokeLine, harnessSmokeSecondLine)
 
 		rows := harnessSmokeRows(t, client, bucket)
 		if len(rows) == 0 {
@@ -93,9 +96,12 @@ func TestInfluxIntegrationHarnessSmoke(t *testing.T) {
 			value:       21.5,
 			time:        harnessSmokeTime,
 		}
-		if len(rows) != 1 || rows[0].measurement != want.measurement || rows[0].field != want.field ||
+		if len(rows) != 2 || rows[0].measurement != want.measurement || rows[0].field != want.field ||
 			rows[0].probe != want.probe || rows[0].value != want.value || !rows[0].time.Equal(want.time) {
-			t.Fatalf("rows = %+v, want exactly [%+v]", rows, want)
+			t.Fatalf("rows = %+v, want [%+v, p2 = 7]", rows, want)
+		}
+		if rows[1].probe != "p2" || rows[1].value != 7.0 || !rows[1].time.Equal(want.time) {
+			t.Fatalf("second row = %+v, want probe p2 = 7 at %s", rows[1], want.time)
 		}
 	})
 	if inner == nil {
@@ -125,5 +131,37 @@ func TestIntegrationHarnessSkipsWithoutOptIn(t *testing.T) {
 		if !skipped {
 			t.Errorf("newIntegrationBucket did not skip with RUN_INFLUX_INTEGRATION=%q", value)
 		}
+	}
+}
+
+func TestInfluxIntegrationHarnessDoesNotSkipWhenOptedIn(t *testing.T) {
+	if os.Getenv("RUN_INFLUX_INTEGRATION") != "1" {
+		t.Skip("set RUN_INFLUX_INTEGRATION=1 to run against a real InfluxDB")
+	}
+	skipped := true
+	t.Run("opted in", func(t *testing.T) {
+		defer func() { skipped = t.Skipped() }()
+		newIntegrationBucket(t)
+	})
+	if skipped {
+		t.Fatal("newIntegrationBucket skipped although RUN_INFLUX_INTEGRATION=1")
+	}
+}
+
+func TestIntegrationSettingsUseContractDefaultsAndOverrides(t *testing.T) {
+	for _, name := range []string{"INFLUX_INTEGRATION_URL", "INFLUX_INTEGRATION_TOKEN", "INFLUX_INTEGRATION_ORG"} {
+		t.Setenv(name, "")
+	}
+	url, token, org := integrationSettings()
+	if url != "http://127.0.0.1:8086" || token != "local-dev-token" || org != "limnopulse" {
+		t.Fatalf("defaults = (%q, %q, %q)", url, token, org)
+	}
+
+	t.Setenv("INFLUX_INTEGRATION_URL", "http://127.0.0.1:18086")
+	t.Setenv("INFLUX_INTEGRATION_TOKEN", "override-token")
+	t.Setenv("INFLUX_INTEGRATION_ORG", "override-org")
+	url, token, org = integrationSettings()
+	if url != "http://127.0.0.1:18086" || token != "override-token" || org != "override-org" {
+		t.Fatalf("overrides = (%q, %q, %q)", url, token, org)
 	}
 }
