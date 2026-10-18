@@ -1,13 +1,17 @@
 from __future__ import annotations
 
 import ast
+import importlib
 import json
 import os
 import re
+import shutil
+import socket
 import stat
 import subprocess
 import sys
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
@@ -305,6 +309,49 @@ def test_fixture_honors_url_token_and_org_overrides(
         )
 
 
+def test_fixture_treats_empty_env_values_as_unset(
+    fake_run, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv("RUN_INFLUX_INTEGRATION", "1")
+    for name in ENV_DEFAULTS:
+        monkeypatch.setenv(name, "")
+
+    result, events = fake_run("-k", "first")
+
+    result.assert_outcomes(passed=1)
+    clients = [event for event in events if event["event"] == "client"]
+    assert clients
+    for client in clients:
+        assert (client["url"], client["token"], client["org"]) == tuple(ENV_DEFAULTS.values())
+
+
+def test_influx_settings_resolves_defaults_empty_values_and_overrides(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    harness = importlib.import_module("tests.support.influx_harness")
+
+    def resolved() -> tuple[str, str, str]:
+        settings = harness.influx_settings()
+        return settings.url, settings.token, settings.org
+
+    for name in ENV_DEFAULTS:
+        monkeypatch.delenv(name, raising=False)
+    assert resolved() == tuple(ENV_DEFAULTS.values())
+
+    for name in ENV_DEFAULTS:
+        monkeypatch.setenv(name, "")
+    assert resolved() == tuple(ENV_DEFAULTS.values())
+
+    monkeypatch.setenv("INFLUX_INTEGRATION_URL", "http://127.0.0.1:18086")
+    monkeypatch.setenv("INFLUX_INTEGRATION_TOKEN", "override-token")
+    monkeypatch.setenv("INFLUX_INTEGRATION_ORG", "override-org")
+    assert resolved() == ("http://127.0.0.1:18086", "override-token", "override-org")
+
+    settings = harness.influx_settings()
+    with pytest.raises(AttributeError):
+        settings.url = "http://example.invalid"  # type: ignore[misc]
+
+
 def test_fixture_errors_instead_of_skipping_when_opted_in_and_unreachable(
     fake_run, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -460,8 +507,15 @@ def test_local_runner_pins_the_influxd_release_and_runs_it_on_loopback() -> None
     assert re.search(r"\binflux (setup|ping|bucket)\b", code) is None
 
 
+def _influx_docs_section() -> str:
+    sections = re.split(r"^## ", DOCS.read_text(encoding="utf-8"), flags=re.MULTILINE)
+    matching = [section for section in sections if "`make verify-influx`" in section]
+    assert len(matching) == 1, "docs/verification.md needs one section for the influx gate"
+    return " ".join(matching[0].split())
+
+
 def test_verification_docs_describe_the_influx_gate() -> None:
-    text = DOCS.read_text(encoding="utf-8")
+    text = _influx_docs_section()
     lowered = text.lower()
 
     for phrase in (
@@ -481,7 +535,7 @@ def test_verification_docs_describe_the_influx_gate() -> None:
 
     for phrase in (
         "without docker",
-        "not part of `make verify`",
+        "`make verify-influx` is not part of `make verify`",
         "every flux query",
         "absolute `range` bounds",
         "non-empty",
@@ -492,8 +546,9 @@ def test_verification_docs_describe_the_influx_gate() -> None:
 
 
 # PATH shims for the runner's behaviour. The fake curl answers like curl:
-# -o writes the body, -w prints %{http_code}, -f/--fail suppresses the body
-# and exits 22 on HTTP >= 400, --fail-with-body keeps it.
+# -o writes the body, -w prints %{http_code} and expands escapes such as \n,
+# -f/--fail suppresses the body and exits 22 on HTTP >= 400, --fail-with-body
+# keeps it, and loopback URLs fail with exit 7 unless FAKE_HEALTHY=1.
 FAKE_CURL = r"""#!/usr/bin/env bash
 printf 'curl %s\n' "$*" >> "$FAKE_LOG"
 out=""; fmt=""; fail=0; keep_body=0; url=""
@@ -515,14 +570,24 @@ done
 code=404; body=""
 case "$url" in
   https://dl.influxdata.com/*) code=200; body="this is not the influxdb tarball" ;;
-  http://127.0.0.1:*/health) code=200; body='{"name":"influxdb","status":"pass"}' ;;
-  http://127.0.0.1:*/api/v2/setup) code="$FAKE_SETUP_CODE"; body="$FAKE_SETUP_BODY" ;;
+  http://127.0.0.1:*)
+    if [ "${FAKE_HEALTHY:-0}" != 1 ]; then
+      # Nothing listens: behave like curl against a closed port.
+      echo "curl: (7) Failed to connect to 127.0.0.1: Connection refused" >&2
+      if [ -n "$fmt" ]; then printf '%b' "${fmt//%\{http_code\}/000}"; fi
+      exit 7
+    fi
+    case "$url" in
+      */health) code=200; body='{"name":"influxdb","status":"pass"}' ;;
+      */api/v2/setup) code="$FAKE_SETUP_CODE"; body="$FAKE_SETUP_BODY" ;;
+    esac
+    ;;
 esac
 if [ "$fail" = 1 ] && [ "$code" -ge 400 ] && [ "$keep_body" = 0 ]; then
   body=""
 fi
 if [ -n "$out" ]; then printf '%s' "$body" > "$out"; else printf '%s' "$body"; fi
-if [ -n "$fmt" ]; then printf '%s' "${fmt//%\{http_code\}/$code}"; fi
+if [ -n "$fmt" ]; then printf '%b' "${fmt//%\{http_code\}/$code}"; fi
 if [ "$fail" = 1 ] && [ "$code" -ge 400 ]; then exit 22; fi
 exit 0
 """
@@ -533,6 +598,12 @@ exit 1
 """
 
 CONFLICT = '{"code":"conflict","message":"onboarding has already been completed"}'
+
+
+def _unused_port() -> int:
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as probe:
+        probe.bind(("127.0.0.1", 0))
+        return probe.getsockname()[1]
 
 
 @pytest.fixture
@@ -550,8 +621,9 @@ def runner_env(tmp_path: Path):
         "HOME": str(tmp_path / "home"),
         "XDG_CACHE_HOME": str(tmp_path / "xdg"),
         "FAKE_LOG": str(log),
-        "INFLUXD_PORT": "18086",
     }
+    port = str(_unused_port())
+    env["INFLUXD_PORT"] = port
     cache = tmp_path / "xdg" / "limnopulse" / "influxd"
 
     def run(setup_code: int, setup_body: str):
@@ -566,17 +638,22 @@ def runner_env(tmp_path: Path):
         )
         return result, log.read_text(encoding="utf-8").splitlines()
 
-    return cache, run
+    return SimpleNamespace(cache=cache, port=port, env=env, run=run, tmp_path=tmp_path)
 
 
 @pytest.fixture
 def live_influxd(runner_env):
-    cache, run = runner_env
-    cache.mkdir(parents=True)
-    process = subprocess.Popen(["sleep", "300"])
-    (cache / "influxd.pid").write_text(f"{process.pid}\n", encoding="utf-8")
+    runner_env.cache.mkdir(parents=True)
+    # A stand-in process whose name is influxd, as a real instance's would be.
+    stand_in_dir = runner_env.tmp_path / "stand-in"
+    stand_in_dir.mkdir()
+    stand_in = stand_in_dir / "influxd"
+    shutil.copy(shutil.which("sleep"), stand_in)
+    process = subprocess.Popen([str(stand_in), "300"])
+    (runner_env.cache / "influxd.pid").write_text(f"{process.pid}\n", encoding="utf-8")
+    runner_env.env["FAKE_HEALTHY"] = "1"
     try:
-        yield run
+        yield runner_env
     finally:
         process.kill()
         process.wait()
@@ -589,30 +666,29 @@ def live_influxd(runner_env):
 def test_local_runner_reuses_a_running_influxd_and_accepts_setup_or_conflict(
     live_influxd, setup_code: int, setup_body: str
 ) -> None:
-    result, calls = live_influxd(setup_code, setup_body)
+    result, calls = live_influxd.run(setup_code, setup_body)
+    port = live_influxd.port
 
     assert result.returncode == 0, result.stdout + result.stderr
     assert not any(call.startswith("influxd") for call in calls), calls
     assert not any("dl.influxdata.com" in call for call in calls), calls
-    assert any("http://127.0.0.1:18086/health" in call for call in calls), calls
+    assert any(f"http://127.0.0.1:{port}/health" in call for call in calls), calls
     setup_calls = [call for call in calls if "/api/v2/setup" in call]
     assert setup_calls, calls
     assert all("-X POST" in call for call in setup_calls), setup_calls
     local_urls = re.findall(r"http://127\.0\.0\.1:(\d+)", "\n".join(calls))
-    assert local_urls and set(local_urls) == {"18086"}, calls
+    assert local_urls and set(local_urls) == {port}, calls
 
 
 def test_local_runner_fails_when_setup_fails_for_another_reason(live_influxd) -> None:
-    result, calls = live_influxd(401, '{"code":"unauthorized","message":"unauthorized access"}')
+    result, calls = live_influxd.run(401, '{"code":"unauthorized","message":"unauthorized access"}')
 
     assert result.returncode != 0, result.stdout + result.stderr
     assert any("/api/v2/setup" in call for call in calls), calls
 
 
 def test_local_runner_refuses_a_tarball_with_the_wrong_sha256(runner_env) -> None:
-    cache, run = runner_env
-
-    result, calls = run(201, "{}")
+    result, calls = runner_env.run(201, "{}")
 
     assert result.returncode != 0, result.stdout + result.stderr
     assert any(f"dl.influxdata.com/influxdb/releases/{TARBALL}" in call for call in calls), calls
@@ -620,4 +696,4 @@ def test_local_runner_refuses_a_tarball_with_the_wrong_sha256(runner_env) -> Non
     assert not any("/api/v2/setup" in call for call in calls), calls
     output = (result.stdout + result.stderr).lower()
     assert "sha256" in output or "checksum" in output, output
-    assert not (cache / "influxd.pid").exists()
+    assert not (runner_env.cache / "influxd.pid").exists()
