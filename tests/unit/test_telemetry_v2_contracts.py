@@ -1068,3 +1068,54 @@ def test_normalization_result_counts_for_empty_result() -> None:
     assert {key: value for key, value in counts.items() if value} == {}
     assert isinstance(result.accepted, tuple)
     assert isinstance(result.quarantined, tuple)
+
+
+# --- review regressions (added after approval of 029c55c) -----------------------------------
+
+
+@pytest.mark.parametrize("observed_at", ["0001-01-01T00:00:00+01:00", "9999-12-31T23:59:59-01:00"])
+def test_offset_overflow_is_a_validation_error(observed_at) -> None:
+    with pytest.raises(ValidationError):
+        source_observation(observed_at=observed_at)
+
+
+@pytest.mark.parametrize(
+    "observed_at",
+    [1_783_598_400, 1_783_598_400_000, 1_783_598_400.5, "2026-07-09T12:00:00.123456789Z"],
+)
+def test_timestamps_reject_unix_numbers_and_sub_microsecond_truncation(observed_at) -> None:
+    with pytest.raises(ValidationError):
+        source_observation(observed_at=observed_at)
+
+
+def test_nine_digit_timestamps_with_trailing_zeros_are_accepted() -> None:
+    observation = source_observation(observed_at="2026-07-09T12:00:00.123456000Z")
+    assert observation.observed_at == OBSERVED + timedelta(microseconds=123_456)
+    assert source_observation(observed_at="2026-07-09T12:00:00Z").observed_at == OBSERVED
+
+
+def test_source_metadata_is_read_only_and_round_trips() -> None:
+    observation = canonical(source_metadata={"firmware_version": "1.2.3"})
+    with pytest.raises(TypeError):
+        observation.source_metadata["location"] = "north"  # type: ignore[index]
+    with pytest.raises(TypeError):
+        source_observation(source_metadata={}).source_metadata["x"] = "y"  # type: ignore[index]
+    dumped = observation.model_dump(mode="json")
+    assert dumped["source_metadata"] == {"firmware_version": "1.2.3"}
+    assert CanonicalObservation.model_validate(observation.model_dump()) == observation
+
+
+@pytest.mark.parametrize("unit", ["pH\nx", "deg\tC", "\x00"])
+def test_unit_codes_must_be_printable(unit) -> None:
+    with pytest.raises(ValidationError):
+        source_observation(source_unit=unit)
+    with pytest.raises(ValidationError):
+        measurement(source_unit=unit)
+
+
+@pytest.mark.parametrize("flag", ["yes", 0, 1, "true"])
+def test_delivery_and_replay_flags_are_strict_booleans(flag) -> None:
+    with pytest.raises(ValidationError):
+        ObservationDelivery(ingested_at=INGESTED, delayed=flag, replay=False)
+    with pytest.raises(ValidationError):
+        trusted_context(replay=flag)

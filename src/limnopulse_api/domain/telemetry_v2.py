@@ -5,10 +5,12 @@ has no ownership field, and ownership is resolved by trusted code into `Observat
 """
 
 import math
+import re
 from collections import Counter
 from collections.abc import Mapping
 from datetime import UTC, datetime
 from enum import StrEnum
+from types import MappingProxyType
 from typing import Annotated, Literal
 from uuid import NAMESPACE_URL, uuid5
 
@@ -18,6 +20,8 @@ from pydantic import (
     BeforeValidator,
     ConfigDict,
     Field,
+    PlainSerializer,
+    StrictBool,
     StrictFloat,
     StrictInt,
     model_validator,
@@ -123,16 +127,33 @@ class QuarantineReason(StrEnum):
 
 
 _PROVENANCE_ORDER = {item: index for index, item in enumerate(QualityProvenance)}
+_OUT_OF_RANGE = "telemetry timestamp outside [1970-01-01, 2262-01-01) UTC"
+_ISO_FRACTION = re.compile(r"T\d{2}:\d{2}:\d{2}[.,](\d+)")
 
 
 def require_telemetry_time(value: datetime) -> datetime:
     """Normalize an aware datetime to UTC inside `[MIN_TELEMETRY_TIME, MAX_TELEMETRY_TIME)`."""
     if value.tzinfo is None or value.utcoffset() is None:
         raise ValueError("telemetry timestamps must be timezone-aware")
-    utc = value.astimezone(UTC)
+    try:
+        utc = value.astimezone(UTC)
+    except OverflowError:
+        raise ValueError(_OUT_OF_RANGE) from None
     if not MIN_TELEMETRY_TIME <= utc < MAX_TELEMETRY_TIME:
-        raise ValueError("telemetry timestamp outside [1970-01-01, 2262-01-01) UTC")
+        raise ValueError(_OUT_OF_RANGE)
     return utc
+
+
+def _require_exact_timestamp_input(value: object) -> object:
+    """Accept datetimes or ISO-8601 text; never unix numbers or sub-microsecond truncation."""
+    if isinstance(value, datetime):
+        return value
+    if not isinstance(value, str):
+        raise ValueError("telemetry timestamps must be datetimes or ISO-8601 strings")
+    fraction = _ISO_FRACTION.search(value)
+    if fraction is not None and fraction.group(1)[6:].strip("0"):
+        raise ValueError("sub-microsecond precision unsupported")
+    return value
 
 
 def _canonical(prefix: str):
@@ -157,13 +178,13 @@ def _require_printable(value: str) -> str:
     return value
 
 
-def _require_metadata(value: dict[str, str]) -> dict[str, str]:
+def _require_metadata(value: dict[str, str]) -> Mapping[str, str]:
     unknown = set(value) - SOURCE_METADATA_ALLOWLIST
     if unknown:
         raise ValueError(f"source_metadata keys not allowed: {sorted(unknown)}")
     if any(len(item) > MAX_SOURCE_METADATA_VALUE_LENGTH for item in value.values()):
         raise ValueError("source_metadata values must be at most 64 characters")
-    return value
+    return MappingProxyType(dict(value))
 
 
 def _require_point_state(value: QualityState) -> QualityState:
@@ -172,7 +193,11 @@ def _require_point_state(value: QualityState) -> QualityState:
     return value
 
 
-TelemetryDatetime = Annotated[datetime, AfterValidator(require_telemetry_time)]
+TelemetryDatetime = Annotated[
+    datetime,
+    BeforeValidator(_require_exact_timestamp_input),
+    AfterValidator(require_telemetry_time),
+]
 SiteId = _canonical("site")
 AssetId = _canonical("ast")
 ComponentId = _canonical("cmp")
@@ -184,12 +209,15 @@ FiniteFloat = Annotated[float, BeforeValidator(_require_number), AfterValidator(
 SourceValue = Annotated[StrictInt | StrictFloat, AfterValidator(_require_finite)]
 SequenceNumber = Annotated[StrictInt, Field(ge=0, le=MAX_SEQUENCE)]
 MetricKey = Annotated[str, Field(min_length=1, max_length=64)]
-UnitCode = Annotated[str, Field(min_length=1, max_length=16)]
+UnitCode = Annotated[str, Field(min_length=1, max_length=16), AfterValidator(_require_printable)]
 SourceEventId = Annotated[
     str, Field(min_length=1, max_length=128), AfterValidator(_require_printable)
 ]
 ConnectorVersion = Annotated[str, Field(max_length=64)]
-SourceMetadata = Annotated[dict[str, str], AfterValidator(_require_metadata)]
+# Read-only after validation (frozen models must not be mutated); serialized as a plain dict.
+SourceMetadata = Annotated[
+    dict[str, str], AfterValidator(_require_metadata), PlainSerializer(dict, return_type=dict)
+]
 
 
 class _TelemetryModel(BaseModel):
@@ -222,7 +250,7 @@ class TrustedSourceContext(_TelemetryModel):
     source_type: SourceType
     connector_version: ConnectorVersion | None
     received_at: TelemetryDatetime
-    replay: bool = False
+    replay: StrictBool = False
     mapping_versions: NormalizationVersions | None = None
 
 
@@ -267,8 +295,8 @@ class ObservationMeasurement(_TelemetryModel):
 
 class ObservationDelivery(_TelemetryModel):
     ingested_at: TelemetryDatetime
-    delayed: bool
-    replay: bool
+    delayed: StrictBool
+    replay: StrictBool
 
 
 class ObservationQuality(_TelemetryModel):

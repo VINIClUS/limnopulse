@@ -258,7 +258,8 @@ def build_legacy_points(
 ) -> tuple[LegacyPoint, ...]:
     """Group D7-eligible observations into Telegraf-identical points (D8).
 
-    Ineligible observations are skipped, never raised: the caller counts them.
+    Ineligible observations are skipped, never raised: the caller counts them. A non-integral
+    value for an integer legacy field (unreachable after `unit-mapping@1`) is ineligible too.
     """
     groups: dict[tuple[str, str, str, datetime], list[tuple[str, CanonicalObservation]]] = {}
     for o in observations:
@@ -272,6 +273,11 @@ def build_legacy_points(
             continue
         definition = metric_definition(o.observation.metric_key)
         if definition is None or definition.legacy_field is None:
+            continue
+        if (
+            definition.legacy_field in LEGACY_INTEGER_FIELDS
+            and not float(o.observation.value).is_integer()
+        ):
             continue
         key = (resolved.tenant_id, pond_id, resolved.device_id, o.observation.observed_at)
         groups.setdefault(key, []).append((definition.legacy_field, o))

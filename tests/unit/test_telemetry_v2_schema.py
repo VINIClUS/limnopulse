@@ -825,3 +825,16 @@ def test_flux_string_literal_escapes_json_and_interpolation(value, expected) -> 
 @pytest.mark.parametrize("value", ["tnt_local_001", 'q"\\\n\t', "x${y}$z", "é"])
 def test_flux_string_literal_is_json_dumps_with_interpolation_escape(value) -> None:
     assert flux_string_literal(value) == json.dumps(value).replace("${", "\\${")
+
+
+# --- review regressions (added after approval of 029c55c) -----------------------------------
+
+
+def test_non_integral_rssi_is_ineligible_not_raised() -> None:
+    items = [
+        observation("device.rssi", -67.5, sequence=None),
+        observation("water.ph", 7.2, sequence=None),
+    ]
+    (point,) = build_legacy_points(items, LEGACY_POND_BY_ASSET)
+    assert dict(point.fields) == {"ph": 7.2}
+    assert build_legacy_points(items[:1], LEGACY_POND_BY_ASSET) == ()
