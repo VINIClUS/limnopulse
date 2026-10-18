@@ -6,6 +6,7 @@ import (
 	"math"
 	"math/rand"
 	"sort"
+	"strings"
 	"testing"
 	"time"
 
@@ -482,5 +483,47 @@ func TestInfluxIntegrationParityQueryErrorsMatchLegacy(t *testing.T) {
 	}
 	if legacy != (alertevaluator.WindowResult{}) || v2 != (alertevaluator.WindowResult{}) {
 		t.Fatalf("results on error = %#v, %#v; want zero values", legacy, v2)
+	}
+}
+
+func TestInfluxIntegrationParityTwoDevicesInOnePond(t *testing.T) {
+	// multi_point_series puts each device in its own pond. Move pond_south's
+	// lines into pond_north (pond tag for legacy, asset tag for v2) so a pond
+	// rule sums two devices per bucket; components stay the legacy defaults.
+	vectors := loadContractVectors(t)
+	scenario := vectors.Scenarios["multi_point_series"]
+	southAsset, northAsset := AssetIDForLegacyPond(scenario.TenantID, "pond_south"), AssetIDForLegacyPond(scenario.TenantID, "pond_north")
+	if scenario.LegacyPondByAsset[southAsset] != "pond_south" || scenario.LegacyPondByAsset[northAsset] != "pond_north" {
+		t.Fatalf("multi_point_series ponds changed: %v", scenario.LegacyPondByAsset)
+	}
+	var lines []string
+	for _, line := range scenario.LegacyLines {
+		lines = append(lines, strings.Replace(line, ",pond_id=pond_south,", ",pond_id=pond_north,", 1))
+	}
+	for _, line := range scenario.V2Lines {
+		lines = append(lines, strings.Replace(line, ",asset_id="+southAsset+",", ",asset_id="+northAsset+",", 1))
+	}
+	client, bucket := newIntegrationBucket(t)
+	writeLines(t, client, bucket, lines...)
+	readers := newParityReaders(client, bucket)
+
+	first, last := scenarioSpan(t, scenario)
+	start := first.Truncate(time.Minute)
+	for _, metric := range []string{"temp_c", "do_mg_l"} {
+		for _, aggregation := range parityAggregations {
+			rule := alertevaluator.EvaluationRule{
+				Rule: alertevaluator.Rule{TenantID: scenario.TenantID}, PondID: "pond_north", Metric: metric,
+			}
+			spec := alertevaluator.WindowSpec{
+				Start: start, End: last.Truncate(time.Minute).Add(time.Minute), ExpectedSampleInterval: time.Minute,
+				EvaluationCadence: time.Minute, MinimumCoverageRatio: .8, MinimumPoints: 3,
+				MaximumSampleAge: 2 * time.Minute, Aggregation: aggregation,
+			}
+			legacy, v2 := evaluateBoth(t, readers, rule, spec)
+			if legacy.ContributingDeviceCount != 2 || legacy.ValidPointCount != 60 || legacy.Quality != alertevaluator.QualitySufficient {
+				t.Fatalf("%s %s: legacy = %#v, want two devices with 30 points each", metric, aggregation, legacy)
+			}
+			assertSameWindowResult(t, fmt.Sprintf("%s %s", metric, aggregation), legacy, v2)
+		}
 	}
 }

@@ -153,7 +153,7 @@ func TestBuildV2QueryUsesTheLegacyReaderWindowBounds(t *testing.T) {
 func TestBuildV2QueryEscapesInterpolationButKeepsLoneDollar(t *testing.T) {
 	start := time.Date(2026, 7, 9, 11, 55, 0, 0, time.UTC)
 	spec := alertevaluator.WindowSpec{Start: start, End: start.Add(time.Minute)}
-	tenant := "t${x}\"q"
+	tenant := "t${x}\"q${y}"
 	pond := "p${w}"
 	device := "a$b$${c}\n"
 	rule := alertevaluator.EvaluationRule{
@@ -166,7 +166,7 @@ func TestBuildV2QueryEscapesInterpolationButKeepsLoneDollar(t *testing.T) {
 	}
 	for _, want := range []string{
 		`from(bucket: "raw$archive")`,
-		`r["tenant_id"] == "t\${x}\"q")`,
+		`r["tenant_id"] == "t\${x}\"q\${y}")`,
 		`r["asset_id"] == "` + AssetIDForLegacyPond(tenant, pond) + `")`,
 		`r["device_id"] == "a$b$\${c}\n")`,
 	} {
@@ -231,6 +231,22 @@ func TestLegacyBuildQueryIsUnchanged(t *testing.T) {
   |> sort(columns: ["_time", "device_id"])`
 	if query != want {
 		t.Fatalf("legacy query changed:\n%s", query)
+	}
+
+	// The v2-only `${` escape must not leak into the legacy builder.
+	query, err = BuildQuery("b${z}", alertevaluator.EvaluationRule{
+		Rule: alertevaluator.Rule{TenantID: "t${x}${y}"}, PondID: "p${w}", DeviceID: "d${v}", Metric: "ph",
+	}, alertevaluator.WindowSpec{Start: start, End: start.Add(time.Minute)})
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, want := range []string{`from(bucket: "b${z}")`, `r["tenant_id"] == "t${x}${y}")`, `r["pond_id"] == "p${w}")`, `r["device_id"] == "d${v}")`} {
+		if !strings.Contains(query, want) {
+			t.Fatalf("legacy query misses %q (as on main):\n%s", want, query)
+		}
+	}
+	if strings.Contains(query, `\$`) {
+		t.Fatalf("legacy query gained a v2 escape:\n%s", query)
 	}
 }
 
@@ -359,6 +375,19 @@ func TestV2WindowReaderMapsAbsentSequenceSentinelToZero(t *testing.T) {
 				t.Fatalf("result = %#v, want value %v", result, test.want)
 			}
 		})
+	}
+}
+
+func TestV2WindowReaderNormalizesSampleTimesToUTC(t *testing.T) {
+	start := time.Date(2026, 7, 9, 12, 0, 0, 0, time.UTC)
+	local := start.Add(3 * time.Second).In(time.FixedZone("BRT", -3*60*60))
+	querier := &fakeV2Querier{rows: []V2Row{{Time: local, DeviceID: vectorDevice, ComponentID: vectorDeviceDefCmp, Value: 3, Sequence: 1}}}
+	result, err := V2WindowReader{Bucket: "raw", Querier: querier}.Evaluate(context.Background(), vectorRule("", "ph"), singleBucketSpec(start))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !result.LatestSampleAt.Equal(local) || result.LatestSampleAt.Location() != time.UTC {
+		t.Fatalf("latest sample at %v (%v), want %v in UTC like the legacy reader", result.LatestSampleAt, result.LatestSampleAt.Location(), local.UTC())
 	}
 }
 

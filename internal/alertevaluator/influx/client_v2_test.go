@@ -72,8 +72,9 @@ func TestClientV2QuerierParsesPivotedRows(t *testing.T) {
 			got.ComponentID != want[index].ComponentID || got.Value != want[index].Value {
 			t.Errorf("row %d = %#v, want %#v", index, got, want[index])
 		}
-		// The -1 sentinel is mapped to Seq 0 either here or by the reader;
-		// any other sequence is passed through exactly.
+		// The reader maps the -1 sentinel to Seq 0 (see
+		// TestV2WindowReaderMapsAbsentSequenceSentinelToZero); the client may
+		// pass it through or map it early. Other sequences pass exactly.
 		if index == 1 {
 			if got.Sequence != -1 && got.Sequence != 0 {
 				t.Errorf("row %d sequence = %d, want the -1 sentinel or 0", index, got.Sequence)
