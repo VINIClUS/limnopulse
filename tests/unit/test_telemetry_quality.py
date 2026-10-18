@@ -125,12 +125,9 @@ def test_values_just_outside_the_range_are_out_of_range(definition: MetricDefini
 @pytest.mark.parametrize("definition", metric_catalog(), ids=lambda item: item.metric_key)
 def test_values_inside_the_range_are_valid(definition: MetricDefinition) -> None:
     low, high = definition.plausible_min, definition.plausible_max
-    for value in (
-        math.nextafter(low, math.inf),
-        (low + high) / 2,
-        math.nextafter(high, -math.inf),
-    ):
-        assert classify(value, definition=definition) == expected()
+    interior = [low + (high - low) * step / 64 for step in range(1, 64)]
+    for value in (math.nextafter(low, math.inf), *interior, math.nextafter(high, -math.inf)):
+        assert classify(value, definition=definition) == expected(), value
 
 
 @pytest.mark.parametrize("value", [-1e300, 1e300, -6.0, 61.0, 4001.0])
@@ -402,6 +399,10 @@ def test_unknown_version_is_checked_against_the_injected_registry() -> None:
         (-timedelta(microseconds=1500), -2),
         (-FIVE_MINUTES, -300_000),
         (-(FIVE_MINUTES + MICRO), -300_001),
+        # Large deltas where float `total_seconds() * 1000` rounds to the wrong millisecond.
+        (timedelta(microseconds=8_626_555_501_451_999), 8_626_555_501_451),
+        (timedelta(microseconds=8_701_726_501_526_000), 8_701_726_501_526),
+        (-timedelta(microseconds=8_701_726_501_526_000), -8_701_726_501_526),
     ],
 )
 def test_delay_ms_is_floor_of_microsecond_difference(delta: timedelta, expected_ms: int) -> None:
@@ -453,6 +454,7 @@ def test_classification_reproduces_every_contract_vector_quality() -> None:
         )
         assert quality == item.quality, item.event_id
         assert (DELAYED in quality.flags) is item.delivery.delayed
+        assert (REPLAY in quality.flags) is item.delivery.replay
         seen_states.add(quality.state)
         seen_flags.update(quality.flags)
     assert seen_states == {VALID, OUT_OF_RANGE}
@@ -468,6 +470,11 @@ FORBIDDEN_IMPORTS = frozenset(
 
 
 def test_quality_module_never_reads_the_clock_or_does_io() -> None:
+    """D4: no clock reads and no I/O.
+
+    Deliberately strict: any identifier named like a clock accessor, any `time` import and
+    any `time.<attr>` reference fail, so the module cannot even alias a clock source.
+    """
     tree = ast.parse(inspect.getsource(telemetry_quality))
     for node in ast.walk(tree):
         if isinstance(node, ast.Name):

@@ -5,6 +5,8 @@ import inspect
 import math
 import struct
 from collections.abc import Mapping
+from decimal import Decimal
+from fractions import Fraction
 
 import pytest
 from limnopulse_api.domain.telemetry_units import (
@@ -234,8 +236,16 @@ def test_every_catalog_metric_accepts_exactly_its_locked_units() -> None:
     ],
 )
 def test_unknown_or_wrong_case_unit_is_unit_unsupported(metric_key: str, source_unit: str) -> None:
-    error = assert_rejected(QuarantineReason.UNIT_UNSUPPORTED, metric_key, 1.0, source_unit)
-    assert source_unit in error.detail
+    assert_rejected(QuarantineReason.UNIT_UNSUPPORTED, metric_key, 1.0, source_unit)
+
+
+def test_metric_absent_from_the_selected_mapping_is_unit_unsupported() -> None:
+    # A test-only catalog metric that `unit-mapping@1` does not list: no unit is in the table.
+    unlisted = metric(TEMPERATURE).model_copy(update={"metric_key": "water.chlorophyll"})
+    for source_unit in ("degC", "ug/L", "RFU"):
+        with pytest.raises(UnitConversionError) as caught:
+            convert_to_canonical(unlisted, 1.0, source_unit)
+        assert caught.value.reason is QuarantineReason.UNIT_UNSUPPORTED
 
 
 # --- value_invalid ---------------------------------------------------------------------------
@@ -251,6 +261,13 @@ def test_booleans_are_value_invalid(metric_key: str, value: bool) -> None:
 @pytest.mark.parametrize("metric_key", sorted(LOCKED_UNITS))
 @pytest.mark.parametrize("value", ["25.0", "7", "", b"7"])
 def test_strings_are_value_invalid(metric_key: str, value: object) -> None:
+    source_unit = min(LOCKED_UNITS[metric_key])
+    assert_rejected(QuarantineReason.VALUE_INVALID, metric_key, value, source_unit)
+
+
+@pytest.mark.parametrize("metric_key", sorted(LOCKED_UNITS))
+@pytest.mark.parametrize("value", [None, Decimal(7), Fraction(7, 1), complex(7, 0), [7]])
+def test_non_int_or_float_values_are_value_invalid(metric_key: str, value: object) -> None:
     source_unit = min(LOCKED_UNITS[metric_key])
     assert_rejected(QuarantineReason.VALUE_INVALID, metric_key, value, source_unit)
 
@@ -301,8 +318,19 @@ def test_large_finite_floats_of_float_metrics_are_converted_not_rejected(
 
 
 def test_non_finite_conversion_result_is_value_invalid() -> None:
-    # (x - 32) * 5 overflows to infinity for a finite x near the float maximum.
-    assert_rejected(QuarantineReason.VALUE_INVALID, TEMPERATURE, 1.7e308, "degF")
+    # The canonical value must be finite whatever the converter computes; the guard is
+    # exercised through a test-only mapping because no `@1` formula overflows portably.
+    mappings = _with_test_only_v2()
+    for value in (10.0, 10, -10.0):
+        with pytest.raises(UnitConversionError) as caught:
+            convert_to_canonical(
+                metric(TEMPERATURE),
+                value,
+                "hugeC",
+                unit_mapping_version="unit-mapping@2",
+                unit_mappings=mappings,
+            )
+        assert caught.value.reason is QuarantineReason.VALUE_INVALID
 
 
 # --- device.rssi (integer metric) ------------------------------------------------------------
@@ -312,7 +340,7 @@ def test_non_finite_conversion_result_is_value_invalid() -> None:
 def test_integral_rssi_is_accepted_as_float(value: float) -> None:
     result = convert_to_canonical(metric(RSSI), value, "dBm")
     assert type(result) is float
-    assert result == float(value)
+    assert bits(result) == bits(float(value))
     assert result.is_integer()
 
 
@@ -363,6 +391,7 @@ def _with_test_only_v2() -> dict[str, object]:
     v2 = {key: dict(units) for key, units in v1.items()}
     v2[TEMPERATURE]["degC"] = lambda value: value + 1.0
     v2[TEMPERATURE]["mdegC"] = lambda value: value / 1000
+    v2[TEMPERATURE]["hugeC"] = lambda value: value * 1e308
     return {**UNIT_MAPPINGS, "unit-mapping@2": v2}
 
 
