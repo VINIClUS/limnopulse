@@ -633,7 +633,7 @@ seq:      source([first returned _time, last returned _time + 1 µs))
             |> filter(_field == "sequence" or "ingested_at_ns" or "event_id") |> pivot(rowKey: ["_time"], columnKey: ["_field"])
             |> filter(sequence != -1)                                  // absent sequences rank lowest
             |> group(tenant_id, asset_id, device_id)                   // one table per legacy series
-            |> sort(["_time", "ingested_at_ns", "event_id"], desc: true) |> unique(column: "_time")   // (latest: limit(n: 1))
+            |> sort(["_time", "ingested_at_ns", "event_id"], desc: true) |> unique(column: "_time")   // latest: the same, over the newest points' span
 summary:  data = source(-period, 3 metrics) |> filter(_field == "value") |> group(columns: ["metric_key"])
             data |> aggregateWindow(every: <i>, fn: mean, createEmpty: false) |> yield("series")
             data |> mean()/min()/max()/count() |> yield(...)
@@ -641,11 +641,11 @@ summary:  data = source(-period, 3 metrics) |> filter(_field == "value") |> grou
 
 **Flux constraints (2.7.11).**
 1. Filters are `==`/`or` chains, which storage pushes down; `contains()` is not pushed down and scans the whole tenant.
-2. One `from()` per query: two yields sharing one source lose the pushdown.
+2. Readings, latest and `seq` use one `from()` per query: two yields sharing one source lose the pushdown. The summary keeps the legacy single-source, multi-yield shape.
 3. No per-row `map`. A vectorized `map` emits its columns in a varying order, so a later `pivot` panics non-deterministically (`column _start:time is not of type string`). A row-based `map` is deterministic but too slow (~0.06 ms per row).
 4. The `seq` winner is ranked per legacy series with `sort(desc) |> unique(column: "_time")`, never with one table per timestamp (`group(..., "_time")`).
 5. The `seq` query only spans the rows the first query returned, so its cost follows `limit`, not the read range.
-6. The summary uses storage aggregates (`aggregateWindow(fn: mean)`, `mean()`, `min()`, `max()`, `count()`) grouped by `metric_key`; raw rows are never transferred.
+6. The summary groups by `metric_key` and applies `aggregateWindow(fn: mean)`, `mean()`, `min()`, `max()` and `count()`, like legacy. The filters and the group are pushed down (`ReadGroup`); the aggregates run in the Flux engine; raw rows never reach the client. The cost profile is the same as legacy.
 
 **Python shaping.**
 - `metric_key` → legacy field name; Asset → pond via the requested pond or `list_ponds`.
@@ -662,7 +662,7 @@ summary:  data = source(-period, 3 metrics) |> filter(_field == "value") |> grou
   - Keep the legacy period/interval table (24h→5m, 7d/30d→1h) and the `do_mg_l`, `ph` and `temp_c` series with mean/min/max/count.
   - Errors are wrapped in `TelemetryQueryError`.
   - **Parity rule (r7.2 relaxation).** `min`, `max`, `count`, the window timestamps and the window set are exact. The float means (`statistics.*.mean` and every `series[*]` window mean) match within `math.isclose(rel_tol=1e-12, abs_tol=0)`.
-  - Reason: InfluxDB storage sums partials per (series, shard group) in series-key order. The v2 series keys differ from the legacy ones by design (`component_id` and the other ownership tags), so last-ulp agreement would need a shard-aware reimplementation, which is fragile and version-sensitive. No consumer depends on last-ulp means: the alert evaluator has its own Go reader, and dashboards round.
+  - Reason: the engine sums the `ReadGroup` stream, which is ordered per shard group and then by series key. The v2 series keys differ from the legacy ones by design (`component_id` and the other ownership tags), so last-ulp agreement would need a shard-aware reimplementation, which is fragile and version-sensitive. No consumer depends on last-ulp means: the alert evaluator has its own Go reader, and dashboards round.
   - The last summary window is stamped with the query's `now()`, as in legacy. Summary equivalence covers completed windows only.
 - **Error propagation.** The other methods, including the `seq` query, propagate errors exactly like the legacy adapter.
 - **Integer fields.** `seq` stays an integer end to end, so sequences up to `MAX_SEQUENCE` stay exact; a boundary test covers `2**53 + 1` and `2**63 - 1`.
@@ -1132,8 +1132,8 @@ Each task also owns the new test files named in its section.
   - The legacy-default component set from `list_devices`.
   - The asset→pond mapping from `list_ponds`.
   - Legacy grouping before `last()`/pivot/`limit`.
-  - The summary sort.
-  - The `rssi` `int(v:)` reconstruction, and the `seq` branch using `_value: r.sequence` (never converted to float or wrapped in `int(v:)`).
+  - The summary aggregates grouped by `metric_key`.
+  - Python `rssi` → `int` when integral (hidden otherwise); `seq` from the integer `sequence` column, never coerced; no `map` or `contains()` in any query.
   - Summary period validation and `TelemetryQueryError` wrapping; the other methods propagate errors.
 - [ ] **Step 2: Write failing equivalence tests** (real InfluxDB).
   - **Setup:** dual-write through the P2-03 `ObservationWriteService`, with both switches on, into one bucket. Write these scenarios:
@@ -1146,7 +1146,7 @@ Each task also owns the new test files named in its section.
     - native probes on a legacy pond Asset;
     - two observations at the same `(device, observed_at)` with conflicting sequences (the tie-break), and sequences `2**53 + 1` and `2**63 - 1` (integer exactness);
     - another tenant.
-  - **Domain-level equality:** for the four methods, `InfluxTelemetryRepository` and `V2ProjectedTelemetryRepository` return equal objects, and every compared result is non-empty.
+  - **Domain-level equality:** for the four methods, `InfluxTelemetryRepository` and `V2ProjectedTelemetryRepository` return equal objects, and every compared result is non-empty. The exception is the summary float means, which match within rel 1e-12; summaries cover completed windows only (r7.2).
   - **HTTP-level equality:** two apps, each with its repository injected, return byte-identical JSON for the four `/v1` endpoints, except the summary float means, which match within rel 1e-12; summaries cover completed windows only (r7.2).
   - **Exclusions:** native probes and the other tenant are absent.
 - [ ] **Step 3: Run red, commit, test gate,** then implement after approval.

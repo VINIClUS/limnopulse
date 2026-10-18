@@ -26,7 +26,6 @@ from anyio import to_thread
 
 from limnopulse_api.core.errors import TelemetryQueryError
 from limnopulse_api.domain.ids import (
-    SAFE_ID_PATTERN,
     asset_id_for_legacy_pond,
     default_component_id_for_legacy_device,
     require_safe_id,
@@ -85,7 +84,8 @@ class V2ProjectedTelemetryRepository:
             base = self._source(
                 tenant_id, ponds, components, f"start: -{period}", metrics=_SUMMARY_METRICS
             )
-            # The legacy summary shape over the v2 rows, aggregated by storage (no raw rows).
+            # The legacy summary shape over the v2 rows: filters and group are pushed down
+            # (`ReadGroup`), the aggregates run in the Flux engine, no raw row reaches the client.
             query = "\n".join(
                 [
                     f"data = {base.lstrip()}",
@@ -165,7 +165,7 @@ class V2ProjectedTelemetryRepository:
             asset_id_for_legacy_pond(tenant_id, pond.pond_id): pond.pond_id
             for pond in await self.domain_repository.list_ponds(tenant_id)
             # A pond ID that is not a safe ID is never dual-written (D7), so it has no data.
-            if isinstance(pond.pond_id, str) and SAFE_ID_PATTERN.fullmatch(pond.pond_id)
+            if _is_safe_id(pond.pond_id)
         }
         latest = await self._latest_by_pond(tenant_id, ponds)
         return [latest[pond_id] for pond_id in sorted(latest)]
@@ -277,6 +277,14 @@ class V2ProjectedTelemetryRepository:
 
     async def _query(self, query: str) -> Any:
         return await to_thread.run_sync(self.query_api.query, query, self.org)
+
+
+def _is_safe_id(value: Any) -> bool:
+    try:
+        require_safe_id(value)
+    except ValueError:
+        return False
+    return True
 
 
 def _series_key(values: Mapping[str, Any], ponds: Mapping[str, str]) -> tuple[str, str] | None:
