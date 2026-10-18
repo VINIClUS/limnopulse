@@ -100,3 +100,76 @@ func TestStagingRequiresExplicitQualitySettings(t *testing.T) {
 		t.Fatalf("staging quality = %#v", config)
 	}
 }
+
+func TestLoadRunConfigDefaultsTelemetrySourceToLegacy(t *testing.T) {
+	config, err := LoadRunConfig(nil, env(nil))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if config.TelemetrySource != "legacy" {
+		t.Fatalf("telemetry source = %q, want legacy", config.TelemetrySource)
+	}
+}
+
+func TestLoadRunConfigReadsTelemetrySourceFromEnvironmentAndFlag(t *testing.T) {
+	for _, test := range []struct {
+		name string
+		args []string
+		env  map[string]string
+		want string
+	}{
+		{name: "env v2", env: map[string]string{"ALERT_EVALUATOR_TELEMETRY_SOURCE": "v2"}, want: "v2"},
+		{name: "env legacy", env: map[string]string{"ALERT_EVALUATOR_TELEMETRY_SOURCE": "legacy"}, want: "legacy"},
+		{name: "flag v2", args: []string{"--telemetry-source=v2"}, want: "v2"},
+		{name: "flag over env", args: []string{"--telemetry-source", "v2"}, env: map[string]string{"ALERT_EVALUATOR_TELEMETRY_SOURCE": "legacy"}, want: "v2"},
+		{name: "flag legacy over env v2", args: []string{"--telemetry-source=legacy"}, env: map[string]string{"ALERT_EVALUATOR_TELEMETRY_SOURCE": "v2"}, want: "legacy"},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			config, err := LoadRunConfig(test.args, env(test.env))
+			if err != nil {
+				t.Fatal(err)
+			}
+			if config.TelemetrySource != test.want {
+				t.Fatalf("telemetry source = %q, want %q", config.TelemetrySource, test.want)
+			}
+		})
+	}
+}
+
+func TestLoadRunConfigRejectsInvalidTelemetrySource(t *testing.T) {
+	for _, value := range []string{"", "V2", "Legacy", "both", "v1", " v2"} {
+		if _, err := LoadRunConfig(nil, env(map[string]string{"ALERT_EVALUATOR_TELEMETRY_SOURCE": value})); err == nil {
+			t.Errorf("env ALERT_EVALUATOR_TELEMETRY_SOURCE=%q accepted", value)
+		}
+		if _, err := LoadRunConfig([]string{"--telemetry-source=" + value}, env(nil)); err == nil {
+			t.Errorf("flag --telemetry-source=%q accepted", value)
+		}
+	}
+}
+
+func TestStagingValidationIsUnchangedByTelemetrySource(t *testing.T) {
+	hosted := map[string]string{
+		"APP_ENV": "prod",
+		"ALERT_EVALUATOR_EXPECTED_SAMPLE_INTERVAL": "20s",
+		"ALERT_EVALUATOR_MIN_COVERAGE_RATIO":       "0.9",
+		"ALERT_EVALUATOR_MIN_POINTS":               "4",
+		"ALERT_EVALUATOR_ALLOWED_LATENESS":         "30s",
+		"ALERT_EVALUATOR_MAX_SAMPLE_AGE":           "1m",
+		"TELEGRAM_DELIVERY_ENABLED":                "false",
+	}
+	config, err := LoadRunConfig(nil, env(hosted))
+	if err != nil {
+		t.Fatalf("prod config without an explicit telemetry source: %v", err)
+	}
+	if config.TelemetrySource != "legacy" {
+		t.Fatalf("prod telemetry source = %q, want the legacy default", config.TelemetrySource)
+	}
+	hosted["ALERT_EVALUATOR_TELEMETRY_SOURCE"] = "v2"
+	if config, err = LoadRunConfig(nil, env(hosted)); err != nil || config.TelemetrySource != "v2" {
+		t.Fatalf("prod v2 config = %q, %v", config.TelemetrySource, err)
+	}
+	delete(hosted, "TELEGRAM_DELIVERY_ENABLED")
+	if _, err := LoadRunConfig([]string{"--telemetry-source=v2"}, env(hosted)); err == nil {
+		t.Fatal("telemetry source relaxed the explicit Telegram flag rule")
+	}
+}

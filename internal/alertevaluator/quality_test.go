@@ -2,6 +2,8 @@ package alertevaluator
 
 import (
 	"math"
+	"math/rand"
+	"sort"
 	"testing"
 	"time"
 )
@@ -120,5 +122,187 @@ func TestTargetDeviceFiltersOtherSeries(t *testing.T) {
 
 	if result.Quality != QualitySufficient || result.Value != 3 || result.ContributingDeviceCount != 1 {
 		t.Fatalf("target result = %#v", result)
+	}
+}
+
+// orderFixtureDevices are listed in byte-wise ascending order (sort.Strings):
+// uppercase before lowercase, "dev-10" before "dev-9". A case-insensitive or
+// natural sort gives a different order.
+var orderFixtureDevices = []string{"B", "Z", "a", "dev-10", "dev-9"}
+
+// Device orders a wrong implementation could plausibly use; the fixture
+// self-check proves each one changes the result bits.
+var orderFixtureWrongDeviceOrders = [][]int{
+	{4, 3, 2, 1, 0}, // descending
+	{2, 0, 1, 3, 4}, // case-insensitive
+	{0, 1, 2, 4, 3}, // natural (numeric-aware)
+	{3, 0, 4, 2, 1}, // mean sample insertion order
+	{4, 2, 0, 3, 1}, // last sample insertion order
+	{1, 2, 0, 3, 4},
+}
+
+// orderFixtureValues[bucket][device] is chosen so that float addition order
+// changes the result: any bucket or device order other than ascending gives
+// different bits (asserted by the fixture self-check below).
+var orderFixtureValues = [][]float64{
+	{0.7, 0.2, -3e15, 0.3, -1e16},
+	{0.1, 0.1, 4, 0.3, 4},
+	{-3e15, 1e16, 1e15, 0.7, -3e15},
+	{1.1, 4, 1e16, 3.399, 0.001},
+	{0.3, 2.2, -3e15, 0.7, 1e15},
+	{2.2, 0.7, 1e15, 0.001, 1},
+}
+
+// orderFixtureSamples gives every device one canonical sample per bucket for
+// mean, plus a superseded earlier sample in the same bucket. All devices
+// share the same timestamps, so time order cannot stand in for ID order.
+func orderFixtureSamples(spec WindowSpec) []Sample {
+	var samples []Sample
+	for _, device := range []int{3, 0, 4, 2, 1} {
+		for bucket, values := range orderFixtureValues {
+			base := spec.Start.Add(time.Duration(bucket) * spec.ExpectedSampleInterval)
+			samples = append(samples,
+				Sample{Time: base.Add(time.Second), DeviceID: orderFixtureDevices[device], Value: 1e9, Seq: 1},
+				Sample{Time: base.Add(5 * time.Second), DeviceID: orderFixtureDevices[device], Value: values[device], Seq: 2},
+			)
+		}
+	}
+	return samples
+}
+
+// orderedMean is the contract: buckets ascending, devices ascending inside a
+// bucket, each bucket weighted by its device count.
+func orderedMean(bucketOrder, deviceOrder []int) float64 {
+	var temporal float64
+	for _, bucket := range bucketOrder {
+		var sum float64
+		for _, device := range deviceOrder {
+			sum += orderFixtureValues[bucket][device]
+		}
+		temporal += sum / float64(len(deviceOrder))
+	}
+	return temporal / float64(len(bucketOrder))
+}
+
+// orderFixtureLatest[device] is each device's latest value for last.
+var orderFixtureLatest = []float64{2.2, 0.1, -3e15, 0.25, 1e15}
+
+// orderedLast sums each device's latest value in the given device order.
+func orderedLast(deviceOrder []int) float64 {
+	var sum float64
+	for _, device := range deviceOrder {
+		sum += orderFixtureLatest[device]
+	}
+	return sum / float64(len(deviceOrder))
+}
+
+func orderFixtureLastSamples(spec WindowSpec) []Sample {
+	var samples []Sample
+	for _, device := range []int{4, 2, 0, 3, 1} {
+		for bucket := 0; bucket < 6; bucket++ {
+			value := 1e9
+			if bucket == 5 {
+				value = orderFixtureLatest[device]
+			}
+			samples = append(samples, Sample{
+				Time:     spec.Start.Add(time.Duration(bucket)*spec.ExpectedSampleInterval + 5*time.Second),
+				DeviceID: orderFixtureDevices[device], Value: value, Seq: int64(bucket),
+			})
+		}
+	}
+	return samples
+}
+
+func TestOrderFixtureIsOrderSensitive(t *testing.T) {
+	if !sort.StringsAreSorted(orderFixtureDevices) {
+		t.Fatalf("fixture devices are not in ascending order: %v", orderFixtureDevices)
+	}
+	ascBuckets := []int{0, 1, 2, 3, 4, 5}
+	ascDevices := []int{0, 1, 2, 3, 4}
+	want := orderedMean(ascBuckets, ascDevices)
+	for _, buckets := range [][]int{{5, 4, 3, 2, 1, 0}, {0, 2, 1, 3, 4, 5}, {0, 1, 2, 3, 5, 4}, {2, 1, 0, 3, 4, 5}} {
+		if math.Float64bits(orderedMean(buckets, ascDevices)) == math.Float64bits(want) {
+			t.Fatalf("mean fixture is not sensitive to bucket order %v", buckets)
+		}
+	}
+	for _, devices := range orderFixtureWrongDeviceOrders {
+		if math.Float64bits(orderedMean(ascBuckets, devices)) == math.Float64bits(want) {
+			t.Fatalf("mean fixture is not sensitive to device order %v", devices)
+		}
+		if math.Float64bits(orderedLast(devices)) == math.Float64bits(orderedLast(ascDevices)) {
+			t.Fatalf("last fixture is not sensitive to device order %v", devices)
+		}
+	}
+}
+
+func assertBitIdentical(t *testing.T, label string, got WindowResult, want float64) {
+	t.Helper()
+	if got.Quality != QualitySufficient || math.Float64bits(got.Value) != math.Float64bits(want) {
+		t.Fatalf("%s: value = %v (%#x), quality %s; want %v (%#x)", label, got.Value, math.Float64bits(got.Value), got.Quality, want, math.Float64bits(want))
+	}
+}
+
+func shuffledCopies(samples []Sample, count int) [][]Sample {
+	random := rand.New(rand.NewSource(20261018))
+	copies := make([][]Sample, 0, count)
+	for i := 0; i < count; i++ {
+		shuffled := append([]Sample(nil), samples...)
+		random.Shuffle(len(shuffled), func(a, b int) { shuffled[a], shuffled[b] = shuffled[b], shuffled[a] })
+		copies = append(copies, shuffled)
+	}
+	return copies
+}
+
+func TestMeanSumsBucketsAndDevicesInAscendingOrder(t *testing.T) {
+	spec := qualitySpec(AggregationMean)
+	samples := orderFixtureSamples(spec)
+	want := orderedMean([]int{0, 1, 2, 3, 4, 5}, []int{0, 1, 2, 3, 4})
+	for i := 0; i < 200; i++ {
+		assertBitIdentical(t, "repeated mean", EvaluateSamples(spec, samples), want)
+	}
+	for i, shuffled := range shuffledCopies(samples, 50) {
+		result := EvaluateSamples(spec, shuffled)
+		assertBitIdentical(t, "shuffled mean", result, want)
+		if result.ValidPointCount != 30 || result.OccupiedBucketCount != 6 || result.ContributingDeviceCount != 5 {
+			t.Fatalf("shuffle %d: counts = %#v", i, result)
+		}
+	}
+}
+
+func TestLastSumsDevicesInAscendingOrder(t *testing.T) {
+	spec := qualitySpec(AggregationLast)
+	samples := orderFixtureLastSamples(spec)
+	want := orderedLast([]int{0, 1, 2, 3, 4})
+	for i := 0; i < 200; i++ {
+		assertBitIdentical(t, "repeated last", EvaluateSamples(spec, samples), want)
+	}
+	for _, shuffled := range shuffledCopies(samples, 50) {
+		assertBitIdentical(t, "shuffled last", EvaluateSamples(spec, shuffled), want)
+	}
+}
+
+func TestDeterministicOrderKeepsOtherResultFields(t *testing.T) {
+	spec := qualitySpec(AggregationMean)
+	samples := orderFixtureSamples(spec)
+	first := EvaluateSamples(spec, samples)
+	wantLatest := spec.Start.Add(5*spec.ExpectedSampleInterval + 5*time.Second)
+	if first.ExpectedBucketCount != 6 || first.CoverageRatio != 1 || !first.LatestSampleAt.Equal(wantLatest) {
+		t.Fatalf("result = %#v", first)
+	}
+	for _, shuffled := range shuffledCopies(samples, 20) {
+		if got := EvaluateSamples(spec, shuffled); got != first {
+			t.Fatalf("shuffled result %#v differs from %#v", got, first)
+		}
+	}
+	for _, aggregation := range []Aggregation{AggregationMin, AggregationMax} {
+		spec := qualitySpec(aggregation)
+		result := EvaluateSamples(spec, orderFixtureSamples(spec))
+		want := -1e16
+		if aggregation == AggregationMax {
+			want = 1e16
+		}
+		if result.Quality != QualitySufficient || result.Value != want {
+			t.Fatalf("%s = %#v, want %v", aggregation, result, want)
+		}
 	}
 }

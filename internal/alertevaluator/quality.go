@@ -2,6 +2,7 @@ package alertevaluator
 
 import (
 	"math"
+	"sort"
 	"time"
 )
 
@@ -129,17 +130,31 @@ func aggregateSamples(spec WindowSpec, canonical map[sampleKey]Sample, values []
 		}
 		return value, true
 	case AggregationMean:
-		bucketSums := make(map[int]float64)
-		bucketDevices := make(map[int]int)
-		for key, sample := range canonical {
-			bucketSums[key.bucket] += sample.Value
-			bucketDevices[key.bucket]++
+		// Sum in a fixed order (buckets ascending, devices ascending) so the
+		// float result does not depend on map iteration order.
+		keys := make([]sampleKey, 0, len(canonical))
+		for key := range canonical {
+			keys = append(keys, key)
 		}
+		sort.Slice(keys, func(a, b int) bool {
+			if keys[a].bucket != keys[b].bucket {
+				return keys[a].bucket < keys[b].bucket
+			}
+			return keys[a].device < keys[b].device
+		})
 		var temporalSum float64
-		for bucket, sum := range bucketSums {
-			temporalSum += sum / float64(bucketDevices[bucket])
+		buckets := 0
+		for start := 0; start < len(keys); {
+			end := start
+			var sum float64
+			for ; end < len(keys) && keys[end].bucket == keys[start].bucket; end++ {
+				sum += canonical[keys[end]].Value
+			}
+			temporalSum += sum / float64(end-start)
+			buckets++
+			start = end
 		}
-		return temporalSum / float64(len(bucketSums)), true
+		return temporalSum / float64(buckets), true
 	case AggregationLast:
 		latestSlotStart := spec.End.Add(-spec.EvaluationCadence)
 		latestByDevice := make(map[string]Sample)
@@ -156,9 +171,14 @@ func aggregateSamples(spec WindowSpec, canonical map[sampleKey]Sample, values []
 		if len(latestByDevice) == 0 {
 			return 0, false
 		}
+		devices := make([]string, 0, len(latestByDevice))
+		for device := range latestByDevice {
+			devices = append(devices, device)
+		}
+		sort.Strings(devices)
 		var sum float64
-		for _, sample := range latestByDevice {
-			sum += sample.Value
+		for _, device := range devices {
+			sum += latestByDevice[device].Value
 		}
 		return sum / float64(len(latestByDevice)), true
 	default:
