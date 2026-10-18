@@ -5,7 +5,7 @@
 
 from typing import Annotated
 
-from fastapi import APIRouter, Depends, HTTPException, Query
+from fastapi import APIRouter, Depends, HTTPException, Query, Request
 from fastapi.exceptions import RequestValidationError
 
 from limnopulse_api.api.dependencies import require_tenant_role
@@ -41,6 +41,27 @@ _RESPONSES: dict[int | str, dict[str, object]] = {
 
 # The access dependency is declared before the reader so a non-member gets 403, never 503.
 TenantReadAccess = Annotated[TenantAccess, Depends(require_tenant_role(*READ_ROLES))]
+_REPEATABLE_PARAMETERS = frozenset({"metric_key", "quality_state"})
+
+
+def reject_repeated_scalar_parameters(request: Request) -> None:
+    """A repeated single-value parameter is 422, never silently resolved to its last value."""
+    params = request.query_params
+    repeated = sorted(
+        name
+        for name in set(params.keys()) - _REPEATABLE_PARAMETERS
+        if len(params.getlist(name)) > 1
+    )
+    if repeated:
+        raise RequestValidationError(
+            [
+                {"type": "value_error", "loc": ("query", name), "msg": "must not repeat"}
+                for name in repeated
+            ]
+        )
+
+
+SingleValuedParameters = Annotated[None, Depends(reject_repeated_scalar_parameters)]
 
 
 def _list_response(items: list[StoredObservation]) -> V2ObservationListResponse:
@@ -59,6 +80,7 @@ def _http_error(exc: NotFoundError | TelemetryQueryError) -> HTTPException:
 async def list_observations(
     tenant_id: str,
     _access: TenantReadAccess,
+    _single: SingleValuedParameters,
     query: Annotated[V2ObservationQuery, Query()],
     reader: ObservationReaderDep,
     site_assets: SiteAssetReaderDep,
@@ -92,6 +114,7 @@ async def list_observations(
 async def list_latest_observations(
     tenant_id: str,
     _access: TenantReadAccess,
+    _single: SingleValuedParameters,
     query: Annotated[V2LatestObservationQuery, Query()],
     reader: ObservationReaderDep,
     site_assets: SiteAssetReaderDep,

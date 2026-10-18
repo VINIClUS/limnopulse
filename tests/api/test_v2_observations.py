@@ -606,6 +606,53 @@ def test_start_in_the_future_without_stop_is_422() -> None:
     assert harness.reader.calls == []
 
 
+@pytest.mark.parametrize(
+    "params",
+    [
+        {"start": "1792321200"},
+        {"stop": "1792324800"},
+        {"stop": "-1"},
+        {"start": "2026-10-18"},
+        {"start": "2026-10-18 10:00:00Z"},
+    ],
+)
+def test_non_iso_timestamps_are_422(params: dict) -> None:
+    harness = build_app()
+    response = get(harness, OBSERVATIONS, {"asset_id": ASSET_ID, **params})
+    assert response.status_code == 422
+    assert harness.reader.calls == []
+
+
+@pytest.mark.parametrize("path", [OBSERVATIONS, LATEST])
+@pytest.mark.parametrize(
+    "params",
+    [
+        [("asset_id", ASSET_ID), ("asset_id", OTHER_ASSET_ID)],
+        [("device_id", DEVICE_ID), ("device_id", DEVICE_ID)],
+    ],
+)
+def test_repeated_selector_is_422(path: str, params: list) -> None:
+    harness = build_app()
+    assert get(harness, path, params).status_code == 422
+    assert harness.reader.calls == []
+    assert harness.entities.calls == []
+
+
+@pytest.mark.parametrize(
+    "repeated",
+    [
+        [("start", "2026-10-18T10:00:00Z"), ("start", "2026-10-18T10:30:00Z")],
+        [("stop", "2026-10-18T11:00:00Z"), ("stop", "2026-10-18T11:30:00Z")],
+        [("limit", "5"), ("limit", "6")],
+    ],
+)
+def test_repeated_scalar_parameters_are_422(repeated: list) -> None:
+    harness = build_app()
+    response = get(harness, OBSERVATIONS, [("asset_id", ASSET_ID), *repeated])
+    assert response.status_code == 422
+    assert harness.reader.calls == []
+
+
 # --- latest --------------------------------------------------------------------------------
 
 

@@ -4,10 +4,11 @@ Domain enums are exposed as plain strings so every OpenAPI component these route
 the `V2` prefix and never collides with a `/v1` component name.
 """
 
+import re
 from datetime import UTC, datetime
 from typing import Annotated
 
-from pydantic import AfterValidator, BaseModel, ConfigDict, Field, model_validator
+from pydantic import AfterValidator, BaseModel, BeforeValidator, ConfigDict, Field, model_validator
 
 from limnopulse_api.api.v2.schemas.common import UtcTimestamp
 from limnopulse_api.domain.metric_catalog import metric_definition
@@ -23,6 +24,16 @@ from limnopulse_api.repositories.telemetry_v2 import ObservationSelector
 DEFAULT_OBSERVATION_LIMIT = 500
 MAX_OBSERVATION_LIMIT = 1000
 _POINT_STATE_VALUES = frozenset(str(state) for state in POINT_QUALITY_STATES)
+_ISO_DATE_TIME = re.compile(r"\d{4}-\d{2}-\d{2}T.+")
+
+
+def _require_iso_text(value: object) -> object:
+    """ISO-8601 date-time text only: lax pydantic would read `1792321200` as epoch seconds."""
+    if isinstance(value, datetime):
+        return value
+    if not isinstance(value, str) or _ISO_DATE_TIME.fullmatch(value) is None:
+        raise ValueError("timestamps must be ISO-8601 date-times")
+    return value
 
 
 def _require_query_bound(value: datetime) -> datetime:
@@ -50,7 +61,9 @@ def _require_point_state(value: str) -> str:
     return value
 
 
-QueryBound = Annotated[datetime, AfterValidator(_require_query_bound)]
+QueryBound = Annotated[
+    datetime, BeforeValidator(_require_iso_text), AfterValidator(_require_query_bound)
+]
 CatalogMetricKey = Annotated[str, AfterValidator(_require_catalog_metric)]
 PointQualityState = Annotated[str, AfterValidator(_require_point_state)]
 
