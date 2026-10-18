@@ -656,7 +656,7 @@ from(bucket: B) |> range(<same bounds as legacy>)
   - Then pivot straight to the legacy row key, as legacy does. Never regroup without `_field` first: that merges integer (`rssi`, `seq`) and float `_value` columns into one table, and the pivot fails with `schema collision` (r7.2 correction).
 - **Summary.**
   - Keep the legacy period/interval table (24h→5m, 7d/30d→1h) and the `do_mg_l`, `ph` and `temp_c` series with mean/min/max/count. Sort by `device_id, _time` after `group(columns: ["_field"])` and before aggregation.
-  - The legacy `mean` is aggregated in storage. Each series is summed in time order, the series sums are added in device order, and the total is divided by the count. A single-pass `mean()` rounds differently in any row order, so the projection rebuilds it with a two-level `reduce` over the sorted rows.
+  - The legacy `mean` is aggregated in storage. Each series is summed in time order, the series sums are added in device order, and the total is divided by the count. A single-pass `mean()` rounds differently in any row order, so the projection rebuilds it with a two-level `reduce` over the sorted rows. This parity depends on the InfluxDB version, because it follows storage pushdown behavior. The equivalence suite on the pinned 2.7.11 CI image is the guard for future upgrades.
   - Windows use `window(every: <i>, createEmpty: false) |> <mean> |> duplicate(column: "_stop", as: "_time")`, never `aggregateWindow(fn: mean)`: its fast path re-orders rows, and the full stdlib expansion is rewritten into the same fast path.
   - The last summary window is stamped with the query's `now()`, as in legacy. Summary equivalence therefore covers completed windows only.
   - Errors are wrapped in `TelemetryQueryError`.
