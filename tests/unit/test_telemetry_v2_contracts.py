@@ -1119,3 +1119,54 @@ def test_delivery_and_replay_flags_are_strict_booleans(flag) -> None:
         ObservationDelivery(ingested_at=INGESTED, delayed=flag, replay=False)
     with pytest.raises(ValidationError):
         trusted_context(replay=flag)
+
+
+# --- PR #78 review regressions (Codex) ------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    "observed_at",
+    [
+        "1783598400",
+        "1783598400.5",
+        "2026-07-09_12:00:00Z",
+        "2026-07-09t12:00:00.123456789Z",
+        "2026-07-09 12:00:00.123456789Z",
+        "2026-07-09T12:00:00,123456789Z",
+    ],
+)
+def test_timestamp_strings_must_be_iso_without_sub_microsecond_digits(observed_at) -> None:
+    with pytest.raises(ValidationError):
+        source_observation(observed_at=observed_at)
+
+
+@pytest.mark.parametrize(
+    "observed_at",
+    ["2026-07-09t12:00:00.123456Z", "2026-07-09 12:00:00.123456000+00:00"],
+)
+def test_iso_timestamp_variants_with_microsecond_precision_are_accepted(observed_at) -> None:
+    assert source_observation(observed_at=observed_at).observed_at == OBSERVED + timedelta(
+        microseconds=123_456
+    )
+
+
+def test_default_source_metadata_is_read_only() -> None:
+    values = {
+        "component_id": COMPONENT,
+        "metric_key": "water.temperature",
+        "value": 25.1,
+        "source_unit": "degC",
+        "observed_at": OBSERVED,
+    }
+    with pytest.raises(TypeError):
+        SourceObservation(**values).source_metadata["location"] = "north"  # type: ignore[index]
+    observation = canonical()
+    observation_without_metadata = CanonicalObservation(
+        **{
+            name: getattr(observation, name)
+            for name in CanonicalObservation.model_fields
+            if name != "source_metadata"
+        }
+    )
+    with pytest.raises(TypeError):
+        observation_without_metadata.source_metadata["location"] = "north"  # type: ignore[index]

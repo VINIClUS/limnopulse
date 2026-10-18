@@ -219,6 +219,10 @@ def encode_observation_line(o: CanonicalObservation) -> str:
     return _line(OBSERVATION_MEASUREMENT, tags, fields, observed_us * 1000)
 
 
+def _encodable_integer(value: float) -> bool:
+    return float(value).is_integer() and _INT64_MIN <= int(value) <= _INT64_MAX
+
+
 def _legacy_integer(value: float | int) -> int:
     if isinstance(value, float):
         if not math.isfinite(value) or not value.is_integer():
@@ -258,8 +262,9 @@ def build_legacy_points(
 ) -> tuple[LegacyPoint, ...]:
     """Group D7-eligible observations into Telegraf-identical points (D8).
 
-    Ineligible observations are skipped, never raised: the caller counts them. A non-integral
-    value for an integer legacy field (unreachable after `unit-mapping@1`) is ineligible too.
+    Ineligible observations are skipped, never raised: the caller counts them. A non-integral or
+    out-of-int64 value for an integer legacy field (unreachable after `unit-mapping@1`) is
+    ineligible too.
     """
     groups: dict[tuple[str, str, str, datetime], list[tuple[str, CanonicalObservation]]] = {}
     for o in observations:
@@ -274,9 +279,8 @@ def build_legacy_points(
         definition = metric_definition(o.observation.metric_key)
         if definition is None or definition.legacy_field is None:
             continue
-        if (
-            definition.legacy_field in LEGACY_INTEGER_FIELDS
-            and not float(o.observation.value).is_integer()
+        if definition.legacy_field in LEGACY_INTEGER_FIELDS and not _encodable_integer(
+            o.observation.value
         ):
             continue
         key = (resolved.tenant_id, pond_id, resolved.device_id, o.observation.observed_at)

@@ -838,3 +838,14 @@ def test_non_integral_rssi_is_ineligible_not_raised() -> None:
     (point,) = build_legacy_points(items, LEGACY_POND_BY_ASSET)
     assert dict(point.fields) == {"ph": 7.2}
     assert build_legacy_points(items[:1], LEGACY_POND_BY_ASSET) == ()
+
+
+@pytest.mark.parametrize("value", [float(2**63), -float(2**64)])
+def test_out_of_int64_rssi_is_ineligible_not_raised(value) -> None:
+    items = [
+        observation("device.rssi", value, sequence=None),
+        observation("water.ph", 7.2, sequence=None),
+    ]
+    (point,) = build_legacy_points(items, LEGACY_POND_BY_ASSET)
+    assert dict(point.fields) == {"ph": 7.2}
+    encode_legacy_line(point)

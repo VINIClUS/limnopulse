@@ -128,7 +128,10 @@ class QuarantineReason(StrEnum):
 
 _PROVENANCE_ORDER = {item: index for index, item in enumerate(QualityProvenance)}
 _OUT_OF_RANGE = "telemetry timestamp outside [1970-01-01, 2262-01-01) UTC"
-_ISO_FRACTION = re.compile(r"T\d{2}:\d{2}:\d{2}[.,](\d+)")
+# Accepted text form: ISO-8601 date and time with "T"/"t" or space, optional fraction, offset.
+_ISO_TIMESTAMP = re.compile(
+    r"\d{4}-\d{2}-\d{2}[Tt ]\d{2}:\d{2}:\d{2}(?:[.,](?P<fraction>\d+))?(?:[Zz]|[+-]\d{2}:?\d{2})?"
+)
 
 
 def require_telemetry_time(value: datetime) -> datetime:
@@ -150,8 +153,11 @@ def _require_exact_timestamp_input(value: object) -> object:
         return value
     if not isinstance(value, str):
         raise ValueError("telemetry timestamps must be datetimes or ISO-8601 strings")
-    fraction = _ISO_FRACTION.search(value)
-    if fraction is not None and fraction.group(1)[6:].strip("0"):
+    match = _ISO_TIMESTAMP.fullmatch(value)
+    if match is None:
+        raise ValueError("telemetry timestamps must be datetimes or ISO-8601 strings")
+    fraction = match.group("fraction") or ""
+    if fraction[6:].strip("0"):
         raise ValueError("sub-microsecond precision unsupported")
     return value
 
@@ -262,7 +268,7 @@ class SourceObservation(_TelemetryModel):
     observed_at: TelemetryDatetime
     sequence: SequenceNumber | None = None
     source_event_id: SourceEventId | None = None
-    source_metadata: SourceMetadata = Field(default_factory=dict)
+    source_metadata: SourceMetadata = Field(default_factory=dict, validate_default=True)
 
 
 class ObservationSource(_TelemetryModel):
@@ -337,7 +343,7 @@ class CanonicalObservation(_TelemetryModel):
     delivery: ObservationDelivery
     quality: ObservationQuality
     mapping: NormalizationVersions = Field(default_factory=NormalizationVersions)
-    source_metadata: SourceMetadata = Field(default_factory=dict)
+    source_metadata: SourceMetadata = Field(default_factory=dict, validate_default=True)
 
     @model_validator(mode="after")
     def validate_identity_and_mirrors(self) -> "CanonicalObservation":
