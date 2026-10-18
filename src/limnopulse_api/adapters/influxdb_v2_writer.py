@@ -15,7 +15,7 @@ from anyio import to_thread
 from influxdb_client import WritePrecision
 from influxdb_client.client.write_api import WriteType
 from influxdb_client.rest import ApiException
-from urllib3.exceptions import HTTPError, LocationValueError
+from urllib3.exceptions import HTTPError
 
 from limnopulse_api.core.errors import TelemetryWriteError
 from limnopulse_api.domain.telemetry_v2 import CanonicalObservation
@@ -64,11 +64,6 @@ class InfluxObservationWriter:
                 await to_thread.run_sync(self._write_chunk, chunk)
             except ApiException as exc:
                 error = _classify_api_error(exc, len(chunk))
-            except LocationValueError as exc:
-                # A malformed InfluxDB URL is configuration, not transport: retrying cannot help.
-                error = TelemetryWriteError(
-                    f"InfluxDB URL is invalid: {type(exc).__name__}", retryable=False
-                )
             except (HTTPError, OSError) as exc:
                 error = TelemetryWriteError(
                     f"InfluxDB write failed in transport: {type(exc).__name__}", retryable=True

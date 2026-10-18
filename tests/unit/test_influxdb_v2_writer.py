@@ -12,8 +12,6 @@ from influxdb_client.rest import ApiException
 from urllib3.exceptions import (
     ConnectTimeoutError,
     HTTPError,
-    LocationParseError,
-    LocationValueError,
     MaxRetryError,
     NewConnectionError,
     ProtocolError,
@@ -420,19 +418,3 @@ async def test_status_zero_log_is_not_a_schema_conflict(caplog: pytest.LogCaptur
 
     assert caplog.records
     assert all("schema" not in record.getMessage().lower() for record in caplog.records)
-
-
-@pytest.mark.asyncio
-@pytest.mark.parametrize("method", WRITE_METHODS)
-@pytest.mark.parametrize(
-    "error",
-    [LocationParseError("http://[bad"), LocationValueError("No host specified.")],
-    ids=lambda error: type(error).__name__,
-)
-async def test_malformed_url_errors_are_permanent(method: str, error: BaseException) -> None:
-    writer = make_writer(FakeWriteApi({1: error}))
-
-    with pytest.raises(TelemetryWriteError) as raised:
-        await _write(writer, method)
-
-    assert raised.value.retryable is False
