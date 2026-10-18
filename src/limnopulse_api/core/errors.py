@@ -28,3 +28,11 @@ class IdentityEmailError(LimnopulseError):
 
 class IdentityServiceUnavailableError(LimnopulseError):
     """Cognito could not verify the current identity."""
+
+
+class TelemetryWriteError(LimnopulseError):
+    """Telemetry was not durably written; the caller must not acknowledge the input."""
+
+    def __init__(self, message: str, *, retryable: bool) -> None:
+        super().__init__(message)
+        self.retryable = retryable
