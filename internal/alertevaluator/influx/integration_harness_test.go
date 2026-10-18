@@ -2,6 +2,8 @@ package influx
 
 import (
 	"context"
+	"crypto/rand"
+	"encoding/hex"
 	"fmt"
 	"os"
 	"strings"
@@ -163,5 +165,61 @@ func TestIntegrationSettingsUseContractDefaultsAndOverrides(t *testing.T) {
 	url, token, org = integrationSettings()
 	if url != "http://127.0.0.1:18086" || token != "override-token" || org != "override-org" {
 		t.Fatalf("overrides = (%q, %q, %q)", url, token, org)
+	}
+}
+
+func integrationEnv(name, fallback string) string {
+	if value := os.Getenv(name); value != "" {
+		return value
+	}
+	return fallback
+}
+
+// integrationSettings resolves the harness connection settings; an empty
+// variable counts as unset.
+func integrationSettings() (url, token, org string) {
+	return integrationEnv("INFLUX_INTEGRATION_URL", "http://127.0.0.1:8086"),
+		integrationEnv("INFLUX_INTEGRATION_TOKEN", "local-dev-token"),
+		integrationEnv("INFLUX_INTEGRATION_ORG", "limnopulse")
+}
+
+// newIntegrationBucket skips unless RUN_INFLUX_INTEGRATION=1. Otherwise it
+// creates a uniquely named bucket with no retention rule through BucketsAPI()
+// and deletes it when the test ends.
+func newIntegrationBucket(t *testing.T) (influxdb2.Client, *domain.Bucket) {
+	t.Helper()
+	if os.Getenv("RUN_INFLUX_INTEGRATION") != "1" {
+		t.Skip("set RUN_INFLUX_INTEGRATION=1 to run against a real InfluxDB")
+	}
+	url, token, orgName := integrationSettings()
+	client := influxdb2.NewClient(url, token)
+	t.Cleanup(client.Close)
+	ctx := context.Background()
+	org, err := client.OrganizationsAPI().FindOrganizationByName(ctx, orgName)
+	if err != nil {
+		t.Fatalf("find org %q at %s: %v", orgName, url, err)
+	}
+	suffix := make([]byte, 8)
+	if _, err := rand.Read(suffix); err != nil {
+		t.Fatalf("bucket name suffix: %v", err)
+	}
+	bucket, err := client.BucketsAPI().CreateBucketWithName(ctx, org, "it_"+hex.EncodeToString(suffix))
+	if err != nil {
+		t.Fatalf("create bucket: %v", err)
+	}
+	// Registered after client.Close, so it runs first.
+	t.Cleanup(func() {
+		if err := client.BucketsAPI().DeleteBucket(context.Background(), bucket); err != nil {
+			t.Errorf("delete bucket %q: %v", bucket.Name, err)
+		}
+	})
+	return client, bucket
+}
+
+// writeLines writes line-protocol records synchronously.
+func writeLines(t *testing.T, client influxdb2.Client, bucket *domain.Bucket, lines ...string) {
+	t.Helper()
+	if err := client.WriteAPIBlocking(*bucket.OrgID, bucket.Name).WriteRecord(context.Background(), lines...); err != nil {
+		t.Fatalf("write to bucket %q: %v", bucket.Name, err)
 	}
 }

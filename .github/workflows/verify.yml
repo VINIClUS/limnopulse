@@ -63,3 +63,33 @@ jobs:
       - run: npm test
       - run: npm run typecheck
       - run: npm run build
+  influx:
+    runs-on: ubuntu-latest
+    services:
+      influxdb:
+        image: influxdb:2.7.11-alpine
+        # Throwaway onboarding that matches the harness defaults.
+        env:
+          DOCKER_INFLUXDB_INIT_MODE: setup
+          DOCKER_INFLUXDB_INIT_USERNAME: limnopulse-ci
+          DOCKER_INFLUXDB_INIT_PASSWORD: throwaway-ci-password
+          DOCKER_INFLUXDB_INIT_ORG: limnopulse
+          DOCKER_INFLUXDB_INIT_BUCKET: limnopulse_ci
+          DOCKER_INFLUXDB_INIT_ADMIN_TOKEN: local-dev-token
+        ports:
+          - 8086:8086
+        options: >-
+          --health-cmd "influx ping"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 30
+    steps:
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+      - uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6
+        with:
+          python-version: "3.12"
+      - uses: astral-sh/setup-uv@d0cc045d04ccac9d8b7881df0226f9e82c39688e # v6.8.0
+      - uses: actions/setup-go@924ae3a1cded613372ab5595356fb5720e22ba16 # v6
+        with:
+          go-version-file: go.mod
+      - run: make verify-influx

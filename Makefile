@@ -1,7 +1,7 @@
 UV ?= uv
 TOFU ?= tofu
 
-.PHONY: verify verify-python verify-go verify-tofu verify-compose
+.PHONY: verify verify-python verify-go verify-tofu verify-compose verify-influx
 
 verify: verify-python verify-go verify-tofu verify-compose
 
@@ -20,3 +20,8 @@ verify-tofu:
 
 verify-compose:
 	docker compose config --quiet
+
+verify-influx:
+	$(UV) sync --locked --extra dev
+	RUN_INFLUX_INTEGRATION=1 $(UV) run --locked --no-sync python -m pytest -q tests/influx
+	RUN_INFLUX_INTEGRATION=1 go test -race -run 'TestInfluxIntegration' ./...

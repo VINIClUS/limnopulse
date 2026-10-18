@@ -29,6 +29,52 @@ that multiprocess integration remains opt-in. It is skipped unless
 `RUN_NOTIFICATION_INTEGRATION=1` is set after its required local services have
 been started explicitly.
 
+## InfluxDB integration gate
+
+`make verify-influx` runs the real-InfluxDB integration tests against
+InfluxDB 2.7.11: the Python tests in `tests/influx/` and every Go test named
+`TestInfluxIntegration`, both with `RUN_INFLUX_INTEGRATION=1`.
+`make verify-influx` is not part of `make verify`. Without that variable the
+default `make verify-python` and `make verify-go` skip these tests, so they
+never need InfluxDB. The CI `influx` job runs the target against a throwaway
+`influxdb:2.7.11-alpine` service container, which is the only place the dev
+token exists.
+
+The harness reads `INFLUX_INTEGRATION_URL` (default `http://127.0.0.1:8086`),
+`INFLUX_INTEGRATION_TOKEN` (default `local-dev-token`) and
+`INFLUX_INTEGRATION_ORG` (default `limnopulse`); an empty value counts as
+unset. Python tests use `tests/support/influx_harness.py`: the
+`influx_bucket` fixture gives each test a uniquely named bucket with no
+retention rule, deleted at teardown, and `influx_clients` and `write_lines`
+write to it synchronously. Go tests in `internal/alertevaluator/influx` use
+`newIntegrationBucket` and `writeLines`, which create and delete buckets
+through `BucketsAPI()`.
+
+To run the gate locally without Docker:
+
+```
+scripts/dev/run_local_influxd.sh
+make verify-influx
+```
+
+`scripts/dev/run_local_influxd.sh` downloads
+`influxdb2-2.7.11_linux_amd64.tar.gz`, checks its SHA-256
+`8d7872013cad3524fb728ca8483d0adc30125ad1af262ab826dcf5d1801159cf` and
+unpacks it into `${XDG_CACHE_HOME:-$HOME/.cache}/limnopulse/influxd`. It
+starts influxd on `127.0.0.1:8086` (`INFLUXD_PORT` overrides the port),
+leaves it running in the background with `influxd.pid` and `influxd.log` in
+that directory, waits for `/health` and onboards the default org and token
+through `POST /api/v2/setup`. A re-run reuses the running instance, and an
+"onboarding has already been completed" conflict counts as success. Stop it
+with `kill "$(cat ~/.cache/limnopulse/influxd/influxd.pid)"`.
+
+Rules for integration tests: every Flux query string a task introduces must
+be executed by at least one integration test, because InfluxDB 2.7.11 panics
+on some syntactically valid chains. Tests use absolute `range` bounds;
+relative-window code paths are tested with data seeded relative to a `now`
+captured once per test, and every comparison asserts the result is non-empty
+first.
+
 ## Safety and readiness boundary
 
 These gates use no AWS credentials. OpenTofu initialization has its backend
