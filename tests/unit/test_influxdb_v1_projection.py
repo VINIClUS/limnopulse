@@ -161,6 +161,20 @@ def contains_set(query: str, column: str) -> set[str]:
     return values
 
 
+def first_filter_set(query: str, column: str) -> set[str]:
+    """The literal set of the first filter on `column` (the point filter before the pivot)."""
+    flat = compact(query)
+    pattern = re.compile(
+        rf'contains\(value:r(?:\["{column}"\]|\.{column}),set:\[([^\]]*)\]\)'
+        rf'|r(?:\["{column}"\]|\.{column})==("(?:[^"\\]|\\.)*")'
+    )
+    match = pattern.search(flat)
+    assert match is not None, f"no filter on {column}"
+    if match.group(1) is not None:
+        return set(_string_list(match.group(1)))
+    return {json.loads(match.group(2))}
+
+
 def group_calls(query: str) -> list[tuple[int, set[str]]]:
     flat = compact(query)
     return [
@@ -225,9 +239,9 @@ async def test_reads_only_observation_numeric_points_of_the_tenant(method: str) 
     flat = compact(query)
 
     assert 'from(bucket:"limnopulse_raw")' in flat
-    assert contains_set(query, "_measurement") == {"observation_numeric"}
-    assert contains_set(query, "tenant_id") == {TENANT}
-    assert contains_set(query, "_field") == POINT_FIELDS
+    assert first_filter_set(query, "_measurement") == {"observation_numeric"}
+    assert first_filter_set(query, "tenant_id") == {TENANT}
+    assert first_filter_set(query, "_field") == POINT_FIELDS
     # One row per point: the pivot comes after the point-field filter.
     field_filter = re.search(r'contains\(value:r(?:\["_field"\]|\._field),set:', flat)
     assert field_filter is not None
@@ -300,11 +314,14 @@ async def test_tenant_latest_reads_the_assets_of_listed_ponds_and_names_their_po
 async def test_rows_carry_the_constant_legacy_shape(method: str) -> None:
     flat = compact(await flux_for(method))
 
-    assert re.search(r'_measurement:"water_quality"', flat)
-    assert re.search(r'source:"mqtt"', flat)
-    assert re.search(r'schema_version:"1"', flat)
+    assert re.search(r'_measurement:"water_quality"|key:"_measurement",value:"water_quality"', flat)
+    assert re.search(r'source:"mqtt"|key:"source",value:"mqtt"', flat)
+    assert re.search(r'schema_version:"1"|key:"schema_version",value:"1"', flat)
+    device = r'r(?:\.device_id|\["device_id"\])'
     assert re.search(
-        r'topic:"limnopulse/v1/devices/"\+r(?:\.device_id|\["device_id"\])\+"/readings"', flat
+        rf'"limnopulse/v1/devices/"\+{device}\+"/readings"'
+        rf'|"limnopulse/v1/devices/\$\{{{device}\}}/readings"',
+        flat,
     )
 
 
@@ -345,6 +362,20 @@ async def test_invalid_pond_id_is_rejected_before_any_query(method: str, pond_id
         await call(projection(query_api), method, pond_id=pond_id)
 
     assert query_api.calls == []
+
+
+@pytest.mark.asyncio
+async def test_listed_pond_ids_never_reach_flux_unescaped() -> None:
+    query_api = FakeQueryApi()
+    domain = FakeDomainRepository(ponds=("pond_1", "pond${x}"))
+
+    try:
+        await call(projection(query_api, domain), "query_latest_metrics_for_tenant")
+    except ValueError:
+        assert query_api.calls == []
+        return
+    flat = compact(query_api.calls[0]["query"])
+    assert "${x}" not in flat.replace("\\${x}", "")
 
 
 # --- range bounds -----------------------------------------------------------------------------
@@ -397,13 +428,21 @@ async def test_readings_reject_invalid_time_bounds_like_legacy(start: str, stop)
 @pytest.mark.asyncio
 @pytest.mark.parametrize("method", ("query_latest_metrics", "query_latest_metrics_for_tenant"))
 async def test_latest_reads_the_legacy_24h_window(method: str) -> None:
-    assert _range(await flux_for(method)) == "range(start:-24h)"
+    legacy_api = FakeQueryApi()
+    await call(legacy(legacy_api), method)
+
+    assert _range(await flux_for(method)) == _range(legacy_api.calls[0]["query"])
 
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("period", ("24h", "7d", "30d"))
 async def test_summary_reads_the_legacy_period_window(period: str) -> None:
-    assert _range(await flux_for("query_summary", period=period)) == f"range(start:-{period})"
+    legacy_api = FakeQueryApi()
+    await call(legacy(legacy_api), "query_summary", period=period)
+
+    assert _range(await flux_for("query_summary", period=period)) == _range(
+        legacy_api.calls[0]["query"]
+    )
 
 
 # --- legacy series tables and tails -----------------------------------------------------------
@@ -429,6 +468,9 @@ async def test_readings_group_by_series_and_field_before_pivot_sort_and_limit() 
     )
     assert "limit(" not in flat[:start]
     assert 'sort(columns:["_time"])' not in flat[:start]
+    # Legacy sort/limit run per series table: nothing regroups the tail.
+    assert "group()" not in flat[start:]
+    assert [position for position, _ in group_calls(query) if position > start] == []
 
 
 @pytest.mark.asyncio
@@ -500,19 +542,19 @@ async def test_seq_branch_drops_absent_sequences_before_ranking_points(method: s
     query = await flux_for(method)
     flat = compact(query)
 
-    absent = re.search(r'r(?:\.sequence|\["sequence"\])!=-1', flat)
+    sequence = r'r(?:\.sequence|\["sequence"\])'
+    absent = re.search(rf"{sequence}(?:!=-1|>=0|>-1)", flat)
     assert absent is not None
     rank = flat.find('sort(columns:["ingested_at_ns","event_id"])')
     assert rank > absent.start()
     assert flat.find("last(", rank) != -1
-    # The ranking groups are legacy (series, _time) groups.
-    seq_groups = [
-        columns for position, columns in group_calls(query) if absent.start() < position < rank
-    ]
+    # The ranking groups are legacy (series, _time) groups, formed after the per-point pivot.
+    pivot = flat.find("pivot(")
+    seq_groups = [columns for position, columns in group_calls(query) if pivot < position < rank]
     assert seq_groups
     assert {"_time", "tenant_id", "device_id"} <= seq_groups[-1]
     assert seq_groups[-1] & {"asset_id", "pond_id"}
-    assert not seq_groups[-1] & {"component_id", "metric_key", "_field"}
+    assert not seq_groups[-1] & {"metric_key", "_field"}
 
 
 # --- decoding (same Python semantics as the legacy adapter) -----------------------------------
@@ -619,6 +661,32 @@ async def test_summary_wraps_query_failures_in_telemetry_query_error() -> None:
         await call(projection(FakeQueryApi(error=error)), "query_summary")
 
     assert raised.value.__cause__ is error
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("method", METHODS)
+@pytest.mark.parametrize("error", [RuntimeError("influx down"), OSError("reset"), KeyError("x")])
+async def test_query_failures_surface_exactly_like_legacy(method: str, error: Exception) -> None:
+    async def outcome(repository: Any) -> tuple[type, str, Exception | None, bool]:
+        with pytest.raises(Exception) as raised:
+            await call(repository, method)
+        exc = raised.value
+        return type(exc), str(exc), exc.__cause__, exc is error
+
+    expected = await outcome(legacy(FakeQueryApi(error=error)))
+    assert await outcome(projection(FakeQueryApi(error=error))) == expected
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("period", ("1h", "7D"))
+async def test_invalid_period_raises_exactly_like_legacy(period: str) -> None:
+    with pytest.raises(ValueError) as expected:
+        await call(legacy(FakeQueryApi()), "query_summary", period=period)
+    with pytest.raises(ValueError) as actual:
+        await call(projection(FakeQueryApi()), "query_summary", period=period)
+
+    assert type(actual.value) is type(expected.value)
+    assert str(actual.value) == str(expected.value)
 
 
 @pytest.mark.asyncio

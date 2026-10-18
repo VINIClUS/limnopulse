@@ -280,13 +280,20 @@ def _tie_observations(base: datetime) -> tuple[list[CanonicalObservation], dict]
     ]
     expected[at] = 10
 
-    # B: equal `ingested_at`, so the greater `event_id` wins.
-    at = base + timedelta(minutes=1)
+    # B: equal `ingested_at`, so the greater `event_id` wins. The time is chosen so that the
+    # winner is `water.ph`, which sorts before `water.temperature`: ranking by `ingested_at_ns`
+    # alone would keep the row that arrives last instead.
+    at = next(
+        candidate
+        for candidate in (base + timedelta(minutes=1, seconds=s) for s in range(60))
+        if _tie_event_id("water.ph", candidate) > _tie_event_id("water.temperature", candidate)
+    )
     pair = [
         tie("water.temperature", 24.1, at, 30, at + timedelta(seconds=3)),
         tie("water.ph", 7.3, at, 40, at + timedelta(seconds=3)),
     ]
     winner = max(pair, key=lambda o: o.event_id)
+    assert winner.observation.metric_key == "water.ph"
     observations += sorted(pair, key=lambda o: o.event_id, reverse=True)
     expected[at] = winner.observation.sequence
 
@@ -311,12 +318,18 @@ def _tie_observations(base: datetime) -> tuple[list[CanonicalObservation], dict]
     observations.append(tie("water.temperature", 24.4, at, SEQ_2_53_PLUS_1, at))
     expected[at] = SEQ_2_53_PLUS_1
     at = base + timedelta(minutes=5)
+    # The latest point also has conflicting sequences, so the latest path ranks them too.
     observations += [
-        tie("water.temperature", 24.5, at, SEQ_MAX, at),
-        tie("device.rssi", -71, at, SEQ_MAX, at),
+        tie("device.rssi", -71, at, 5, at),
+        tie("water.temperature", 24.5, at, SEQ_MAX, at + timedelta(seconds=1)),
     ]
     expected[at] = SEQ_MAX
     return observations, expected
+
+
+def _tie_event_id(metric_key: str, at: datetime) -> str:
+    component = default_component_id_for_legacy_device(TENANT, TIE_DEVICE)
+    return observation_event_id(TENANT, component, metric_key, at)
 
 
 def _site_assets(devices: dict[str, dict[str, str]]) -> InMemorySiteAssets:
@@ -359,6 +372,21 @@ def seed(bucket: str, now: datetime) -> Seeded:
         observed_at=now - timedelta(milliseconds=500),
         sequence=7,
     )
+    # Another tenant's point carrying this tenant's asset and component IDs: only the
+    # tenant filter keeps it out (v2 only; its Asset is unknown, so it is not dual-written).
+    other_tenant_same_ids = make_observation(
+        tenant_id=OTHER_TENANT,
+        pond_id="pond_local_001",
+        device_id="local-device-001",
+        metric_key="water.dissolved_oxygen",
+        value=44.4,
+        observed_at=now - timedelta(milliseconds=400),
+        sequence=8,
+        component_id=default_component_id_for_legacy_device(TENANT, "local-device-001"),
+    )
+    other_data = other_tenant_same_ids.model_dump()
+    other_data["resolved"]["asset_id"] = asset_id_for_legacy_pond(TENANT, "pond_local_001")
+    other_tenant_same_ids = CanonicalObservation.model_validate(other_data)
     sum_base = _five_minute_floor(now - timedelta(minutes=15))
     sum_observations = _sum_observations(sum_base)
     tie_observations, expected_tie_seq = _tie_observations(now - timedelta(minutes=12))
@@ -377,9 +405,14 @@ def seed(bucket: str, now: datetime) -> Seeded:
     batches = [
         legacy_sample.observations + sub_second.observations + out_of_range.observations,
         series.observations,
-        native.observations + (native_on_legacy_device, other_tenant),
+        native.observations + (native_on_legacy_device, other_tenant, other_tenant_same_ids),
         tuple(sum_observations) + tuple(tie_observations),
     ]
+    # Every point lies in the hour before `now` (a completed hour), within every read window.
+    for batch in batches:
+        for o in batch:
+            assert now - timedelta(hours=1) <= o.observation.observed_at < now
+    assert len(series.observations) >= 2 * 30
     site_assets = _site_assets(devices)
     settings = influx_settings()
     with influx_clients(bucket) as (_query_api, write_api):
@@ -396,8 +429,8 @@ def seed(bucket: str, now: datetime) -> Seeded:
             outcome = _run(service.write(batch))
             assert outcome.v2_points == len(batch)
             excluded += outcome.legacy_excluded
-    # Exactly the three native observations are kept out of `water_quality` (D7).
-    assert excluded == 3
+    # The three native observations and the unknown-Asset point stay out of `water_quality`.
+    assert excluded == 4
     return Seeded(
         now=now,
         devices=devices,
@@ -466,6 +499,8 @@ def _reading_calls(seeded: Seeded) -> list[dict[str, Any]]:
         {"pond_id": "pond_north", "start": "-2h", "stop": None, "limit": 7},
         {"pond_id": "pond_sum", "start": "-2h", "stop": None, "limit": 1},
         {"pond_id": "pond_tie", "start": "-2h", "stop": None, "limit": 3},
+        # A relative stop bound.
+        {"pond_id": "pond_north", "start": "-2h", "stop": "-5m", "limit": 1000},
         # Absolute bounds, sub-second data included.
         {
             "pond_id": "pond_local_001",
@@ -517,6 +552,15 @@ async def test_readings_limit_applies_per_device_like_legacy(
             tenant_id=TENANT, pond_id="pond_sum", start="-2h", stop=None, limit=1
         )
     assert [reading.device_id for reading in readings] == list(SUM_DEVICES)
+    with repositories(influx_bucket, seeded.devices) as (_legacy, projected, _recording, _domain):
+        north = await projected.query_readings(
+            tenant_id=TENANT, pond_id="pond_north", start="-2h", stop=None, limit=1000
+        )
+        limited = await projected.query_readings(
+            tenant_id=TENANT, pond_id="pond_north", start="-2h", stop=None, limit=7
+        )
+    assert len(north) >= 30
+    assert limited == north[:7]
 
 
 @pytest.mark.asyncio
@@ -728,6 +772,10 @@ def test_v1_http_responses_are_byte_identical(influx_bucket: str, seeded: Seeded
         projected_app = _app(domain, projected)
         headers = {"X-Dev-User-Sub": "sub_1"}
         with TestClient(legacy_app) as legacy_client, TestClient(projected_app) as client:
+            # The startup hook must not replace the injected repositories.
+            assert legacy_client.app.state.telemetry_repository is legacy
+            assert client.app.state.telemetry_repository is projected
+            assert client.app.state.domain_repository is domain
             for path, params in _http_paths(seeded):
                 expected = legacy_client.get(path, params=params, headers=headers)
                 actual = client.get(path, params=params, headers=headers)
