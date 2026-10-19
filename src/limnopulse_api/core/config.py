@@ -10,7 +10,8 @@ TelemetryReadSource = Literal["legacy", "v2"]
 
 
 class Settings(BaseSettings):
-    model_config = SettingsConfigDict(env_file=".env", extra="ignore")
+    # Validation errors never echo input values: the settings carry tokens and secrets.
+    model_config = SettingsConfigDict(env_file=".env", extra="ignore", hide_input_in_errors=True)
 
     app_env: AppEnv = "local"
     auth_mode: AuthMode = "dev"

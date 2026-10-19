@@ -28,7 +28,7 @@ from typing import Any, NoReturn
 import boto3
 from influxdb_client import InfluxDBClient
 from influxdb_client.client.write_api import SYNCHRONOUS
-from pydantic import TypeAdapter
+from pydantic import TypeAdapter, ValidationError
 
 from limnopulse_api.adapters.dynamodb_deployments import DynamoDeploymentRepository
 from limnopulse_api.adapters.dynamodb_devices_v2 import DynamoDeviceComponentRepository
@@ -62,6 +62,9 @@ class _ArgumentParser(argparse.ArgumentParser):
     """Usage errors exit 1, never argparse's default 2 (which means quarantined here)."""
 
     def error(self, message: str) -> NoReturn:
+        # argparse echoes unrecognized argv tokens, which may be a pasted secret.
+        if message.startswith("unrecognized arguments"):
+            message = "unrecognized arguments (see --help)"
         raise _UsageError(message)
 
 
@@ -183,13 +186,21 @@ def main(argv: Sequence[str] | None = None) -> int:
             connector_version=None,
             received_at=received_at,
         )
-    except (_UsageError, OSError, ValueError) as exc:
-        # ValueError covers malformed JSON and an invalid trusted context (pydantic).
+    except (_UsageError, OSError, ValueError, RecursionError) as exc:
+        # ValueError covers malformed JSON and an invalid trusted context (pydantic);
+        # RecursionError covers JSON nested too deeply to parse.
         sys.stderr.write(f"{parser.prog}: error: {type(exc).__name__}: {_usage_detail(exc)}\n")
         return EXIT_ERROR
 
     try:
-        outcome = asyncio.run(_ingest(Settings(), context, payload))
+        settings = Settings()
+    except ValidationError as exc:
+        # Settings errors hide input values; their messages name the misconfigured switch.
+        messages = "; ".join(str(error["msg"]) for error in exc.errors())
+        sys.stderr.write(f"{parser.prog}: configuration error: {messages}\n")
+        return EXIT_ERROR
+    try:
+        outcome = asyncio.run(_ingest(settings, context, payload))
     except Exception as exc:  # noqa: BLE001 - every failure maps to exit 1; nothing was written.
         sys.stderr.write(f"{parser.prog}: ingest failed: {type(exc).__name__}\n")
         return EXIT_ERROR
