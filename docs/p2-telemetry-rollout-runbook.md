@@ -119,8 +119,11 @@ Run all three for every pond over the D16 window.
 
 A missing tuple shows as `missing` on its side. `points` compares the canonical value as stored, so a
 legacy integer field (`rssi`) and its float v2 value compare equal when the numbers are equal. `seq`
-is compared only where v2 has a sequence (`-1` means absent). `latest` and `summary` cover the metric
-fields only.
+is compared against the metric rows of the reading whose sequence is present (`-1` means absent),
+which is how the `/v1` projection picks `seq`. A reading whose every metric was rewritten without a
+sequence (the D10 case) is reported; a partial rewrite of some metrics without a sequence is not,
+because the projection still serves the remaining rows' `seq`, as legacy does. `latest` and
+`summary` cover the metric fields only.
 
 `points` and `latest` compare keys, so a duplicate v2 series with an equal value (for example the
 backdated-Deployment case below) is visible only to `summary`, and only for its three fields. A `seq`
