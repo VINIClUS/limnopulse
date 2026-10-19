@@ -294,6 +294,25 @@ def test_a_payload_that_is_not_a_json_object_exits_1_without_ingesting(
     assert "v2_points" not in out
 
 
+class RawPayloadPipeline(FakePipeline):
+    """Records the payload object as received, so a non-object can never be masked."""
+
+    async def ingest_legacy_reading(self, context, payload) -> PipelineOutcome:
+        self.calls.append((context, payload))
+        return _outcome()
+
+
+@pytest.mark.parametrize("content", ["[1, 2, 3]", '"a string"', "42", "null"])
+def test_a_non_object_payload_never_reaches_the_pipeline(
+    cli, monkeypatch: pytest.MonkeyPatch, content: str
+) -> None:
+    monkeypatch.setattr(ingest_reading_v2, "TelemetryPipeline", RawPayloadPipeline)
+    cli.reading.write_text(content, encoding="utf-8")
+
+    assert _run(file=cli.reading) == 1
+    assert all(pipeline.calls == [] for pipeline in FakePipeline.instances)
+
+
 def test_a_missing_file_exits_1(cli, capsys) -> None:
     assert _run(file=cli.tmp_path / "missing.json") == 1
     assert all(pipeline.calls == [] for pipeline in FakePipeline.instances)
