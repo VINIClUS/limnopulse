@@ -8,6 +8,7 @@ from fastapi.exceptions import RequestValidationError
 from fastapi.requests import Request
 from fastapi.responses import JSONResponse
 from influxdb_client import InfluxDBClient
+from influxdb_client.client.write_api import SYNCHRONOUS
 
 from limnopulse_api.adapters.alert_events import DynamoAlertEventRepository
 from limnopulse_api.adapters.alert_rules import DynamoAlertRuleRepository
@@ -18,6 +19,9 @@ from limnopulse_api.adapters.dynamodb_devices_v2 import DynamoDeviceComponentRep
 from limnopulse_api.adapters.dynamodb_integrations import DynamoIntegrationRepository
 from limnopulse_api.adapters.dynamodb_sites_assets import DynamoSiteAssetRepository
 from limnopulse_api.adapters.influxdb import InfluxTelemetryRepository
+from limnopulse_api.adapters.influxdb_v1_projection import V2ProjectedTelemetryRepository
+from limnopulse_api.adapters.influxdb_v2_reader import InfluxObservationReader
+from limnopulse_api.adapters.influxdb_v2_writer import InfluxObservationWriter
 from limnopulse_api.adapters.notification_preferences import (
     DynamoNotificationPreferenceRepository,
 )
@@ -35,6 +39,7 @@ from limnopulse_api.services.telegram_webhook_secret import (
     SecretsManagerTelegramWebhookSecretVerifier,
     StaticTelegramWebhookSecretVerifier,
 )
+from limnopulse_api.services.telemetry_v2_writes import ObservationWriteService
 
 
 def _dynamodb_client_kwargs(settings: Settings) -> dict[str, str]:
@@ -86,6 +91,9 @@ def create_app(settings: Settings | None = None) -> FastAPI:
                 "device_component_repository",
                 "integration_repository",
                 "deployment_repository",
+                "observation_reader",
+                "observation_writer",
+                "observation_write_service",
             )
         ):
             yield
@@ -184,10 +192,41 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             org=resolved_settings.influxdb_org,
         )
         app.state.influxdb_client = influxdb_client
-        app.state.telemetry_repository = InfluxTelemetryRepository(
-            query_api=influxdb_client.query_api(),
-            org=resolved_settings.influxdb_org,
-            bucket=resolved_settings.influxdb_bucket_raw,
+        query_api = influxdb_client.query_api()
+        influxdb_org = resolved_settings.influxdb_org
+        influxdb_bucket = resolved_settings.influxdb_bucket_raw
+        if resolved_settings.v1_telemetry_read_source == "v2":
+            app.state.telemetry_repository = V2ProjectedTelemetryRepository(
+                query_api=query_api,
+                org=influxdb_org,
+                bucket=influxdb_bucket,
+                domain_repository=app.state.domain_repository,
+            )
+        else:
+            app.state.telemetry_repository = InfluxTelemetryRepository(
+                query_api=query_api, org=influxdb_org, bucket=influxdb_bucket
+            )
+        app.state.observation_reader = InfluxObservationReader(
+            query_api=query_api, org=influxdb_org, bucket=influxdb_bucket
+        )
+        v2_write_enabled = resolved_settings.telemetry_v2_write_enabled
+        legacy_dual_write_enabled = resolved_settings.telemetry_legacy_dual_write_enabled
+        # The default write_api() batches in a background thread and would acknowledge failed
+        # writes; a synchronous one is created only when a write switch is on.
+        observation_writer = None
+        if v2_write_enabled or legacy_dual_write_enabled:
+            observation_writer = InfluxObservationWriter(
+                write_api=influxdb_client.write_api(write_options=SYNCHRONOUS),
+                bucket=influxdb_bucket,
+                org=influxdb_org,
+            )
+        app.state.observation_writer = observation_writer
+        app.state.observation_write_service = ObservationWriteService(
+            writer=observation_writer if v2_write_enabled else None,
+            legacy_writer=observation_writer if legacy_dual_write_enabled else None,
+            site_assets=app.state.site_asset_repository,
+            v2_write_enabled=v2_write_enabled,
+            legacy_dual_write_enabled=legacy_dual_write_enabled,
         )
 
         try:
@@ -206,6 +245,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         build_api_router(
             telegram_webhook_enabled=resolved_settings.telegram_webhook_enabled,
             enable_v2=resolved_settings.api_v2_enabled,
+            enable_v2_telemetry=resolved_settings.api_v2_telemetry_enabled,
         )
     )
     return app

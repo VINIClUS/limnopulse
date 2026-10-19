@@ -70,6 +70,10 @@ FORBIDDEN_V2_FRAGMENTS = (
 def _isolate_flag_environment(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.delenv("API_V2_ENABLED", raising=False)
     monkeypatch.delenv("V1_POND_DEVICE_PROJECTION_ENABLED", raising=False)
+    monkeypatch.delenv("TELEMETRY_V2_WRITE_ENABLED", raising=False)
+    monkeypatch.delenv("TELEMETRY_LEGACY_DUAL_WRITE_ENABLED", raising=False)
+    monkeypatch.delenv("API_V2_TELEMETRY_ENABLED", raising=False)
+    monkeypatch.delenv("V1_TELEMETRY_READ_SOURCE", raising=False)
 
 
 def _settings(**overrides: object) -> Settings:

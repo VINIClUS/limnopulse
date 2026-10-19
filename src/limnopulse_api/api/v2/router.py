@@ -1,4 +1,7 @@
-"""Aggregate of the M1 `/v2` domain routers; mounted under `/v2` only when `API_V2_ENABLED`."""
+"""Aggregate of the `/v2` routers; mounted under `/v2` only when `API_V2_ENABLED`.
+
+The P2 telemetry routers join only with `enable_telemetry` (`API_V2_TELEMETRY_ENABLED`).
+"""
 
 import math
 from typing import Any
@@ -16,13 +19,15 @@ from limnopulse_api.api.v2.routers import (
     deployments,
     devices,
     integrations,
+    metric_definitions,
+    observations,
     sites,
 )
 
 V2_PREFIX = "/v2"
 
 
-def build_v2_router() -> APIRouter:
+def build_v2_router(enable_telemetry: bool = False) -> APIRouter:
     v2_router = APIRouter()
     v2_router.include_router(sites.router)
     v2_router.include_router(assets.router)
@@ -30,6 +35,9 @@ def build_v2_router() -> APIRouter:
     v2_router.include_router(components.router)
     v2_router.include_router(integrations.router)
     v2_router.include_router(deployments.router)
+    if enable_telemetry:
+        v2_router.include_router(metric_definitions.router)
+        v2_router.include_router(observations.router)
     return v2_router
 
 

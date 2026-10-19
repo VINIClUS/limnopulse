@@ -169,6 +169,34 @@ The four M1 repositories reuse the API's single DynamoDB client and `LimnopulseD
 
 `<started_at>` in deployment history SKs is the canonical UTC key (`canonical_timestamp_key`, `YYYY-MM-DDTHH:MM:SS.ffffffZ` with fixed six-digit microseconds), so lexicographic order is chronological. Idempotency receipts carry the numeric `expires_at` TTL (24 hours); no other M1 record expires.
 
+## P2 canonical telemetry (behind disabled rollout switches)
+
+P2 introduces transport-independent metric observations, stored as InfluxDB `observation_numeric` points in the existing `INFLUXDB_BUCKET_RAW` bucket (D6), next to the unchanged legacy `water_quality` measurement. It ships dark (D16): every switch defaults off, and with all of them off the running application behaves like `main@2918532`.
+
+| Switch | Default | Effect |
+|---|---|---|
+| `TELEMETRY_V2_WRITE_ENABLED` | `false` | Write `observation_numeric` points. |
+| `TELEMETRY_LEGACY_DUAL_WRITE_ENABLED` | `false` | Write eligible legacy `water_quality` points from the normalizer path (D7/D8). |
+| `API_V2_TELEMETRY_ENABLED` | `false` | Mount the three `/v2` telemetry routes; valid only with `API_V2_ENABLED=true` (settings validation error otherwise). |
+| `V1_TELEMETRY_READ_SOURCE` | `legacy` | `legacy` or `v2` implementation behind the `/v1` `TelemetryRepository` (D10). |
+| `ALERT_EVALUATOR_TELEMETRY_SOURCE` | `legacy` | Go alert evaluator `WindowReader` selection (D12). |
+
+Composition (API lifespan): the single `InfluxDBClient` provides one query API shared by the `/v1` telemetry repository (`app.state.telemetry_repository`, now chosen by `V1_TELEMETRY_READ_SOURCE`) and the observation reader (`app.state.observation_reader`). A synchronous write API, and the one `InfluxObservationWriter` that serves both write targets (`app.state.observation_writer`), exist only when a write switch is on; otherwise `app.state.observation_writer` is `None` and no write API is created. `app.state.observation_write_service` applies the two independent write switches, v2 first and then legacy; any failure raises `TelemetryWriteError` and nothing is reported as written (D9).
+
+With `API_V2_ENABLED=true` alone `/v2` mounts only the 13 M1 paths (D11). Adding `API_V2_TELEMETRY_ENABLED=true` mounts exactly these three read routes, each requiring tenant membership with a read role:
+
+```text
+GET /v2/tenants/{tenant_id}/metric-definitions
+GET /v2/tenants/{tenant_id}/observations
+GET /v2/tenants/{tenant_id}/observations/latest
+```
+
+`/v1` paths, schemas and the OpenAPI golden stay identical in every switch combination.
+
+**D16 — ships dark.** No deployed service calls the telemetry pipeline in P2, and Telegraf keeps writing only `water_quality`. The only producer is the dev CLI `scripts/dev/ingest_reading_v2.py`, which builds the trusted `legacy_mqtt` source context from its arguments (never from the payload), uses the DynamoDB-backed M1 repositories and the configured InfluxDB, and honors the two write switches (both off is a dry run). `V1_TELEMETRY_READ_SOURCE=v2` and `ALERT_EVALUATOR_TELEMETRY_SOURCE=v2` may be enabled only where a producer writes every legacy device to `observation_numeric` and the keyed divergence check reports zero missing or different `(pond, device, metric, _time, value)` tuples over max(longest rule window, legacy read window). Production enablement is a P3 exit step.
+
+**Rollback:** switch the flags back to their defaults and restart. No data deletion; legacy `water_quality` writes and reads never depend on a P2 switch.
+
 ## Authentication and tenant authorization
 
 The access token authenticates a user; it does not grant tenant access by itself. Every tenant route resolves an active DynamoDB membership and then enforces the required role.

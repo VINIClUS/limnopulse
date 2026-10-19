@@ -6,10 +6,12 @@ from pydantic_settings import BaseSettings, SettingsConfigDict
 
 AppEnv = Literal["local", "test", "staging", "prod"]
 AuthMode = Literal["dev", "cognito"]
+TelemetryReadSource = Literal["legacy", "v2"]
 
 
 class Settings(BaseSettings):
-    model_config = SettingsConfigDict(env_file=".env", extra="ignore")
+    # Validation errors never echo input values: the settings carry tokens and secrets.
+    model_config = SettingsConfigDict(env_file=".env", extra="ignore", hide_input_in_errors=True)
 
     app_env: AppEnv = "local"
     auth_mode: AuthMode = "dev"
@@ -47,6 +49,10 @@ class Settings(BaseSettings):
     telegram_webhook_secret_cache_ttl_seconds: int = Field(default=60, ge=5, le=300)
     api_v2_enabled: bool = False
     v1_pond_device_projection_enabled: bool = False
+    telemetry_v2_write_enabled: bool = False
+    telemetry_legacy_dual_write_enabled: bool = False
+    api_v2_telemetry_enabled: bool = False
+    v1_telemetry_read_source: TelemetryReadSource = "legacy"
 
     @model_validator(mode="after")
     def validate_auth_mode_for_environment(self) -> "Settings":
@@ -61,6 +67,8 @@ class Settings(BaseSettings):
                 raise ValueError("TELEGRAM_WEBHOOK_SECRET_ARN is required")
             if self.telegram_bot_username == "limnopulse_local_bot":
                 raise ValueError("TELEGRAM_BOT_USERNAME must be configured")
+        if self.api_v2_telemetry_enabled and not self.api_v2_enabled:
+            raise ValueError("API_V2_TELEMETRY_ENABLED requires API_V2_ENABLED=true")
         return self
 
 

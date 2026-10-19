@@ -186,7 +186,35 @@ GET/POST  /v2/tenants/{tenant_id}/deployments
 POST      /v2/tenants/{tenant_id}/deployments/{deployment_id}/end
 ```
 
-There are no `/v2` telemetry, observation, health, calibration, billing, AWS IoT, notification-destination or command routes. `API_V2_ENABLED` does not change any `/v1` path, dependency or response. Rollout follows the M1-08 runbook (to be added). A local `.env` with `API_V2_ENABLED=true` changes the default route count that the tenant-mapping conformance tests expect, so keep it `false` when running the test suite.
+`API_V2_ENABLED` alone mounts no `/v2` telemetry or observation route; the three P2 telemetry routes are mounted only with `API_V2_TELEMETRY_ENABLED=true` as well (see [P2 Canonical Telemetry](#p2-canonical-telemetry-ships-dark)). There are no health, calibration, billing, AWS IoT, notification-destination or command routes. `API_V2_ENABLED` does not change any `/v1` path, dependency or response. Rollout follows the M1-08 runbook (to be added). A local `.env` with `API_V2_ENABLED=true` changes the default route count that the tenant-mapping conformance tests expect, so keep it `false` when running the test suite.
+
+## P2 Canonical Telemetry (ships dark)
+
+P2 adds canonical metric observations in the InfluxDB `observation_numeric` measurement (in the existing `INFLUXDB_BUCKET_RAW` bucket), an ack-safe normalizer pipeline and a `/v1` read projection. Every switch is off by default (see `.env.example`); with all of them off the API behaves exactly as before P2:
+
+| Switch | Default | Effect |
+|---|---|---|
+| `TELEMETRY_V2_WRITE_ENABLED` | `false` | Write `observation_numeric` points (only the dev CLI writes in P2). |
+| `TELEMETRY_LEGACY_DUAL_WRITE_ENABLED` | `false` | Also write eligible legacy `water_quality` points from the normalizer path. |
+| `API_V2_TELEMETRY_ENABLED` | `false` | Mount `GET /v2/tenants/{tenant_id}/metric-definitions`, `.../observations` and `.../observations/latest`; requires `API_V2_ENABLED=true` (the API refuses to start otherwise). |
+| `V1_TELEMETRY_READ_SOURCE` | `legacy` | `legacy` reads `/v1` telemetry from `water_quality`; `v2` swaps in the projection from `observation_numeric`. |
+| `ALERT_EVALUATOR_TELEMETRY_SOURCE` | `legacy` | Go alert evaluator window reader (`legacy` or `v2`; also `--telemetry-source`). |
+
+The two write switches are independent; the write path writes v2 first, then legacy, and any failure raises without reporting anything as written (D9).
+
+**D16 — P2 ships dark.** No deployed service calls the pipeline in P2, and Telegraf keeps writing only `water_quality`. `V1_TELEMETRY_READ_SOURCE=v2` and `ALERT_EVALUATOR_TELEMETRY_SOURCE=v2` may be enabled only where a producer writes every legacy device to `observation_numeric` and the keyed divergence check reports zero missing or different `(pond, device, metric, _time, value)` tuples over max(longest rule window, legacy read window). Production enablement is a P3 exit step.
+
+The only P2 producer is the dev CLI `scripts/dev/ingest_reading_v2.py`. It builds the trusted source context (`legacy_mqtt`) from its arguments only; a tenant, pond or device in the payload is never authority. `--observed-at now` rewrites the payload `ts` so that a Deployment created at seed time covers it:
+
+```bash
+TELEMETRY_V2_WRITE_ENABLED=true TELEMETRY_LEGACY_DUAL_WRITE_ENABLED=true \
+  python scripts/dev/ingest_reading_v2.py --tenant tnt_local_001 --device local-device-001 \
+  --observed-at now
+```
+
+It uses the DynamoDB-backed M1 repositories and the configured InfluxDB, and prints one JSON object of counts (no secrets). With both write switches off it is a dry run: the reading is normalized and zero points are written. Exit codes: `0` nothing quarantined, `2` anything quarantined, `1` any error (nothing reported as written; ingest again).
+
+**Rollback:** set the switches back to their defaults (`false`, and `legacy` for the read sources) and restart. No data deletion is needed; `water_quality` and the legacy reads are untouched throughout.
 
 ## Local Telemetry Ingestion
 
