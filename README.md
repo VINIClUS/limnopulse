@@ -214,7 +214,9 @@ TELEMETRY_V2_WRITE_ENABLED=true TELEMETRY_LEGACY_DUAL_WRITE_ENABLED=true \
 
 It uses the DynamoDB-backed M1 repositories and the configured InfluxDB, and prints one JSON object of counts (no secrets). With both write switches off it is a dry run: the reading is normalized and zero points are written. Exit codes: `0` nothing quarantined, `2` anything quarantined, `1` any error (nothing reported as written; ingest again).
 
-**Rollback:** set the switches back to their defaults (`false`, and `legacy` for the read sources) and restart. No data deletion is needed; `water_quality` and the legacy reads are untouched throughout.
+**Rollback:** before cutover (while Telegraf still writes `water_quality`), set the switches back to their defaults (`false`, and `legacy` for the read sources) and restart. No data deletion is needed; `water_quality` and the legacy reads are untouched while legacy dual write is off. After cutover, follow the post-cutover rollback in the runbook below: restore a `water_quality` producer before switching any read source back to `legacy`.
+
+The rollout sequence, release gate, keyed divergence checks and known limitations are in the [P2 telemetry rollout runbook](docs/p2-telemetry-rollout-runbook.md).
 
 ## Local Telemetry Ingestion
 
