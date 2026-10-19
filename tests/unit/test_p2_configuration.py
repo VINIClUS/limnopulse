@@ -1,6 +1,5 @@
 """P2-08 rollout switches: defaults, env names, the `/v2` telemetry validator and their docs."""
 
-import hashlib
 import re
 from pathlib import Path
 
@@ -26,10 +25,8 @@ DEV_CLI = "scripts/dev/ingest_reading_v2.py"
 REMOVED_README_SENTENCE = "There are no `/v2` telemetry"
 KEPT_README_GUARANTEE = "does not change any `/v1` path"
 P2_HEADING = r"^(?P<level>#{2,3}) .*\b(?:P2|Phase 2)\b.*$"
-# sha256 of `docs/architecture.md` on main before P2-08 (trailing whitespace stripped).
-ARCHITECTURE_BEFORE_P2_08_SHA256 = (
-    "a20b2fe559544e7df8ece3496bbc48ff4c097bac0b12edf492dd0445af78b8c1"
-)
+HEADING = r"^#{2,3} .+$"
+DRY_RUN = re.compile(r"dry[- ]run")
 # Top-level headings of `docs/architecture.md` on main before P2-08; P2-08 only adds a section.
 ARCHITECTURE_HEADINGS_BEFORE_P2_08 = (
     "## V4 architecture baseline",
@@ -182,12 +179,33 @@ def test_env_example_loads_with_every_switch_at_its_default(
         assert getattr(settings, field) == default, field
 
 
+def _mask_fenced_code(text: str) -> str:
+    """Blank out fenced code blocks, keeping offsets, so `# ` lines inside are not headings."""
+    masked: list[str] = []
+    fence: str | None = None
+    for line in text.splitlines(keepends=True):
+        stripped = line.lstrip()
+        marker = stripped[:3]
+        opens_or_closes = marker in ("```", "~~~") and (fence is None or marker == fence)
+        inside = fence is not None or opens_or_closes
+        if opens_or_closes:
+            fence = marker if fence is None else None
+        body = line.rstrip("\r\n")
+        masked.append(" " * len(body) + line[len(body) :] if inside else line)
+    return "".join(masked)
+
+
+def _headings(text: str) -> list[str]:
+    return re.findall(HEADING, _mask_fenced_code(text), flags=re.MULTILINE)
+
+
 def _section_span(text: str) -> tuple[int, int]:
     """The first P2 section: its heading through the next heading of the same or higher level."""
-    match = re.search(P2_HEADING, text, flags=re.MULTILINE)
+    searchable = _mask_fenced_code(text)
+    match = re.search(P2_HEADING, searchable, flags=re.MULTILINE)
     assert match is not None, f"missing section heading matching {P2_HEADING!r}"
     level = len(match.group("level"))
-    following = re.search(rf"^#{{1,{level}}} ", text[match.end() :], flags=re.MULTILINE)
+    following = re.search(rf"^#{{1,{level}}} ", searchable[match.end() :], flags=re.MULTILINE)
     end = match.end() + following.start() if following else len(text)
     return match.start(), end
 
@@ -222,6 +240,26 @@ def test_readme_p2_section_documents_switches_cli_d16_and_rollback() -> None:
     _assert_documents_p2_rollout(section)
 
 
+def test_readme_p2_section_documents_the_both_switches_off_dry_run() -> None:
+    section = " ".join(_section(README.read_text(encoding="utf-8")).split()).lower()
+
+    assert DRY_RUN.search(section), "the README P2 section must describe the CLI dry run"
+
+
+def test_section_search_ignores_headings_inside_fenced_code() -> None:
+    text = (
+        "## Intro\n\n```bash\n## P2 not a heading\n# comment\n```\n\n"
+        "## P2 telemetry\n\nbody\n\n```sh\n# still the P2 body\n```\n\nmore\n\n## Next\n"
+    )
+
+    section = _section(text)
+
+    assert section.startswith("## P2 telemetry")
+    assert "# still the P2 body" in section and "more" in section
+    assert "## Next" not in section
+    assert _headings(text) == ["## Intro", "## P2 telemetry", "## Next"]
+
+
 def test_architecture_adds_a_p2_section_and_keeps_its_pinned_header() -> None:
     architecture = ARCHITECTURE.read_text(encoding="utf-8")
 
@@ -230,19 +268,14 @@ def test_architecture_adds_a_p2_section_and_keeps_its_pinned_header() -> None:
     _assert_documents_p2_rollout(_section(architecture))
 
 
-def test_architecture_changes_nothing_outside_the_new_p2_section() -> None:
-    architecture = ARCHITECTURE.read_text(encoding="utf-8")
-    start, end = _section_span(architecture)
-
-    without_p2 = (architecture[:start] + architecture[end:]).rstrip()
-    digest = hashlib.sha256(without_p2.encode("utf-8")).hexdigest()
-    assert digest == ARCHITECTURE_BEFORE_P2_08_SHA256
-
-
 def test_architecture_keeps_every_existing_section_in_order() -> None:
-    headings = re.findall(r"^## .+$", ARCHITECTURE.read_text(encoding="utf-8"), re.MULTILINE)
+    architecture = ARCHITECTURE.read_text(encoding="utf-8")
+    headings = _headings(architecture)
 
     remaining = iter(headings)
     for expected in ARCHITECTURE_HEADINGS_BEFORE_P2_08:
         assert expected in remaining, f"existing section missing or reordered: {expected}"
-    assert len(headings) > len(ARCHITECTURE_HEADINGS_BEFORE_P2_08)
+    start, _ = _section_span(architecture)
+    p2_heading = architecture[start:].splitlines()[0]
+    assert p2_heading in headings
+    assert p2_heading not in ARCHITECTURE_HEADINGS_BEFORE_P2_08

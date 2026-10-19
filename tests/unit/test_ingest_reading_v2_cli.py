@@ -334,7 +334,15 @@ def test_the_script_entry_point_returns_main_exit_code_to_the_shell(cli) -> None
     )
 
     assert result.returncode == 1, result.stderr
+    assert "Traceback" not in result.stderr
     assert TOKEN not in result.stdout and TOKEN not in result.stderr
+
+
+def test_help_documents_the_both_switches_off_dry_run(cli, capsys) -> None:
+    assert _exit_code(["--help"]) == 0
+
+    out, _ = capsys.readouterr()
+    assert re.search(r"dry[- ]run", " ".join(out.split()).lower()), out
 
 
 @pytest.mark.parametrize(
