@@ -18,7 +18,10 @@ from limnopulse_api.api.v2.router import V2_PREFIX, build_v2_router
 
 
 def build_api_router(
-    *, telegram_webhook_enabled: bool = True, enable_v2: bool = False
+    *,
+    telegram_webhook_enabled: bool = True,
+    enable_v2: bool = False,
+    enable_v2_telemetry: bool = False,
 ) -> APIRouter:
     api_router = APIRouter()
     if telegram_webhook_enabled:
@@ -36,5 +39,7 @@ def build_api_router(
     api_router.include_router(alert_events.router, prefix="/v1")
     api_router.include_router(leads.router, prefix="/v1")
     if enable_v2:
-        api_router.include_router(build_v2_router(), prefix=V2_PREFIX)
+        api_router.include_router(
+            build_v2_router(enable_telemetry=enable_v2_telemetry), prefix=V2_PREFIX
+        )
     return api_router
