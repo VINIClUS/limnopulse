@@ -80,7 +80,12 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument("--tenant", required=True, help="trusted tenant ID (never the payload's)")
     parser.add_argument("--device", required=True, help="trusted legacy device ID")
-    parser.add_argument("--file", type=Path, default=DEFAULT_READING, help="legacy JSON reading")
+    parser.add_argument(
+        "--file",
+        type=Path,
+        default=DEFAULT_READING,
+        help="legacy JSON reading: a regular file of at most 1 MiB inside the working directory",
+    )
     parser.add_argument(
         "--observed-at",
         help="'now' or an ISO-8601 timestamp that replaces the payload 'ts' (rehearsals)",
