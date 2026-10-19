@@ -93,7 +93,8 @@ Each step is a separate change with its own soak time. Never skip a step; roll b
 
 1. Set `TELEMETRY_V2_WRITE_ENABLED=true` in the producer (the P3 worker; the dev CLI in a rehearsal).
    Only `observation_numeric` is written; legacy reads and alerts are unchanged.
-2. Run the keyed divergence checks for every pond until they are clean over the D16 window.
+2. Run the keyed divergence checks for every pond until they pass (see the pass criterion) over the
+   D16 window.
    Telegraf still writes `water_quality`, so the checks compare the two producers.
 3. Set `TELEMETRY_LEGACY_DUAL_WRITE_ENABLED=true` only after the P3 durable redrive test passes
    (#15): a legacy write that fails after acceptance must be redelivered, never dropped.
@@ -110,6 +111,12 @@ The checks compare each pond's `water_quality` points with its `observation_nume
 key. Counts alone are not sufficient: equal counts can hide a missing point balanced by an extra one,
 or a changed value. Each check returns **only divergent rows**; an empty result means no divergence.
 Run all three for every pond over the D16 window.
+
+**Pass criterion.** A pond passes when `latest` and `summary` return no rows and `points` returns no
+row whose `field` is a metric field. `points` rows with `field = "seq"` are diagnostics: review each
+one, and accept it only when it is the D10 present-to-absent case (`v2` = `missing` for a reading
+whose sequence was removed). Any other `seq` row, or any metric-field row, blocks the D16
+precondition.
 
 | Check | Key | Compares | Divergent row columns |
 |---|---|---|---|
@@ -450,8 +457,16 @@ producer (the P3 worker; the dev CLI reads them per run), the API and the evalua
 Roll back in the reverse order of the [rollout sequence](#rollout-sequence); each switch is
 independent. Set `API_V2_TELEMETRY_ENABLED=false` before or with any change to `API_V2_ENABLED`
 (the API refuses to start with the telemetry routes on and `API_V2_ENABLED=false`); reset
-`API_V2_ENABLED` only if it was `false` before step 4. Rolling `/v1` back to `legacy` reads serves
-current data only while a `water_quality` producer is live (Telegraf, or legacy dual write). Never delete points from `observation_numeric` or `water_quality`: canonical points are
+`API_V2_ENABLED` only if it was `false` before step 4.
+
+After the stop-dual-write criteria have retired every `water_quality` producer, restore one before
+switching either read source back: re-enable Telegraf or `TELEMETRY_LEGACY_DUAL_WRITE_ENABLED=true`
+first, and switch `V1_TELEMETRY_READ_SOURCE` and `ALERT_EVALUATOR_TELEMETRY_SOURCE` back to `legacy`
+only once `water_quality` holds the legacy read window and the longest rule window again (rewrite
+the gap from the canonical source with the dual write if needed). Otherwise `/v1` serves stale data
+and legacy alert windows miss new samples.
+
+Never delete points from `observation_numeric` or `water_quality`: canonical points are
 idempotent by identity, so writing again after a rollback overwrites the same points, and the legacy
 reads never depended on them.
 
@@ -472,7 +487,8 @@ window.
 - **D10 present-to-absent `seq`.** An identity rewritten from a present to an absent `sequence`
   keeps the old legacy `seq` (the legacy line omits `seq`, as Telegraf does), while v2 stores `-1`.
   This case is outside `/v1` parity and shows up in the `points` check as a `seq` divergence
-  (`v2` = `missing`). It does not block the D16 precondition, which keys on value tuples.
+  (`v2` = `missing`). It does not block the D16 precondition, which keys on value tuples (see the pass criterion under
+  [Keyed divergence checks](#keyed-divergence-checks)).
 - **Backdated Deployment end (P2-07).** A redelivery or correction after a Deployment was ended
   with a backdated `ended_at` can resolve to a different `deployment_id`, so one legacy point becomes
   two v2 series. The projection's readings and latest pick one series by series-key order; its
