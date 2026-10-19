@@ -216,6 +216,8 @@ It uses the DynamoDB-backed M1 repositories and the configured InfluxDB, and pri
 
 **Rollback:** set the switches back to their defaults (`false`, and `legacy` for the read sources) and restart. No data deletion is needed; `water_quality` and the legacy reads are untouched throughout.
 
+The rollout sequence, release gate, keyed divergence checks and known limitations are in the [P2 telemetry rollout runbook](docs/p2-telemetry-rollout-runbook.md).
+
 ## Local Telemetry Ingestion
 
 Phase 2B adds a local MQTT-to-InfluxDB scaffold:
