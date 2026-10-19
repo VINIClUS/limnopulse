@@ -313,6 +313,18 @@ def test_a_non_object_payload_never_reaches_the_pipeline(
     assert all(pipeline.calls == [] for pipeline in FakePipeline.instances)
 
 
+def test_a_file_outside_the_working_directory_is_rejected(cli, tmp_path_factory) -> None:
+    outside = tmp_path_factory.mktemp("outside") / "reading.json"
+    outside.write_text(EXAMPLE_READING.read_text(encoding="utf-8"), encoding="utf-8")
+    link = cli.tmp_path / "link.json"
+    link.symlink_to(outside)
+
+    assert _run(file=outside) == 1
+    assert _run(file=Path("..") / outside.parent.name / outside.name) == 1
+    assert _run(file=link) == 1
+    assert all(pipeline.calls == [] for pipeline in FakePipeline.instances)
+
+
 def test_a_missing_file_exits_1(cli, capsys) -> None:
     assert _run(file=cli.tmp_path / "missing.json") == 1
     assert all(pipeline.calls == [] for pipeline in FakePipeline.instances)
