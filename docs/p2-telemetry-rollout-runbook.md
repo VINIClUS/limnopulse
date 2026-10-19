@@ -31,7 +31,9 @@ on any switch in a shared environment is therefore a **rehearsal** until P3 deli
 ## Release gate
 
 Run from the repository root. `make verify-influx` needs a reachable InfluxDB 2.7.11 (CI uses the
-`influx` job's service container; locally, `scripts/dev/run_local_influxd.sh`). It runs every Python
+`influx` job's service container; locally, `scripts/dev/run_local_influxd.sh`). For a non-default
+InfluxDB, set `INFLUX_INTEGRATION_URL`, `INFLUX_INTEGRATION_TOKEN` and `INFLUX_INTEGRATION_ORG`
+(`tests/support/influx_harness.py`). It runs every Python
 `tests/influx` test and the Go `TestInfluxIntegration*` tests, including the evaluator v2 parity
 suite, with `-count=1`.
 
@@ -71,7 +73,7 @@ deferral. Gate numbers refer to the P2-09 acceptance gate.
 | ADR-006 event-time alert windows, completeness delay, order independence | P2-05 `internal/alertevaluator/influx/parity_integration_test.go::TestInfluxIntegrationParityIsIndependentOfWriteOrder`; existing `AllowedLateness`/ordering tests `internal/alertevaluator/schedule_test.go::TestLatestCompleteSlotIsStableWithinCadence`, `internal/alertevaluator/quality_test.go::TestMeanSumsBucketsAndDevicesInAscendingOrder` |
 | ADR-007 duplicate/ordering/conversion/cardinality/evaluator parity/visibility before enabling v2 reads | Gates 4, 6, 7 and 1: `tests/influx/test_p2_acceptance_influx.py::test_gate4_duplicate_replay_reclassified_and_shuffled_writes_are_idempotent`, `tests/influx/test_p2_acceptance_influx.py::test_gate6_and_gate8_stored_points_keep_conversion_versions_and_quality`, `tests/influx/test_p2_acceptance_influx.py::test_gate7_tag_keys_are_the_allowlist_and_no_identity_or_quality_is_a_tag`, `tests/influx/test_p2_acceptance_influx.py::test_gate1_v1_responses_are_identical_in_both_read_modes`; evaluator parity `internal/alertevaluator/influx/parity_integration_test.go::TestInfluxIntegrationParityScenarios` |
 | ADR-007 outage after durable acceptance: no ack, recovery without loss | Gate 9: `tests/influx/test_p2_acceptance_influx.py::test_gate9_outage_never_acknowledges_and_redelivery_recovers_the_exact_points`, `tests/influx/test_p2_acceptance_influx.py::test_gate9_permanent_write_error_is_never_acknowledged`; P2-06 `tests/unit/test_telemetry_pipeline.py::test_failed_ingest_is_never_acknowledged_and_redelivery_matches_the_baseline`. Durable SQS redrive is **DEFERRED → #15** (D13) and blocks production dual write (D16). |
-| ADR-007 each write path disabled independently | P2-03 `tests/unit/test_telemetry_v2_write_service.py::test_v2_only_writes_every_observation_and_no_legacy_point`, `tests/unit/test_telemetry_v2_write_service.py::test_legacy_only_writes_the_legacy_point_and_no_v2_observation`; P2-08 `tests/api/test_v2_telemetry_composition.py::test_lifespan_without_a_write_switch_creates_no_write_api` |
+| ADR-007 each write path disabled independently | P2-03 `tests/unit/test_telemetry_v2_write_service.py::test_v2_only_writes_every_observation_and_no_legacy_point`, `tests/unit/test_telemetry_v2_write_service.py::test_legacy_only_writes_the_legacy_point_and_no_v2_observation`; P2-08 `tests/api/test_v2_telemetry_composition.py::test_lifespan_creates_one_synchronous_writer_only_when_a_write_switch_is_on`, `tests/api/test_v2_telemetry_composition.py::test_lifespan_without_a_write_switch_creates_no_write_api` |
 
 ## D16 precondition
 
@@ -110,7 +112,10 @@ Each step is a separate change with its own soak time. Never skip a step; roll b
 The checks compare each pond's `water_quality` points with its `observation_numeric` points key by
 key. Counts alone are not sufficient: equal counts can hide a missing point balanced by an extra one,
 or a changed value. Each check returns **only divergent rows**; an empty result means no divergence.
-Run all three for every pond over the D16 window.
+Run all three for every pond over the D16 window. An empty diff proves nothing if a placeholder is
+wrong on both sides (for example `<pond_id>` or `<asset_id>`), so first confirm that both
+measurements have points for the pond in the window, for example with a `count()` of the `temp_c`
+field in `water_quality` and of the `value` field in `observation_numeric` under the same filters.
 
 **Pass criterion.** A pond passes when `latest` and `summary` return no rows and `points` returns no
 row whose `field` is a metric field. `points` rows with `field = "seq"` are diagnostics: review each
@@ -445,8 +450,9 @@ Stopping dual write means setting `TELEMETRY_LEGACY_DUAL_WRITE_ENABLED=false`. I
 
 ## Rollback
 
-Rollback is by switches only. Set them back to their defaults and restart (or redeploy) the
-producer (the P3 worker; the dev CLI reads them per run), the API and the evaluator:
+Before cutover (while Telegraf still writes `water_quality`), rollback is by switches only. Set
+them back to their defaults and restart (or redeploy) the producer (the P3 worker; the dev CLI reads
+them per run), the API and the evaluator:
 
 - `TELEMETRY_V2_WRITE_ENABLED=false`
 - `TELEMETRY_LEGACY_DUAL_WRITE_ENABLED=false`
@@ -459,12 +465,21 @@ independent. Set `API_V2_TELEMETRY_ENABLED=false` before or with any change to `
 (the API refuses to start with the telemetry routes on and `API_V2_ENABLED=false`); reset
 `API_V2_ENABLED` only if it was `false` before step 4.
 
-After the stop-dual-write criteria have retired every `water_quality` producer, restore one before
-switching either read source back: re-enable Telegraf or `TELEMETRY_LEGACY_DUAL_WRITE_ENABLED=true`
-first, and switch `V1_TELEMETRY_READ_SOURCE` and `ALERT_EVALUATOR_TELEMETRY_SOURCE` back to `legacy`
-only once `water_quality` holds the legacy read window and the longest rule window again (rewrite
-the gap from the canonical source with the dual write if needed). Otherwise `/v1` serves stale data
-and legacy alert windows miss new samples.
+**After cutover** (the stop-dual-write criteria have retired every `water_quality` producer), the
+defaults above are not safe on their own: with Telegraf retired and dual write off, nothing writes
+`water_quality`, so `/v1` serves stale data and legacy alert windows miss new samples. Instead:
+
+1. Restore a `water_quality` producer first: re-enable Telegraf, or set
+   `TELEMETRY_LEGACY_DUAL_WRITE_ENABLED=true` (with `TELEMETRY_V2_WRITE_ENABLED` as needed) on a
+   running producer.
+2. Switch `V1_TELEMETRY_READ_SOURCE` and `ALERT_EVALUATOR_TELEMETRY_SOURCE` back to `legacy` only
+   once `water_quality` holds the legacy read window and the longest rule window again. Nothing
+   rewrites `water_quality` from `observation_numeric`: dual write runs only on the normalizer ingest
+   path. Filling a gap means replaying the retained source observations through the pipeline with the
+   replay marker and their first-receipt context (D5), which depends on P3 retention and durable
+   redrive (#15); otherwise wait until new data covers both windows.
+3. Return the write switches to their defaults only if Telegraf is the restored producer. If legacy
+   dual write is the restored producer, keep it and its producer on.
 
 Never delete points from `observation_numeric` or `water_quality`: canonical points are
 idempotent by identity, so writing again after a rollback overwrites the same points, and the legacy
@@ -508,19 +523,23 @@ window.
 - **Go v2 reader IDs (#71).** The evaluator v2 reader escapes IDs in Flux literals rather than
   validating them, the same model as the legacy reader; this is an explicit exemption from the
   plan's "every ID is validated" constraint.
-- **Flux string literals (#84).** `flux_string_literal` (JSON escaping, then `${` → `\${`) is not
-  lossless for `$${`, `$"` or non-ASCII characters. It fails safe (no interpolation) and is
-  unreachable with today's validated IDs; lossless literals are backlog #84.
+- **Flux string literals (#84).** Python `flux_string_literal` and Go `fluxV2String`
+  (`internal/alertevaluator/influx/query_v2.go`) apply JSON escaping, then `${` → `\${`. They are
+  not lossless for `$${`, `$"` or non-ASCII characters, and Go `json.Marshal` also escapes `<`, `>`,
+  `&` and U+2028. They fail safe (no interpolation) and are unreachable with today's IDs; lossless
+  literals are backlog #84.
 - **InfluxDB version.** CI pins the `influx` job to `influxdb:2.7.11@sha256:d92a10e9e75aff18eca38ff3a8f0b4a800706a5dd44d1b0ece264af04458525b`
   (a true 2.7.11; the `influxdb:2.7.11-alpine` tag drifted to 2.7.12, plan erratum r7.1).
   Production compose uses the floating `influxdb:2-alpine`. The projection's Flux shapes and the
   divergence checks follow 2.7.11 behavior; re-run the release gate before any upgrade.
-- **Writer error classes (P2-03).** A TLS misconfiguration or transport failure (status 0), 429 and
-  5xx are retryable; 422 (a partial write) and other 4xx, including an auth or bucket
-  misconfiguration (401/403/404), are permanent; over-limit batches and
-  unclassified failures are not retryable. Every failure is a `TelemetryWriteError`, and the
-  pipeline never acknowledges on `TelemetryWriteError`: the caller redelivers, or dead-letters a
-  non-retryable failure (P3).
+- **Writer error classes (P2-03).** A TLS misconfiguration (status 0), a transport failure
+  (urllib3 `HTTPError` or `OSError`), 429, 5xx and an Asset lookup failure are retryable; 422 (a
+  partial write) and other 4xx, including an auth or bucket misconfiguration (401/403/404), are
+  permanent; over-limit batches and unclassified failures are not retryable. Every write failure is
+  a `TelemetryWriteError`, and the pipeline never acknowledges on `TelemetryWriteError`: the caller
+  redelivers, or dead-letters a non-retryable failure (P3). Through the pipeline, an over-limit batch
+  or an unknown mapping version raises `ValueError` in the normalizer before any write (caller
+  misuse); it is never acknowledged either.
 
 ## Out of scope
 
