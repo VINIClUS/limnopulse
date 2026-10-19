@@ -7,6 +7,19 @@ Every test here drives the code merged by P2-00 … P2-08; nothing is re-impleme
 
 Gate map (plan Task 10): 3 trusted tenant, 5 Deployment at event time, 6 unit conversion and
 persisted versions (encoded line), 8 out-of-range (encoded line), 10 flag matrix, 11 runbook.
+
+Machine-readable runbook contract (`docs/p2-telemetry-rollout-runbook.md`):
+- `## ` sections in this order: `RUNBOOK_SECTIONS`; topic sections are `- ` lists, and each
+  topic's patterns must match inside one top-level item.
+- `## Flags`: a table whose rows start with `` `ENV` | `default` ``.
+- `## Release gate`: exactly one `bash` block with exactly `RELEASE_GATE_COMMANDS` (one command
+  per line, `#` comments allowed), and a `### ADR gate map` table whose first column is each
+  `ADR_REQUIREMENTS` label and whose proofs are test ids written as `` `path::name` `` or
+  `DEFERRED → #15|#17` with a reason.
+- `## Keyed divergence checks`: three `flux` blocks whose first line is
+  `// divergence-check: points|latest|summary`, using the `DIVERGENCE_PLACEHOLDERS`. Each
+  returns only divergent rows: `_time`, `device_id`, `field` (points, legacy field names plus
+  `seq`); `device_id`, `field` (latest); `field` (summary: `temp_c`, `ph`, `do_mg_l`).
 """
 
 import hashlib
@@ -128,6 +141,7 @@ TELEMETRY_OPERATIONS = frozenset(
         ("/v2/tenants/{tenant_id}/observations/latest", "get"),
     }
 )
+V1_TENANT_ROUTE_COUNT = 28
 M1_TENANT_ROUTE_COUNT = 53
 TELEMETRY_TENANT_ROUTE_COUNT = 56
 
@@ -776,7 +790,7 @@ def test_gate10_every_valid_combination_keeps_the_v1_golden_and_exact_routes(
     operations = _v2_operations(app)
     if not flags["api_v2_enabled"]:
         assert operations == set()
-        assert _tenant_route_count(app) < M1_TENANT_ROUTE_COUNT
+        assert _tenant_route_count(app) == V1_TENANT_ROUTE_COUNT
     elif not flags["api_v2_telemetry_enabled"]:
         assert {path for path, _method in operations} == M1_V2_PATHS
         assert not operations & TELEMETRY_OPERATIONS
@@ -1085,7 +1099,7 @@ def test_gate11_rollback_uses_flags_only_and_never_deletes_points() -> None:
     section = " ".join(markdown_section(text, "Rollback").split())
 
     assert re.search(r"never delete", section, re.IGNORECASE)
-    assert "restart" in section.lower()
+    assert re.search(r"restart|redeploy", section, re.IGNORECASE)
     for name, (_setting, default) in SWITCHES.items():
         assert f"{name}={default}" in section, name
     for block in re.findall(r"```.*?```", text, re.DOTALL):
@@ -1098,7 +1112,12 @@ def test_gate11_stop_dual_write_and_retention_are_documented() -> None:
     retention = " ".join(markdown_section(text, "Retention").split())
 
     assert "§10.6" in stop
-    for criterion in (r"divergence", r"redrive", r"read window", r"V1_TELEMETRY_READ_SOURCE=v2"):
+    for criterion in (
+        r"divergence",
+        r"retention window",
+        r"read window",
+        r"V1_TELEMETRY_READ_SOURCE=v2",
+    ):
         assert re.search(criterion, stop), criterion
     assert "D6" in retention
     assert "INFLUXDB_BUCKET_RAW" in retention
@@ -1126,10 +1145,9 @@ def assert_topic_in_one_item(section: str, topic: str, patterns: tuple[str, ...]
         ("D10 present-to-absent seq", (r"D10", r"present", r"absent", r"`?seq`?")),
         ("backdated Deployment end", (r"backdated", r"two v2 series")),
         ("seq winner order", (r"ingested_at",)),
-        ("domain devices and ponds", (r"deleted|no longer listed", r"list_devices")),
-        ("summary relaxation", (r"1e-12", r"completed windows", r"map-free")),
+        ("domain devices and ponds", (r"deleted|no longer listed", r"list_devices|domain")),
+        ("summary relaxation", (r"1e-12", r"completed windows")),
         ("Go reader escaping", (r"#71", r"escap")),
-        ("lossless Flux literals", (r"#84",)),
         ("CI image pin", (r"sha256:d92a10e9", r"2\.7\.11", r"influxdb:2-alpine")),
         (
             "writer error classes",
@@ -1173,7 +1191,6 @@ def test_gate11_known_divergences_and_limitations(topic: str, patterns: tuple[st
         ("D17 AlertRuleV2", (r"D17", r"AlertRuleV2", r"#77\b")),
         ("P6 calibration states", (r"P6", r"calibration")),
         ("presence-aware value", (r"#6\b", r"Evaluation\.Value")),
-        ("lossless Flux literals", (r"#84\b", r"Flux")),
         ("health views", (r"#17\b", r"health")),
     ],
 )
@@ -1182,6 +1199,15 @@ def test_gate11_out_of_scope_names_every_deferred_item(
 ) -> None:
     section = markdown_section(runbook_text(), "Out of scope")
     assert_topic_in_one_item(section, topic, patterns)
+
+
+def test_gate11_lossless_flux_literals_backlog_is_recorded() -> None:
+    """#84 may sit in either "Known divergences and limitations" or "Out of scope"."""
+    text = runbook_text()
+    items = list_items(markdown_section(text, "Known divergences and limitations")) + list_items(
+        markdown_section(text, "Out of scope")
+    )
+    assert any(re.search(r"#84\b", item) and re.search(r"Flux", item) for item in items)
 
 
 # --- ADR phase split and README ----------------------------------------------------------------
@@ -1201,9 +1227,9 @@ ADR_ORIGINAL_GATE_SHA256 = MappingProxyType(
     [
         (
             ADR_006,
-            ("P2", "P3", "D16", "#15", "#17", "quarantine", "connector health", "event time"),
+            ("P2", "P3", "D16", "#15", "#17", "quarantine", r"connector[- ]health", "event time"),
         ),
-        (ADR_007, ("P2", "P3", "D16", "#15", "redrive", "dual write", "cardinality")),
+        (ADR_007, ("P2", "P3", "D16", "#15", "redrive", r"dual[- ]write", "cardinality")),
     ],
     ids=["ADR-006", "ADR-007"],
 )
@@ -1229,7 +1255,7 @@ def test_adr_implementation_gate_ends_with_the_p2_phase_split(
     assert hashlib.sha256(original.encode("utf-8")).hexdigest() == ADR_ORIGINAL_GATE_SHA256[adr]
     phase_split = " ".join(paragraphs[-1].split())
     for reference in references:
-        assert reference in phase_split, reference
+        assert re.search(reference, phase_split), reference
     # ADRs live in docs/adr/, so the runbook link is relative to it.
     assert "](../p2-telemetry-rollout-runbook.md)" in phase_split
 

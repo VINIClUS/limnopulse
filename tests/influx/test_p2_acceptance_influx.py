@@ -437,7 +437,13 @@ async def test_gate1_v1_responses_are_identical_in_both_read_modes(world: World)
                 actual = projected.get(path, params=params, headers=HEADERS)
                 assert expected.status_code == 200, (path, expected.text)
                 body = expected.json()
-                assert body.get("items", [body]) != [], path
+                if path.endswith("/readings"):
+                    assert body["items"], path
+                elif path == f"{base}/metrics/latest":
+                    pond = [item for item in body["items"] if item["pond_id"] == POND]
+                    assert len(pond) == 1 and pond[0]["measured_at"] is not None, body
+                else:
+                    assert body["measured_at"] is not None, body
                 assert actual.status_code == 200, (path, actual.text)
                 assert actual.content == expected.content, (path, params)
 
@@ -1185,4 +1191,23 @@ async def test_runbook_summary_check_compares_counts_not_only_means(world: World
 
     summary = run_divergence_check(world, "summary", rehearsal.now)
 
+    assert [row["field"] for row in summary] == ["temp_c"]
+
+
+@pytest.mark.asyncio
+async def test_runbook_summary_check_reports_a_mean_only_divergence(world: World) -> None:
+    rehearsal = await _rehearse(world)
+    # A series point of DEVICE that is neither the newest nor a temp_c min or max: shifting it
+    # by +0.01 changes only the mean (count, min and max stay equal).
+    at = rehearsal.now - timedelta(minutes=50) + timedelta(minutes=10)
+    write_lines(world.bucket, [_legacy_line(DEVICE, "temp_c=24.51", at)])
+
+    points = run_divergence_check(world, "points", rehearsal.now)
+    latest = run_divergence_check(world, "latest", rehearsal.now)
+    summary = run_divergence_check(world, "summary", rehearsal.now)
+
+    assert [(row["_time"], row["device_id"], row["field"]) for row in points] == [
+        (at, DEVICE, "temp_c")
+    ]
+    assert latest == []
     assert [row["field"] for row in summary] == ["temp_c"]
