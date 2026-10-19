@@ -122,7 +122,8 @@ def _read_payload(path: Path, observed_at: str | None) -> dict[str, Any]:
     if not isinstance(payload, dict):
         raise _UsageError("the reading must be a JSON object")
     if observed_at == OBSERVED_AT_NOW:
-        # `isoformat()` of an aware UTC datetime is the Telegraf layout: `T`, `+00:00`, µs.
+        # `isoformat()` of an aware UTC datetime is the Telegraf layout: `T`, `+00:00` and at
+        # most six fraction digits (none when the microsecond is 0).
         payload["ts"] = datetime.now(UTC).isoformat()
     elif observed_at is not None:
         payload["ts"] = _parse_time("--observed-at", observed_at).isoformat()
