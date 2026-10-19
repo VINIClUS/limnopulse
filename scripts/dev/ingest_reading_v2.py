@@ -10,7 +10,8 @@ Exit codes: 0 nothing quarantined (everything accepted was written, or the dry r
 quarantined; 1 any error, usage errors included (2 is reserved for quarantine). On an error
 nothing is reported as written, and the reading must be ingested again (D9).
 
-Run from the repository root:
+Run from the repository root; --file must resolve (symlinks included) to a regular file of at
+most 1 MiB inside the working directory:
     python scripts/dev/ingest_reading_v2.py --tenant tnt_local_001 --device local-device-001 \
         [--file examples/telemetry/reading.local.json] [--observed-at now|ISO] [--received-at ISO]
 """
@@ -45,6 +46,7 @@ from limnopulse_api.services.telemetry_pipeline import PipelineOutcome, Telemetr
 from limnopulse_api.services.telemetry_v2_writes import ObservationWriteService
 
 DEFAULT_READING = Path("examples/telemetry/reading.local.json")
+MAX_READING_BYTES = 1024 * 1024
 LEGACY_INTEGRATION_TYPE = "legacy_mqtt"
 OBSERVED_AT_NOW = "now"
 EXIT_OK = 0
@@ -94,8 +96,24 @@ def _parse_time(name: str, value: str) -> datetime:
         raise _UsageError(f"{name} must be an ISO-8601 timestamp with a timezone") from exc
 
 
+def _contained_reading(path: Path) -> Path:
+    """Resolve `path` (symlinks included) and require a regular file inside the working dir."""
+    base = Path.cwd().resolve()
+    try:
+        resolved = (base / path).resolve(strict=True)
+    except (OSError, RuntimeError) as exc:
+        raise _UsageError(f"cannot read --file: {type(exc).__name__}") from exc
+    if not resolved.is_relative_to(base):
+        raise _UsageError("--file must be inside the current working directory")
+    if not resolved.is_file():
+        raise _UsageError("--file must be a regular file")
+    if resolved.stat().st_size > MAX_READING_BYTES:
+        raise _UsageError("--file must be at most 1 MiB")
+    return resolved
+
+
 def _read_payload(path: Path, observed_at: str | None) -> dict[str, Any]:
-    payload = json.loads(path.read_text(encoding="utf-8"))
+    payload = json.loads(_contained_reading(path).read_text(encoding="utf-8"))
     if not isinstance(payload, dict):
         raise _UsageError("the reading must be a JSON object")
     if observed_at == OBSERVED_AT_NOW:
