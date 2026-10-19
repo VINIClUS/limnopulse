@@ -62,13 +62,13 @@ deferral. Gate numbers refer to the P2-09 acceptance gate.
 | ADR-005 `/v1` pivot equivalence | Gate 1: `tests/influx/test_p2_acceptance_influx.py::test_gate1_v1_responses_are_identical_in_both_read_modes`; P2-07 `tests/influx/test_v1_projection_equivalence.py::test_v1_http_responses_match_legacy` |
 | ADR-005 bounded tag cardinality | Gate 7: `tests/influx/test_p2_acceptance_influx.py::test_gate7_tag_keys_are_the_allowlist_and_no_identity_or_quality_is_a_tag`; P2-00 `tests/unit/test_telemetry_v2_schema.py::test_guard_rejects_unknown_tags` |
 | ADR-005 out-of-range never valid, with provenance | Gate 8: `tests/contracts/test_p2_acceptance_gate.py::test_gate8_out_of_range_is_stored_with_its_state_and_provenance`, `tests/influx/test_p2_acceptance_influx.py::test_gate6_and_gate8_stored_points_keep_conversion_versions_and_quality`; P2-02 `tests/unit/test_telemetry_quality.py::test_far_out_of_range_values_are_never_valid` |
-| ADR-005 mapping versions persisted; replay after revision keeps version and identity | `tests/unit/test_telemetry_normalizer.py::test_replay_pinned_to_v1_reproduces_the_original_mapping`, `tests/unit/test_telemetry_pipeline.py::test_pinned_replay_through_the_pipeline_restores_the_v1_point_in_the_same_series`, `tests/unit/test_telemetry_v2_contracts.py::test_observation_event_id_ignores_versions_quality_and_delivery_times` |
+| ADR-005 mapping versions persisted; replay after revision keeps version and identity | Versions on stored points (gate 6): `tests/influx/test_p2_acceptance_influx.py::test_gate6_and_gate8_stored_points_keep_conversion_versions_and_quality`; `tests/unit/test_telemetry_normalizer.py::test_replay_pinned_to_v1_reproduces_the_original_mapping`, `tests/unit/test_telemetry_pipeline.py::test_pinned_replay_through_the_pipeline_restores_the_v1_point_in_the_same_series`, `tests/unit/test_telemetry_v2_contracts.py::test_observation_event_id_ignores_versions_quality_and_delivery_times` |
 | ADR-006 delayed/duplicated/replayed/out-of-order | Gate 4: `tests/influx/test_p2_acceptance_influx.py::test_gate4_duplicate_replay_reclassified_and_shuffled_writes_are_idempotent`; P2-02 `tests/unit/test_telemetry_quality.py::test_replay_marker_adds_replay_flag_and_provenance`; P2-03 `tests/influx/test_influx_v2_writer_integration.py::test_reclassified_redelivery_overwrites_every_field_of_the_same_point` |
 | ADR-006 clock-skew flag | P2-02 `tests/unit/test_telemetry_quality.py::test_future_skew_of_300_seconds_plus_one_microsecond_is_flagged`, `tests/unit/test_telemetry_quality.py::test_delay_of_30_days_plus_one_microsecond_is_past_extreme_and_delayed` |
 | ADR-006 deployment at event time; no fallback | Gate 5: `tests/contracts/test_p2_acceptance_gate.py::test_gate5_each_reading_resolves_the_deployment_of_its_event_time`, `tests/contracts/test_p2_acceptance_gate.py::test_gate5_replay_after_the_move_keeps_the_original_deployment`, `tests/contracts/test_p2_acceptance_gate.py::test_gate5_unresolved_deployment_is_quarantined_without_fallback` |
 | ADR-006 quarantine persistence + connector health | **DEFERRED → #15** (D13): P2 delivers only the bounded `QuarantinedObservation` record and the no-fallback rule; quarantine/DLQ persistence and connector-health marking are P3 entry gates and block production canonical writes (D16). |
 | ADR-006 current health uses receive/ingest time | `observations/latest` is a data view, not a health view (D11): `tests/influx/test_influx_v2_reader_integration.py::test_a_replay_with_newer_receipt_never_becomes_latest`. Health and online status are **DEFERRED → #17** (P6), built on `received_at`/`ingested_at`. |
-| ADR-006 event-time alert windows, completeness delay, order independence | P2-05 `internal/alertevaluator/influx/parity_integration_test.go::TestInfluxIntegrationParityIsIndependentOfWriteOrder`, `internal/alertevaluator/schedule_test.go::TestLatestCompleteSlotIsStableWithinCadence`, `internal/alertevaluator/quality_test.go::TestMeanSumsBucketsAndDevicesInAscendingOrder` |
+| ADR-006 event-time alert windows, completeness delay, order independence | P2-05 `internal/alertevaluator/influx/parity_integration_test.go::TestInfluxIntegrationParityIsIndependentOfWriteOrder`; existing `AllowedLateness`/ordering tests `internal/alertevaluator/schedule_test.go::TestLatestCompleteSlotIsStableWithinCadence`, `internal/alertevaluator/quality_test.go::TestMeanSumsBucketsAndDevicesInAscendingOrder` |
 | ADR-007 duplicate/ordering/conversion/cardinality/evaluator parity/visibility before enabling v2 reads | Gates 4, 6, 7 and 1: `tests/influx/test_p2_acceptance_influx.py::test_gate4_duplicate_replay_reclassified_and_shuffled_writes_are_idempotent`, `tests/influx/test_p2_acceptance_influx.py::test_gate6_and_gate8_stored_points_keep_conversion_versions_and_quality`, `tests/influx/test_p2_acceptance_influx.py::test_gate7_tag_keys_are_the_allowlist_and_no_identity_or_quality_is_a_tag`, `tests/influx/test_p2_acceptance_influx.py::test_gate1_v1_responses_are_identical_in_both_read_modes`; evaluator parity `internal/alertevaluator/influx/parity_integration_test.go::TestInfluxIntegrationParityScenarios` |
 | ADR-007 outage after durable acceptance: no ack, recovery without loss | Gate 9: `tests/influx/test_p2_acceptance_influx.py::test_gate9_outage_never_acknowledges_and_redelivery_recovers_the_exact_points`, `tests/influx/test_p2_acceptance_influx.py::test_gate9_permanent_write_error_is_never_acknowledged`; P2-06 `tests/unit/test_telemetry_pipeline.py::test_failed_ingest_is_never_acknowledged_and_redelivery_matches_the_baseline`. Durable SQS redrive is **DEFERRED → #15** (D13) and blocks production dual write (D16). |
 | ADR-007 each write path disabled independently | P2-03 `tests/unit/test_telemetry_v2_write_service.py::test_v2_only_writes_every_observation_and_no_legacy_point`, `tests/unit/test_telemetry_v2_write_service.py::test_legacy_only_writes_the_legacy_point_and_no_v2_observation`; P2-08 `tests/api/test_v2_telemetry_composition.py::test_lifespan_without_a_write_switch_creates_no_write_api` |
@@ -99,7 +99,7 @@ Each step is a separate change with its own soak time. Never skip a step; roll b
    (#15): a legacy write that fails after acceptance must be redelivered, never dropped.
 4. Set `API_V2_ENABLED=true` and `API_V2_TELEMETRY_ENABLED=true` to expose the three `/v2` telemetry
    reads.
-5. Set `ALERT_EVALUATOR_TELEMETRY_SOURCE=v2` in one environment first, and compare alert outcomes with
+5. Once the D16 precondition holds, set `ALERT_EVALUATOR_TELEMETRY_SOURCE=v2` in one environment first, and compare alert outcomes with
    a `legacy` evaluator there before any wider rollout. Expect the D15 divergence.
 6. Set `V1_TELEMETRY_READ_SOURCE=v2` only after the `observation_numeric` retention covers the legacy
    read window (see [Retention](#retention)) and the D16 precondition holds.
@@ -122,6 +122,10 @@ legacy integer field (`rssi`) and its float v2 value compare equal when the numb
 is compared only where v2 has a sequence (`-1` means absent). `latest` and `summary` cover the metric
 fields only.
 
+`points` and `latest` compare keys, so a duplicate v2 series with an equal value (for example the
+backdated-Deployment case below) is visible only to `summary`, and only for its three fields. A `seq`
+divergence is reported once per v2 metric row of that reading (up to seven identical rows).
+
 ### Inputs
 
 Replace the placeholders before running a check (for example in the InfluxDB UI or with
@@ -133,7 +137,7 @@ Replace the placeholders before running a check (for example in the InfluxDB UI 
 | `<tenant_id>` | the tenant |
 | `<pond_id>` | the legacy pond |
 | `<asset_id>` | `asset_id_for_legacy_pond(tenant_id, pond_id)` |
-| `<component_ids>` | comma-separated quoted `default_component_id_for_legacy_device(tenant_id, device_id)` of the pond's legacy devices |
+| `<component_ids>` | comma-separated quoted `default_component_id_for_legacy_device(tenant_id, device_id)` of every legacy device of the tenant (at least every device that reported to this pond in the window; the `<asset_id>` filter already limits the pond) |
 | `<start>`, `<stop>` | RFC 3339 bounds covering the D16 window, for example `2026-10-01T00:00:00Z` |
 
 The IDs come from `limnopulse_api.domain.ids`:
@@ -158,12 +162,13 @@ bucket = "<bucket>"
 tenant = "<tenant_id>"
 pond = "<pond_id>"
 asset = "<asset_id>"
-// The legacy default Components of the pond's legacy devices (see "Inputs").
+// The legacy default Components of the tenant's legacy devices (see "Inputs").
 components = [<component_ids>]
 start = <start>
 stop = <stop>
 
-// join.full rejects an empty input, so each side carries one placeholder row that never matches.
+// join.full rejects an empty input, so each side carries one placeholder row (device_id "");
+// the final `device_id != ""` filter drops it.
 placeholder = (value) => array.from(rows: [{_time: 1970-01-01T00:00:00Z, device_id: "", _value: value}])
 
 legacy = (field, empty) =>
@@ -249,12 +254,13 @@ bucket = "<bucket>"
 tenant = "<tenant_id>"
 pond = "<pond_id>"
 asset = "<asset_id>"
-// The legacy default Components of the pond's legacy devices (see "Inputs").
+// The legacy default Components of the tenant's legacy devices (see "Inputs").
 components = [<component_ids>]
 start = <start>
 stop = <stop>
 
-// join.full rejects an empty input, so each side carries one placeholder row that never matches.
+// join.full rejects an empty input, so each side carries one placeholder row (device_id "");
+// the final `device_id != ""` filter drops it.
 placeholder = array.from(rows: [{device_id: "", latest: ""}])
 
 newest = (tables=<-) =>
@@ -334,7 +340,7 @@ bucket = "<bucket>"
 tenant = "<tenant_id>"
 pond = "<pond_id>"
 asset = "<asset_id>"
-// The legacy default Components of the pond's legacy devices (see "Inputs").
+// The legacy default Components of the tenant's legacy devices (see "Inputs").
 components = [<component_ids>]
 start = <start>
 stop = <stop>
@@ -407,7 +413,7 @@ union(
 
             return r.legacy_count != r.v2_count or r.legacy_min != r.v2_min or
                 r.legacy_max != r.v2_max or
-                math.abs(x: legacyMean - v2Mean) > 0.000000000001 * math.abs(x: legacyMean)
+                math.abs(x: legacyMean - v2Mean) > 0.000000000001 * math.mMax(x: math.abs(x: legacyMean), y: math.abs(x: v2Mean))
         },
     )
     |> sort(columns: ["field"])
@@ -429,8 +435,8 @@ Stopping dual write means setting `TELEMETRY_LEGACY_DUAL_WRITE_ENABLED=false`. I
 
 ## Rollback
 
-Rollback is by switches only. Set them back to their defaults and restart (or redeploy) the API and
-the evaluator:
+Rollback is by switches only. Set them back to their defaults and restart (or redeploy) the
+producer (the P3 worker; the dev CLI reads them per run), the API and the evaluator:
 
 - `TELEMETRY_V2_WRITE_ENABLED=false`
 - `TELEMETRY_LEGACY_DUAL_WRITE_ENABLED=false`
@@ -439,7 +445,10 @@ the evaluator:
 - `ALERT_EVALUATOR_TELEMETRY_SOURCE=legacy`
 
 Roll back in the reverse order of the [rollout sequence](#rollout-sequence); each switch is
-independent. Never delete points from `observation_numeric` or `water_quality`: canonical points are
+independent. Set `API_V2_TELEMETRY_ENABLED=false` before or with any change to `API_V2_ENABLED`
+(the API refuses to start with the telemetry routes on and `API_V2_ENABLED=false`); reset
+`API_V2_ENABLED` only if it was `false` before step 4. Rolling `/v1` back to `legacy` reads serves
+current data only while a `water_quality` producer is live (Telegraf, or legacy dual write). Never delete points from `observation_numeric` or `water_quality`: canonical points are
 idempotent by identity, so writing again after a rollback overwrites the same points, and the legacy
 reads never depended on them.
 
@@ -459,7 +468,8 @@ window.
   so an alert evaluator on `v2` can stay silent where `legacy` fires.
 - **D10 present-to-absent `seq`.** An identity rewritten from a present to an absent `sequence`
   keeps the old legacy `seq` (the legacy line omits `seq`, as Telegraf does), while v2 stores `-1`.
-  This case is outside `/v1` parity and shows up in the `points` check as a `seq` divergence.
+  This case is outside `/v1` parity and shows up in the `points` check as a `seq` divergence
+  (`v2` = `missing`). It does not block the D16 precondition, which keys on value tuples.
 - **Backdated Deployment end (P2-07).** A redelivery or correction after a Deployment was ended
   with a backdated `ended_at` can resolve to a different `deployment_id`, so one legacy point becomes
   two v2 series. The projection's readings and latest pick one series by series-key order; its
@@ -486,8 +496,9 @@ window.
   (a true 2.7.11; the `influxdb:2.7.11-alpine` tag drifted to 2.7.12, plan erratum r7.1).
   Production compose uses the floating `influxdb:2-alpine`. The projection's Flux shapes and the
   divergence checks follow 2.7.11 behavior; re-run the release gate before any upgrade.
-- **Writer error classes (P2-03).** A misconfiguration, a TLS or transport failure (status 0), 429 and
-  5xx are retryable; 422 (a partial write) and other 4xx are permanent; over-limit batches and
+- **Writer error classes (P2-03).** A TLS misconfiguration or transport failure (status 0), 429 and
+  5xx are retryable; 422 (a partial write) and other 4xx, including an auth or bucket
+  misconfiguration (401/403/404), are permanent; over-limit batches and
   unclassified failures are not retryable. Every failure is a `TelemetryWriteError`, and the
   pipeline never acknowledges on `TelemetryWriteError`: the caller redelivers, or dead-letters a
   non-retryable failure (P3).
