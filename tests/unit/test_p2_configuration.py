@@ -119,6 +119,25 @@ def test_api_v2_telemetry_env_without_api_v2_env_is_rejected(
         _settings()
 
 
+def test_settings_validation_errors_never_echo_secret_values(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    secret = "zq9x-influx-token-must-not-leak"
+    # Pydantic would echo the head of the env-sourced input; make the token lead it.
+    for field in Settings.model_fields:
+        if field == "influxdb_token":
+            break
+        monkeypatch.delenv(field.upper(), raising=False)
+    monkeypatch.setenv("INFLUXDB_TOKEN", secret)
+    monkeypatch.setenv("API_V2_TELEMETRY_ENABLED", "true")
+
+    with pytest.raises(ValidationError) as exc_info:
+        Settings(_env_file=None)
+
+    assert "zq9x" not in str(exc_info.value)
+    assert "API_V2_TELEMETRY_ENABLED" in str(exc_info.value)
+
+
 def test_api_v2_telemetry_with_api_v2_is_accepted() -> None:
     settings = _settings(api_v2_enabled=True, api_v2_telemetry_enabled=True)
 

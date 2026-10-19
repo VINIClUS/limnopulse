@@ -373,6 +373,36 @@ def test_an_invalid_time_argument_exits_1_not_2(cli, extra: tuple[str, str]) -> 
     assert all(pipeline.calls == [] for pipeline in FakePipeline.instances)
 
 
+def test_an_invalid_switch_combination_exits_1_naming_the_switch(
+    cli, capsys, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv("API_V2_TELEMETRY_ENABLED", "true")
+    monkeypatch.setenv("API_V2_ENABLED", "false")
+
+    assert _run(file=cli.reading) == 1
+
+    out, err = capsys.readouterr()
+    assert "API_V2_TELEMETRY_ENABLED" in err
+    assert TOKEN not in out and TOKEN not in err
+    assert all(pipeline.calls == [] for pipeline in FakePipeline.instances)
+
+
+def test_unrecognized_arguments_are_not_echoed(cli, capsys) -> None:
+    secret = "pasted-secret-value-123"
+
+    assert _exit_code(["--tenant", TENANT, "--device", DEVICE, "--token", secret]) == 1
+
+    out, err = capsys.readouterr()
+    assert secret not in out and secret not in err
+
+
+def test_json_nested_too_deeply_exits_1_without_raising(cli) -> None:
+    cli.reading.write_text("[" * 100_000 + "]" * 100_000, encoding="utf-8")
+
+    assert _run(file=cli.reading) == 1
+    assert all(pipeline.calls == [] for pipeline in FakePipeline.instances)
+
+
 def test_an_invalid_tenant_argument_exits_1(cli) -> None:
     assert _run(file=cli.reading, tenant="Not A Tenant!") == 1
     assert all(pipeline.calls == [] for pipeline in FakePipeline.instances)
