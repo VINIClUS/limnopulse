@@ -80,6 +80,39 @@ ASSET = asset_id_for_legacy_pond(TENANT, POND)
 NATIVE_COMPONENT = "cmp_0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f"
 CREATED = datetime(2026, 1, 1, tzinfo=UTC)
 HEADERS = {"X-Dev-User-Sub": "sub_1"}
+ALLOWED_TAG_KEYS = frozenset(
+    {
+        "asset_id",
+        "component_id",
+        "deployment_id",
+        "device_id",
+        "metric_key",
+        "probe_id",
+        "schema_version",
+        "site_id",
+        "tenant_id",
+    }
+)
+EXPECTED_FIELD_KEYS = frozenset(
+    {
+        "catalog_version",
+        "delay_ms",
+        "event_id",
+        "ingested_at_ns",
+        "integration_id",
+        "quality_flags_json",
+        "quality_policy_version",
+        "quality_provenance_json",
+        "quality_state",
+        "received_at_ns",
+        "sequence",
+        "source_event_id",
+        "source_type",
+        "source_unit",
+        "unit_mapping_version",
+        "value",
+    }
+)
 TIME_MIN = "1970-01-01T00:00:00Z"
 TIME_MAX = "2262-01-01T00:00:00Z"
 
@@ -383,6 +416,7 @@ async def test_gate1_v1_responses_are_identical_in_both_read_modes(world: World)
         assert isinstance(service.writer, InfluxObservationWriter)
         assert type(legacy.app.state.telemetry_repository) is InfluxTelemetryRepository
         times = await ingest_rehearsal(world.pipeline(legacy, lambda: now), now)
+        await write_native(legacy, now, times)
         with world.app(v1_telemetry_read_source="v2") as projected:
             assert isinstance(
                 projected.app.state.telemetry_repository, V2ProjectedTelemetryRepository
@@ -737,8 +771,10 @@ async def test_gate7_tag_keys_are_the_allowlist_and_no_identity_or_quality_is_a_
             f'predicate: (r) => r._measurement == "water_quality", start: {start})',
         )
     }
-    assert {key for key in tag_keys if not key.startswith("_")} == OBSERVATION_TAG_KEYS
-    assert field_keys == OBSERVATION_FIELD_KEYS
+    # Literal sets (plan "InfluxDB observation_numeric schema"), and the frozen constants.
+    assert {key for key in tag_keys if not key.startswith("_")} == ALLOWED_TAG_KEYS
+    assert ALLOWED_TAG_KEYS == OBSERVATION_TAG_KEYS
+    assert field_keys == EXPECTED_FIELD_KEYS == OBSERVATION_FIELD_KEYS
     assert not field_keys & tag_keys
     assert {key for key in legacy_tag_keys if not key.startswith("_")} == LEGACY_TAG_KEYS
 
@@ -773,16 +809,20 @@ async def test_gate7_tag_keys_are_the_allowlist_and_no_identity_or_quality_is_a_
 
 
 class FlakyWriteApi:
-    """Wraps the real synchronous `WriteApi`; the listed call numbers (1-based) fail."""
+    """Wraps the real synchronous `WriteApi`; the listed call numbers (1-based) fail, with a
+    transport error, or with HTTP 422 when `permanent`."""
 
-    def __init__(self, write_api: Any, failing_calls: set[int]) -> None:
+    def __init__(self, write_api: Any, failing_calls: set[int], *, permanent: bool = False) -> None:
         self.write_api = write_api
         self.failing_calls = failing_calls
+        self.permanent = permanent
         self.calls = 0
 
     def write(self, **kwargs: Any) -> None:
         self.calls += 1
         if self.calls in self.failing_calls:
+            if self.permanent:
+                raise ApiException(status=422, reason="Unprocessable Entity")
             if self.calls % 2:
                 raise ApiException(status=503, reason="Service Unavailable")
             raise ProtocolError("connection reset by peer")
@@ -798,12 +838,14 @@ class Message:
 
 
 class QueueFake:
-    """At-least-once delivery: the head message is redelivered until it is acknowledged."""
+    """At-least-once delivery: the head message is redelivered until it is acknowledged. A
+    non-retryable failure stops the consumer with the message still pending (never acked)."""
 
     def __init__(self, messages: Sequence[Message]) -> None:
         self.pending = deque(messages)
         self.acked: list[str] = []
         self.deliveries: list[str] = []
+        self.stopped_on: str | None = None
 
     async def drain(self, pipeline: TelemetryPipeline, *, max_deliveries: int = 20) -> list[str]:
         failures = []
@@ -815,9 +857,11 @@ class QueueFake:
             try:
                 outcome = await pipeline.ingest_legacy_reading(context, message.payload)
             except TelemetryWriteError as exc:
-                assert exc.retryable
                 assert message.message_id not in self.acked
                 failures.append(message.message_id)
+                if not exc.retryable:
+                    self.stopped_on = message.message_id
+                    break
                 continue
             assert outcome.quarantined == ()
             self.acked.append(message.message_id)
@@ -841,12 +885,18 @@ def _messages(now: datetime) -> list[Message]:
 
 
 async def _drive(
-    world: World, bucket: str, now: datetime, failing: set[int]
+    world: World,
+    bucket: str,
+    now: datetime,
+    failing: set[int],
+    *,
+    permanent: bool = False,
+    queue: QueueFake | None = None,
 ) -> tuple[QueueFake, list[str]]:
     settings = influx_settings()
-    queue = QueueFake(_messages(now))
+    queue = queue or QueueFake(_messages(now))
     with influx_clients(bucket) as (_query_api, write_api):
-        flaky = FlakyWriteApi(write_api, failing)
+        flaky = FlakyWriteApi(write_api, failing, permanent=permanent)
         writer = InfluxObservationWriter(write_api=flaky, bucket=bucket, org=settings.org)
         pipeline = TelemetryPipeline(
             normalizer=TelemetryNormalizer(
@@ -861,7 +911,6 @@ async def _drive(
             ),
         )
         failures = await queue.drain(pipeline)
-    assert flaky.calls >= 2 * len(queue.acked)
     return queue, failures
 
 
@@ -885,6 +934,7 @@ async def test_gate9_outage_never_acknowledges_and_redelivery_recovers_the_exact
 
     assert control_failures == []
     assert control.acked == ["m0", "m1", "m2"]
+    assert queue.stopped_on is None
     assert len(failures) == len(failing)
     assert queue.acked == ["m0", "m1", "m2"]
     assert len(queue.deliveries) == 3 + len(failing)
@@ -897,6 +947,31 @@ async def test_gate9_outage_never_acknowledges_and_redelivery_recovers_the_exact
     assert snapshot(world.bucket) == expected
 
 
+@pytest.mark.asyncio
+async def test_gate9_permanent_write_error_is_never_acknowledged(
+    world: World, control_bucket: str
+) -> None:
+    now = captured_hour()
+    await seed_tenant(world)
+
+    control, _ = await _drive(world, control_bucket, now, set())
+    # HTTP 422 on the second call: m0's v2 write is stored, its legacy write is rejected.
+    queue, failures = await _drive(world, world.bucket, now, {2}, permanent=True)
+
+    assert failures == ["m0"]
+    assert queue.stopped_on == "m0"
+    assert queue.acked == []
+    assert [m.message_id for m in queue.pending] == ["m0", "m1", "m2"]
+    stored = snapshot(world.bucket)
+    assert stored and {row[0] for row in stored} == {"observation_numeric"}
+    # Once the cause is fixed, redriving the unacknowledged messages recovers the exact set.
+    queue, failures = await _drive(world, world.bucket, now, set(), queue=queue)
+    assert failures == [] and queue.acked == ["m0", "m1", "m2"]
+    expected = snapshot(control_bucket)
+    assert expected and control.acked == ["m0", "m1", "m2"]
+    assert snapshot(world.bucket) == expected
+
+
 # --- Runbook keyed divergence checks ------------------------------------------------------------
 
 
@@ -906,6 +981,21 @@ class Rehearsal:
     times: dict[str, datetime]
 
 
+async def write_native(client: TestClient, now: datetime, times: dict[str, datetime]) -> None:
+    """Native probes on the pond Asset, and a native Component on a legacy device at the time of
+    a legacy reading: v2 only, never visible through `/v1`."""
+    probes = scenario("two_probes_same_metric").rebased(now - timedelta(minutes=3))
+    template = probes.observations[0].model_dump()
+    template["resolved"].update(device_id=DEVICE, component_id=NATIVE_COMPONENT)
+    template["event_id"] = observation_event_id(
+        TENANT, NATIVE_COMPONENT, "water.dissolved_oxygen", times["sample"]
+    )
+    template["observation"]["observed_at"] = times["sample"]
+    native = CanonicalObservation.model_validate(template)
+    outcome = await client.app.state.observation_write_service.write((*probes.observations, native))
+    assert (outcome.v2_points, outcome.legacy_points) == (3, 0)
+
+
 async def _rehearse(world: World) -> Rehearsal:
     now = captured_hour()
     await seed_tenant(world)
@@ -913,19 +1003,7 @@ async def _rehearse(world: World) -> Rehearsal:
         telemetry_v2_write_enabled=True, telemetry_legacy_dual_write_enabled=True
     ) as app:
         times = await ingest_rehearsal(world.pipeline(app, lambda: now), now)
-        # Native probes on the pond Asset and a native Component on a legacy device: v2 only.
-        probes = scenario("two_probes_same_metric").rebased(now - timedelta(minutes=3))
-        template = probes.observations[0].model_dump()
-        template["resolved"].update(device_id=DEVICE, component_id=NATIVE_COMPONENT)
-        template["event_id"] = observation_event_id(
-            TENANT, NATIVE_COMPONENT, "water.dissolved_oxygen", times["sample"]
-        )
-        template["observation"]["observed_at"] = times["sample"]
-        native = CanonicalObservation.model_validate(template)
-        outcome = await app.app.state.observation_write_service.write(
-            (*probes.observations, native)
-        )
-        assert outcome.legacy_points == 0
+        await write_native(app, now, times)
     return Rehearsal(now=now, times=times)
 
 
@@ -1018,3 +1096,93 @@ async def test_runbook_points_check_detects_a_changed_seq(world: World) -> None:
     assert {(row["_time"], row["device_id"], row["field"]) for row in points} == {
         (sample, DEVICE, "seq")
     }
+
+
+async def _write_v2_only(world: World, observed_at: datetime, now: datetime) -> None:
+    """One default-Component reading written to `observation_numeric` only (legacy dual-write
+    off), as a producer that drops the legacy write would."""
+    context = legacy_context(TENANT, DEVICE, received_at=observed_at + timedelta(seconds=2))
+    mapped = map_legacy_reading(context, example_payload(observed_at, seq=777))
+    normalized = await TelemetryNormalizer(
+        components=world.repos, deployments=world.repos, clock=lambda: now
+    ).normalize(context, mapped.observations)
+    assert len(normalized.accepted) == 7
+    settings = influx_settings()
+    with influx_clients(world.bucket) as (_query_api, write_api):
+        writer = InfluxObservationWriter(write_api=write_api, bucket=world.bucket, org=settings.org)
+        service = ObservationWriteService(
+            writer=writer,
+            legacy_writer=None,
+            site_assets=world.repos,
+            v2_write_enabled=True,
+            legacy_dual_write_enabled=False,
+        )
+        outcome = await service.write(normalized.accepted)
+    assert (outcome.v2_points, outcome.legacy_points) == (7, 0)
+
+
+@pytest.mark.asyncio
+async def test_runbook_divergence_checks_detect_a_v2_point_missing_from_legacy(
+    world: World,
+) -> None:
+    rehearsal = await _rehearse(world)
+    v2_only = rehearsal.now - timedelta(minutes=1)
+    await _write_v2_only(world, v2_only, rehearsal.now)
+
+    points = run_divergence_check(world, "points", rehearsal.now)
+    latest = run_divergence_check(world, "latest", rehearsal.now)
+    summary = run_divergence_check(world, "summary", rehearsal.now)
+
+    fields = {"temp_c", "ph", "do_mg_l", "turbidity_ntu", "salinity_ppt", "battery_v", "rssi"}
+    assert {(row["_time"], row["device_id"], row["field"]) for row in points} == {
+        (v2_only, DEVICE, field) for field in fields | {"seq"}
+    }
+    assert {(row["device_id"], row["field"]) for row in latest} == {
+        (DEVICE, field) for field in fields
+    }
+    assert sorted(row["field"] for row in summary) == ["do_mg_l", "ph", "temp_c"]
+
+
+@pytest.mark.asyncio
+async def test_runbook_summary_check_uses_the_relative_mean_tolerance(world: World) -> None:
+    rehearsal = await _rehearse(world)
+    # A series point of DEVICE that is neither the newest nor a temp_c min or max.
+    at = rehearsal.now - timedelta(minutes=50) + timedelta(minutes=10)
+    write_lines(world.bucket, [_legacy_line(DEVICE, f"temp_c={24.5 * (1 + 1e-13)!r}", at)])
+
+    points = run_divergence_check(world, "points", rehearsal.now)
+    latest = run_divergence_check(world, "latest", rehearsal.now)
+    summary = run_divergence_check(world, "summary", rehearsal.now)
+
+    # The keyed point check is exact; the summary means compare within rel 1e-12 (r7.2).
+    assert [(row["_time"], row["device_id"], row["field"]) for row in points] == [
+        (at, DEVICE, "temp_c")
+    ]
+    assert latest == []
+    assert summary == []
+
+
+@pytest.mark.asyncio
+async def test_runbook_summary_check_compares_counts_not_only_means(world: World) -> None:
+    rehearsal = await _rehearse(world)
+    start = rehearsal.now - timedelta(hours=2)
+    values = [
+        row["_value"]
+        for row in query_records(
+            world.bucket,
+            f'from(bucket: "{world.bucket}") '
+            f"|> range(start: {_iso(start)}, stop: {_iso(rehearsal.now)}) "
+            '|> filter(fn: (r) => r._measurement == "water_quality" and r._field == "temp_c")',
+        )
+    ]
+    assert len(values) > 20
+    mean = sum(values) / len(values)
+    # A legacy-only point at the mean: the count changes, the mean, min and max do not.
+    write_lines(
+        world.bucket,
+        [_legacy_line(SECOND_DEVICE, f"temp_c={mean!r}", rehearsal.now - timedelta(minutes=1))],
+    )
+
+    summary = run_divergence_check(world, "summary", rehearsal.now)
+
+    assert [row["field"] for row in summary] == ["temp_c"]

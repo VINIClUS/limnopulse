@@ -9,6 +9,7 @@ Gate map (plan Task 10): 3 trusted tenant, 5 Deployment at event time, 6 unit co
 persisted versions (encoded line), 8 out-of-range (encoded line), 10 flag matrix, 11 runbook.
 """
 
+import hashlib
 import json
 import re
 from collections.abc import Mapping, Sequence
@@ -895,22 +896,22 @@ ADR_REQUIREMENTS = (
     "ADR-007 outage after durable acceptance: no ack, recovery without loss",
     "ADR-007 each write path disabled independently",
 )
-# Requirements the plan proves with a P2-09 gate: the row must cite a gate test.
-GATE_PROVEN = frozenset(
+# Requirements the plan proves with a P2-09 gate: the row must cite that gate's test(s).
+GATE_PROVEN = MappingProxyType(
     {
-        "ADR-005 unit conversion",
-        "ADR-005 two probes for one metric",
-        "ADR-005 trusted tenant mapping",
-        "ADR-005 /v1 pivot equivalence",
-        "ADR-005 bounded tag cardinality",
-        "ADR-005 out-of-range never valid, with provenance",
-        "ADR-006 delayed/duplicated/replayed/out-of-order",
-        "ADR-006 deployment at event time; no fallback",
+        "ADR-005 unit conversion": ("test_gate6_",),
+        "ADR-005 two probes for one metric": ("test_gate2_",),
+        "ADR-005 trusted tenant mapping": ("test_gate3_",),
+        "ADR-005 /v1 pivot equivalence": ("test_gate1_",),
+        "ADR-005 bounded tag cardinality": ("test_gate7_",),
+        "ADR-005 out-of-range never valid, with provenance": ("test_gate8_",),
+        "ADR-006 delayed/duplicated/replayed/out-of-order": ("test_gate4_",),
+        "ADR-006 deployment at event time; no fallback": ("test_gate5_",),
         (
             "ADR-007 duplicate/ordering/conversion/cardinality/evaluator parity/visibility before "
             "enabling v2 reads"
-        ),
-        "ADR-007 outage after durable acceptance: no ack, recovery without loss",
+        ): ("test_gate4_", "test_gate6_", "test_gate7_", "test_gate1_"),
+        "ADR-007 outage after durable acceptance: no ack, recovery without loss": ("test_gate9_",),
     }
 )
 DEFERRED = MappingProxyType(
@@ -973,7 +974,7 @@ def test_gate11_flags_table_lists_the_five_switches_with_their_defaults() -> Non
 def test_gate11_release_gate_lists_exactly_the_gate_commands() -> None:
     section = markdown_section(runbook_text(), "Release gate")
     blocks = fenced_blocks(section, "bash")
-    assert blocks, "the release gate needs a bash block"
+    assert len(blocks) == 1, "the release gate has exactly one bash block"
     commands = [
         re.sub(r"\s+#.*$", "", line).strip()
         for line in blocks[0].splitlines()
@@ -1016,8 +1017,11 @@ def test_gate11_every_adr_gate_maps_to_a_proving_test_or_a_deferral() -> None:
             assert not ids or all(_test_exists(p, n) for p, n in ids)
         else:
             assert ids, f"{requirement}: no proving test"
-        if requirement in GATE_PROVEN:
-            assert any(path in GATE_FILES for path, _name in ids), requirement
+        for prefix in GATE_PROVEN.get(requirement, ()):
+            assert any(path in GATE_FILES and name.startswith(prefix) for path, name in ids), (
+                requirement,
+                prefix,
+            )
         if requirement in DEFERRED:
             marker = f"DEFERRED → {DEFERRED[requirement]}"
             assert marker in proof, (requirement, proof)
@@ -1045,7 +1049,7 @@ def test_gate11_rollout_sequence_is_ordered() -> None:
     steps = (
         ("TELEMETRY_V2_WRITE_ENABLED=true",),
         ("keyed divergence",),
-        ("TELEMETRY_LEGACY_DUAL_WRITE_ENABLED=true", "redrive"),
+        ("TELEMETRY_LEGACY_DUAL_WRITE_ENABLED=true", "P3", "redrive"),
         ("API_V2_TELEMETRY_ENABLED=true",),
         ("ALERT_EVALUATOR_TELEMETRY_SOURCE=v2", "one environment"),
         ("V1_TELEMETRY_READ_SOURCE=v2", "retention"),
@@ -1082,8 +1086,8 @@ def test_gate11_rollback_uses_flags_only_and_never_deletes_points() -> None:
 
     assert re.search(r"never delete", section, re.IGNORECASE)
     assert "restart" in section.lower()
-    for name in SWITCHES:
-        assert name in section, name
+    for name, (_setting, default) in SWITCHES.items():
+        assert f"{name}={default}" in section, name
     for block in re.findall(r"```.*?```", text, re.DOTALL):
         assert "influx delete" not in block and "/api/v2/delete" not in block
 
@@ -1094,15 +1098,31 @@ def test_gate11_stop_dual_write_and_retention_are_documented() -> None:
     retention = " ".join(markdown_section(text, "Retention").split())
 
     assert "§10.6" in stop
+    for criterion in (r"divergence", r"redrive", r"read window", r"V1_TELEMETRY_READ_SOURCE=v2"):
+        assert re.search(criterion, stop), criterion
+    assert "D6" in retention
     assert "INFLUXDB_BUCKET_RAW" in retention
     assert "legacy read window" in retention
     assert "observation_numeric" in retention
 
 
+def list_items(section: str) -> list[str]:
+    """Top-level `- ` list items of a section (nested lines stay with their item), whitespace
+    collapsed."""
+    items = re.split(r"^- ", section, flags=re.MULTILINE)[1:]
+    return [" ".join(item.split()) for item in items]
+
+
+def assert_topic_in_one_item(section: str, topic: str, patterns: tuple[str, ...]) -> None:
+    items = list_items(section)
+    assert items, "the section must be a list"
+    assert any(all(re.search(p, item) for p in patterns) for item in items), (topic, patterns)
+
+
 @pytest.mark.parametrize(
     ("topic", "patterns"),
     [
-        ("D15 out-of-range", (r"D15", r"out_of_range", r"quality-gated")),
+        ("D15 out-of-range", (r"D15", r"out_of_range", r"quality-gated", r"alert")),
         ("D10 present-to-absent seq", (r"D10", r"present", r"absent", r"`?seq`?")),
         ("backdated Deployment end", (r"backdated", r"two v2 series")),
         ("seq winner order", (r"ingested_at",)),
@@ -1111,47 +1131,80 @@ def test_gate11_stop_dual_write_and_retention_are_documented() -> None:
         ("Go reader escaping", (r"#71", r"escap")),
         ("lossless Flux literals", (r"#84",)),
         ("CI image pin", (r"sha256:d92a10e9", r"2\.7\.11", r"influxdb:2-alpine")),
-        ("writer error classes", (r"429", r"5xx", r"422", r"TelemetryWriteError", r"retryable")),
+        (
+            "writer error classes",
+            (
+                r"misconfigur",
+                r"status 0",
+                r"429",
+                r"5xx",
+                r"422",
+                r"4xx",
+                r"over-limit",
+                r"unclassified",
+                r"TelemetryWriteError",
+                r"never acknowledge",
+            ),
+        ),
     ],
 )
 def test_gate11_known_divergences_and_limitations(topic: str, patterns: tuple[str, ...]) -> None:
-    section = " ".join(
-        markdown_section(runbook_text(), "Known divergences and limitations").split()
-    )
-    for pattern in patterns:
-        assert re.search(pattern, section), (topic, pattern)
+    section = markdown_section(runbook_text(), "Known divergences and limitations")
+    assert_topic_in_one_item(section, topic, patterns)
 
 
-def test_gate11_out_of_scope_names_every_deferred_item() -> None:
-    section = " ".join(markdown_section(runbook_text(), "Out of scope").split())
-    for pattern in (
-        r"D13",
-        r"quarantine",
-        r"connector[- ]health",
-        r"last-seen",
-        r"reconciliation",
-        r"sequence gap",
-        r"redrive",
-        r"§23\.2",
-        r"D17",
-        r"AlertRuleV2",
-        r"#77",
-        r"P6",
-        r"calibration",
-        r"#6\b",
-        r"#84\b",
-        r"#15\b",
-        r"#17\b",
-    ):
-        assert re.search(pattern, section), pattern
+@pytest.mark.parametrize(
+    ("topic", "patterns"),
+    [
+        (
+            "D13 phase split",
+            (
+                r"D13",
+                r"#15\b",
+                r"quarantine",
+                r"connector[- ]health",
+                r"last-seen",
+                r"reconciliation",
+                r"sequence gap",
+                r"redrive",
+                r"§23\.2",
+            ),
+        ),
+        ("D17 AlertRuleV2", (r"D17", r"AlertRuleV2", r"#77\b")),
+        ("P6 calibration states", (r"P6", r"calibration")),
+        ("presence-aware value", (r"#6\b", r"Evaluation\.Value")),
+        ("lossless Flux literals", (r"#84\b", r"Flux")),
+        ("health views", (r"#17\b", r"health")),
+    ],
+)
+def test_gate11_out_of_scope_names_every_deferred_item(
+    topic: str, patterns: tuple[str, ...]
+) -> None:
+    section = markdown_section(runbook_text(), "Out of scope")
+    assert_topic_in_one_item(section, topic, patterns)
 
 
 # --- ADR phase split and README ----------------------------------------------------------------
 
 
+# sha256 of the `## Implementation gate` text on main before P2-09: it must stay unchanged.
+ADR_ORIGINAL_GATE_SHA256 = MappingProxyType(
+    {
+        ADR_006: "8a0096c1d9fbe4ac2752dbce277035ed7bcc64665bab6ba68d1c4c5a92cb9d8a",
+        ADR_007: "1d95075ae0cacc9febf2cfe7bc957d7b620efb71afb090641080032fc1b3dbf6",
+    }
+)
+
+
 @pytest.mark.parametrize(
     ("adr", "references"),
-    [(ADR_006, ("P3", "#15", "#17")), (ADR_007, ("P3", "#15"))],
+    [
+        (
+            ADR_006,
+            ("P2", "P3", "D16", "#15", "#17", "quarantine", "connector health", "event time"),
+        ),
+        (ADR_007, ("P2", "P3", "D16", "#15", "redrive", "dual write", "cardinality")),
+    ],
     ids=["ADR-006", "ADR-007"],
 )
 def test_adr_implementation_gate_ends_with_the_p2_phase_split(
@@ -1172,9 +1225,13 @@ def test_adr_implementation_gate_ends_with_the_p2_phase_split(
     paragraphs = [p.strip() for p in section.strip().split("\n\n") if p.strip()]
     assert len(paragraphs) >= 2, "the original gate paragraph must stay"
     assert paragraphs[-1].startswith("**Phase split (P2).**")
-    assert not paragraphs[0].startswith("**Phase split (P2).**")
+    original = "\n\n".join(paragraphs[:-1])
+    assert hashlib.sha256(original.encode("utf-8")).hexdigest() == ADR_ORIGINAL_GATE_SHA256[adr]
+    phase_split = " ".join(paragraphs[-1].split())
     for reference in references:
-        assert reference in paragraphs[-1], reference
+        assert reference in phase_split, reference
+    # ADRs live in docs/adr/, so the runbook link is relative to it.
+    assert "](../p2-telemetry-rollout-runbook.md)" in phase_split
 
 
 def test_readme_links_the_rollout_runbook() -> None:
