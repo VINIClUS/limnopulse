@@ -16,6 +16,7 @@ ROOT = Path(__file__).resolve().parents[2]
 def test_simulator_capture_contains_at_least_two_replayable_readings():
     result = subprocess.run(
         [sys.executable, str(ROOT / "ops/e2e/wokwi/replay.py"), "--dry-run"],
+        check=False,
         cwd=ROOT,
         capture_output=True,
         text=True,

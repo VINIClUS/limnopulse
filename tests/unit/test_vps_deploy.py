@@ -81,7 +81,13 @@ def deploy(tmp_path):
             "LIMNOPULSE_DEPLOY_SCRIPT_UNDER_TEST", str(ROOT / "ops/vps/limnopulse-deploy.sh")
         )
         result = subprocess.run(
-            ["bash", script], env=env, cwd=tmp_path, text=True, capture_output=True, timeout=10
+            ["bash", script],
+            check=False,
+            env=env,
+            cwd=tmp_path,
+            text=True,
+            capture_output=True,
+            timeout=10,
         )
         history = (
             [json.loads(line) for line in calls.read_text().splitlines()] if calls.exists() else []
@@ -187,6 +193,7 @@ def test_workflow_tag_validation_never_executes_input(tmp_path, payload):
     }
     result = subprocess.run(
         ["bash", "-e", "-c", script],
+        check=False,
         cwd=tmp_path,
         env=env,
         capture_output=True,
@@ -206,6 +213,7 @@ def test_production_gate_only_parses_the_example_configuration(tmp_path):
     docker.chmod(0o755)
     result = subprocess.run(
         ["make", "--no-print-directory", "verify-compose-production"],
+        check=False,
         cwd=ROOT,
         env={**os.environ, "PATH": f"{bin_dir}:{os.environ['PATH']}"},
         capture_output=True,
@@ -240,6 +248,7 @@ def test_deploy_configuration_keeps_production_defaults():
     env = {key: value for key, value in os.environ.items() if not key.startswith("LIMNOPULSE_")}
     result = subprocess.run(
         ["bash", "-c", script + '\nprintf "%s\\n" "$STACK_DIR" "$LOG" "$HEALTH_TIMEOUT_SECONDS"'],
+        check=False,
         env=env,
         capture_output=True,
         text=True,
@@ -288,6 +297,7 @@ def test_workflow_ssh_receives_the_tag_as_one_literal_argument(tmp_path, payload
     }
     result = subprocess.run(
         ["bash", "-e", "-c", render(step["run"])],
+        check=False,
         cwd=tmp_path,
         env=env,
         capture_output=True,
