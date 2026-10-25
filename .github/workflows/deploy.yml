@@ -21,8 +21,10 @@ jobs:
     environment: production
     steps:
       - name: Validate tag format
+        env:
+          IMAGE_TAG: ${{ inputs.image_tag }}
         run: |
-          tag="${{ inputs.image_tag }}"
+          tag="$IMAGE_TAG"
           if ! [[ "$tag" =~ ^main-[0-9a-f]{7,40}$ ]]; then
             echo "::error::image_tag must match ^main-[0-9a-f]{7,40}\$, got: $tag"
             exit 1

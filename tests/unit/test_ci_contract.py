@@ -155,6 +155,9 @@ def test_makefile_exposes_safe_reproducible_targets() -> None:
             "tofu -chdir=infra/opentofu validate -no-color",
         ],
         "verify-compose": ["docker compose config --quiet"],
+        "verify-compose-production": [
+            "IMAGE_TAG=main-0000000000000000000000000000000000000000 docker compose --env-file .env.production.example -f compose.production.yaml config --quiet"
+        ],
     }
     influx_recipe = [
         "uv sync --locked --extra dev",
