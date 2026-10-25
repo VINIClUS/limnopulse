@@ -11,9 +11,10 @@
 # itself (SSH_ORIGINAL_COMMAND), never a free-form shell.
 set -euo pipefail
 
-STACK_DIR=/opt/limnopulse
-COMPOSE="docker compose --env-file .env --env-file .env.image -f compose.production.yaml"
-LOG=/var/log/limnopulse-deploy.log
+STACK_DIR="${LIMNOPULSE_STACK_DIR:-/opt/limnopulse}"
+COMPOSE=(docker compose --env-file .env --env-file .env.image -f compose.production.yaml)
+LOG="${LIMNOPULSE_DEPLOY_LOG:-/var/log/limnopulse-deploy.log}"
+HEALTH_TIMEOUT_SECONDS="${LIMNOPULSE_HEALTH_TIMEOUT_SECONDS:-120}"
 
 log() {
   echo "$(date -u +%Y-%m-%dT%H:%M:%SZ) $*" | tee -a "$LOG"
@@ -22,6 +23,10 @@ log() {
 TAG="${SSH_ORIGINAL_COMMAND:-}"
 if ! [[ "$TAG" =~ ^main-[0-9a-f]{7,40}$ ]]; then
   log "rejected tag='$TAG' (must match main-<git-sha>)"
+  exit 1
+fi
+if ! [[ "$HEALTH_TIMEOUT_SECONDS" =~ ^[0-9]+$ ]]; then
+  log "invalid health timeout (must be a nonnegative integer)"
   exit 1
 fi
 
@@ -34,11 +39,22 @@ if [ -f .env.image ]; then
 fi
 
 rollback() {
-  log "deploy failed tag=$TAG, rolling back to prev=$PREV_TAG"
+  # Recovery failures must not recursively trigger another rollback.
+  trap - ERR
+  local rollback_failed=0
+  log "deploy failed tag=$TAG, rolling back to prev=$PREV_TAG" || true
   if [ -n "$PREV_TAG" ]; then
-    echo "IMAGE_TAG=$PREV_TAG" > .env.image
-    $COMPOSE pull >>"$LOG" 2>&1 || true
-    $COMPOSE up -d --remove-orphans >>"$LOG" 2>&1 || true
+    printf 'IMAGE_TAG=%s\n' "$PREV_TAG" > .env.image || rollback_failed=1
+    "${COMPOSE[@]}" pull >>"$LOG" 2>&1 || rollback_failed=1
+    "${COMPOSE[@]}" up -d --remove-orphans >>"$LOG" 2>&1 || rollback_failed=1
+  else
+    # Compose still needs the candidate env file while stopping its services.
+    # Stop preserves the volumes and network; this is not a stack reset.
+    "${COMPOSE[@]}" stop >>"$LOG" 2>&1 || rollback_failed=1
+    rm -f -- .env.image || rollback_failed=1
+  fi
+  if [ "$rollback_failed" -ne 0 ]; then
+    log "rollback failed; inspect the stack before retrying deployment" || true
   fi
   exit 1
 }
@@ -46,15 +62,15 @@ trap rollback ERR
 
 echo "IMAGE_TAG=$TAG" > .env.image
 
-$COMPOSE pull >>"$LOG" 2>&1
-$COMPOSE up -d --remove-orphans >>"$LOG" 2>&1
+"${COMPOSE[@]}" pull >>"$LOG" 2>&1
+"${COMPOSE[@]}" up -d --remove-orphans >>"$LOG" 2>&1
 
 log "waiting for api health"
-deadline=$((SECONDS + 120))
-until [ "$($COMPOSE ps -q api | xargs -r docker inspect -f '{{.State.Health.Status}}' 2>/dev/null)" = "healthy" ]; do
+deadline=$((SECONDS + 10#$HEALTH_TIMEOUT_SECONDS))
+until [ "$("${COMPOSE[@]}" ps -q api | xargs -r docker inspect -f '{{.State.Health.Status}}' 2>/dev/null)" = "healthy" ]; do
   if [ "$SECONDS" -ge "$deadline" ]; then
-    log "api did not become healthy within 120s"
-    exit 1
+    log "api did not become healthy within ${HEALTH_TIMEOUT_SECONDS}s"
+    rollback
   fi
   sleep 3
 done

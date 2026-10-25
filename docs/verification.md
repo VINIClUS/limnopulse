@@ -22,7 +22,29 @@ and `TOFU` Make variables when a controlled local binary is required.
   disabled, checks recursive formatting, and validates the configuration.
 - `make verify-compose` parses and validates `compose.yaml` quietly. It does
   not start, build, pull, or create services.
-- `make verify` runs all four boundaries.
+- `make verify-compose-production` parses `compose.production.yaml` with
+  `.env.production.example` and a dummy image tag. It does not start, build,
+  pull, or create services. The build workflow uses this same target.
+- `make verify` runs these five boundaries. Frontend checks remain separate:
+  run `npm ci`, `npm test`, `npm run typecheck` and `npm run build` inside
+  `frontend/` with Node 22, matching CI.
+
+`tests/unit/test_vps_deploy.py` executes the real deployment script in a
+temporary stack, replacing only Docker and SSH at the command boundary.
+It covers literal workflow inputs, promotion, pull/up failures, health
+timeout, rollback failure and first-deployment cleanup without deleting
+volumes. It never connects to the VPS.
+
+Build jobs for pull requests use read-only repository access and do not
+persist checkout credentials. Only the separate publisher, gated on a push
+to `main`, receives `packages: write`; both paths use the same four-image
+matrix and build steps. The parse-only production gate remains read-only.
+
+Leave rollout variables unset for the normal test command so each test can
+choose its settings. Forcing `V1_POND_DEVICE_PROJECTION_ENABLED=false` in the
+process environment also overrides the deliberately enabled defaults of test
+Settings subclasses. Keep local `.env` rollout flags absent or at their
+documented defaults; use explicit flags for the opt-in E2E processes below.
 
 The Python suite includes `tests/integration/test_notifications_local.py`, but
 that multiprocess integration remains opt-in. It is skipped unless
@@ -152,6 +174,54 @@ unless the dispatch input `allow_v2_unavailable` or the repository variable
 simulates the probe sketch and replays its serial output, and it runs only
 when the `WOKWI_CLI_TOKEN` secret is configured; a separate gate job checks
 for the secret, and only the simulation step receives it.
+
+### Local Wokwi toolchain and access
+
+Use the versions and SHA-256 checksums in `.github/workflows/e2e-m1.yml`:
+Arduino CLI 1.3.1, ESP32 core 3.0.7, Wokwi CLI 0.28.1, MQTTX CLI 1.13.1,
+Node-RED 5.0.8, pyserial 3.5 and the four Arduino libraries pinned there.
+Install binaries and libraries in a user-owned tool directory; an isolated
+Python environment for pyserial avoids changing system Python. Keep Node 22
+available for these tools without changing an existing global Node default.
+
+Create a free account at https://wokwi.com/login and a CI token at
+https://wokwi.com/dashboard/ci. The Free allowance is 50 simulation minutes
+in a rolling 30-day window, with a five-minute maximum per session. Store the
+token outside the checkout in a mode-0600 file and register it as the Actions
+secret `WOKWI_CLI_TOKEN`. Feed it to `gh secret set` through stdin and to the
+simulator through its process environment; never put the value in a command
+argument, `.env`, shell history or serial log.
+
+Compile and lint without a token:
+
+```bash
+arduino-cli compile --fqbn esp32:esp32:esp32 --warnings default \
+  --output-dir ops/e2e/wokwi/build ops/e2e/wokwi/sketch/limnopulse_probe
+wokwi-cli lint --warnings-as-errors ops/e2e/wokwi
+```
+
+With `WOKWI_CLI_TOKEN` securely loaded into the simulator's environment:
+
+```bash
+wokwi-cli ops/e2e/wokwi --scenario scenario.yaml \
+  --serial-log-file ops/e2e/wokwi/serial.log --timeout 120000
+WOKWI_SERIAL_LOG=ops/e2e/wokwi/serial.log \
+  uv run --locked --no-sync python -m pytest -q tests/e2e/test_wokwi_capture.py
+```
+
+The scenario waits for the end of each JSON line; the strict replay parser
+consumes the capture without dropping malformed records. MQTT access from
+inside the simulator is optional: replay the serial output through the local
+MQTTX/Node-RED harness. A Private IoT Gateway is not required. Run the M1 E2E
+with `WOKWI_SERIAL_LOG` pointing to the capture, and dispatch `e2e-m1` to verify
+the GitHub secret too. A skipped job or the deterministic fixture alone does
+not establish that online simulation works.
+
+For local integration, select a dedicated `COMPOSE_PROJECT_NAME`, an explicit
+Compose file list, disposable DynamoDB tables and local endpoints. Check port
+conflicts first. Use the same project/files during cleanup; preserve the
+default development stack's volumes. Influx integration uses the exact
+2.7.11 digest above, independently of mutable development tags.
 
 `ops/e2e/ci_stack.sh down` stops the API and runs `docker compose down -v`,
 which deletes the local compose volumes (DynamoDB, Influx and broker data). It

@@ -1,9 +1,9 @@
 UV ?= uv
 TOFU ?= tofu
 
-.PHONY: verify verify-python verify-go verify-tofu verify-compose verify-influx
+.PHONY: verify verify-python verify-go verify-tofu verify-compose verify-compose-production verify-influx
 
-verify: verify-python verify-go verify-tofu verify-compose
+verify: verify-python verify-go verify-tofu verify-compose verify-compose-production
 
 verify-python:
 	$(UV) lock --check
@@ -20,6 +20,9 @@ verify-tofu:
 
 verify-compose:
 	docker compose config --quiet
+
+verify-compose-production:
+	IMAGE_TAG=main-0000000000000000000000000000000000000000 docker compose --env-file .env.production.example -f compose.production.yaml config --quiet
 
 verify-influx:
 	$(UV) sync --locked --extra dev

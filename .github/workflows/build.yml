@@ -11,33 +11,38 @@ concurrency:
 
 permissions:
   contents: read
-  packages: write
 
 jobs:
   compose-production-config:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+        with:
+          persist-credentials: false
       - name: Validate compose.production.yaml (parse only, no start)
-        run: docker compose -f compose.production.yaml config --quiet
+        run: make verify-compose-production
 
   image:
+    # PR-controlled builds never receive a package publishing token.
+    if: github.event_name == 'pull_request'
     needs: compose-production-config
     runs-on: ubuntu-latest
-    strategy:
+    strategy: &image-strategy
       matrix:
         app:
           - api
           - frontend
           - alert-evaluator
           - notifications
-    steps:
+    steps: &image-steps
       - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+        with:
+          persist-credentials: false
 
       - uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f # v3
 
       - name: Log in to GHCR
-        if: github.event_name != 'pull_request'
+        if: github.event_name == 'push' && github.ref == 'refs/heads/main'
         uses: docker/login-action@c94ce9fb468520275223c153574b00df6fe4bcc9 # v3.7.0
         with:
           registry: ghcr.io
@@ -54,7 +59,7 @@ jobs:
           context: .
           file: Dockerfile.${{ matrix.app }}
           platforms: linux/amd64
-          push: ${{ github.event_name != 'pull_request' }}
+          push: ${{ github.event_name == 'push' && github.ref == 'refs/heads/main' }}
           tags: ghcr.io/viniclus/limnopulse/${{ matrix.app }}:main-${{ github.sha }}
           build-args: |
             VITE_COGNITO_USER_POOL_ID=${{ vars.VITE_COGNITO_USER_POOL_ID }}
@@ -63,3 +68,14 @@ jobs:
           sbom: true
           cache-from: type=gha,scope=${{ matrix.app }}
           cache-to: type=gha,mode=max,scope=${{ matrix.app }}
+
+  publish:
+    # Only a main-branch push can authenticate to GHCR and publish images.
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    needs: compose-production-config
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+    strategy: *image-strategy
+    steps: *image-steps
