@@ -53,16 +53,27 @@ never automatically deploys production").
 ## 3. Deploy user
 
 ```bash
-useradd --system --create-home --shell /usr/sbin/nologin limnopulse-deploy
+useradd --system --create-home --shell /bin/bash limnopulse-deploy
+usermod -aG docker limnopulse-deploy
 mkdir -p /home/limnopulse-deploy/.ssh
 chmod 700 /home/limnopulse-deploy/.ssh
 ```
 
+`/bin/bash`, not `/usr/sbin/nologin` — `nologin` intercepts the SSH
+forced-command before it ever runs and always prints "This account is
+currently not available.", regardless of `authorized_keys`. The `command=`
+restriction below is what actually locks the account down, not the shell.
+Verified empirically; matches the working `cnesdeploy`/`cnesdeployprod` shell
+choice on this same VPS.
+
 Install the scp'd deploy script as `/usr/local/bin/limnopulse-deploy`
-(root:root, 0755):
+(root:root, 0755), and pre-create its log file (the deploy script runs as
+`limnopulse-deploy`, which can't create a file directly under `/var/log`):
 
 ```bash
 install -o root -g root -m 0755 /tmp/limnopulse-deploy.sh /usr/local/bin/limnopulse-deploy
+touch /var/log/limnopulse-deploy.log
+chown limnopulse-deploy:limnopulse-deploy /var/log/limnopulse-deploy.log
 ```
 
 Generate a dedicated deploy key locally (not one already in use elsewhere)
@@ -77,6 +88,14 @@ command="/usr/local/bin/limnopulse-deploy",no-port-forwarding,no-agent-forwardin
 ```bash
 chown -R limnopulse-deploy:limnopulse-deploy /home/limnopulse-deploy/.ssh
 chmod 600 /home/limnopulse-deploy/.ssh/authorized_keys
+```
+
+`/opt/limnopulse` (step 1) also needs to be owned by `limnopulse-deploy`, not
+root, since the deploy script writes `.env.image` there and runs `docker
+compose` as that user:
+
+```bash
+chown -R limnopulse-deploy:limnopulse-deploy /opt/limnopulse
 ```
 
 Register the **private** half as the `VPS_SSH_KEY` secret, and
@@ -139,3 +158,28 @@ site with a login that can never succeed. Order:
    checklist in the plan document.
 
 Finally, clean up the staging copies: `rm -f /tmp/limnopulse-deploy.sh /tmp/Caddyfile.limnopulse`.
+
+## Deployment verification and recovery
+
+Before promoting a release, run `make verify-compose-production` locally.
+This parses the production manifest using the example environment and a dummy
+image tag; it does not start services or contact the VPS. The build workflow
+uses the same gate.
+
+The deploy script rolls back after a failed image pull, failed Compose update
+or API health timeout. It restores the previous tag and attempts both pull and
+update, reporting any recovery failure and always exiting nonzero for the
+failed promotion. On a first deployment with no previous tag, it stops the
+candidate services before removing `.env.image`, preserving all volumes.
+Inspect `/var/log/limnopulse-deploy.log` before retrying a failed promotion.
+
+For isolated testing, the script accepts `LIMNOPULSE_STACK_DIR`,
+`LIMNOPULSE_DEPLOY_LOG` and `LIMNOPULSE_HEALTH_TIMEOUT_SECONDS`. Defaults remain
+`/opt/limnopulse`, `/var/log/limnopulse-deploy.log` and 120 seconds. A zero-second
+timeout performs one health check and immediately recovers if unhealthy.
+The forced SSH command still accepts only an image tag, never shell code or
+configuration arguments. CI receives `image_tag` through its environment.
+
+The script is installed manually and remains root-owned. Merging a correction
+does not update `/usr/local/bin/limnopulse-deploy` on an existing VPS: copy and
+install the reviewed script using step 3 before relying on its recovery fixes.
