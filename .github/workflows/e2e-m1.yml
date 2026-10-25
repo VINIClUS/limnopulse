@@ -141,7 +141,7 @@ jobs:
         env:
           RUN_M1_E2E: "1"
           WOKWI_SERIAL_LOG: ops/e2e/wokwi/serial.log
-        run: uv run --locked --no-sync python -m pytest -q tests/e2e/test_m1_e2e_stack.py
+        run: uv run --locked --no-sync python -m pytest -q tests/e2e/test_wokwi_capture.py tests/e2e/test_m1_e2e_stack.py
       - name: Diagnostics
         if: failure()
         run: |
