@@ -240,6 +240,42 @@ def test_ci_reuses_the_production_configuration_gate():
     ]
 
 
+def test_pr_controlled_build_jobs_cannot_publish_or_persist_checkout_credentials():
+    workflow = yaml.load((ROOT / ".github/workflows/build.yml").read_text(), Loader=yaml.BaseLoader)
+    defaults = workflow["permissions"]
+    assert defaults.get("packages", "none") != "write"
+    publishing_jobs = []
+    for name, job in workflow["jobs"].items():
+        permissions = job.get("permissions", defaults)
+        assert permissions.get("contents") == "read"
+        if permissions.get("packages") == "write":
+            publishing_jobs.append(name)
+            assert job["if"] == "github.event_name == 'push' && github.ref == 'refs/heads/main'"
+        for step in job["steps"]:
+            if step.get("uses", "").startswith("actions/checkout@"):
+                assert step["with"]["persist-credentials"] == "false"
+    assert set(publishing_jobs) == {"publish"}
+    assert workflow["jobs"]["image"]["if"] == "github.event_name == 'pull_request'"
+    publisher = workflow["jobs"]["publish"]
+    assert publisher["needs"] in ("compose-production-config", ["compose-production-config"])
+    assert publisher["strategy"] == workflow["jobs"]["image"]["strategy"]
+    assert set(publisher["strategy"]["matrix"]["app"]) == {
+        "api",
+        "frontend",
+        "alert-evaluator",
+        "notifications",
+    }
+    for job_name in ("image", "publish"):
+        builder = next(
+            step
+            for step in workflow["jobs"][job_name]["steps"]
+            if step.get("uses", "").startswith("docker/build-push-action@")
+        )
+        assert builder["with"]["push"] == (
+            "${{ github.event_name == 'push' && github.ref == 'refs/heads/main' }}"
+        )
+
+
 def test_deploy_configuration_keeps_production_defaults():
     # Evaluate only setup declarations, before tag validation or any deploy I/O.
     script = (
