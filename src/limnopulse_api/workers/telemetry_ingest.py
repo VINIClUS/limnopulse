@@ -51,13 +51,34 @@ from limnopulse_api.workers.telemetry_ingest_loop import IngestWorkerConfig, Ing
 logger = logging.getLogger("limnopulse.telemetry.ingest")
 
 EXIT_REFUSED = 2
-_CONNECT_TIMEOUT_SECONDS = 10
-_DYNAMODB_READ_TIMEOUT_SECONDS = 30
-# Added to the long-poll wait, so an idle receive returns well before the read times out.
-_SQS_READ_TIMEOUT_MARGIN_SECONDS = 20
-# Standard mode retries throttling and transient errors with a bounded number of attempts, so
-# one hung call cannot hold the drain past the compose stop grace (A47).
-_RETRIES = {"mode": "standard", "max_attempts": 3}
+# Shutdown budget (A47): after SIGTERM an in-flight long poll may run `wait + 5` s, then the
+# drain gets `drain_seconds`, and the loop still waits for any boto3 call already in flight
+# (heartbeat, delete, visibility change or a DynamoDB request). Each client's worst single call
+# is bounded below, and SHUTDOWN_CALL_BUDGET_SECONDS is the larger of the two, so
+# `wait + 5 + drain + SHUTDOWN_CALL_BUDGET_SECONDS` must stay below the compose stop grace.
+_CONNECT_TIMEOUT_SECONDS = 3
+# SQS: no botocore retry (the loop retries a failed poll, and a failed heartbeat, delete or
+# visibility change only means a later redelivery). The read timeout must outlast the long poll.
+_SQS_READ_TIMEOUT_MARGIN_SECONDS = 5
+_SQS_RETRIES = {"mode": "standard", "max_attempts": 1}
+# DynamoDB: one bounded retry for throttling or a transient error.
+_DYNAMODB_READ_TIMEOUT_SECONDS = 10
+_DYNAMODB_RETRIES = {"mode": "standard", "max_attempts": 2}
+
+
+def shutdown_call_budget_seconds(settings: Settings) -> int:
+    """The longest a single in-flight SQS or DynamoDB call can take, retries included."""
+    sqs = _SQS_RETRIES["max_attempts"] * (
+        _CONNECT_TIMEOUT_SECONDS
+        + settings.telemetry_ingest_worker_wait_seconds
+        + _SQS_READ_TIMEOUT_MARGIN_SECONDS
+    )
+    dynamodb = _DYNAMODB_RETRIES["max_attempts"] * (
+        _CONNECT_TIMEOUT_SECONDS + _DYNAMODB_READ_TIMEOUT_SECONDS
+    )
+    return max(sqs, dynamodb)
+
+
 _LOCAL_ENVIRONMENTS = {"local", "test"}
 
 
@@ -96,7 +117,7 @@ def build_worker(
         config=Config(
             connect_timeout=_CONNECT_TIMEOUT_SECONDS,
             read_timeout=_DYNAMODB_READ_TIMEOUT_SECONDS,
-            retries=_RETRIES,
+            retries=_DYNAMODB_RETRIES,
         ),
     )
     sqs = client_factory(
@@ -106,7 +127,7 @@ def build_worker(
             connect_timeout=_CONNECT_TIMEOUT_SECONDS,
             read_timeout=settings.telemetry_ingest_worker_wait_seconds
             + _SQS_READ_TIMEOUT_MARGIN_SECONDS,
-            retries=_RETRIES,
+            retries=_SQS_RETRIES,
         ),
     )
     influxdb = influx_client_factory(

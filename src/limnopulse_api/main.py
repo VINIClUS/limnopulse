@@ -1,3 +1,4 @@
+import logging
 from contextlib import asynccontextmanager
 
 import boto3
@@ -31,7 +32,10 @@ from limnopulse_api.adapters.notification_preferences import (
 from limnopulse_api.adapters.redis import RedisCacheRepository
 from limnopulse_api.adapters.sqs_ingestion import SqsIngressQueue
 from limnopulse_api.adapters.telegram_bindings import DynamoTelegramBindingRepository
-from limnopulse_api.adapters.telemetry_metrics_log import StructuredLogTelemetryMetrics
+from limnopulse_api.adapters.telemetry_metrics_log import (
+    METRICS_LOGGER,
+    StructuredLogTelemetryMetrics,
+)
 from limnopulse_api.api.ingestion_dependencies import INGESTION_STATE_NAMES
 from limnopulse_api.api.router import build_api_router
 from limnopulse_api.api.v2.router import v2_safe_request_validation_exception_handler
@@ -78,8 +82,21 @@ def _cognito_client_kwargs(settings: Settings) -> dict[str, str]:
     return kwargs
 
 
+def _enable_metrics_logging() -> None:
+    """Emit the INFO metric lines of `StructuredLogTelemetryMetrics` under uvicorn, which
+    configures only its own loggers (the root stays at WARNING with no handler)."""
+    metrics_logger = logging.getLogger(METRICS_LOGGER)
+    metrics_logger.setLevel(logging.INFO)
+    if not any(getattr(h, "_limnopulse_metrics", False) for h in metrics_logger.handlers):
+        handler = logging.StreamHandler()
+        handler.setFormatter(logging.Formatter("%(message)s"))
+        handler._limnopulse_metrics = True  # type: ignore[attr-defined]
+        metrics_logger.addHandler(handler)
+
+
 def _wire_ingestion(app: FastAPI, settings: Settings, dynamodb_client: object) -> None:
     """The frozen P3 `app.state` ports (D15); built only when `INGEST_V2_ENABLED`."""
+    _enable_metrics_logging()
     table = settings.dynamodb_domain_table
     audit_table = settings.dynamodb_audit_table
     credentials = DynamoIngestCredentialRepository(

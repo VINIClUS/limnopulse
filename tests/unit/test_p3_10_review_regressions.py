@@ -7,9 +7,14 @@
   are empty, instead of polling with no credentials while the API keeps answering 202.
 - The production worker passes its tuning knobs through (except drain and wait, which A47 binds
   to the stop grace) and disables the instance-metadata credential lookup.
+- Codex review on #120: the shutdown budget (poll grace + drain + the longest in-flight boto3
+  call, retries included) fits the compose stop grace, and the API emits its INFO ingest
+  metrics under uvicorn.
 """
 
 import asyncio
+import logging
+import re
 from pathlib import Path
 from typing import Any
 
@@ -217,3 +222,85 @@ def test_production_worker_passes_tuning_knobs_except_drain_and_wait() -> None:
     # A47 binds these two to the 75 s stop grace; they stay at their defaults.
     assert "TELEMETRY_INGEST_DRAIN_SECONDS" not in environment
     assert "TELEMETRY_INGEST_WORKER_WAIT_SECONDS" not in environment
+
+
+def _grace_seconds(path: Path) -> int:
+    compose = yaml.safe_load(path.read_text(encoding="utf-8"))
+    value = compose["services"]["telemetry-ingest-worker"]["stop_grace_period"]
+    match = re.fullmatch(r"(?:(?P<m>[0-9]+)m)?(?:(?P<s>[0-9]+)s)?", value)
+    assert match is not None and value
+    return int(match.group("m") or 0) * 60 + int(match.group("s") or 0)
+
+
+@pytest.mark.parametrize("name", ["compose.yaml", "compose.production.yaml"])
+def test_stop_grace_covers_poll_grace_drain_and_one_in_flight_call(name: str) -> None:
+    defaults = Settings(_env_file=None, app_env="test", auth_mode="dev")
+    budget = (
+        defaults.telemetry_ingest_worker_wait_seconds
+        + 5  # the P3-08 loop's _POLL_GRACE_SECONDS
+        + defaults.telemetry_ingest_drain_seconds
+        + telemetry_ingest.shutdown_call_budget_seconds(defaults)
+    )
+
+    assert _grace_seconds(ROOT / name) > budget
+
+
+@pytest.mark.parametrize("service_name", ["dynamodb", "sqs"])
+def test_shutdown_call_budget_matches_the_built_clients(service_name: str) -> None:
+    clients = _Clients()
+    settings = Settings(
+        _env_file=None,
+        app_env="test",
+        auth_mode="dev",
+        telemetry_v2_write_enabled=True,
+        sqs_telemetry_ingress_queue_url=QUEUE_URL,
+    )
+
+    build_worker(settings, client_factory=clients.client, influx_client_factory=clients.influx)
+
+    config = clients.calls[service_name]["config"]
+    worst = config.retries["max_attempts"] * (config.connect_timeout + config.read_timeout)
+    assert worst <= telemetry_ingest.shutdown_call_budget_seconds(settings)
+
+
+def test_api_emits_info_ingest_metrics_when_ingest_is_on(monkeypatch: pytest.MonkeyPatch) -> None:
+    class _Redis:
+        async def aclose(self, close_connection_pool=None) -> None:
+            return None
+
+    class _Influx:
+        def __init__(self, **kwargs: Any) -> None:
+            pass
+
+        def query_api(self) -> object:
+            return object()
+
+        def write_api(self, *args: Any, **kwargs: Any) -> object:
+            return object()
+
+        def close(self) -> None:
+            pass
+
+    monkeypatch.setattr("limnopulse_api.main.boto3.client", lambda name, **kwargs: object())
+    monkeypatch.setattr("limnopulse_api.main.redis.from_url", lambda url: _Redis())
+    monkeypatch.setattr("limnopulse_api.main.InfluxDBClient", _Influx)
+    metrics_logger = logging.getLogger("limnopulse.telemetry.metrics")
+    monkeypatch.setattr(metrics_logger, "level", logging.NOTSET)
+    monkeypatch.setattr(metrics_logger, "handlers", [])
+    app = create_app(
+        Settings(
+            _env_file=None,
+            app_env="test",
+            auth_mode="dev",
+            api_v2_enabled=True,
+            telemetry_v2_write_enabled=True,
+            ingest_v2_enabled=True,
+            sqs_telemetry_ingress_queue_url=QUEUE_URL,
+        )
+    )
+
+    with TestClient(app):
+        pass
+
+    assert metrics_logger.isEnabledFor(logging.INFO)
+    assert metrics_logger.handlers, "uvicorn configures no handler for this logger"

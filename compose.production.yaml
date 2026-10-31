@@ -175,7 +175,8 @@ services:
       AWS_EC2_METADATA_DISABLED: "true"
       # Tuning knobs, defaulted as in core/config.py. TELEMETRY_INGEST_DRAIN_SECONDS and
       # TELEMETRY_INGEST_WORKER_WAIT_SECONDS stay at their defaults on purpose: the stop grace
-      # below must exceed drain + wait + 5 s poll grace (A47); change all three together.
+      # below must exceed wait + 5 s poll grace + drain + the in-flight call budget (A47; see
+      # workers/telemetry_ingest.py); change them together.
       TELEMETRY_INGEST_WORKER_CONCURRENCY: ${TELEMETRY_INGEST_WORKER_CONCURRENCY:-4}
       TELEMETRY_INGEST_WORKER_MAX_MESSAGES: ${TELEMETRY_INGEST_WORKER_MAX_MESSAGES:-10}
       TELEMETRY_INGEST_WORKER_VISIBILITY_SECONDS: ${TELEMETRY_INGEST_WORKER_VISIBILITY_SECONDS:-60}
@@ -194,7 +195,7 @@ services:
       - no-new-privileges:true
     cap_drop: [ALL]
     init: true
-    stop_grace_period: 75s
+    stop_grace_period: 90s
     deploy:
       resources:
         limits:
