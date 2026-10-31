@@ -154,6 +154,12 @@ def test_readme_rollbacks_recreate_instead_of_restarting() -> None:
     assert re.search(r"set `INGEST_V2_ENABLED=false` and recreate the API", p3)
     assert re.search(r"`docker compose [^`]*up -d api`", p3)
     assert "](docs/p3-ingestion-rollout-runbook.md#rollback)" in p3
+    # The architecture overview repeats both rollbacks; it must not keep the old instruction.
+    architecture = " ".join((ROOT / "docs/architecture.md").read_text(encoding="utf-8").split())
+    assert "unset `INGEST_V2_ENABLED`" not in architecture
+    assert "restart the API" not in architecture
+    assert "set `INGEST_V2_ENABLED=false` and recreate the API" in architecture
+    assert "defaults and restart." not in architecture
     # GitHub's `#rollback` anchor needs a heading whose text is exactly "Rollback".
     assert re.search(r"^#+ Rollback\s*$", RUNBOOK.read_text(encoding="utf-8"), re.MULTILINE)
 

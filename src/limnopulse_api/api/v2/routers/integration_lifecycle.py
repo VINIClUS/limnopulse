@@ -1,8 +1,9 @@
 """Unmounted `/v2` lifecycle routes for IntegrationAccounts and DeviceIntegrations (P3-04).
 
 Owner and admin only. P3-10 mounts the router under `/v2` when `INGEST_V2_ENABLED` is on. Every
-transition is version-fenced and writes one D23 audit item; a DeviceIntegration that the path
-Device does not own is 404.
+transition is version-fenced and writes one D23 audit item; a same-status request (for example
+active to active) is a 200 no-op that returns the row unchanged and audits nothing (#116). A
+DeviceIntegration that the path Device does not own is 404, before the version check.
 """
 
 from typing import Annotated
