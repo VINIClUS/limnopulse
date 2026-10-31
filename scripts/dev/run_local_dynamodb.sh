@@ -120,6 +120,8 @@ if [[ ! -f "${JAR_PATH}" ]]; then
 fi
 
 # In-memory: every run starts empty, and the harness creates and deletes its own tables.
+# Started from the cache directory, where DynamoDB Local writes its metadata file.
+cd "${CACHE_DIR}"
 nohup java -Djava.library.path="${INSTALL_DIR}/DynamoDBLocal_lib" -jar "${JAR_PATH}" \
   -inMemory -port "${PORT}" >"${LOG_FILE}" 2>&1 &
 pid="$!"
