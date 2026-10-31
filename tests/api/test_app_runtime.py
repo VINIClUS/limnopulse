@@ -20,6 +20,7 @@ from limnopulse_api.adapters.notification_preferences import (
 )
 from limnopulse_api.adapters.redis import RedisCacheRepository
 from limnopulse_api.adapters.telegram_bindings import DynamoTelegramBindingRepository
+from limnopulse_api.api.ingestion_dependencies import INGESTION_STATE_NAMES
 from limnopulse_api.auth.cognito import CognitoJwtAuthProvider
 from limnopulse_api.auth.models import Principal
 from limnopulse_api.core.config import Settings
@@ -45,6 +46,11 @@ P2_FLAG_ENVIRONMENT = (
     "TELEMETRY_LEGACY_DUAL_WRITE_ENABLED",
     "API_V2_TELEMETRY_ENABLED",
     "V1_TELEMETRY_READ_SOURCE",
+    # P3-10: the ingest switch and its queue settings never leak in from the environment.
+    "INGEST_V2_ENABLED",
+    "SQS_ENDPOINT_URL",
+    "SQS_TELEMETRY_INGRESS_QUEUE_URL",
+    "SQS_TELEMETRY_INGRESS_DLQ_URL",
 )
 
 
@@ -412,7 +418,9 @@ def test_lifespan_wires_m1_repositories_to_the_one_dynamo_client(
         assert {repository.table_name for repository in repositories} == {"DomainUnderTest"}
 
 
-@pytest.mark.parametrize("prewired_name", [*M1_REPOSITORY_TYPES, *P2_STATE_NAMES])
+@pytest.mark.parametrize(
+    "prewired_name", [*M1_REPOSITORY_TYPES, *P2_STATE_NAMES, *INGESTION_STATE_NAMES]
+)
 def test_prewired_m1_repository_skips_runtime_wiring(monkeypatch, prewired_name: str) -> None:
     def fail(*args, **kwargs):
         raise AssertionError("prewired test apps must not create runtime clients")
