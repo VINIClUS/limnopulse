@@ -1,7 +1,9 @@
 """Trusted source observations -> canonical V4 observations (P2-06).
 
 Per observation, in order: Component ownership and measurement capability, catalog metric,
-unit conversion, then the Deployment at event time. The Deployment is resolved only with
+unit conversion, then the Deployment at event time. Measurement capability (P2 D14): an actuator
+never measures, and a probe or hybrid with a non-empty `measurement_metric_keys` measures only
+those metrics; an empty set (legacy defaults) is not gated. The Deployment is resolved only with
 `get_deployment_at` (ADR-006): there is no fallback to the current Deployment, so an
 observation outside every interval is quarantined as `deployment_unresolved`.
 
@@ -142,6 +144,14 @@ class _NormalizationCall:
         if component.kind is ComponentKind.ACTUATOR:
             raise _Quarantine(
                 QuarantineReason.COMPONENT_NOT_MEASURING, "actuator components do not measure"
+            )
+        declared = (
+            component.probe_profile.measurement_metric_keys if component.probe_profile else ()
+        )
+        if declared and source.metric_key not in declared:
+            raise _Quarantine(
+                QuarantineReason.COMPONENT_NOT_MEASURING,
+                "metric is not declared by the component's probe profile",
             )
         metric = metric_definition(
             source.metric_key, version=versions.catalog_version, catalogs=normalizer.catalogs

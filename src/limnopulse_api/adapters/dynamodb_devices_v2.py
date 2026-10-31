@@ -273,8 +273,12 @@ class DynamoDeviceComponentRepository(DynamoV2RepositoryBase):
 
     # Devices ---------------------------------------------------------------------------------
 
-    async def get_device(self, tenant_id: str, device_id: str) -> DeviceV2 | None:
-        item = await self.get_item(self.keys.device(tenant_id, device_id))
+    async def get_device(
+        self, tenant_id: str, device_id: str, *, consistent: bool = False
+    ) -> DeviceV2 | None:
+        """M1 reads stay eventually consistent; `consistent=True` is the adapter-only P3 read
+        (`ConsistentDeviceReader`) used by admission and the fence."""
+        item = await self.get_item(self.keys.device(tenant_id, device_id), consistent=consistent)
         if item is None or item.get("tenant_id") != tenant_id:
             return None
         return device_v2_from_item(item)
