@@ -390,6 +390,8 @@ Receipt keys use `idempotency_key_hash` on the raw key, scoped to the authentica
 }
 ```
 - **Serialization.** Compact: `separators=(",", ":")`, `exclude_none`, `exclude_defaults`.
+  - **Exception:** `mapping_versions` is always serialized with all three version strings, even when they equal the current defaults, so a later default change cannot re-fill them on parse.
+  - P3-00 adds a wire-format vector that requires `catalog_version`, `unit_mapping_version` and `quality_policy_version` to appear literally in the JSON.
 - **Parsing.** The worker parses with `IngressEnvelope.model_validate_json` and rebuilds `SourceObservation`s.
 - **Context.** The `TrustedSourceContext` is:
   - `tenant_id`, `device_id` from the **re-resolved** DI;
@@ -1566,3 +1568,4 @@ Applied inline. Sources:
 | A36 | issue audit | The ports take `audit: AuditContext`. New: the `IngressDenial.observation_index` field, the `ConsistentDeviceReader` and `DeviceComponentLister` ports, a condition → enum table, a wider fake subset (issuance check, simple mark, `ALL_OLD`), and the `build_ingest_marks` fence input. |
 | A37 | issue audit | Ownership changes: P3-08 builds the quarantine rows and ordinals. Test changes: quarantine logical expiry; the fallback vectors are owned by P3-06. |
 | A38 | issue audit | Task text aligned with the issues:<br>• P3-02 audit `PutItem` (absent today), plus the exact test names;<br>• the P3-03 statuses and redaction scope;<br>• the P3-04 audit, path check and roles;<br>• the P3-05 error type, `send_raw` and tests;<br>• the P3-08 acceptance and InfluxDB requirement;<br>• the P3-10 rehearsal and the worker's InfluxDB dependency;<br>• the P3-11 runbook items and the post-merge CI check.<br>Also: the metrics emission unit, the replay id namespace, and the D16 decision wording. |
+| A39 | Codex | `mapping_versions` is exempt from `exclude_defaults`, and a wire-format vector requires all three version strings. |
