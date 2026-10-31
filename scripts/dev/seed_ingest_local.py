@@ -40,6 +40,7 @@ from limnopulse_api.domain.integrations import (
 )
 from limnopulse_api.services.ingest_credentials import IngestCredentialService
 from limnopulse_api.services.integrations import IntegrationService
+from limnopulse_api.workers.telemetry_ingest import dynamodb_client_kwargs
 
 TENANT_ID = "tnt_local_001"
 DEVICE_ID = "local-device-001"
@@ -57,13 +58,8 @@ def _status(message: str) -> None:
 
 
 async def seed(settings: Settings) -> str:
-    client = boto3.client(
-        "dynamodb",
-        region_name=settings.aws_region,
-        endpoint_url=settings.dynamodb_endpoint_url,
-        aws_access_key_id="local",
-        aws_secret_access_key="local",
-    )
+    # The worker's helper: dummy credentials only for a local endpoint in APP_ENV local/test.
+    client = boto3.client("dynamodb", **dynamodb_client_kwargs(settings))
     table = settings.dynamodb_domain_table
     audit_table = settings.dynamodb_audit_table
     integrations = DynamoIntegrationRepository(table, client, audit_table_name=audit_table)

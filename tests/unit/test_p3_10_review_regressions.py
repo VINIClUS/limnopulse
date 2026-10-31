@@ -304,3 +304,12 @@ def test_api_emits_info_ingest_metrics_when_ingest_is_on(monkeypatch: pytest.Mon
 
     assert metrics_logger.isEnabledFor(logging.INFO)
     assert metrics_logger.handlers, "uvicorn configures no handler for this logger"
+
+
+def test_seed_script_hard_codes_no_aws_access_keys() -> None:
+    """Sonar python:S7625 on #120: the seed reuses the worker's local-only client kwargs."""
+    source = (ROOT / "scripts/dev/seed_ingest_local.py").read_text(encoding="utf-8")
+
+    assert "aws_access_key_id=" not in source
+    assert "aws_secret_access_key=" not in source
+    assert "dynamodb_client_kwargs(settings)" in source
