@@ -24,6 +24,7 @@ guessed.
 
 import ast
 import functools
+import os
 import re
 from collections.abc import Callable, Iterator
 from dataclasses import dataclass, field
@@ -145,7 +146,7 @@ TRANSACTION_FORWARDERS = {
 
 # Least-privilege bounds of the unconditional grants. `REQUIRED` must all be present; anything
 # beyond `REQUIRED | LEGACY_INDEX_GRANTS` is rejected. The legacy entries are actions granted on
-# `index/*` before issue #108: only Query is authorized on an index, so they authorize nothing
+# `index/*` before issue #108: only Query and Scan are authorized on an index, so they authorize nothing
 # and may be dropped, but not added to.
 _DOMAIN_READS = {("dynamodb:GetItem", "domain"), ("dynamodb:Query", "domain")}
 REQUIRED_DYNAMODB_GRANTS = {
@@ -208,6 +209,7 @@ def _norm(pairs: set[tuple[str, str]]) -> set[tuple[str, str]]:
 
 _DOMAIN_TABLE_EXPRESSIONS = {"self.table_name", "self.domain_table_name"}
 _AUDIT_TABLE_EXPRESSIONS = {"self.audit_table_name"}
+_TABLE_ATTRIBUTES = {"table_name", "domain_table_name", "audit_table_name"}
 _MAX_DEPTH = 25
 
 
@@ -294,6 +296,7 @@ class _PythonSources:
             item_keys: set[int] = set()
             self._walk(tree, module, None, None, item_keys)
             self._find_strays(tree, module, item_keys)
+            self._find_write_values(tree, module)
 
     @classmethod
     def from_paths(cls, paths: list[Path]) -> "_PythonSources":
@@ -317,6 +320,8 @@ class _PythonSources:
                 self._walk(child, module, function, child.name, item_keys)
                 continue
             if isinstance(child, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                if child.name in _TABLE_ATTRIBUTES:  # e.g. a `table_name` property
+                    self.table_mutations.append(f"{module}:{child.lineno}")
                 prefix = function.qualname if function else cls
                 qualname = f"{prefix}.{child.name}" if prefix else child.name
                 defined = _Function(
@@ -333,6 +338,14 @@ class _PythonSources:
     ) -> None:
         where = f"{module}:{getattr(node, 'lineno', '?')}"
         if isinstance(node, ast.Dict):
+            for key, value in zip(node.keys, node.values, strict=True):
+                if (
+                    key is not None
+                    and not isinstance(key, ast.Constant)
+                    and self._names_table(value)
+                ):
+                    # `{op: {"TableName": ...}}`: an item whose operation the scan cannot name.
+                    self.stray_operations.append(f"{where}: [{ast.unparse(key)}]")
             operations = [
                 (key, value)
                 for key, value in zip(node.keys, node.values, strict=True)
@@ -353,13 +366,29 @@ class _PythonSources:
                 name == "resource" and "boto3" in ast.unparse(node.func)
             ):
                 self.unclassified_access.append(f"{where}: {ast.unparse(node.func)}")
-            if name == "getattr" and any(
-                isinstance(arg, ast.Constant)
-                and arg.value
-                in {*PY_WRITE_METHODS, *PY_UNCLASSIFIED_ACCESS, "transact_write_items"}
-                for arg in node.args
+            if name == "getattr" and (
+                any(
+                    isinstance(arg, ast.Constant)
+                    and arg.value
+                    in {*PY_WRITE_METHODS, *PY_UNCLASSIFIED_ACCESS, "transact_write_items"}
+                    for arg in node.args
+                )
+                or (
+                    len(node.args) > 1
+                    and not isinstance(node.args[1], ast.Constant)
+                    and "client" in ast.unparse(node.args[0])
+                )
             ):
                 self.unclassified_access.append(f"{where}: {ast.unparse(node)}")
+            if (
+                name == "setattr"
+                and len(node.args) > 1
+                and not (
+                    isinstance(node.args[1], ast.Constant)
+                    and node.args[1].value not in _TABLE_ATTRIBUTES
+                )
+            ):
+                self.table_mutations.append(where)
             if name in {"update", "setdefault"} and self._sets_table_name(node):
                 self.table_mutations.append(where)
         if isinstance(node, (ast.Assign, ast.AugAssign, ast.AnnAssign)):
@@ -371,6 +400,12 @@ class _PythonSources:
                     and target.slice.value == "TableName"
                 ):
                     self.table_mutations.append(where)
+                if (
+                    function is None
+                    and isinstance(target, ast.Name)
+                    and target.id in _TABLE_ATTRIBUTES
+                ):
+                    self.table_mutations.append(where)  # a class-level or module-level table
                 if (
                     isinstance(target, ast.Attribute)
                     and ast.unparse(target)
@@ -412,6 +447,21 @@ class _PythonSources:
                     self.stray_operations.append(f"{module}:{node.lineno}: {node.value!r}")
             elif isinstance(node, ast.keyword) and node.arg in ITEM_ACTIONS:
                 self.stray_operations.append(f"{module}:{node.value.lineno}: {node.arg}=")
+
+    def _find_write_values(self, tree: ast.AST, module: str) -> None:
+        """A write method used other than as a call or a positional call argument."""
+        allowed: set[int] = set()
+        for node in ast.walk(tree):
+            if isinstance(node, ast.Call):
+                allowed.add(id(node.func))
+                allowed.update(id(arg) for arg in node.args)
+        for node in ast.walk(tree):
+            if (
+                isinstance(node, ast.Attribute)
+                and node.attr in {*PY_WRITE_METHODS, *PY_UNCLASSIFIED_ACCESS}
+                and id(node) not in allowed
+            ):
+                self.unclassified_access.append(f"{module}:{node.lineno}: {ast.unparse(node)}")
 
     # Resolution -------------------------------------------------------------------------------
 
@@ -519,8 +569,6 @@ class _PythonSources:
             function = current.function
             if function is None:
                 break
-            if name in function.params():
-                return self._call_sites(function, name, depth, resolve)
             assigned = [
                 node.value
                 for node in _own_nodes(function.node)
@@ -535,6 +583,10 @@ class _PythonSources:
                     and node.value is not None
                 )
             ]
+            if name in function.params():
+                # A rebound parameter holds either the caller's value or the new one.
+                result = self._call_sites(function, name, depth, resolve)
+                return result.union(*(resolve(value, current, depth + 1) for value in assigned))
             if assigned:
                 return set().union(*(resolve(value, current, depth + 1) for value in assigned))
             current = _Scope(function.parent) if function.parent else None
@@ -614,7 +666,10 @@ class _PythonSources:
                         table is None
                         and requests
                         and all(
-                            isinstance(r, ast.Name) and r.id in function.params() for r in requests
+                            isinstance(r, ast.Name)
+                            and r.id in function.params()
+                            and not self._rebinds(function, r.id)
+                            for r in requests
                         )
                     )
                     if forwards:
@@ -626,6 +681,20 @@ class _PythonSources:
             if set(forwarders) <= set(methods):
                 return sites
             methods.update(forwarders)
+
+    @staticmethod
+    def _rebinds(function: _Function, name: str) -> bool:
+        for node in _own_nodes(function.node):
+            targets = (
+                node.targets
+                if isinstance(node, ast.Assign)
+                else [node.target]
+                if isinstance(node, (ast.AnnAssign, ast.AugAssign, ast.NamedExpr))
+                else []
+            )
+            if any(isinstance(target, ast.Name) and target.id == name for target in targets):
+                return True
+        return False
 
     def writes(self) -> list[_Write]:
         writes: list[_Write] = []
@@ -668,14 +737,19 @@ _GO_TABLE_SOURCES = {"config.DynamoDBTable", "table", 'envOr("DYNAMODB_DOMAIN_TA
 
 
 def _go_files() -> list[Path]:
-    return sorted(
-        path
-        for path in ROOT.rglob("*.go")
-        if not path.name.endswith("_test.go")
-        and not any(
-            part.startswith(".") or part == "node_modules" for part in path.relative_to(ROOT).parts
+    files: list[Path] = []
+    for directory, subdirectories, names in os.walk(ROOT):
+        subdirectories[:] = [
+            name
+            for name in subdirectories
+            if not name.startswith(".") and name not in {"node_modules", "vendor"}
+        ]
+        files.extend(
+            Path(directory) / name
+            for name in names
+            if name.endswith(".go") and not name.endswith("_test.go")
         )
-    )
+    return sorted(files)
 
 
 def _strip_go_comments(text: str, *, blank_strings: bool = False) -> str:
@@ -793,8 +867,8 @@ def _statement_grants(document) -> set[tuple[str, str]]:
     for statement in document.nested("statement"):
         actions = [_unquote(item) for item in _list_items(statement.attrs["actions"])]
         if not any(action.lower().startswith("dynamodb:") for action in actions):
-            assert "dynamodb" not in repr(statement.attrs).lower(), statement.attrs
-            assert "dynamodb" not in repr([b.attrs for b in statement.blocks]).lower()
+            scope = [statement.attrs["actions"], statement.attrs.get("resources", "")]
+            assert "dynamodb" not in repr(scope).lower(), statement.attrs
             continue
         assert set(statement.attrs) <= {"sid", "effect", "actions", "resources"}, statement.attrs
         assert statement.blocks == [], f"{document.labels}: conditions are not modelled here"
@@ -832,6 +906,7 @@ def _attachments() -> tuple[dict[str, set[tuple[str, str]]], frozenset[tuple[str
         user = re.fullmatch(r"aws_iam_user\.(\w+)\.name", block.attrs["user"])
         policy = re.fullmatch(r"aws_iam_policy\.(\w+)(\[0\])?\.arn", block.attrs["policy_arn"])
         assert user is not None and policy is not None, block.labels
+        assert "for_each" not in block.attrs, block.labels
         if "count" in block.attrs:
             # Flag-gated: the base grants must not depend on an optional feature.
             assert policy.group(2) == "[0]", block.labels
@@ -940,6 +1015,8 @@ def test_every_transaction_module_and_package_yields_a_derived_item() -> None:
         if "transact_write_items" in text or "TransactItems" in text:
             assert module in with_items | TRANSACTION_FORWARDERS, module
     assert TRANSACTION_FORWARDERS.isdisjoint(with_items)
+    # A bare "Put"/"Update"/"Delete"/"ConditionCheck" literal outside an item key may build an
+    # item the scan cannot see; a non-item use needs another spelling.
     assert sources.stray_operations == []
     assert sources.unclassified_access == []
 
@@ -1031,8 +1108,9 @@ def test_go_workers_only_reach_the_domain_table() -> None:
             assert binding == "DYNAMODB_DOMAIN_TABLE", path
         for default in re.findall(r"\bDynamoDBTable\s*:\s*([^,}\n]+)", text):
             assert default.strip() == '"LimnopulseDomain"', path
-        for assigned in re.findall(r"\btable\s*:?=\s*([^\n]+)", text):
-            assert "DYNAMODB_DOMAIN_TABLE" in assigned, path
+        if re.search(r"\bTable\s*:\s*table\b", text):
+            for assigned in re.findall(r"\btable\s*:?=\s*([^\n]+)", text):
+                assert "DYNAMODB_DOMAIN_TABLE" in assigned, path
 
     assert names
     assert names <= _GO_TABLE_NAMES
@@ -1128,6 +1206,11 @@ class Repo(Base):
         self.client.update_item(TableName=self.audit_table_name, Key=item)
     async def record(self, item):
         await self.put_item({"TableName": self.audit_table_name, "Item": item})
+    def rebinding(self, request):
+        request = {**request, "TableName": self.audit_table_name}
+        self.client.update_item(**request)
+    def caller(self, item):
+        self.rebinding({"TableName": self.table_name, "Key": item})
 """
     standalone = [w for w in _fixture(source).writes() if w.standalone]
     assert sorted((w.site, w.action, set(w.tables)) for w in standalone) == sorted(
@@ -1135,6 +1218,7 @@ class Repo(Base):
             ("fixture.py::Repo.create", "dynamodb:PutItem", {"domain"}),
             ("fixture.py::Repo.log", "dynamodb:UpdateItem", {"audit"}),
             ("fixture.py::Repo.record", "dynamodb:PutItem", {"audit"}),
+            ("fixture.py::Repo.rebinding", "dynamodb:UpdateItem", {"domain", "audit"}),
         ]
     )
 
@@ -1150,19 +1234,30 @@ class Repo:
         built = dict(Delete={"TableName": self.audit_table_name})
         other = {}
         other["ConditionCheck"] = request
+        keyed = {op: {"TableName": self.audit_table_name, "Key": item}}
         writer = getattr(self.client, "delete_item")
         boto3.resource("dynamodb").Table(self.audit_table_name).delete_item(Key=item)
         self.client.execute_statement(Statement="DELETE FROM x")
+        update = self.client.update_item
+        dynamic = getattr(self.client, op)
+        setattr(self, "table_name", self.audit_table_name)
         return request["Put"]
+
+class Other:
+    table_name = "LimnopulseLeads"
+    @property
+    def domain_table_name(self):
+        return self.audit_table_name
 """
     sources = _fixture(source)
 
-    assert len(sources.table_mutations) == 3
+    assert len(sources.table_mutations) == 6
     assert sorted(stray.split(": ")[1] for stray in sources.stray_operations) == [
         "'ConditionCheck'",
         "Delete=",
+        "[op]",
     ]
-    assert len(sources.unclassified_access) == 4
+    assert len(sources.unclassified_access) == 6
 
 
 def test_go_scanner_sees_items_beyond_composite_literals_and_skips_comments() -> None:
