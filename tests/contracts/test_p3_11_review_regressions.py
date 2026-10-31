@@ -154,11 +154,14 @@ def test_readme_rollbacks_recreate_instead_of_restarting() -> None:
     assert re.search(r"set `INGEST_V2_ENABLED=false` and recreate the API", p3)
     assert re.search(r"`docker compose [^`]*up -d api`", p3)
     assert "](docs/p3-ingestion-rollout-runbook.md#rollback)" in p3
+    # GitHub's `#rollback` anchor needs a heading whose text is exactly "Rollback".
+    assert re.search(r"^#+ Rollback\s*$", RUNBOOK.read_text(encoding="utf-8"), re.MULTILINE)
 
 
 def test_runbook_grace_bullet_says_drain_and_wait_are_not_interpolated() -> None:
-    text = _section("Production environment")
-    (bullet,) = [b for b in text.split("- ") if b.startswith("**`stop_grace_period`.**")]
+    raw = markdown_section(RUNBOOK.read_text(encoding="utf-8"), "Production environment")
+    bullets = [" ".join(b.split()) for b in re.split(r"(?m)^- ", raw)]
+    (bullet,) = [b for b in bullets if b.startswith("**`stop_grace_period`.**")]
     assert re.search(r"must exceed drain \+ wait \+ 5 s \(A47\)", bullet)
     assert re.search(r"not interpolated", bullet)
     assert re.search(r"no effect", bullet)
@@ -167,6 +170,8 @@ def test_runbook_grace_bullet_says_drain_and_wait_are_not_interpolated() -> None
         worker = services["telemetry-ingest-worker"]
         assert "env_file" not in worker, compose  # `.env` reaches the worker only by name
         environment = worker.get("environment") or {}
+        if isinstance(environment, list):  # the `- NAME=value` form
+            environment = dict(entry.partition("=")[::2] for entry in environment)
         for name in ("TELEMETRY_INGEST_DRAIN_SECONDS", "TELEMETRY_INGEST_WORKER_WAIT_SECONDS"):
             assert name in bullet, name
             assert name not in environment, (compose, name)  # the claim holds in both files

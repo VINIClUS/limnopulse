@@ -15,7 +15,7 @@ import threading
 from collections.abc import Coroutine
 from datetime import timedelta
 from pathlib import Path
-from typing import Any
+from typing import Any, ClassVar
 
 import boto3
 import pytest
@@ -48,6 +48,7 @@ from limnopulse_api.services.ingress_redrive import redrive_dlq
 from limnopulse_api.services.integration_lifecycle import IntegrationLifecycleService
 from limnopulse_api.workers import telemetry_ingest
 from scripts.admin import telemetry_dlq, telemetry_quarantine
+from tests.support.ingestion_contract_kits import ACCOUNT as ACCOUNT_ID
 from tests.support.ingestion_contract_kits import (
     AUDIT,
     DEVICE,
@@ -62,7 +63,6 @@ from tests.support.ingestion_contract_kits import (
     integration_account,
     store_errors,
 )
-from tests.support.ingestion_contract_kits import ACCOUNT as ACCOUNT_ID
 from tests.support.ingestion_dynamo_fake import IngestionDynamoClient
 from tests.support.ingestion_fakes import (
     FakeIngressQueue,
@@ -197,6 +197,37 @@ async def test_a_same_status_device_integration_transition_is_a_no_op(lifecycle:
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("status", list(IntegrationAccountStatus))
+async def test_every_same_status_account_transition_is_a_no_op(
+    lifecycle: Any, status: IntegrationAccountStatus
+) -> None:
+    """#116 P3-04: terminal states too (`revoked` → `revoked` used to bump and audit)."""
+    seeded = integration_account(status=status)
+    await lifecycle.seed_account(seeded)
+
+    first = await _account_to(lifecycle, status, 1)
+    again = await _account_to(lifecycle, status, 1)  # still version 1: nothing was bumped
+
+    assert first == again == seeded
+    assert lifecycle.audit_items() == []
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("status", list(DeviceIntegrationStatus))
+async def test_every_same_status_device_integration_transition_is_a_no_op(
+    lifecycle: Any, status: DeviceIntegrationStatus
+) -> None:
+    seeded = device_integration(status=status)
+    await lifecycle.seed_device_integration(seeded)
+
+    first = await _integration_to(lifecycle, status, 1, device_id=DEVICE)
+    again = await _integration_to(lifecycle, status, 1)
+
+    assert first == again == seeded
+    assert lifecycle.audit_items() == []
+
+
+@pytest.mark.asyncio
 async def test_a_stale_same_status_transition_is_still_a_version_conflict(lifecycle: Any) -> None:
     """#116 P3-04: the no-op never bypasses the version fence."""
     await lifecycle.seed_account(integration_account())
@@ -212,17 +243,19 @@ async def test_a_stale_same_status_transition_is_still_a_version_conflict(lifecy
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("version", [1, 9], ids=["current", "stale"])
+@pytest.mark.parametrize(
+    "target", [DeviceIntegrationStatus.ERROR, DeviceIntegrationStatus.ACTIVE], ids=["move", "same"]
+)
 async def test_the_repository_404s_another_devices_integration_before_the_version(
-    lifecycle: Any, version: int
+    lifecycle: Any, version: int, target: DeviceIntegrationStatus
 ) -> None:
-    """#116 P3-04: ownership is checked on the consistent pre-read, before the version fence,
-    so a wrong Device is 404 even with a stale version."""
+    """#116 P3-04: ownership is checked on the consistent pre-read, before the version fence
+    and before the same-status no-op, so a wrong Device is 404 even with a stale version and
+    never gets another Device's integration back."""
     await lifecycle.seed_device_integration(device_integration())
 
     with pytest.raises(NotFoundError):
-        await _integration_to(
-            lifecycle, DeviceIntegrationStatus.ERROR, version, device_id=OTHER_DEVICE
-        )
+        await _integration_to(lifecycle, target, version, device_id=OTHER_DEVICE)
 
     assert lifecycle.audit_items() == []
     owned = await _integration_to(lifecycle, DeviceIntegrationStatus.ERROR, 1, device_id=DEVICE)
@@ -259,9 +292,12 @@ async def test_the_service_checks_ownership_without_a_tenant_wide_query() -> Non
 
 
 @pytest.mark.asyncio
-async def test_the_fake_queue_receive_yields_to_the_event_loop() -> None:
+@pytest.mark.parametrize("queued", [0, 1], ids=["empty", "with_a_message"])
+async def test_the_fake_queue_receive_yields_to_the_event_loop(queued: int) -> None:
     """#116 P3-05: a fake that never suspends lets a busy scan loop defeat `wait_for`."""
     queue = FakeIngressQueue(Faults())
+    for _ in range(queued):
+        await queue.send_raw("{}")
     ticks = 0
 
     async def ticker() -> None:
@@ -277,6 +313,7 @@ async def test_the_fake_queue_receive_yields_to_the_event_loop() -> None:
         await queue.receive(max_messages=1, wait_seconds=0, visibility_seconds=1)
     finally:
         task.cancel()
+        await asyncio.gather(task, return_exceptions=True)
 
     assert ticks > before
 
@@ -404,7 +441,8 @@ async def test_an_applied_redrive_that_stops_midway_exits_3_with_the_counts_so_f
 @pytest.mark.asyncio
 async def test_a_dry_run_that_stops_midway_exits_3_with_the_count_so_far() -> None:
     harness = DlqHarness()
-    await harness.fill([f"body-{index:02d}" for index in range(12)])
+    # Exactly one receive's worth, so `all_visible` (one receive of 10) proves all were released.
+    await harness.fill([f"body-{index:02d}" for index in range(10)])
     _fail_second_receive(harness, RuntimeError(SENTINEL))
 
     code = await harness.run("redrive", "--max", "20")
@@ -422,6 +460,120 @@ async def test_a_dry_run_that_stops_midway_exits_3_with_the_count_so_far() -> No
     assert harness.source.bodies() == []
     assert len(await harness.all_visible()) == 10  # everything it held was released
     assert SENTINEL not in harness.out.getvalue()
+
+
+@pytest.mark.asyncio
+async def test_a_failure_inside_a_batch_counts_per_message_and_releases_the_rest() -> None:
+    """#116 P3-05: a failure on the third message of a batch reports 3 seen and 2 moved (not
+    the batch), and the messages it never reached are released, not hidden for the hold."""
+    harness = DlqHarness()
+    await harness.fill([f"body-{index:02d}" for index in range(10)])
+    inner_send = harness.source.send_raw
+    sends = 0
+
+    async def failing_third_send(body: str) -> str:
+        nonlocal sends
+        sends += 1
+        if sends == 3:
+            raise RuntimeError(SENTINEL)
+        return await inner_send(body)
+
+    harness.source.send_raw = failing_third_send  # type: ignore[method-assign]
+
+    code = await harness.run("redrive", "--max", "20", "--apply")
+
+    assert code == 3
+    assert harness.summary() == {
+        "command": "redrive",
+        "apply": True,
+        "seen": 3,
+        "redriven": 2,
+        "failed": 0,
+        "error": "unexpected",
+    }
+    assert harness.metric_total("redriven") == 2
+    assert sorted(harness.source.bodies()) == ["body-00", "body-01"]
+    assert await harness.all_visible() == [f"body-{index:02d}" for index in range(2, 10)]
+    assert SENTINEL not in harness.out.getvalue()
+
+
+@pytest.mark.asyncio
+async def test_a_redrive_cancelled_during_a_send_releases_the_whole_batch() -> None:
+    harness = DlqHarness()
+    await harness.fill([f"body-{index:02d}" for index in range(5)])
+    sending = asyncio.Event()
+
+    async def blocked_send(body: str) -> str:
+        sending.set()
+        await asyncio.Event().wait()  # the send never returns: Ctrl-C lands here
+        raise AssertionError("unreachable")
+
+    harness.source.send_raw = blocked_send  # type: ignore[method-assign]
+    task = asyncio.ensure_future(
+        redrive_dlq(dlq=harness.dlq, source=harness.source, max_messages=10, apply=True)
+    )
+    await asyncio.wait_for(sending.wait(), 10)
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await asyncio.wait_for(task, 10)
+
+    assert await harness.all_visible() == [f"body-{index:02d}" for index in range(5)]
+
+
+@pytest.mark.asyncio
+async def test_a_ctrl_c_after_applied_moves_still_reports_and_counts_them() -> None:
+    """#116 P3-05: Ctrl-C after two moves: the summary so far and the metric for the two are
+    written before the interrupt propagates, and the rest of the batch is released."""
+    harness = DlqHarness()
+    await harness.fill([f"body-{index:02d}" for index in range(5)])
+    inner_send = harness.source.send_raw
+    third = asyncio.Event()
+    sends = 0
+
+    async def send_blocking_on_the_third(body: str) -> str:
+        nonlocal sends
+        sends += 1
+        if sends == 3:
+            third.set()
+            await asyncio.Event().wait()  # Ctrl-C lands here
+        return await inner_send(body)
+
+    harness.source.send_raw = send_blocking_on_the_third  # type: ignore[method-assign]
+    out = io.StringIO()
+    task = asyncio.ensure_future(
+        telemetry_dlq.run(
+            ["redrive", "--apply"],
+            dlq=harness.dlq,
+            source=harness.source,
+            metrics=harness.metrics,
+            out=out,
+        )
+    )
+    await asyncio.wait_for(third.wait(), 10)
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await asyncio.wait_for(task, 10)
+
+    (summary,) = [json.loads(line) for line in out.getvalue().splitlines()]
+    assert summary == {
+        "command": "redrive",
+        "apply": True,
+        "seen": 3,
+        "redriven": 2,
+        "failed": 0,
+        "error": "interrupted",
+    }
+    assert harness.metric_total("redriven") == 2
+    assert await harness.all_visible() == ["body-02", "body-03", "body-04"]
+
+
+@pytest.mark.asyncio
+async def test_a_clean_redrive_summary_has_no_error_key() -> None:
+    harness = DlqHarness()
+    await harness.fill(["body-00", "body-01"])
+
+    assert await harness.run("redrive", "--apply") == 0
+    assert "error" not in harness.summary()
 
 
 # P3-06: no empty round trip after an exact page ---------------------------------------------------
@@ -448,6 +600,35 @@ async def test_a_page_of_exactly_limit_rows_costs_no_extra_round_trip(
             TENANT, after_sk=page.next_after_sk, limit=3
         )
         assert len(rest.entries) == 1 and rest.next_after_sk is None
+
+
+@pytest.mark.asyncio
+async def test_a_filtered_page_whose_remaining_rows_are_filtered_out_ends_the_listing() -> None:
+    """#116 P3-06, with the CLI's default `--status open`: rows 0-5 are open, open, dismissed,
+    dismissed, open, dismissed. The second Query reads [open, dismissed] and ends the partition,
+    so the page of 3 is the last one; no cursor to an empty page."""
+    subject = DynamoQuarantineSubject()
+    await subject.repository.put_quarantine_entries(fenced_entries(5))
+    ordered = (await subject.repository.list_quarantine_entries(TENANT, after_sk=None, limit=10))
+    for index in (2, 3, 5):
+        await subject.repository.transition_quarantine_entry(
+            TENANT,
+            ordered.entries[index].entry_key,
+            QuarantineEntryStatus.DISMISSED,
+            expected_version=1,
+            at=RECEIVED,
+        )
+    before = len(subject.client.reads)
+
+    page = await subject.repository.list_quarantine_entries(
+        TENANT, status=QuarantineEntryStatus.OPEN, after_sk=None, limit=3
+    )
+
+    assert [entry.entry_key for entry in page.entries] == [
+        ordered.entries[index].entry_key for index in (0, 1, 4)
+    ]
+    assert page.next_after_sk is None
+    assert [kind for kind, _, _ in subject.client.reads[before:]] == ["query", "query"]
 
 
 # P3-07: the "claim lost twice" warning is redacted ----------------------------------------------
@@ -478,7 +659,13 @@ async def test_the_claim_lost_twice_warning_never_carries_the_raw_key_or_a_secre
         and record.name == "limnopulse_api.services.ingestion"
         and "claim lost twice" in record.getMessage()
     ]
-    assert len(warnings) == 1
+    (warning,) = warnings
+    # The static text only: no key, hash, account, tenant or credential id can ride along.
+    assert (warning.getMessage(), warning.args, warning.exc_info) == (
+        "ingest receipt claim lost twice",
+        (),
+        None,
+    )
     for secret in (IDEMPOTENCY_KEY, OTHER_KEY, TOKEN, SECRET, stale.key_sha256):
         assert secret not in caplog.text
 
@@ -514,6 +701,23 @@ async def test_dismiss_maps_a_store_failure_to_failed_store_unavailable(error: E
     }
     statuses = [harness.row(entry).status for entry in entries]
     assert statuses == [QuarantineEntryStatus.OPEN, QuarantineEntryStatus.DISMISSED]
+
+
+@pytest.mark.asyncio
+async def test_dismiss_maps_only_store_errors_an_unexpected_error_still_aborts() -> None:
+    harness = QuarantineHarness()
+    entries, _ = _fenced(2)
+    await harness.seed(entries)
+    first, second = _keys(entries)
+    harness.faults.fail_next("transition_quarantine_entry", RuntimeError(SENTINEL))
+
+    code = await harness.run("dismiss", "--tenant", TENANT, "--entry", first, second, "--apply")
+
+    assert code == telemetry_quarantine.EXIT_ERROR == 1
+    assert harness.lines()[-1] == {"error": "unexpected"}
+    assert SENTINEL not in harness.out.getvalue()
+    statuses = [harness.row(entry).status for entry in entries]
+    assert statuses == [QuarantineEntryStatus.OPEN, QuarantineEntryStatus.OPEN]
 
 
 @pytest.mark.asyncio
@@ -586,7 +790,9 @@ async def test_the_fake_queue_rejects_what_elasticmq_lets_through() -> None:
 _TABLE = "LimnopulseDomain"
 _KEY = {"PK": {"S": "P#1"}, "SK": {"S": "S#1"}}
 _X = {":v": {"S": "x"}}
-_RESERVED = {
+# Each case names an unaliased reserved word somewhere DynamoDB parses an expression. The
+# DynamoDB Local twin (`tests/ingestion/test_116_review_regressions_dynamodb.py`) replays them.
+_RESERVED_BODIES: dict[str, tuple[str, dict[str, Any]]] = {
     "update_set": ("update_item", {"Key": _KEY, "UpdateExpression": "SET state = :v"}),
     "update_remove": (
         "update_item",
@@ -604,33 +810,72 @@ _RESERVED = {
         },
     ),
     "mixed_case": ("update_item", {"Key": _KEY, "UpdateExpression": "SET Name = :v"}),
-    "query_filter": (
-        "query",
+    "function_argument": (
+        "put_item",
+        {"Item": {**_KEY}, "ConditionExpression": "attribute_exists(status) OR PK = :v"},
+    ),
+    "path_element": (
+        "update_item",
         {
-            "KeyConditionExpression": "PK = :pk AND begins_with(SK, :sk_prefix)",
-            "FilterExpression": "source = :v",
-            "ExpressionAttributeValues": {
-                ":pk": {"S": "P#1"},
-                ":sk_prefix": {"S": "S#"},
-                **_X,
-            },
+            "Key": _KEY,
+            "UpdateExpression": "SET #d.state = :v",
+            "ExpressionAttributeNames": {"#d": "details"},
         },
     ),
+    "delete_condition": (
+        "delete_item",
+        {"Key": _KEY, "ConditionExpression": "attribute_not_exists(PK) OR type = :v"},
+    ),
+    **{
+        f"word_{word}": ("update_item", {"Key": _KEY, "UpdateExpression": f"SET {word} = :v"})
+        for word in ["abort", "count", "comment", "date", "hash", "owner", "region", "role", "timestamp", "token", "url", "user", "value", "zone"]
+    },
 }
+_TRANSACT_BODIES = {
+    "transact_put": (
+        "Put",
+        {"Item": {**_KEY}, "ConditionExpression": "attribute_not_exists(PK) OR role = :v"},
+    ),
+    "transact_update": ("Update", {"Key": _KEY, "UpdateExpression": "SET owner = :v"}),
+    "transact_delete": ("Delete", {"Key": _KEY, "ConditionExpression": "region = :v"}),
+    "transact_condition_check": (
+        "ConditionCheck",
+        {"Key": _KEY, "ConditionExpression": "token = :v"},
+    ),
+}
+RESERVED_CASES = sorted([*_RESERVED_BODIES, "query_filter", *_TRANSACT_BODIES])
 
 
-@pytest.mark.parametrize("case", sorted(_RESERVED))
+def reserved_request(case: str, table: str) -> tuple[str, dict[str, Any]]:
+    """`(operation, kwargs)` for one case against `table`, complete and otherwise valid."""
+    if case == "query_filter":
+        return "query", {
+            "TableName": table,
+            "KeyConditionExpression": "PK = :pk AND begins_with(SK, :sk_prefix)",
+            "FilterExpression": "source = :v",
+            "ExpressionAttributeValues": {":pk": {"S": "P#1"}, ":sk_prefix": {"S": "S#"}, **_X},
+        }
+    if case in _TRANSACT_BODIES:
+        action, body = _TRANSACT_BODIES[case]
+        item = {"TableName": table, "ExpressionAttributeValues": _X, **body}
+        return "transact_write_items", {"TransactItems": [{action: item}]}
+    operation, body = _RESERVED_BODIES[case]
+    return operation, {"TableName": table, "ExpressionAttributeValues": _X, **body}
+
+
+@pytest.mark.parametrize("case", RESERVED_CASES)
 def test_the_dynamo_fake_rejects_an_unaliased_reserved_word(case: str) -> None:
-    """#116 P3-00: like DynamoDB, a reserved word (`state`, `status`, ...) needs a `#` alias."""
-    operation, request = _RESERVED[case]
-    request = {"ExpressionAttributeValues": _X, **request}
+    """#116 P3-00: like DynamoDB, a reserved word (`state`, `status`, ...) needs a `#` alias, in
+    every expression of every write and of a Query, transaction bodies included."""
+    operation, request = reserved_request(case, _TABLE)
     client = IngestionDynamoClient()
 
     with pytest.raises(ClientError) as exc_info:
-        getattr(client, operation)(TableName=_TABLE, **request)
+        getattr(client, operation)(**request)
 
     assert exc_info.value.response["Error"]["Code"] == "ValidationException"
     assert "reserved keyword" in exc_info.value.response["Error"]["Message"]
+    assert client.items == {}
 
 
 def test_the_dynamo_fake_accepts_aliases_functions_and_syntax_keywords() -> None:
@@ -653,6 +898,14 @@ def test_the_dynamo_fake_accepts_aliases_functions_and_syntax_keywords() -> None
             ":id": {"S": "ing_1"},
         },
     )
+    # `:status`/`:state` placeholders, and names that merely contain a reserved word.
+    client.update_item(
+        TableName=_TABLE,
+        Key=_KEY,
+        UpdateExpression="SET #status = :status, source_type = :state, data_hash = :state",
+        ExpressionAttributeNames={"#status": "status"},
+        ExpressionAttributeValues={":status": {"S": "open"}, ":state": {"S": "x"}},
+    )
     response = client.query(
         TableName=_TABLE,
         KeyConditionExpression="PK = :pk AND begins_with(SK, :sk_prefix)",
@@ -661,15 +914,18 @@ def test_the_dynamo_fake_accepts_aliases_functions_and_syntax_keywords() -> None
 
     assert len(response["Items"]) == 1
     assert client.items[("P#1", "S#1")]["state"] == "enqueued"
+    assert client.items[("P#1", "S#1")]["source_type"] == "x"
 
 
-def _report(*, outcome: str, wasxfail: str | None = None) -> pytest.TestReport:
+def _report(
+    *, outcome: str, wasxfail: str | None = None, longrepr: Any = ("tests/ingestion/x.py", 1, "r")
+) -> pytest.TestReport:
     report = pytest.TestReport(
         nodeid="tests/ingestion/test_x.py::test_x",
         location=("tests/ingestion/test_x.py", 1, "test_x"),
         keywords={},
         outcome=outcome,  # type: ignore[arg-type]
-        longrepr=None if outcome == "passed" else ("tests/ingestion/test_x.py", 1, "reason"),
+        longrepr=None if outcome == "passed" else longrepr,
         when="call",
     )
     if wasxfail is not None:
@@ -688,17 +944,28 @@ def _guarded(report: pytest.TestReport) -> pytest.TestReport:
     return stop.value.value
 
 
-@pytest.mark.parametrize("wasxfail", [None, "known flake"], ids=["skip", "xfail"])
+@pytest.mark.parametrize(
+    ("wasxfail", "longrepr"),
+    [
+        (None, ("tests/ingestion/x.py", 1, "r")),
+        ("known flake", ("tests/ingestion/x.py", 1, "r")),
+        ("known flake", "AssertionError: an exception repr, as a real xfail carries"),
+    ],
+    ids=["skip", "xfail", "xfail_exception_repr"],
+)
 def test_the_ingestion_no_skip_guard_fails_an_xfail_too(
-    monkeypatch: pytest.MonkeyPatch, wasxfail: str | None
+    monkeypatch: pytest.MonkeyPatch, wasxfail: str | None, longrepr: Any
 ) -> None:
     """#116 P3-00: under the gate an xfail would hide a failing test as silently as a skip."""
     monkeypatch.setenv("RUN_INGESTION_INTEGRATION", "1")
 
-    guarded = _guarded(_report(outcome="skipped", wasxfail=wasxfail))
+    guarded = _guarded(_report(outcome="skipped", wasxfail=wasxfail, longrepr=longrepr))
 
     assert guarded.outcome == "failed"
+    assert not hasattr(guarded, "wasxfail")  # a plain failure, never reported as "xfailed"
     assert "must not skip" in str(guarded.longrepr)
+    if wasxfail is not None:
+        assert wasxfail in str(guarded.longrepr)
 
 
 def test_the_ingestion_no_skip_guard_leaves_reports_alone_without_the_gate(
@@ -726,7 +993,7 @@ def test_verification_documents_the_elasticmq_gaps_the_unit_fake_covers() -> Non
 def test_the_dynamodb_local_bind_address_is_documented() -> None:
     """#116 P3-00: DynamoDB Local has no bind flag, so the runner listens on every interface."""
     section = _ingestion_gate_section()
-    assert re.search(r"DynamoDB Local[^.]*\b0\.0\.0\.0\b", section)
+    assert re.search(r"DynamoDB Local.{0,300}?\b0\.0\.0\.0\b.{0,300}?bind", section)
     runner = (ROOT / "scripts/dev/run_local_dynamodb.sh").read_text(encoding="utf-8")
     comments = " ".join(line for line in runner.splitlines() if line.lstrip().startswith("#"))
     assert re.search(r"\b0\.0\.0\.0\b", comments)
@@ -735,7 +1002,7 @@ def test_the_dynamodb_local_bind_address_is_documented() -> None:
 
 def test_verification_says_the_ingestion_guard_fails_an_xfail_too() -> None:
     section = _ingestion_gate_section()
-    assert re.search(r"any skip or `xfail` in that directory into a failure", section)
+    assert re.search(r"skip or `xfail`.{0,80}fail", section)
 
 
 # P3-10: metrics logging, API SQS budget, shared kwargs, Influx close -----------------------------
@@ -826,11 +1093,29 @@ def test_api_metric_lines_are_emitted_once_even_with_a_root_handler(
     assert root.lines == []
 
 
+def test_the_worker_metric_lines_still_reach_the_root_handler(
+    metrics_logger: logging.Logger,
+) -> None:
+    """#116 P3-10: only the API's `_enable_metrics_logging` stops propagation; the worker logs
+    through `basicConfig`'s root handler, so the adapter itself must leave it on."""
+    root = _Counting()
+    logging.getLogger().addHandler(root)
+    metrics_logger.setLevel(logging.INFO)
+    try:
+        StructuredLogTelemetryMetrics().increment("ingest_requests_total", outcome="accepted")
+    finally:
+        logging.getLogger().removeHandler(root)
+
+    assert metrics_logger.propagate is True
+    assert len(root.lines) == 1
+
+
 def test_api_sqs_admission_worst_case_is_two_attempts_within_30_seconds(
     monkeypatch: pytest.MonkeyPatch, metrics_logger: logging.Logger
 ) -> None:
     """#116 P3-10: botocore's `max_attempts` counts retries, so the old 3 meant 4 × 15 s = 60 s;
     the budget is read from a real client, never from that convention."""
+    monkeypatch.delenv("AWS_PROFILE", raising=False)
     clients: dict[str, dict[str, Any]] = {}
     with TestClient(_ingest_app(monkeypatch, clients)):
         pass
@@ -853,14 +1138,49 @@ def test_the_api_and_the_worker_share_one_client_kwargs_helper() -> None:
     from limnopulse_api.adapters import aws_clients
 
     assert not hasattr(main, "_dynamodb_client_kwargs")
+    for helper in (aws_clients.dynamodb_client_kwargs, aws_clients.sqs_client_kwargs):
+        assert helper.__module__ == "limnopulse_api.adapters.aws_clients"  # defined, not re-exported
     assert main.dynamodb_client_kwargs is aws_clients.dynamodb_client_kwargs
     assert telemetry_ingest.dynamodb_client_kwargs is aws_clients.dynamodb_client_kwargs
     assert telemetry_ingest.sqs_client_kwargs is aws_clients.sqs_client_kwargs
     assert main.sqs_client_kwargs is aws_clients.sqs_client_kwargs
 
 
+@pytest.mark.parametrize(
+    ("app_env", "endpoint", "expected"),
+    [
+        ("local", "http://127.0.0.1:8001", {"endpoint_url": "http://127.0.0.1:8001", "local": True}),
+        ("test", "http://127.0.0.1:8001", {"endpoint_url": "http://127.0.0.1:8001", "local": True}),
+        ("production", "http://127.0.0.1:8001", {"endpoint_url": "http://127.0.0.1:8001"}),
+        ("local", None, {}),
+        ("production", None, {}),
+    ],
+    ids=["local_endpoint", "test_endpoint", "deployed_endpoint", "local_aws", "deployed_aws"],
+)
+@pytest.mark.parametrize("service", ["dynamodb", "sqs"])
+def test_the_shared_helper_adds_dummy_credentials_only_for_a_local_endpoint(
+    service: str, app_env: str, endpoint: str | None, expected: dict[str, Any]
+) -> None:
+    from limnopulse_api.adapters import aws_clients
+
+    settings = Settings.model_construct(
+        aws_region="us-east-2",
+        app_env=app_env,
+        dynamodb_endpoint_url=endpoint if service == "dynamodb" else "http://other.invalid",
+        sqs_endpoint_url=endpoint if service == "sqs" else "http://other.invalid",
+    )
+    helper = getattr(aws_clients, f"{service}_client_kwargs")
+    wanted: dict[str, str] = {"region_name": "us-east-2"}
+    if "endpoint_url" in expected:
+        wanted["endpoint_url"] = expected["endpoint_url"]
+    if expected.get("local"):
+        wanted |= {"aws_access_key_id": "local", "aws_secret_access_key": "local"}
+
+    assert helper(settings) == wanted
+
+
 class _WorkerInflux:
-    instances: list["_WorkerInflux"] = []
+    instances: ClassVar[list["_WorkerInflux"]] = []
 
     def __init__(self, **kwargs: Any) -> None:
         self.closed = 0
@@ -873,21 +1193,35 @@ class _WorkerInflux:
         self.closed += 1
 
 
+def _still_open() -> None:
+    assert [client.closed for client in _WorkerInflux.instances] == [0], "closed before the run"
+
+
 class _StoppedLoop:
     async def run(self, stop: asyncio.Event) -> None:
-        return None
+        _still_open()
 
 
 class _CrashedLoop:
     async def run(self, stop: asyncio.Event) -> None:
+        _still_open()
         raise RuntimeError("crash")
 
 
-@pytest.mark.parametrize("ending", ["stop", "crash", "composition_failure"])
+class _CancelledLoop:
+    async def run(self, stop: asyncio.Event) -> None:
+        _still_open()
+        raise asyncio.CancelledError
+
+
+@pytest.mark.parametrize("ending", ["stop", "crash", "cancelled", "composition_failure"])
 def test_the_worker_closes_its_influx_client_on_every_exit(
-    monkeypatch: pytest.MonkeyPatch, ending: str
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, ending: str
 ) -> None:
-    """#116 P3-10: the worker never closed `InfluxDBClient`."""
+    """#116 P3-10: the worker never closed `InfluxDBClient`. The seam: `main()` hands
+    `build_worker` an `influx_client_factory` that creates the module's `InfluxDBClient` and
+    closes each client it created when the run ends, however it ends."""
+    monkeypatch.chdir(tmp_path)
     monkeypatch.setenv("APP_ENV", "test")
     monkeypatch.setenv("TELEMETRY_V2_WRITE_ENABLED", "true")
     monkeypatch.setenv("SQS_TELEMETRY_INGRESS_QUEUE_URL", QUEUE_URL)
@@ -898,13 +1232,15 @@ def test_the_worker_closes_its_influx_client_on_every_exit(
         influx_client_factory(url="http://influx.invalid", token="t", org="o")
         if ending == "composition_failure":
             raise RuntimeError("composition")
-        return _StoppedLoop() if ending == "stop" else _CrashedLoop()
+        return {"stop": _StoppedLoop, "crash": _CrashedLoop, "cancelled": _CancelledLoop}[ending]()
 
     monkeypatch.setattr(telemetry_ingest, "build_worker", build)
 
-    code = telemetry_ingest.main()
-
-    assert code == (0 if ending == "stop" else 1)
+    if ending == "cancelled":
+        with pytest.raises(asyncio.CancelledError):
+            telemetry_ingest.main()
+    else:
+        assert telemetry_ingest.main() == (0 if ending == "stop" else 1)
     assert [client.closed for client in _WorkerInflux.instances] == [1]
 
 
@@ -914,16 +1250,3 @@ def test_the_stop_grace_comment_names_the_current_grace() -> None:
 
     assert "75 s" not in source
     assert "90 s stop grace" in source
-
-
-def test_the_metric_line_is_json(metrics_logger: logging.Logger) -> None:
-    """Sanity for the handler-based assertions above: one compact JSON object per call."""
-    own = _Counting()
-    metrics_logger.addHandler(own)
-    metrics_logger.setLevel(logging.INFO)
-
-    StructuredLogTelemetryMetrics().increment("ingest_requests_total", outcome="accepted")
-
-    assert [json.loads(line) for line in own.lines] == [
-        {"metric": "ingest_requests_total", "value": 1, "labels": {"outcome": "accepted"}}
-    ]

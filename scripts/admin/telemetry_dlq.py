@@ -11,8 +11,10 @@ Nothing here runs on its own: the DLQ is only touched when an operator runs a su
 Output is JSON lines on stdout. Exit codes: 0 ok (a dry run included), 1 error, 3 partial (an
 applied redrive with failures, or a redrive that stopped midway after it had seen messages: its
 summary then carries the counts so far and an `error` category). Metrics go to an injected
-`TelemetryMetrics`; the default sink writes JSON lines to stderr. A Ctrl-C during a receive
-waits for that receive and releases its messages (see `receive_held`).
+`TelemetryMetrics`; the default sink writes JSON lines to stderr. A Ctrl-C releases every
+message the run still held (a receive in flight is awaited first, see `receive_held`); once the
+run has seen messages it also prints the summary so far (`error: interrupted`) and, with
+`--apply`, the metrics of what already moved.
 """
 
 import argparse
@@ -40,7 +42,12 @@ from limnopulse_api.repositories.ingestion import (
     IngressQueueProducer,
     TelemetryMetrics,
 )
-from limnopulse_api.services.ingress_redrive import RedriveProgress, receive_held, redrive_dlq
+from limnopulse_api.services.ingress_redrive import (
+    RedriveProgress,
+    RedriveReport,
+    receive_held,
+    redrive_dlq,
+)
 
 EXIT_OK = 0
 EXIT_ERROR = 1
@@ -147,12 +154,28 @@ async def _redrive(
         report = await redrive_dlq(
             dlq=dlq, source=source, max_messages=max_messages, apply=apply, progress=progress
         )
+    except asyncio.CancelledError:
+        if progress.seen:
+            # Ctrl-C: what already moved is still counted and reported before the interrupt.
+            _report_redrive(metrics, out, progress.report(), apply=apply, error="interrupted")
+        raise
     except Exception as failure:
         if not progress.seen:
             raise  # nothing was touched: the plain error exit
         # Stopped midway: report what already moved instead of hiding it behind exit 1.
         report = progress.report()
         error = "queue_unavailable" if isinstance(failure, IngressQueueError) else "unexpected"
+    return _report_redrive(metrics, out, report, apply=apply, error=error)
+
+
+def _report_redrive(
+    metrics: TelemetryMetrics,
+    out: TextIO,
+    report: RedriveReport,
+    *,
+    apply: bool,
+    error: str | None,
+) -> int:
     if apply:
         for result, value in (("redriven", report.redriven), ("failed", report.failed)):
             if value:

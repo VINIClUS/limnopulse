@@ -241,6 +241,25 @@ async def test_illegal_or_stale_account_transition_is_a_conflict() -> None:
     assert len(subject.audit_items()) == 1
 
 
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("path", "status"),
+    [(ACCOUNT_PATH, "pending"), (INTEGRATION_PATH, "provisioning")],
+    ids=["account", "device_integration"],
+)
+async def test_a_same_status_post_is_a_200_no_op(path: str, status: str) -> None:
+    """#116 P3-04: re-posting the current status returns the row unchanged; nothing is written
+    and nothing is audited."""
+    subject = await _seeded()
+
+    response = client_for(subject).post(path, json={"status": status, "expected_version": 1})
+
+    assert response.status_code == 200
+    assert (response.json()["status"], response.json()["version"]) == (status, 1)
+    assert _writes(subject) == []
+    assert subject.audit_items() == []
+
+
 # Device integration status -------------------------------------------------------------------
 
 

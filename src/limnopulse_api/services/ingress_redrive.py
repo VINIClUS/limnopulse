@@ -6,8 +6,9 @@ the DLQ, so a failed send never loses a message (a duplicate after a failed dele
 Messages are held for the whole run and released only after the scan. A message whose hold lapsed
 in a slow run comes back with a new receipt handle; it is recognised by its message id and never
 counted or moved twice, and its newest handle is the one released. The release is best-effort,
-also runs when the scan fails, and with `apply` covers the messages that could not be moved, so
-an immediate rerun sees them again.
+also runs when the scan fails, and covers every received message that did not move (with
+`apply`: the failed ones, and those of the batch a failure stopped before), so an immediate rerun
+sees them again.
 
 A receive cannot be stopped once its boto3 call is in flight, so a cancelled run (Ctrl-C) first
 waits for that call (about `_WAIT_SECONDS`) and releases what it returned, instead of leaving it
@@ -69,19 +70,21 @@ async def redrive_dlq(
             batch = await receive_held(dlq, max_messages=min(_MAX_BATCH, max_messages - len(seen)))
             if not batch:
                 break
+            # The whole batch is held until each message moves, so a run that raises or is
+            # cancelled midway still releases the messages it had not reached yet (#116).
+            held.update((message.message_id, message) for message in batch)
             for message in batch:
                 if message.message_id in seen:
-                    held[message.message_id] = message  # seen before: never counted twice
-                    continue
+                    continue  # seen before: never counted twice
                 seen.add(message.message_id)
                 counts.seen = len(seen)
                 if not apply:
-                    held[message.message_id] = message
-                elif await _move(dlq, source, message):
+                    continue
+                if await _move(dlq, source, message):
+                    del held[message.message_id]
                     counts.redriven += 1
                 else:
                     counts.failed += 1
-                    held[message.message_id] = message
     finally:
         await _release(dlq, list(held.values()))
     return counts.report()

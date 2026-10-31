@@ -18,11 +18,13 @@ from tests.support.ingestion_contract_kits import RECEIVED, TENANT, fenced_entri
 from tests.support.ingestion_dynamo_fake import IngestionDynamoClient
 from tests.support.ingestion_harness import IngestionTables, dynamodb_client
 from tests.unit.test_116_review_regressions import (  # noqa: F401 - re-run on DynamoDB Local
-    _RESERVED,
-    _X,
+    RESERVED_CASES,
+    reserved_request,
     test_a_same_status_account_transition_is_a_no_op,
     test_a_same_status_device_integration_transition_is_a_no_op,
     test_a_stale_same_status_transition_is_still_a_version_conflict,
+    test_every_same_status_account_transition_is_a_no_op,
+    test_every_same_status_device_integration_transition_is_a_no_op,
     test_the_repository_404s_another_devices_integration_before_the_version,
 )
 from tests.unit.test_dynamodb_integration_resolver import DynamoIngestionSubject
@@ -74,19 +76,18 @@ async def test_a_page_of_exactly_limit_rows_costs_one_query_on_dynamodb_local(
     assert (page.next_after_sk is not None) is more
 
 
-@pytest.mark.parametrize("case", sorted(_RESERVED))
+@pytest.mark.parametrize("case", RESERVED_CASES)
 def test_dynamodb_local_and_the_fake_both_reject_an_unaliased_reserved_word(
     ingestion_tables: IngestionTables, case: str
 ) -> None:
-    operation, request = _RESERVED[case]
-    request = {"ExpressionAttributeValues": _X, **request}
     codes = []
     for client, table in (
         (dynamodb_client(), ingestion_tables.domain),
         (IngestionDynamoClient(), "LimnopulseDomain"),
     ):
+        operation, request = reserved_request(case, table)
         with pytest.raises(ClientError) as exc_info:
-            getattr(client, operation)(TableName=table, **request)
+            getattr(client, operation)(**request)
         error = exc_info.value.response["Error"]
         assert "reserved keyword" in error["Message"], error
         codes.append(error["Code"])
