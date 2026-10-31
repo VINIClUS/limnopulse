@@ -15,6 +15,8 @@ PORT="${DYNAMODB_LOCAL_PORT:-8001}"
 CACHE_DIR="${XDG_CACHE_HOME:-$HOME/.cache}/limnopulse/dynamodb-local"
 INSTALL_DIR="${CACHE_DIR}/dynamodb-local-3.3.2"
 JAR_PATH="${INSTALL_DIR}/DynamoDBLocal.jar"
+# Records the tarball checksum the install was verified against.
+VERIFIED_FILE="${INSTALL_DIR}/.verified-sha256"
 PID_FILE="${CACHE_DIR}/dynamodb-local.pid"
 PORT_FILE="${CACHE_DIR}/dynamodb-local.port"
 LOG_FILE="${CACHE_DIR}/dynamodb-local.log"
@@ -92,6 +94,7 @@ install_dynamodb_local() {
   mkdir -p "${WORK_DIR}/extract"
   tar -xzf "${WORK_DIR}/${TARBALL}" -C "${WORK_DIR}/extract"
   rm -rf "${INSTALL_DIR}"
+  echo "${TARBALL_SHA256}" >"${WORK_DIR}/extract/.verified-sha256"
   mv "${WORK_DIR}/extract" "${INSTALL_DIR}"
   rm -rf "${WORK_DIR}"
   WORK_DIR=""
@@ -115,7 +118,8 @@ if ready; then
   echo "another server already answers on ${BASE_URL}; stop it or set DYNAMODB_LOCAL_PORT" >&2
   exit 1
 fi
-if [[ ! -f "${JAR_PATH}" ]]; then
+# Reinstall unless the cached copy was verified against the current pin.
+if [[ ! -f "${JAR_PATH}" || "$(cat "${VERIFIED_FILE}" 2>/dev/null || true)" != "${TARBALL_SHA256}" ]]; then
   install_dynamodb_local
 fi
 
