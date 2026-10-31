@@ -521,17 +521,25 @@ OPERATIONS = {
 }
 
 
+FINAL_ACTIONS = ("delete", "change_visibility", "heartbeat")
+ERROR_BUILDERS = {
+    "queue_error_retryable": lambda: IngressQueueError("injected at the client", retryable=True),
+    "queue_error_permanent": lambda: IngressQueueError("injected at the client", retryable=False),
+    "non_botocore": lambda: RuntimeError("a bug, not a queue failure"),
+}
+# An injected IngressQueueError passes through every operation (A44). Any other non-botocore
+# error passes through send, send_raw and receive, which map botocore errors only; on the final
+# actions it is a permanent queue error instead (see the next test).
+PASS_THROUGH = [
+    pytest.param(operation, build, id=f"{operation}-{kind}")
+    for operation in OPERATIONS
+    for kind, build in ERROR_BUILDERS.items()
+    if not (kind == "non_botocore" and operation in FINAL_ACTIONS)
+]
+
+
 @pytest.mark.asyncio
-@pytest.mark.parametrize("operation", list(OPERATIONS))
-@pytest.mark.parametrize(
-    "build",
-    [
-        lambda: IngressQueueError("injected at the client boundary", retryable=True),
-        lambda: IngressQueueError("injected at the client boundary", retryable=False),
-        lambda: RuntimeError("a bug, not a queue failure"),
-    ],
-    ids=["queue_error_retryable", "queue_error_permanent", "non_botocore"],
-)
+@pytest.mark.parametrize(("operation", "build"), PASS_THROUGH)
 async def test_non_botocore_errors_pass_through_unchanged(
     client: StubSqsClient, queue: SqsIngressQueue, operation: str, build: Any
 ) -> None:
@@ -544,3 +552,20 @@ async def test_non_botocore_errors_pass_through_unchanged(
 
     assert exc_info.value is injected  # never re-wrapped
     assert client.methods() == [method]  # never retried internally
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("operation", FINAL_ACTIONS)
+async def test_final_action_non_queue_errors_are_permanent(
+    client: StubSqsClient, queue: SqsIngressQueue, operation: str
+) -> None:
+    method, invoke = OPERATIONS[operation]
+    injected = RuntimeError("an unexpected failure")
+    client.answer(method, injected)
+
+    with pytest.raises(IngressQueueError) as exc_info:
+        await invoke(queue)
+
+    assert exc_info.value.retryable is False
+    assert exc_info.value.__cause__ is injected
+    assert client.methods() == [method]
