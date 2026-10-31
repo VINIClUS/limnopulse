@@ -4,6 +4,8 @@ frozen). Each test pins one finding of the two diff reviews of the runbook and A
 import re
 from pathlib import Path
 
+import yaml
+
 from tests.contracts.test_p2_acceptance_gate import markdown_section
 
 ROOT = Path(__file__).resolve().parents[2]
@@ -128,3 +130,49 @@ def test_runbook_does_not_promise_replay_for_terminal_fences() -> None:
     assert re.search(r"Dismiss fenced rows", drill)
     assert re.search(r"fenced again", drill)
     assert "persisted as replayable" not in _section("Decommissioning")
+
+
+# --- #116 follow-ups from the P3-11 audit ---------------------------------------------------------
+
+README = ROOT / "README.md"
+
+
+def _readme_paragraphs(start: str) -> list[str]:
+    text = README.read_text(encoding="utf-8")
+    return [" ".join(p.split()) for p in text.split("\n\n") if p.strip().startswith(start)]
+
+
+def test_readme_rollbacks_recreate_instead_of_restarting() -> None:
+    """`docker compose restart` keeps a container's old environment, so a rollback that only
+    restarts the API leaves the switch on."""
+    text = " ".join(README.read_text(encoding="utf-8").split())
+    assert "unset `INGEST_V2_ENABLED`" not in text
+    assert "restart the API" not in text
+    p2, p3 = _readme_paragraphs("**Rollback:**")
+    assert not re.search(r"\band restart\b", p2)
+    assert re.search(r"recreate", p2) and re.search(r"up -d", p2)
+    assert re.search(r"set `INGEST_V2_ENABLED=false` and recreate the API", p3)
+    assert re.search(r"`docker compose [^`]*up -d api`", p3)
+    assert "](docs/p3-ingestion-rollout-runbook.md#rollback)" in p3
+
+
+def test_runbook_grace_bullet_says_drain_and_wait_are_not_interpolated() -> None:
+    text = _section("Production environment")
+    (bullet,) = [b for b in text.split("- ") if b.startswith("**`stop_grace_period`.**")]
+    assert re.search(r"must exceed drain \+ wait \+ 5 s \(A47\)", bullet)
+    assert re.search(r"not interpolated", bullet)
+    assert re.search(r"no effect", bullet)
+    for compose in ("compose.yaml", "compose.production.yaml"):
+        services = yaml.safe_load((ROOT / compose).read_text(encoding="utf-8"))["services"]
+        worker = services["telemetry-ingest-worker"]
+        assert "env_file" not in worker, compose  # `.env` reaches the worker only by name
+        environment = worker.get("environment") or {}
+        for name in ("TELEMETRY_INGEST_DRAIN_SECONDS", "TELEMETRY_INGEST_WORKER_WAIT_SECONDS"):
+            assert name in bullet, name
+            assert name not in environment, (compose, name)  # the claim holds in both files
+
+
+def test_runbook_says_a_rerun_after_a_partial_mark_gets_a_new_replay_id() -> None:
+    """#116 P3-09: already on main since P3-11; pinned so it cannot regress."""
+    text = _section("Quarantine reconciliation drill")
+    assert re.search(r"After a partial mark.{0,300}new replay id", text)

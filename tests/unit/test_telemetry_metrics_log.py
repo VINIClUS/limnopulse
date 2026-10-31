@@ -5,7 +5,7 @@ from __future__ import annotations
 
 import json
 import logging
-from collections.abc import Callable
+from collections.abc import Callable, Iterator
 from typing import Any
 
 import pytest
@@ -39,9 +39,19 @@ class LogMetricsSubject:
 
 
 @pytest.fixture
-def subject(caplog: pytest.LogCaptureFixture) -> LogMetricsSubject:
+def subject(
+    caplog: pytest.LogCaptureFixture, monkeypatch: pytest.MonkeyPatch
+) -> Iterator[LogMetricsSubject]:
     caplog.set_level(logging.DEBUG)
-    return LogMetricsSubject(caplog)
+    # #116: the API sets `propagate=False` on this logger, so after any ingest-on app in the same
+    # process caplog's root handler sees nothing; capture on the logger itself, exactly once.
+    logger = logging.getLogger(LOGGER)
+    monkeypatch.setattr(logger, "propagate", False)
+    logger.addHandler(caplog.handler)
+    try:
+        yield LogMetricsSubject(caplog)
+    finally:
+        logger.removeHandler(caplog.handler)
 
 
 @pytest.mark.asyncio
