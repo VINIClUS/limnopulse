@@ -1,0 +1,15 @@
+[Unit]
+Description=Limnopulse simulated HTTPS pilot connector (one ingest batch)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+EnvironmentFile=/opt/limnopulse/pilot/pilot-sim.env
+ExecStart=/usr/bin/python3 -I /opt/limnopulse/pilot/pilot_sim.py
+DynamicUser=no
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+ReadOnlyPaths=/opt/limnopulse/pilot
