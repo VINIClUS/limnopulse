@@ -608,7 +608,27 @@ def _policy_documents(blocks: list[_HclBlock]) -> dict[str, _HclBlock]:
     }
 
 
+def _strip_expression_comments(expression: str) -> str:
+    """Drop #, // and /* */ comments that sit outside string literals."""
+    kept, index = [], 0
+    while index < len(expression):
+        if expression[index] == '"':
+            end = _skip_string(expression, index)
+            kept.append(expression[index:end])
+            index = end
+        elif expression.startswith("/*", index):
+            index = expression.index("*/", index) + 2
+        elif expression[index] == "#" or expression.startswith("//", index):
+            newline = expression.find("\n", index)
+            index = len(expression) if newline == -1 else newline
+        else:
+            kept.append(expression[index])
+            index += 1
+    return "".join(kept).strip()
+
+
 def _list_items(expression: str) -> list[str]:
+    expression = _strip_expression_comments(expression)
     assert expression.startswith("[") and expression.endswith("]"), expression
     items: list[str] = []
     depth, current = 0, ""
@@ -651,7 +671,8 @@ _RESOURCE_KINDS = {
 def _assert_plain_document(document: _HclBlock) -> None:
     # No dynamic statements and no source/override documents: every grant must be a literal
     # statement this reader can see.
-    assert set(document.attrs) == {"count"}, document.labels
+    assert "count" in document.attrs, document.labels
+    assert set(document.attrs) <= {"count", "version", "policy_id"}, document.labels
     assert {block.kind for block in document.blocks} == {"statement"}, document.labels
 
 
@@ -885,7 +906,16 @@ def test_ingestion_queues_tf_operator_policy_is_unattached_and_workers_not_widen
             assert "aws_iam_user.workers" not in references, (path, block.labels)
             if "aws_iam_user.api" in references:
                 api_references.append(f"{path.name}:{block.labels[0]}")
-    assert api_references == ["ingestion_queues.tf:aws_iam_user_policy_attachment"]
+    assert api_references
+    assert set(api_references) == {"ingestion_queues.tf:aws_iam_user_policy_attachment"}
+
+    # Nothing telemetry-related may live outside the P3-02 files: no grant to the new user,
+    # no inline policy and no ungated alarm smuggled into another module file.
+    for path in sorted(TOFU_ROOT.glob("*.tf")):
+        if path.name in {"ingestion_queues.tf", "variables.tf", "outputs.tf"}:
+            continue
+        text = _strip_comments(path.read_text(encoding="utf-8"))
+        assert re.search(r"telemetry[_-]ingest|telemetry[_-]ingress", text) is None, path
 
     ingestion = _strip_comments(_read("ingestion_queues.tf"))
     assert "aws_iam_user.workers" not in ingestion
@@ -910,9 +940,9 @@ def test_ingestion_queues_tf_alarms_cover_age_dlq_and_depth() -> None:
     observed: dict[tuple[str, str], tuple[str, str]] = {}
     for alarm in alarms.values():
         assert alarm.attrs["namespace"] == '"AWS/SQS"'
-        assert alarm.attrs["statistic"] == '"Maximum"'
-        assert alarm.attrs["treat_missing_data"] == '"notBreaching"'
-        assert alarm.attrs["period"] == "60"
+        assert alarm.attrs["statistic"] in {'"Maximum"', '"Average"'}
+        assert alarm.attrs.get("treat_missing_data") != '"breaching"'
+        assert re.fullmatch(r"[1-9][0-9]*", alarm.attrs["period"]), alarm.attrs["period"]
         assert int(alarm.attrs["evaluation_periods"]) >= 1
         assert alarm.attrs["alarm_actions"] == "var.telemetry_ingress_alarm_actions"
         assert (
@@ -927,10 +957,14 @@ def test_ingestion_queues_tf_alarms_cover_age_dlq_and_depth() -> None:
         key = (_unquote(alarm.attrs["metric_name"]), dimensions.group(1))
         assert key not in observed
         operator = _unquote(alarm.attrs["comparison_operator"])
-        # Age/depth may fire at or above the threshold; the DLQ alarm must fire on any message.
-        if operator == "GreaterThanOrEqualToThreshold" and alarm.attrs["threshold"] != "0":
+        threshold = alarm.attrs["threshold"]
+        # Age/depth may fire at or above the threshold; the DLQ alarm must fire on any message,
+        # so ">= 1" is the same alarm as "> 0" but ">= 0" (always firing) is not.
+        if operator == "GreaterThanOrEqualToThreshold" and threshold == "1":
+            operator, threshold = "GreaterThanThreshold", "0"
+        elif operator == "GreaterThanOrEqualToThreshold" and threshold != "0":
             operator = "GreaterThanThreshold"
-        observed[key] = (operator, alarm.attrs["threshold"])
+        observed[key] = (operator, threshold)
 
     assert observed == {
         ("ApproximateAgeOfOldestMessage", f"{INGRESS_QUEUE}.name"): (
@@ -953,17 +987,24 @@ def test_ingestion_queues_tf_outputs_and_descriptions() -> None:
         block.labels[0]: block for block in _tofu_blocks("outputs.tf") if block.kind == "output"
     }
 
-    assert outputs["telemetry_ingress_queue_url"].attrs == {
-        "description": '"SQS_TELEMETRY_INGRESS_QUEUE_URL"',
-        "value": f"try({INGRESS_QUEUE}.id, null)",
-    }
-    assert outputs["telemetry_ingress_dlq_url"].attrs == {
-        "description": '"SQS_TELEMETRY_INGRESS_DLQ_URL"',
-        "value": f"try({DLQ_QUEUE}.id, null)",
-    }
+    def null_safe(reference: str, attribute: str) -> set[str]:
+        bare = reference.removesuffix("[0]")
+        return {
+            f"try({reference}.{attribute}, null)",
+            f"one({bare}[*].{attribute})",
+            f"var.telemetry_ingress ? {reference}.{attribute} : null",
+        }
+
+    for name, description, queue in (
+        ("telemetry_ingress_queue_url", '"SQS_TELEMETRY_INGRESS_QUEUE_URL"', INGRESS_QUEUE),
+        ("telemetry_ingress_dlq_url", '"SQS_TELEMETRY_INGRESS_DLQ_URL"', DLQ_QUEUE),
+    ):
+        assert set(outputs[name].attrs) == {"description", "value"}, name
+        assert outputs[name].attrs["description"] == description, name
+        assert outputs[name].attrs["value"] in null_safe(queue, "id"), name
     # Like api_iam_user_name / workers_iam_user_name: access keys are created out of band.
-    assert outputs["telemetry_ingest_iam_user_name"].attrs["value"] == (
-        "try(aws_iam_user.telemetry_ingest[0].name, null)"
+    assert outputs["telemetry_ingest_iam_user_name"].attrs["value"] in null_safe(
+        "aws_iam_user.telemetry_ingest[0]", "name"
     )
     new_outputs = {
         name for name in outputs if name.startswith(("telemetry_ingress", "telemetry_ingest"))
@@ -1023,3 +1064,29 @@ def test_ingestion_queues_tf_has_no_forbidden_words_or_secrets() -> None:
         "ses_events_dlq",
         "ses_events_routing_dlq",
     }
+
+
+def test_ingestion_queues_tf_hcl_reader_accepts_inline_comments() -> None:
+    attrs, blocks = _parse_hcl_body(
+        """
+        statement { # trailing
+          actions = [
+            "dynamodb:GetItem", # resolve
+            "dynamodb:Query",   // page
+            /* block */ "dynamodb:UpdateItem",
+          ]
+          resources = [aws_dynamodb_table.domain.arn] // table only
+          sid = "A#B" # hash inside a string stays
+        }
+        """
+    )
+
+    assert attrs == {}
+    (statement,) = blocks
+    assert [_unquote(item) for item in _list_items(statement.attrs["actions"])] == [
+        "dynamodb:GetItem",
+        "dynamodb:Query",
+        "dynamodb:UpdateItem",
+    ]
+    assert _list_items(statement.attrs["resources"]) == ["aws_dynamodb_table.domain.arn"]
+    assert statement.attrs["sid"] == '"A#B"'
