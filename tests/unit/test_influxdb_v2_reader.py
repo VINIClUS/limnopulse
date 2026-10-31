@@ -400,6 +400,17 @@ async def test_bucket_is_always_a_helper_escaped_literal(bucket: str) -> None:
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("bucket", ["raw\x00", "raw\x1b[0m", "raw\ud800"], ids=ascii)
+async def test_bucket_that_cannot_round_trip_is_rejected_before_any_query(bucket: str) -> None:
+    # P2 plan D19 (#84): the helper raises, so nothing reaches InfluxDB.
+    for run in (run_query, run_latest):
+        api = FakeQueryApi()
+        with pytest.raises(ValueError):
+            await run(api, bucket=bucket)
+        assert api.calls == []
+
+
+@pytest.mark.asyncio
 async def test_every_runtime_literal_goes_through_the_escaping_helper(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

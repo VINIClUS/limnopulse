@@ -379,6 +379,31 @@ async def test_bucket_literal_is_escaped(method: str, bucket: str, literal: str)
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("method", METHODS)
+async def test_bucket_literal_is_lossless(method: str) -> None:
+    # P2 plan D19 (#84): non-ASCII and HTML characters stay raw; every `$` becomes `\x24`.
+    query_api = FakeQueryApi(*one_row(method))
+    await call(projection(query_api, bucket="é<&>\u2028${x}"), method)
+
+    assert query_api.calls
+    for item in query_api.calls:
+        assert 'from(bucket: "é<&>\u2028\\x24{x}")' in item["query"]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("method", METHODS)
+@pytest.mark.parametrize("bucket", ["raw\x00", "raw\x1b[0m", "raw\ud800"], ids=ascii)
+async def test_bucket_that_cannot_round_trip_is_rejected_before_any_query(
+    method: str, bucket: str
+) -> None:
+    query_api = FakeQueryApi(*one_row(method))
+    with pytest.raises(ValueError):
+        await call(projection(query_api, bucket=bucket), method)
+
+    assert query_api.calls == []
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("method", METHODS)
 @pytest.mark.parametrize("tenant_id", ['tnt"1', "tnt${x}", "tnt 1", ""])
 async def test_invalid_tenant_id_is_rejected_before_any_query(method: str, tenant_id: str) -> None:
     query_api = FakeQueryApi()

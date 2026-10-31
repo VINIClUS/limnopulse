@@ -5,8 +5,11 @@ value is compared on the server against a reference literal made of `\\x` escape
 bytes, and only a boolean and a rune count come back.
 """
 
+import json
 from collections.abc import Iterator
 from datetime import UTC, datetime
+from pathlib import Path
+from typing import Any
 
 import pytest
 from influxdb_client import InfluxDBClient
@@ -17,32 +20,12 @@ from limnopulse_api.repositories.telemetry_v2 import ObservationSelector
 from tests.support.influx_harness import influx_clients, influx_settings, write_lines
 from tests.support.telemetry_v2_vectors import scenario
 
-# The #84 list, the characters Go `encoding/json` escapes even without HTML escaping, and
-# neighbours of the escapes the rule emits.
-ROUND_TRIP_VALUES = (
-    "$${a}",
-    "${a}",
-    "$",
-    "t$\n",
-    "\\${z}",
-    "$$$${{a}}",
-    "a$\\${b}",
-    "é",
-    "<&>",
-    'a"b\\c',
-    "\u2028",
-    "\u2029",
-    '$"',
-    "raw$archive",
-    "\r\t",
-    "a\x7fb\x85",
-    "😀",
-    "\\u2028",
-    "\\x24",
-    "\\",
-    "}{$",
-    "",
-)
+# Shared with tests/unit/test_telemetry_v2_schema.py and the Go tests.
+ROUND_TRIP_VALUES = json.loads(
+    (Path(__file__).resolve().parents[2] / "testdata/flux_literals/d19_cases.json").read_text(
+        encoding="utf-8"
+    )
+)["round_trip"]
 
 # Line protocol cannot carry an empty tag, a raw CR/LF/tab or a trailing backslash; spaces,
 # commas and equals signs would need line-protocol escapes, so they are left out too.
@@ -55,6 +38,8 @@ TAG_VALUES = tuple(
 TENANT = "tnt_local_001"
 POND_ASSET = "ast_751707aef3455ab2ba60733d238b594f"
 WINDOW = (datetime(2026, 7, 9, 11, 0, tzinfo=UTC), datetime(2026, 7, 9, 14, 0, tzinfo=UTC))
+# A bucket name that needs every D19 step: `$${`, non-ASCII, HTML characters, U+2028 and `\${`.
+HOSTILE_SUFFIX = "_$${a}é<&>" + chr(0x2028) + "\\${z}"
 
 
 def hex_reference(value: str) -> str:
@@ -83,7 +68,7 @@ def test_literal_round_trips_on_influxdb(influx_bucket: str, value: str) -> None
 
 
 def test_tag_filter_finds_exactly_the_written_value(influx_bucket: str) -> None:
-    assert len(TAG_VALUES) >= 10
+    assert len(TAG_VALUES) >= 20
     lines = [
         f"flux_literal,probe={value} index={index}i 1767268800000000000"
         for index, value in enumerate(TAG_VALUES)
@@ -103,7 +88,7 @@ def test_tag_filter_finds_exactly_the_written_value(influx_bucket: str) -> None:
 @pytest.fixture
 def hostile_bucket(influx_bucket: str) -> Iterator[str]:
     """A second bucket whose name needs every D19 step; `influx_bucket` supplies the skip."""
-    name = f"{influx_bucket}_$${{a}}é<&>\u2028\\${{z}}"
+    name = influx_bucket + HOSTILE_SUFFIX
     settings = influx_settings()
     client = InfluxDBClient(url=settings.url, token=settings.token, org=settings.org)
     try:
@@ -116,6 +101,19 @@ def hostile_bucket(influx_bucket: str) -> Iterator[str]:
         client.close()
 
 
+async def read_asset(query_api: Any, bucket: str) -> list[Any]:
+    reader = InfluxObservationReader(query_api=query_api, org=influx_settings().org, bucket=bucket)
+    return await reader.query_observations(
+        tenant_id=TENANT,
+        selector=ObservationSelector("asset", POND_ASSET),
+        metric_keys=None,
+        quality_states=None,
+        start=WINDOW[0],
+        stop=WINDOW[1],
+        limit=1000,
+    )
+
+
 @pytest.mark.asyncio
 async def test_v2_reader_reads_a_bucket_whose_name_needs_lossless_literals(
     hostile_bucket: str,
@@ -123,25 +121,35 @@ async def test_v2_reader_reads_a_bucket_whose_name_needs_lossless_literals(
     observations = scenario("legacy_sample").observations
     write_lines(hostile_bucket, [encode_observation_line(o) for o in observations])
     with influx_clients(hostile_bucket) as (query_api, _write_api):
-        reader = InfluxObservationReader(
-            query_api=query_api, org=influx_settings().org, bucket=hostile_bucket
-        )
-        result = await reader.query_observations(
-            tenant_id=TENANT,
-            selector=ObservationSelector("asset", POND_ASSET),
-            metric_keys=None,
-            quality_states=None,
-            start=WINDOW[0],
-            stop=WINDOW[1],
-            limit=1000,
-        )
+        result = await read_asset(query_api, hostile_bucket)
     assert result
     assert sorted(item.event_id for item in result) == sorted(o.event_id for o in observations)
 
 
+class CountingQueryApi:
+    """Forwards to the real query API and counts the queries that reach it."""
+
+    def __init__(self, inner: Any) -> None:
+        self.inner = inner
+        self.calls = 0
+
+    def query(self, *args: Any, **kwargs: Any) -> Any:
+        self.calls += 1
+        return self.inner.query(*args, **kwargs)
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize(
-    "value", ["\x00", "a\x01b", "\x08", "\x0c", "\x1b[0m", "$${\x1f}"], ids=ascii
+    "suffix", ["\x00", "\x01b", "\x08", "\x0c", "\x1b[0m", "$${\x1f}"], ids=ascii
 )
-def test_c0_controls_are_rejected_before_any_query(value: str) -> None:
-    with pytest.raises(ValueError, match="control character"):
-        flux_string_literal(value)
+async def test_v2_reader_rejects_a_c0_bucket_before_any_query(
+    influx_bucket: str, suffix: str
+) -> None:
+    with influx_clients(influx_bucket) as (query_api, _write_api):
+        counting = CountingQueryApi(query_api)
+        with pytest.raises(ValueError, match="control"):
+            await read_asset(counting, influx_bucket + suffix)
+        assert counting.calls == 0
+        # The same reader and server answer once the bucket is clean.
+        assert await read_asset(counting, influx_bucket) == []
+        assert counting.calls == 1
