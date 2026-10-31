@@ -155,3 +155,17 @@ and valid clean window. `recovery_duration` and
 `recovery_threshold`/hysteresis are reserved schema extensions if tests or
 production telemetry later show flapping; opening `duration` is not implicitly
 reused for recovery.
+
+## Evaluation values and state compatibility
+
+An evaluation value is present only for a sufficient evaluation. No data, stale
+data, query errors, timeouts and invalid or out-of-range aggregates have no
+value: DynamoDB value attributes are omitted or removed, never written as `0`.
+The evaluator state document (`state_json`) carries `"SchemaVersion":2`.
+
+Old and new evaluator binaries can overlap or roll back in either order. An
+unknown state schema version fails the rule closed under the `state_schema`
+error category, so a future version must ship its reader before any writer.
+
+The compatibility contract is in
+`docs/superpowers/specs/2026-10-31-optional-evaluation-value-design.md`.
