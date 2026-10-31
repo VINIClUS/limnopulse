@@ -67,6 +67,8 @@ class ScriptedConsumer:
         self.receive_errors: deque[BaseException] = deque()
         self.delete_errors: deque[BaseException] = deque()
         self.visibility_errors: deque[BaseException] = deque()
+        self.heartbeat_errors: deque[BaseException] = deque()
+        self.heartbeat_gate: asyncio.Event | None = None  # holds an in-flight heartbeat
 
     async def receive(
         self, *, max_messages: int, wait_seconds: int, visibility_seconds: int
@@ -101,7 +103,13 @@ class ScriptedConsumer:
 
     async def heartbeat(self, message: Any, seconds: int) -> None:
         self.events.append(("heartbeat_start", message.message_id, seconds))
-        call = asyncio.ensure_future(asyncio.sleep(self.heartbeat_seconds))
+        if self.heartbeat_errors:
+            self.events.append(("heartbeat_end", message.message_id))
+            raise self.heartbeat_errors.popleft()
+        gate = self.heartbeat_gate
+        call = asyncio.ensure_future(
+            gate.wait() if gate is not None else asyncio.sleep(self.heartbeat_seconds)
+        )
         try:
             await asyncio.shield(call)
         except asyncio.CancelledError:
@@ -123,7 +131,9 @@ class StubProcessor:
         *,
         decide: Callable[[Any], ProcessDecision] | None = None,
         delay: float = 0.0,
+        delays: dict[str, float] | None = None,
         hang: bool = False,
+        raises: BaseException | None = None,
     ) -> None:
         self.events = events
         self.decide = decide or (
@@ -132,7 +142,9 @@ class StubProcessor:
             )
         )
         self.delay = delay
+        self.delays = delays or {}
         self.hang = hang
+        self.raises = raises
         self.gates: dict[str, asyncio.Event] = {}
         self.gated = False
         self.active = 0
@@ -156,8 +168,11 @@ class StubProcessor:
                 await asyncio.Event().wait()
             if self.gated:
                 await self.gates.setdefault(message.message_id, asyncio.Event()).wait()
-            if self.delay:
-                await asyncio.sleep(self.delay)
+            delay = self.delays.get(message.message_id, self.delay)
+            if delay:
+                await asyncio.sleep(delay)
+            if self.raises is not None:
+                raise self.raises
         except asyncio.CancelledError:
             self.cancelled.append(message.message_id)
             raise
@@ -315,6 +330,19 @@ async def test_each_receive_asks_for_min_of_max_messages_and_free_permits() -> N
     assert all(1 <= r["max_messages"] <= 2 for r in consumer.receives)
 
 
+async def test_empty_receives_release_their_permits() -> None:
+    consumer = ScriptedConsumer()
+    loop, _ = make_loop(consumer, StubProcessor(consumer.events), concurrency=3, max_messages=10)
+
+    async with running(loop):
+        await wait_for(lambda: len(consumer.receives) >= 3)  # several empty long polls
+        consumer.pending.extend(make_message(i) for i in range(1, 4))
+        await wait_for(lambda: len(consumer.named("delete")) == 3)
+        await wait_for(lambda: consumer.receives[-1]["max_messages"] == 3)
+
+    assert all(r["max_messages"] == 3 for r in consumer.receives[:3])
+
+
 async def test_no_receive_asks_for_zero_messages() -> None:
     consumer = ScriptedConsumer([make_message(i) for i in range(1, 6)])
     processor = StubProcessor(consumer.events, delay=0.02)
@@ -342,7 +370,7 @@ async def test_the_concurrency_bound_is_respected_and_reached() -> None:
 
 async def test_the_heartbeat_extends_visibility_on_a_slow_message() -> None:
     consumer = ScriptedConsumer([make_message(1)])
-    processor = StubProcessor(consumer.events, delay=1.3)
+    processor = StubProcessor(consumer.events, delay=1.8)
     loop, _ = make_loop(consumer, processor, visibility_seconds=1)
 
     await run_until(loop, lambda: bool(consumer.named("delete")))
@@ -362,45 +390,84 @@ async def test_a_fast_message_gets_no_heartbeat() -> None:
     assert consumer.named("heartbeat_start") == []
 
 
-async def test_the_heartbeat_starts_at_receive_and_ends_before_the_final_action() -> None:
-    consumer = ScriptedConsumer([make_message(1)], heartbeat_seconds=0.2)
-    processor = StubProcessor(consumer.events, delay=0.6)
-    loop, _ = make_loop(consumer, processor, visibility_seconds=1)
+HEARTBEAT_SCENARIOS = ["delete", "visibility", "processor-raises", "deadline"]
+
+
+@pytest.mark.parametrize("scenario", HEARTBEAT_SCENARIOS)
+async def test_an_in_flight_heartbeat_is_awaited_before_the_final_action(scenario: str) -> None:
+    """Deterministic ordering: the heartbeat is held in flight on a gate while processing ends
+    (or the deadline fires); the final action must wait for it, and nothing may follow."""
+    consumer = ScriptedConsumer([make_message(1, receive_count=2)])
+    consumer.heartbeat_gate = asyncio.Event()
+    decide = None
+    if scenario == "visibility":
+        decide = lambda m: ProcessDecision(
+            action="visibility", seconds=77, category=IngressFailureCategory.DEFERRED
+        )
+    processor = StubProcessor(
+        consumer.events,
+        decide=decide,
+        hang=scenario == "deadline",
+        raises=RuntimeError("bug") if scenario == "processor-raises" else None,
+    )
+    processor.gate()
+    overrides: dict[str, Any] = {"visibility_seconds": 1}
+    if scenario == "deadline":
+        overrides["processing_deadline_seconds"] = 0.7
+    loop, metrics = make_loop(consumer, processor, **overrides)
+    final_kind = "delete" if scenario == "delete" else "visibility"
 
     async with running(loop):
-        await wait_for(lambda: bool(consumer.named("delete")))
+        await wait_for(lambda: bool(consumer.named("heartbeat_start")))
+        assert processor.active == 1  # the heartbeat runs while the message is processed
+        if scenario == "deadline":
+            await wait_for(lambda: processor.cancelled == ["m1"])
+        else:
+            processor.release("m1")
+            await wait_for(lambda: processor.active == 0)
+        await asyncio.sleep(0.05)
+        assert consumer.named(final_kind) == []  # held until the heartbeat call returns
+        consumer.heartbeat_gate.set()
+        await wait_for(lambda: bool(consumer.named(final_kind)))
         await asyncio.sleep(0.8)  # a heartbeat that kept running would show up now
 
     kinds = [event[0] for event in consumer.events if event[0] != "receive"]
-    final = kinds.index("delete")
-    assert "heartbeat_start" in kinds[:final]
-    assert kinds.index("heartbeat_start") < kinds.index("process_end")
-    # The in-flight heartbeat was cancelled AND awaited: it ended before the delete, and
-    # nothing touched the message afterwards.
+    final = kinds.index(final_kind)
     assert kinds[final - 1] == "heartbeat_end"
     assert kinds[final + 1 :] == []
+    if scenario == "visibility":
+        assert consumer.named("visibility") == [("visibility", "m1", 77)]
+    if scenario in {"processor-raises", "deadline"}:
+        assert consumer.named("visibility") == [("visibility", "m1", processor.retry.backoff(2))]
+        assert messages_total(metrics) == [{"outcome": "retry", "category": "unexpected"}]
 
 
-async def test_the_heartbeat_is_cancelled_before_a_visibility_change() -> None:
-    consumer = ScriptedConsumer([make_message(1)], heartbeat_seconds=0.2)
-    processor = StubProcessor(
-        consumer.events,
-        delay=0.6,
-        decide=lambda m: ProcessDecision(
-            action="visibility", seconds=77, category=IngressFailureCategory.DEFERRED
-        ),
-    )
-    loop, _ = make_loop(consumer, processor, visibility_seconds=1)
+async def test_each_message_has_its_own_heartbeat() -> None:
+    consumer = ScriptedConsumer([make_message(1), make_message(2)])
+    processor = StubProcessor(consumer.events, delays={"m1": 0.05, "m2": 1.3})
+    loop, _ = make_loop(consumer, processor, visibility_seconds=1, max_messages=2)
 
-    async with running(loop):
-        await wait_for(lambda: bool(consumer.named("visibility")))
-        await asyncio.sleep(0.8)
+    await run_until(loop, lambda: len(consumer.named("delete")) == 2)
 
-    kinds = [event[0] for event in consumer.events if event[0] != "receive"]
-    final = kinds.index("visibility")
-    assert kinds[final - 1] == "heartbeat_end"
-    assert kinds[final + 1 :] == []
-    assert consumer.named("visibility") == [("visibility", "m1", 77)]
+    assert consumer.receives[0]["max_messages"] == 2  # both arrived in one batch
+    m1_deleted = consumer.events.index(("delete", "m1"))
+    assert not [e for e in consumer.events[m1_deleted:] if e[:2] == ("heartbeat_start", "m1")]
+    assert len([e for e in consumer.events if e[:2] == ("heartbeat_start", "m2")]) >= 2
+
+
+async def test_a_heartbeat_failure_neither_stops_the_message_nor_the_loop(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    caplog.set_level(logging.DEBUG)
+    consumer = ScriptedConsumer([make_message(1), make_message(2)])
+    consumer.heartbeat_errors.append(_queue_error("change_visibility", 1))
+    processor = StubProcessor(consumer.events, delays={"m1": 1.3, "m2": 0.01})
+    loop, _ = make_loop(consumer, processor, visibility_seconds=1, concurrency=1)
+
+    await run_until(loop, lambda: len(consumer.named("delete")) == 2)
+
+    assert processor.finished == ["m1", "m2"]
+    _assert_redacted_logs(caplog)
 
 
 # Processing deadline ---------------------------------------------------------------------------
@@ -487,7 +554,10 @@ async def test_a_visibility_failure_is_counted_and_not_raised(
 async def test_a_receive_failure_does_not_stop_the_loop(caplog: pytest.LogCaptureFixture) -> None:
     caplog.set_level(logging.DEBUG)
     consumer = ScriptedConsumer([make_message(1)])
-    consumer.receive_errors.append(_queue_error("receive", 9))
+    # A45: receive failures surface as retryable queue errors.
+    error = IngressQueueError("SQS receive failed (RequestThrottled)", retryable=True)
+    error.__cause__ = RuntimeError(f"handle {RECEIPT_SECRET}-9 for {TENANT}")
+    consumer.receive_errors.append(error)
     loop, _ = make_loop(consumer, StubProcessor(consumer.events))
 
     await run_until(loop, lambda: bool(consumer.named("delete")))
@@ -547,6 +617,7 @@ async def test_drain_gives_up_after_drain_seconds() -> None:
     await asyncio.sleep(0.8)  # no heartbeat may outlive the loop
 
     assert elapsed < 1.5
+    assert processor.cancelled == ["m1"]  # nothing is left running after the drain
     assert consumer.named("delete") == [] and consumer.named("visibility") == []
     beats = len(consumer.named("heartbeat_start"))
     await asyncio.sleep(0.6)

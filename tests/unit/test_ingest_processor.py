@@ -7,6 +7,7 @@ context, the event ids and the normalizer quarantine are the production ones.
 
 from __future__ import annotations
 
+import asyncio
 import copy
 import inspect
 import math
@@ -33,6 +34,7 @@ from limnopulse_api.domain.ingestion import (
     IngressFenceReason,
     IngressQueueMessage,
     QuarantineEntryKind,
+    TrustedIngress,
     build_quarantine_entries,
     build_trusted_context,
     ingress_backoff_seconds,
@@ -94,6 +96,8 @@ FOREIGN_COMPONENT = default_component_id_for_legacy_device(TENANT, OTHER_DEVICE)
 RECEIPT_HANDLE = "rh-SECRET-receipt-handle-0001"
 REPLAY_OF = "ing_" + "9" * 32
 HALF = 0.5
+# Non-default policy numbers, so an implementation that ignores the injected policy fails.
+BASE, CAP, PERMANENT = 7, 50, 61
 WORKER_METRICS = frozenset(
     {
         "ingress_messages_total",
@@ -253,6 +257,7 @@ async def make_world(
     integration: dict[str, Any] | None = None,
     account: dict[str, Any] | None = None,
     device: dict[str, Any] | None = None,
+    wrap_mapping: Callable[[Any], Any] | None = None,
 ) -> World:
     events: list[str] = []
     subject = KitSubject(
@@ -285,19 +290,23 @@ async def make_world(
     )
     metrics = RecordingTelemetryMetrics()
     processor = IngestMessageProcessor(
-        mapping=Spy(subject.mapping, events, "mapping"),
+        mapping=Spy(
+            subject.mapping if wrap_mapping is None else wrap_mapping(subject.mapping),
+            events,
+            "mapping",
+        ),
         pipeline=pipeline,
         quarantine=Spy(subject.quarantine, events, "quarantine"),
         state=IngestStateService(Spy(subject.state, events, "state"), clock=lambda: NOW),
         metrics=metrics,
         clock=lambda: NOW,
-        retry=RetryPolicy(base=30, cap=900, permanent_visibility=60, random=random),
+        retry=RetryPolicy(base=BASE, cap=CAP, permanent_visibility=PERMANENT, random=random),
     )
     return World(subject, repos, writer, pipeline, metrics, processor, events)
 
 
 def backoff(receive_count: int) -> int:
-    return ingress_backoff_seconds(receive_count, base=30, cap=900, random=lambda: HALF)
+    return ingress_backoff_seconds(receive_count, base=BASE, cap=CAP, random=lambda: HALF)
 
 
 def assert_decision(
@@ -379,6 +388,7 @@ async def test_a_trusted_message_is_processed_and_deleted() -> None:
 
     assert_decision(decision, action="delete", category=IngressFailureCategory.PROCESSED)
     assert [point.observation.metric_key for point in world.writer.points] == ["water.temperature"]
+    assert world.quarantine_rows == []  # nothing quarantined: no row, no summary row
 
 
 @pytest.mark.parametrize(
@@ -413,7 +423,7 @@ async def test_an_invalid_envelope_is_permanent_and_touches_nothing(body: str) -
         decision,
         action="visibility",
         category=IngressFailureCategory.ENVELOPE_INVALID,
-        seconds=PERMANENT_VISIBILITY_SECONDS,
+        seconds=PERMANENT,
     )
     assert world.events == []  # no resolve, no pipeline, no write
     assert_nothing_written(world)
@@ -519,7 +529,7 @@ async def test_an_unverified_fence_writes_nothing_and_is_permanent(
         decision,
         action="visibility",
         category=IngressFailureCategory.FENCED_UNVERIFIED,
-        seconds=PERMANENT_VISIBILITY_SECONDS,
+        seconds=PERMANENT,
     )
     assert_nothing_written(world)
     assert "quarantine.put_quarantine_entries" not in world.events
@@ -601,7 +611,7 @@ async def test_a_failed_fence_persist_never_deletes(error: BaseException) -> Non
     ("retryable", "category", "seconds"),
     [
         (True, IngressFailureCategory.WRITE_RETRYABLE, backoff(5)),
-        (False, IngressFailureCategory.WRITE_PERMANENT, PERMANENT_VISIBILITY_SECONDS),
+        (False, IngressFailureCategory.WRITE_PERMANENT, PERMANENT),
     ],
     ids=["retryable", "permanent"],
 )
@@ -612,13 +622,11 @@ async def test_a_telemetry_write_error_never_deletes(
     world.pipeline.fail_with = TelemetryWriteError("influx down", retryable=retryable)
 
     decision = await world.processor.process(
-        message_for(
-            envelope(observations=[reading(component_id=FOREIGN_COMPONENT)]), receive_count=5
-        )
+        message_for(envelope(observations=[reading()]), receive_count=5)
     )
 
     assert_decision(decision, action="visibility", category=category, seconds=seconds)
-    assert world.quarantine_rows == [] and not world.wrote_state
+    assert not world.wrote_state
     assert world.count("ingress_write_failures_total", retryable=str(retryable).lower()) == 1
 
 
@@ -635,7 +643,7 @@ async def test_an_unknown_mapping_version_is_a_contract_violation() -> None:
         decision,
         action="visibility",
         category=IngressFailureCategory.CONTRACT_VIOLATION,
-        seconds=PERMANENT_VISIBILITY_SECONDS,
+        seconds=PERMANENT,
     )
     assert_nothing_written(world)
 
@@ -650,7 +658,7 @@ async def test_a_pipeline_value_error_is_a_contract_violation() -> None:
         decision,
         action="visibility",
         category=IngressFailureCategory.CONTRACT_VIOLATION,
-        seconds=PERMANENT_VISIBILITY_SECONDS,
+        seconds=PERMANENT,
     )
 
 
@@ -718,22 +726,130 @@ async def test_a_quarantine_failure_skips_the_state_marks() -> None:
     assert decision.action == "visibility"
     assert "state.apply_ingest_marks" not in world.events
     assert not world.wrote_state
+    assert_no_processed_metrics(world)
 
 
-async def test_a_redelivery_after_a_quarantine_failure_persists_the_same_rows() -> None:
+def assert_no_processed_metrics(world: World) -> None:
+    """D8 step 6: metrics follow the durable writes, so a retried message never counts twice."""
+    for name in (
+        "ingress_observations_total",
+        "ingress_quarantined_total",
+        "ingress_quality_flags_total",
+        "ingress_sequence_events_total",
+    ):
+        assert world.metric(name) == []
+
+
+@pytest.mark.parametrize("operation", ["apply_ingest_marks", "get_component_states"])
+async def test_a_state_failure_emits_no_processed_metrics(operation: str) -> None:
+    world = await make_world()
+    world.fail_next(operation, store_errors()[0])
+    item = envelope(
+        replay=False,
+        observations=[reading(sequence=1), reading(component_id=FOREIGN_COMPONENT)],
+    )
+
+    decision = await world.processor.process(message_for(item))
+
+    assert decision.category == IngressFailureCategory.STORE_UNAVAILABLE
+    assert_no_processed_metrics(world)
+
+
+async def test_a_failed_fence_persist_emits_no_fence_metric() -> None:
+    world = await make_world(integration={"status": DeviceIntegrationStatus.DECOMMISSIONED})
+    world.fail_next("put_quarantine_entries", store_errors()[0])
+
+    await world.processor.process(message_for(envelope(observations=[reading()])))
+
+    assert world.metric("ingress_fenced_total") == []
+
+
+@pytest.mark.parametrize("error", store_errors(), ids=["client-error", "endpoint-error"])
+async def test_a_failed_fence_mark_never_deletes(error: BaseException) -> None:
+    world = await make_world(integration={"status": DeviceIntegrationStatus.DECOMMISSIONED})
+    world.fail_next("apply_ingest_marks", error)
+
+    decision = await world.processor.process(
+        message_for(envelope(observations=[reading()]), receive_count=3)
+    )
+
+    assert_decision(
+        decision,
+        action="visibility",
+        category=IngressFailureCategory.STORE_UNAVAILABLE,
+        seconds=backoff(3),
+    )
+    assert len(world.quarantine_rows) == 2  # the rows were persisted first; a retry re-creates them
+    assert world.metric("ingress_fenced_total") == []
+
+
+async def test_a_cancellation_is_never_turned_into_a_decision() -> None:
+    """The loop's deadline cancels `process`; swallowing that would hide the timeout."""
+    world = await make_world()
+    world.pipeline.fail_with = asyncio.CancelledError()
+
+    with pytest.raises(asyncio.CancelledError):
+        await world.processor.process(message_for(envelope(observations=[reading()])))
+
+
+async def test_a_redelivery_after_a_state_failure_rebuilds_the_same_rows() -> None:
+    """The first attempt persists its row, then fails; the redelivery must hit the same id."""
     world = await make_world()
     item = envelope(observations=[reading(sequence=1), reading(component_id=FOREIGN_COMPONENT)])
-    world.fail_next("put_quarantine_entries", store_errors()[0])
-    await world.processor.process(message_for(item, receive_count=1))
+    world.fail_next("apply_ingest_marks", store_errors()[0])
+    first = await world.processor.process(message_for(item, receive_count=1))
+    (persisted,) = world.quarantine_rows
 
     decision = await world.processor.process(message_for(item, receive_count=2))
 
+    assert first.category == IngressFailureCategory.STORE_UNAVAILABLE
     assert_decision(decision, action="delete", category=IngressFailureCategory.PROCESSED)
     (row,) = world.quarantine_rows
+    assert row.quarantine_id == persisted.quarantine_id
     assert row.reason == QuarantineReason.COMPONENT_NOT_OWNED.value
 
 
+@pytest.mark.parametrize("operation", ["put_quarantine_entries", "apply_ingest_marks"])
+async def test_a_value_error_outside_the_pipeline_is_unexpected(operation: str) -> None:
+    """Only a `ValueError` from the pipeline is a contract violation (failure table)."""
+    world = await make_world()
+    world.fail_next(operation, ValueError("bug"))
+    item = envelope(observations=[reading(sequence=1), reading(component_id=FOREIGN_COMPONENT)])
+
+    decision = await world.processor.process(message_for(item, receive_count=2))
+
+    assert_decision(
+        decision,
+        action="visibility",
+        category=IngressFailureCategory.UNEXPECTED,
+        seconds=backoff(2),
+    )
+
+
 # Context, replay and forged components ---------------------------------------------------------
+
+
+async def test_the_pipeline_gets_exactly_the_context_the_fence_returned() -> None:
+    """The context comes from `TrustedIngress` (the re-resolved DI), never from envelope fields."""
+    item = envelope(observations=[reading()])
+    sentinel = build_trusted_context(item, device_integration()).model_copy(
+        update={"connector_version": "ctx-from-mapping"}
+    )
+
+    class SentinelMapping:
+        def __init__(self, inner: Any) -> None:
+            self.inner = inner
+
+        async def fence(self, envelope: IngressEnvelope) -> Any:
+            result = await self.inner.fence(envelope)
+            assert isinstance(result, TrustedIngress)
+            return result.model_copy(update={"context": sentinel})
+
+    world = await make_world(wrap_mapping=SentinelMapping)
+
+    await world.processor.process(message_for(item))
+
+    assert world.pipeline.contexts == [sentinel]
 
 
 async def test_the_context_is_rebuilt_from_the_re_resolved_integration() -> None:
@@ -829,14 +945,6 @@ async def test_quarantine_rows_come_from_build_quarantine_entries() -> None:
         )
         assert (row.source_type, row.connector_version) == (item.source_type, "fw-9")
         assert (row.device_integration_id, row.device_id) == (INTEGRATION, DEVICE)
-
-
-async def test_a_message_without_quarantine_writes_no_rows() -> None:
-    world = await make_world()
-
-    await world.processor.process(message_for(envelope(observations=[reading()])))
-
-    assert world.quarantine_rows == []
 
 
 # Accepted data never vanishes --------------------------------------------------------------------
