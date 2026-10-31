@@ -78,7 +78,9 @@ data "aws_iam_policy_document" "dynamodb_domain_access" {
     ]
   }
 
-  # Item actions are authorized against the table, never an index.
+  # Item actions are authorized against the table ARN, never an index, so
+  # this statement names the table alone. The item actions the statement
+  # above also lists on index/* predate issue #108 and authorize nothing.
   statement {
     sid    = "DomainTableTransactionItems"
     effect = "Allow"
