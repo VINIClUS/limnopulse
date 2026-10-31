@@ -211,3 +211,62 @@ async def test_a_failed_delete_after_a_send_counts_as_failed_and_keeps_the_messa
     assert report == RedriveReport(seen=1, redriven=0, failed=1)
     assert source.sent == bodies  # sent once; the duplicate on a rerun is safe (D10)
     assert await dlq.visible() == bodies
+
+
+# --- slow runs (Codex review on #112) ---------------------------------------------------------
+
+
+class Clock:
+    def __init__(self) -> None:
+        self.now = 1_000.0
+
+    def __call__(self) -> float:
+        return self.now
+
+
+@pytest.mark.asyncio
+async def test_a_slow_apply_run_moves_each_distinct_message_once() -> None:
+    """Failed sends of 31 s each outlast the 300 s hold: the first batch reappears mid-run."""
+    clock = Clock()
+    dlq, source = SpyQueue(), SpyQueue()
+    dlq.inner = FakeIngressQueue(Faults(), clock=clock)
+    bodies = await _seed(dlq, 20)
+    source.fail_send = True
+    attempts: list[str] = []
+
+    async def slow_failing_send(body: str) -> str:
+        attempts.append(body)
+        clock.now += 31
+        raise IngressQueueError("source unavailable", retryable=True)
+
+    source.send_raw = slow_failing_send  # type: ignore[method-assign]
+
+    report = await _redrive(dlq=dlq, source=source, max_messages=20, apply=True)
+
+    assert report == RedriveReport(seen=20, redriven=0, failed=20)
+    assert sorted(attempts) == bodies  # every distinct message once, none twice
+    assert await dlq.visible() == bodies[:10]  # released through their newest handles
+    assert await dlq.visible() == bodies[10:]
+
+
+@pytest.mark.asyncio
+async def test_a_slow_dry_run_counts_each_distinct_message_once() -> None:
+    clock = Clock()
+    dlq, source = SpyQueue(), SpyQueue()
+    dlq.inner = FakeIngressQueue(Faults(), clock=clock)
+    bodies = await _seed(dlq, 12)
+    receive = dlq.receive
+
+    async def receive_then_stall(**kwargs: Any) -> list[IngressQueueMessage]:
+        batch = await receive(**kwargs)
+        if dlq.receive_calls == 1:
+            clock.now += 400  # the first batch's hold lapses before the next receive
+        return batch
+
+    dlq.receive = receive_then_stall  # type: ignore[method-assign]
+
+    report = await _redrive(dlq=dlq, source=source, max_messages=20)
+
+    assert report == RedriveReport(seen=12, redriven=0, failed=0)
+    assert await dlq.visible() == bodies[:10]
+    assert await dlq.visible() == bodies[10:]

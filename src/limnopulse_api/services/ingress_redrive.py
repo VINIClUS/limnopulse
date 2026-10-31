@@ -3,9 +3,11 @@
 Dry-run is the default: it only counts, then releases every message it saw with visibility 0.
 With `apply`, each raw body is sent unchanged to the source queue and only then deleted from
 the DLQ, so a failed send never loses a message (a duplicate after a failed delete is safe).
-Messages are held for the whole run and released only after the scan, so one run never counts a
-message twice; the release is best-effort and also runs when the scan fails, and with `apply` it
-covers the messages that could not be moved, so an immediate rerun sees them again.
+Messages are held for the whole run and released only after the scan. A message whose hold lapsed
+in a slow run comes back with a new receipt handle; it is recognised by its message id and never
+counted or moved twice, and its newest handle is the one released. The release is best-effort,
+also runs when the scan fails, and with `apply` covers the messages that could not be moved, so
+an immediate rerun sees them again.
 """
 
 import logging
@@ -37,31 +39,35 @@ async def redrive_dlq(
     max_messages: int,
     apply: bool = False,
 ) -> RedriveReport:
-    seen = 0
+    seen: set[str] = set()
     redriven = failed = 0
-    held: list[IngressQueueMessage] = []
+    # message id -> its latest receive; a hold that lapsed in a slow run brings a message back
+    # with a new receipt handle, and only the newest handle can release it.
+    held: dict[str, IngressQueueMessage] = {}
     try:
-        while seen < max_messages:
+        while len(seen) < max_messages:
             batch = await dlq.receive(
-                max_messages=min(_MAX_BATCH, max_messages - seen),
+                max_messages=min(_MAX_BATCH, max_messages - len(seen)),
                 wait_seconds=_WAIT_SECONDS,
                 visibility_seconds=_HOLD_SECONDS,
             )
             if not batch:
                 break
-            seen += len(batch)
-            if not apply:
-                held.extend(batch)
-                continue
             for message in batch:
-                if await _move(dlq, source, message):
+                if message.message_id in seen:
+                    held[message.message_id] = message  # seen before: never counted twice
+                    continue
+                seen.add(message.message_id)
+                if not apply:
+                    held[message.message_id] = message
+                elif await _move(dlq, source, message):
                     redriven += 1
                 else:
                     failed += 1
-                    held.append(message)
+                    held[message.message_id] = message
     finally:
-        await _release(dlq, held)
-    return RedriveReport(seen=seen, redriven=redriven, failed=failed)
+        await _release(dlq, list(held.values()))
+    return RedriveReport(seen=len(seen), redriven=redriven, failed=failed)
 
 
 async def _move(
