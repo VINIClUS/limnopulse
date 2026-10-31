@@ -11,8 +11,13 @@
 # (frontend/src/lib/api.ts) — no VITE_API_BASE_URL exists. /v1 and
 # /webhooks must therefore be served from this same host, or every API
 # call from the browser 404s. This also means CORS is not needed.
+# /v2 is served here too so a signed-in session can call it same-origin;
+# /ingest/* stays on api.limnopulse.com only (connectors, not the SPA).
 limnopulse.com {
     handle /v1/* {
+        reverse_proxy limnopulse-api:8000
+    }
+    handle /v2/* {
         reverse_proxy limnopulse-api:8000
     }
     handle /webhooks/* {
