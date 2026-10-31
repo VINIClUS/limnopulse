@@ -12,13 +12,15 @@ from typing import Any
 
 import pytest
 from boto3.dynamodb.types import TypeDeserializer, TypeSerializer
-
 from limnopulse_api.adapters.dynamodb_ingest_state import DynamoIngestStateRepository
 from limnopulse_api.adapters.dynamodb_quarantine import DynamoQuarantineRepository
+from limnopulse_api.services.ingest_state import IngestStateService
+
 from limnopulse_api.adapters.dynamodb_v2 import (
     DynamoV2KeyBuilder,
     device_ingest_state_from_item,
 )
+from limnopulse_api.core.errors import ConflictError, NotFoundError
 from limnopulse_api.domain.ingestion import (
     QUARANTINE_TTL,
     ComponentMark,
@@ -31,8 +33,6 @@ from limnopulse_api.domain.ingestion import (
     QuarantineEntryStatus,
     SequenceEvent,
 )
-from limnopulse_api.core.errors import ConflictError, NotFoundError
-from limnopulse_api.services.ingest_state import IngestStateService
 from limnopulse_api.services.telemetry_pipeline import PipelineOutcome
 from limnopulse_api.services.telemetry_v2_writes import TelemetryWriteOutcome
 from tests.support.ingestion_contract_kits import (
@@ -222,6 +222,38 @@ async def test_quarantine_transition_conflicts_and_expiry_on_dynamodb_local(
     assert local.raw(
         KEYS.quarantine_entry(TENANT, entries[1].received_at, entries[1].quarantine_id)
     )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("attempt", range(3))
+async def test_concurrent_transitions_on_one_entry_on_dynamodb_local(
+    local: LocalSubject, attempt: int
+) -> None:
+    entries = fenced_entries()
+    await local.quarantine.put_quarantine_entries(entries)
+    key = entries[attempt].entry_key
+
+    results = await asyncio.gather(
+        local.quarantine.transition_quarantine_entry(
+            TENANT, key, QuarantineEntryStatus.DISMISSED, expected_version=1, at=RECEIVED
+        ),
+        local.quarantine.transition_quarantine_entry(
+            TENANT,
+            key,
+            QuarantineEntryStatus.REPLAYED,
+            expected_version=1,
+            at=RECEIVED,
+            replayed_ingress_id="ing_" + "5" * 32,
+        ),
+        return_exceptions=True,
+    )
+
+    winners = [result for result in results if not isinstance(result, BaseException)]
+    losers = [result for result in results if isinstance(result, BaseException)]
+    assert len(winners) == 1 and len(losers) == 1
+    assert isinstance(losers[0], ConflictError)
+    assert await local.quarantine.get_quarantine_entry(TENANT, key) == winners[0]
+    assert winners[0].version == 2
 
 
 # Order independence under real concurrency ---------------------------------------------------

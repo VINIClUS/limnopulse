@@ -38,7 +38,7 @@ from tests.support.ingestion_contract_kits import (
 )
 from tests.support.ingestion_fakes import KitSubject, ingest_state_subject
 
-O = OBSERVED
+T0 = OBSERVED
 S = timedelta(seconds=1)
 NOW = RECEIVED + timedelta(seconds=30)
 REPLAY_OF = "ing_" + "9" * 32
@@ -79,7 +79,7 @@ def quarantined(reason: QuarantineReason) -> QuarantinedObservation:
         device_id=DEVICE,
         component_id=COMPONENT,
         metric_key="temperature",
-        observed_at=O,
+        observed_at=T0,
         received_at=RECEIVED,
         source_event_id=None,
         detail="quarantined",
@@ -145,17 +145,17 @@ def is_empty(marks: IngestMarks) -> bool:
 @pytest.mark.parametrize(
     ("previous", "pair", "expected"),
     [
-        (None, (O, 10), SequenceEvent.FIRST),
-        ((O, None), (O + S, 10), SequenceEvent.FIRST),  # state row without an observed pair
-        ((O, 10), (O + S, 11), SequenceEvent.CONTIGUOUS),
-        ((O, 10), (O + S, 12), SequenceEvent.GAP),
-        ((O, 10), (O + S, 10), SequenceEvent.REGRESSION),
-        ((O, 10), (O + S, 3), SequenceEvent.REGRESSION),
-        ((O, 10), (O, 10), SequenceEvent.DUPLICATE),
-        ((O, 10), (O, 11), SequenceEvent.LATE),
-        ((O, 10), (O, 9), SequenceEvent.LATE),
-        ((O, 10), (O - S, 11), SequenceEvent.LATE),
-        ((O, 10), (O - S, 3), SequenceEvent.LATE),
+        (None, (T0, 10), SequenceEvent.FIRST),
+        ((T0, None), (T0 + S, 10), SequenceEvent.FIRST),  # state row without an observed pair
+        ((T0, 10), (T0 + S, 11), SequenceEvent.CONTIGUOUS),
+        ((T0, 10), (T0 + S, 12), SequenceEvent.GAP),
+        ((T0, 10), (T0 + S, 10), SequenceEvent.REGRESSION),
+        ((T0, 10), (T0 + S, 3), SequenceEvent.REGRESSION),
+        ((T0, 10), (T0, 10), SequenceEvent.DUPLICATE),
+        ((T0, 10), (T0, 11), SequenceEvent.LATE),
+        ((T0, 10), (T0, 9), SequenceEvent.LATE),
+        ((T0, 10), (T0 - S, 11), SequenceEvent.LATE),
+        ((T0, 10), (T0 - S, 3), SequenceEvent.LATE),
     ],
 )
 async def test_events_follow_the_truth_table_against_stored_state(
@@ -183,18 +183,18 @@ async def test_a_message_is_classified_pair_by_pair_and_per_component(
 ) -> None:
     await service.record_outcome(
         envelope(ingress_id="ing_" + "1" * 32),
-        outcome(reading(O, 10), reading(O, 100, component_id=OTHER_COMPONENT)),
+        outcome(reading(T0, 10), reading(T0, 100, component_id=OTHER_COMPONENT)),
         receive_count=1,
     )
     message = outcome(
-        reading(O - S, 5),  # LATE; does not move prev
-        reading(O + S, 11),  # CONTIGUOUS
-        reading(O + 2 * S, 12),  # CONTIGUOUS
-        reading(O + 2 * S, 12, metric_key="ph"),  # same pair: one event, not two
-        reading(O + 3 * S, 20),  # GAP
-        reading(O + 4 * S, None),  # no sequence: no event
-        reading(O + S, 101, component_id=OTHER_COMPONENT),  # CONTIGUOUS against its own state
-        reading(O + 2 * S, 101, component_id=OTHER_COMPONENT),  # REGRESSION
+        reading(T0 - S, 5),  # LATE; does not move prev
+        reading(T0 + S, 11),  # CONTIGUOUS
+        reading(T0 + 2 * S, 12),  # CONTIGUOUS
+        reading(T0 + 2 * S, 12, metric_key="ph"),  # same pair: one event, not two
+        reading(T0 + 3 * S, 20),  # GAP
+        reading(T0 + 4 * S, None),  # no sequence: no event
+        reading(T0 + S, 101, component_id=OTHER_COMPONENT),  # CONTIGUOUS against its own state
+        reading(T0 + 2 * S, 101, component_id=OTHER_COMPONENT),  # REGRESSION
     )
 
     events = await service.record_outcome(envelope(), message, receive_count=1)
@@ -210,8 +210,8 @@ async def test_a_message_is_classified_pair_by_pair_and_per_component(
     # The stored mark is each Component's maximum (observed_at, sequence) pair of the message.
     state = await component_state(subject)
     other = await component_state(subject, OTHER_COMPONENT)
-    assert (state.last_observed_at, state.last_observed_sequence) == (O + 3 * S, 20)
-    assert (other.last_observed_at, other.last_observed_sequence) == (O + 2 * S, 101)
+    assert (state.last_observed_at, state.last_observed_sequence) == (T0 + 3 * S, 20)
+    assert (other.last_observed_at, other.last_observed_sequence) == (T0 + 2 * S, 101)
 
 
 @pytest.mark.asyncio
@@ -219,7 +219,7 @@ async def test_observations_without_a_sequence_produce_no_event(
     service: IngestStateService,
 ) -> None:
     events = await service.record_outcome(
-        envelope(), outcome(reading(O, None), reading(O + S, None)), receive_count=1
+        envelope(), outcome(reading(T0, None), reading(T0 + S, None)), receive_count=1
     )
 
     assert events == ()
@@ -241,9 +241,9 @@ async def test_state_is_read_once_per_message_before_the_marks(
     events = await service.record_outcome(
         envelope(),
         outcome(
-            reading(O, 10),
-            reading(O + S, 11),
-            reading(O, 4, component_id=OTHER_COMPONENT),
+            reading(T0, 10),
+            reading(T0 + S, 11),
+            reading(T0, 4, component_id=OTHER_COMPONENT),
         ),
         receive_count=1,
     )
@@ -263,12 +263,12 @@ async def test_state_is_read_once_per_message_before_the_marks(
 async def test_a_redelivery_is_not_classified_but_still_marks(
     subject: KitSubject, service: IngestStateService, clock: Clock
 ) -> None:
-    first = await service.record_outcome(envelope(), outcome(reading(O, 10)), receive_count=1)
+    first = await service.record_outcome(envelope(), outcome(reading(T0, 10)), receive_count=1)
     clock.now = NOW + timedelta(minutes=1)
 
     redelivery = await service.record_outcome(
         envelope(ingress_id="ing_" + "2" * 32, received_at=RECEIVED + S),
-        outcome(reading(O + S, 11)),
+        outcome(reading(T0 + S, 11)),
         receive_count=2,
     )
 
@@ -276,7 +276,7 @@ async def test_a_redelivery_is_not_classified_but_still_marks(
     assert redelivery == ()
     state = await component_state(subject)
     assert (state.last_received_at, state.last_ingested_at) == (RECEIVED + S, clock.now)
-    assert (state.last_observed_at, state.last_observed_sequence) == (O + S, 11)
+    assert (state.last_observed_at, state.last_observed_sequence) == (T0 + S, 11)
 
 
 @pytest.mark.asyncio
@@ -284,7 +284,7 @@ async def test_a_redriven_message_is_classified_again(
     subject: KitSubject, service: IngestStateService
 ) -> None:
     message = envelope()
-    accepted = outcome(reading(O, 10))
+    accepted = outcome(reading(T0, 10))
     assert await service.record_outcome(message, accepted, receive_count=1) == (
         SequenceEvent.FIRST,
     )
@@ -297,7 +297,7 @@ async def test_a_redriven_message_is_classified_again(
     again = await service.record_outcome(message, accepted, receive_count=1)
     assert again and set(again) <= redriven
     await service.record_outcome(
-        envelope(ingress_id="ing_" + "2" * 32), outcome(reading(O + S, 11)), receive_count=1
+        envelope(ingress_id="ing_" + "2" * 32), outcome(reading(T0 + S, 11)), receive_count=1
     )
     later = await service.record_outcome(message, accepted, receive_count=1)
     assert later and set(later) <= redriven
@@ -313,7 +313,7 @@ async def test_a_replay_never_writes_or_classifies(
     events = await service.record_outcome(
         replay,
         outcome(
-            reading(O + timedelta(days=1), 99),
+            reading(T0 + timedelta(days=1), 99),
             quarantined=[quarantined(QuarantineReason.METRIC_UNKNOWN)],
         ),
         receive_count=1,
@@ -333,7 +333,7 @@ async def test_a_replay_never_writes_or_classifies(
 async def test_a_replay_never_makes_a_device_look_current(
     subject: KitSubject, service: IngestStateService, clock: Clock
 ) -> None:
-    await service.record_outcome(envelope(), outcome(reading(O, 10)), receive_count=1)
+    await service.record_outcome(envelope(), outcome(reading(T0, 10)), receive_count=1)
     before = (
         dict(subject.store.component_states[COMPONENT]),
         dict(subject.store.device_states[DEVICE]),
@@ -348,7 +348,7 @@ async def test_a_replay_never_makes_a_device_look_current(
             replay_of=REPLAY_OF,
             received_at=RECEIVED + timedelta(days=2),
         ),
-        outcome(reading(O + timedelta(days=2), 11)),
+        outcome(reading(T0 + timedelta(days=2), 11)),
         receive_count=1,
     )
 
@@ -366,7 +366,7 @@ async def test_a_replay_never_makes_a_device_look_current(
 async def test_marks_use_received_at_for_last_seen_and_the_clock_for_ingested(
     subject: KitSubject, service: IngestStateService
 ) -> None:
-    await service.record_outcome(envelope(), outcome(reading(O, 10)), receive_count=1)
+    await service.record_outcome(envelope(), outcome(reading(T0, 10)), receive_count=1)
 
     state = await component_state(subject)
     assert state == ComponentIngestState(
@@ -375,7 +375,7 @@ async def test_marks_use_received_at_for_last_seen_and_the_clock_for_ingested(
         device_id=DEVICE,
         last_received_at=RECEIVED,
         last_ingested_at=NOW,
-        last_observed_at=O,
+        last_observed_at=T0,
         last_observed_sequence=10,
     )
     device = await subject.device_state(DEVICE)
@@ -388,7 +388,7 @@ async def test_a_redelivery_converges_except_last_ingested_at(
     subject: KitSubject, service: IngestStateService, clock: Clock
 ) -> None:
     message = envelope()
-    accepted = outcome(reading(O, 10), quarantined=[quarantined(QuarantineReason.VALUE_INVALID)])
+    accepted = outcome(reading(T0, 10), quarantined=[quarantined(QuarantineReason.VALUE_INVALID)])
     await service.record_outcome(message, accepted, receive_count=1)
     first = (
         await component_state(subject),
@@ -416,16 +416,16 @@ async def test_a_redelivery_converges_except_last_ingested_at(
 async def test_a_clock_skewed_observation_never_advances_the_observed_pair(
     subject: KitSubject, service: IngestStateService, flag: QualityFlag
 ) -> None:
-    await service.record_outcome(envelope(), outcome(reading(O, 10)), receive_count=1)
+    await service.record_outcome(envelope(), outcome(reading(T0, 10)), receive_count=1)
 
     await service.record_outcome(
         envelope(ingress_id="ing_" + "2" * 32, received_at=RECEIVED + S),
-        outcome(reading(O + timedelta(days=365), 99, flags=[flag])),
+        outcome(reading(T0 + timedelta(days=365), 99, flags=[flag])),
         receive_count=1,
     )
 
     state = await component_state(subject)
-    assert (state.last_observed_at, state.last_observed_sequence) == (O, 10)
+    assert (state.last_observed_at, state.last_observed_sequence) == (T0, 10)
     assert state.last_received_at == RECEIVED + S  # server-time marks still advance
 
 
@@ -436,16 +436,16 @@ async def test_within_a_message_skewed_pairs_are_ignored_for_the_observed_mark(
     await service.record_outcome(
         envelope(),
         outcome(
-            reading(O + 5 * S, 12),
-            reading(O + timedelta(days=30), 500, flags=[QualityFlag.CLOCK_SKEW_FUTURE]),
-            reading(O + 2 * S, 30),
-            reading(O - timedelta(days=9000), 900, flags=[QualityFlag.CLOCK_SKEW_PAST_EXTREME]),
+            reading(T0 + 5 * S, 12),
+            reading(T0 + timedelta(days=30), 500, flags=[QualityFlag.CLOCK_SKEW_FUTURE]),
+            reading(T0 + 2 * S, 30),
+            reading(T0 - timedelta(days=9000), 900, flags=[QualityFlag.CLOCK_SKEW_PAST_EXTREME]),
         ),
         receive_count=1,
     )
 
     state = await component_state(subject)
-    assert (state.last_observed_at, state.last_observed_sequence) == (O + 5 * S, 12)
+    assert (state.last_observed_at, state.last_observed_sequence) == (T0 + 5 * S, 12)
 
 
 # Connector health ----------------------------------------------------------------------------
@@ -455,7 +455,7 @@ async def test_within_a_message_skewed_pairs_are_ignored_for_the_observed_mark(
 async def test_connector_health_marks_accepted_messages(
     subject: KitSubject, service: IngestStateService
 ) -> None:
-    await service.record_outcome(envelope(), outcome(reading(O, None)), receive_count=1)
+    await service.record_outcome(envelope(), outcome(reading(T0, None)), receive_count=1)
 
     assert await subject.repository.get_connector_health(TENANT, ACCOUNT) == ConnectorHealth(
         tenant_id=TENANT,
@@ -497,7 +497,7 @@ async def test_connector_health_keeps_the_greatest_reason_of_a_message(
     await service.record_outcome(
         envelope(),
         outcome(
-            reading(O, 1),
+            reading(T0, 1),
             quarantined=[
                 quarantined(QuarantineReason.DEPLOYMENT_UNRESOLVED),
                 quarantined(QuarantineReason.VALUE_INVALID),
@@ -561,7 +561,7 @@ async def test_store_failures_propagate_unwrapped(
     for error in store_errors():
         subject.fail_next(operation, error)
         with pytest.raises(type(error)) as raised:
-            await service.record_outcome(envelope(), outcome(reading(O, 10)), receive_count=1)
+            await service.record_outcome(envelope(), outcome(reading(T0, 10)), receive_count=1)
         assert raised.value is error
 
 
@@ -572,7 +572,7 @@ async def test_a_failed_state_read_applies_no_marks(
     subject.fail_next("get_component_states", store_errors()[0])
 
     with pytest.raises(type(store_errors()[0])):
-        await service.record_outcome(envelope(), outcome(reading(O, 10)), receive_count=1)
+        await service.record_outcome(envelope(), outcome(reading(T0, 10)), receive_count=1)
 
     assert subject.store.component_states == {}
     assert subject.store.connector_health == {}

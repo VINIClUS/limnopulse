@@ -134,6 +134,39 @@ async def test_rows_use_the_frozen_keys_and_codecs(subject: DynamoIngestStateSub
     assert isinstance(component["last_observed_sequence"], int)
     # Absent, never NULL: the monotone conditions test attribute_not_exists.
     assert "last_fenced_at" not in health and "last_fence_reason" not in health
+    # Exactly the frozen attributes: nothing else (e.g. sequence events) is ever persisted.
+    assert set(component) == {
+        "PK",
+        "SK",
+        "entity_type",
+        "tenant_id",
+        "component_id",
+        "device_id",
+        "last_received_at",
+        "last_ingested_at",
+        "last_observed_at",
+        "last_observed_sequence",
+    }
+    assert set(device) == {
+        "PK",
+        "SK",
+        "entity_type",
+        "tenant_id",
+        "device_id",
+        "last_received_at",
+        "last_ingested_at",
+    }
+    assert set(health) == {
+        "PK",
+        "SK",
+        "entity_type",
+        "tenant_id",
+        "integration_account_id",
+        "last_received_at",
+        "last_accepted_at",
+        "last_quarantined_at",
+        "last_quarantine_reason",
+    }
 
 
 @pytest.mark.asyncio

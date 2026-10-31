@@ -285,7 +285,8 @@ async def test_a_store_failure_mid_batch_propagates_and_a_retry_completes(
 
     assert raised.value is error  # neither swallowed nor re-wrapped
     assert len(sent) == len(set(sent))  # no internal retry of the failed row
-    assert len(await _all(subject.repository, limit=10)) == 1  # the first row is persisted
+    # Puts may run sequentially or concurrently: some, but not all, rows are persisted.
+    assert 1 <= len(await _all(subject.repository, limit=10)) <= len(entries) - 1
     await subject.repository.put_quarantine_entries(entries)  # the redelivery completes the rest
     listed = await _all(subject.repository, limit=10)
     assert sorted(item.entry_key for item in listed) == sorted(item.entry_key for item in entries)
@@ -688,6 +689,7 @@ async def test_list_queries_only_the_tenant_partition_without_exclusive_start_ke
     assert queries
     for query in queries:
         assert "ExclusiveStartKey" not in query  # paging resumes from the SK lower bound
+        assert 1 <= query["Limit"] <= 3  # every Query is bounded by the page size (2, or 2 + 1)
         assert query["ExpressionAttributeValues"][":pk"] == {"S": f"QUARANTINE#{TENANT}"}
     resumed = [q for q in queries if q is not queries[0]]
     assert resumed and all(
