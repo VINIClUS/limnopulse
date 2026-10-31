@@ -78,7 +78,10 @@ def quarantine_entry_id(ingress_id: str, ordinal: int, excerpt_json: str) -> str
 
 def replay_ingress_id(entry_keys: Iterable[str]) -> str:
     """Deterministic per replay group, so a rerun after a crash reuses it (D10)."""
-    name = "limnopulse:replay:" + ",".join(sorted(entry_keys))
+    keys = sorted(entry_keys)
+    if not keys:
+        raise ValueError("a replay group needs at least one entry key")
+    name = "limnopulse:replay:" + ",".join(keys)
     return f"ing_{uuid5(NAMESPACE_URL, name).hex}"
 
 

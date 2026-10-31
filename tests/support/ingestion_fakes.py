@@ -17,7 +17,12 @@ from typing import Any
 from uuid import uuid4
 
 from limnopulse_api.adapters.dynamodb_v2 import account_scoped_identity_hash
-from limnopulse_api.core.errors import ConflictError, IngressMessageTooLarge, NotFoundError
+from limnopulse_api.core.errors import (
+    ConflictError,
+    IngressMessageTooLarge,
+    IngressQueueError,
+    NotFoundError,
+)
 from limnopulse_api.domain.alerts import AuditContext
 from limnopulse_api.domain.devices_v2 import ComponentStatus, DeviceComponent, DeviceV2
 from limnopulse_api.domain.ids import default_component_id_for_legacy_device
@@ -124,7 +129,10 @@ class IngestionStore:
         self.faults.check("resolve_external_identity")
         key = self.external_ids.get((provider_key, external_identity_hash))
         integration = None if key is None else self.device_integrations.get(key)
-        if integration is None or (integration.provider_key, integration.external_identity_hash) != (
+        if integration is None or (
+            integration.provider_key,
+            integration.external_identity_hash,
+        ) != (
             provider_key,
             external_identity_hash,
         ):
@@ -170,9 +178,7 @@ class FakeIngestCredentialRepository:
     ) -> IngestCredential:
         self.store.faults.check("create_ingest_credential")
         # One atomic step: the account check, the slot, the row and the audit item.
-        account = self.store.accounts.get(
-            (credential.tenant_id, credential.integration_account_id)
-        )
+        account = self.store.accounts.get((credential.tenant_id, credential.integration_account_id))
         if account is None:
             raise NotFoundError("integration account not found")
         if account.status not in _ISSUABLE or account.provider_key not in HTTPS_PROVIDER_KEYS:
@@ -440,13 +446,18 @@ class FakeTrustedMapping:
             observations=observations,
         )
 
-    async def fence(self, envelope: IngressEnvelope) -> TrustedIngress | IngressFence | IngressDefer:
+    async def fence(
+        self, envelope: IngressEnvelope
+    ) -> TrustedIngress | IngressFence | IngressDefer:
         self.store.faults.check("fence")
         integration = self.store.resolve_external_identity(
             envelope.provider_key, envelope.external_identity_hash
         )
-        tenant_id = envelope.tenant_id if integration is None else integration.tenant_id
-        account = self.store.get_integration_account(tenant_id, envelope.integration_account_id)
+        # `account_verified` means an authoritative row exists for the ENVELOPE's tenant and
+        # account (D8). When the DI tenant differs, the fence is a mismatch anyway.
+        account = self.store.get_integration_account(
+            envelope.tenant_id, envelope.integration_account_id
+        )
         device = None
         if integration is not None:
             device = self.store.get_device(integration.tenant_id, integration.device_id)
@@ -469,7 +480,9 @@ class FakeIngressReceiptRepository:
         self.store.faults.check("get_ingress_receipt")
         return self.store.receipts.get((integration_account_id, key_sha256))
 
-    async def claim_ingress_receipt(self, receipt: IngressReceipt, *, now: datetime) -> IngressReceipt:
+    async def claim_ingress_receipt(
+        self, receipt: IngressReceipt, *, now: datetime
+    ) -> IngressReceipt:
         self.store.faults.check("claim_ingress_receipt")
         key = (receipt.integration_account_id, receipt.key_sha256)
         current = self.store.receipts.get(key)
@@ -539,13 +552,25 @@ class FakeIngressQueue:
 
     async def delete(self, message: IngressQueueMessage) -> None:
         self.faults.check("delete")
-        self.messages.pop(message.message_id, None)
+        stored = self.messages.get(message.message_id)
+        if stored is not None:
+            self._require_current_handle(stored, message)
+            del self.messages[message.message_id]
 
     async def change_visibility(self, message: IngressQueueMessage, seconds: int) -> None:
         self.faults.check("change_visibility")
         stored = self.messages.get(message.message_id)
-        if stored is not None:
-            stored["visible_at"] = self.clock() + seconds
+        if stored is None:
+            raise IngressQueueError("message is no longer on the queue", retryable=False)
+        self._require_current_handle(stored, message)
+        stored["visible_at"] = self.clock() + seconds
+
+    @staticmethod
+    def _require_current_handle(stored: dict[str, Any], message: IngressQueueMessage) -> None:
+        # Like SQS, a receive issues a new handle; an older one (e.g. a late heartbeat of a
+        # worker whose visibility ran out) is refused instead of touching the new receiver's copy.
+        if stored["receipt_handle"] != message.receipt_handle:
+            raise IngressQueueError("stale receipt handle", retryable=False)
 
     def _append(self, body: str) -> str:
         message_id = uuid4().hex
@@ -582,6 +607,8 @@ class FakeQuarantineRepository:
         limit: int,
     ) -> QuarantinePage:
         self.store.faults.check("list_quarantine_entries")
+        if limit < 1:
+            raise ValueError("limit must be at least 1")
         matching = [
             entry
             for (owner, key), entry in sorted(self.store.quarantine.items())
@@ -619,8 +646,9 @@ class FakeQuarantineRepository:
             raise ConflictError("quarantine entry is terminal")
         if current.version != expected_version:
             raise ConflictError("quarantine entry version conflict")
-        updated = current.model_copy(
-            update={
+        updated = QuarantineEntry.model_validate(
+            {
+                **current.model_dump(),
                 "status": target,
                 "replayed_ingress_id": replayed_ingress_id,
                 "updated_at": at,
@@ -682,7 +710,9 @@ class FakeIngestStateRepository:
             _advance(row, "last_ingested_at", marks.device_mark.ingested_at)
         connector = marks.connector_mark
         if any(value is not None for value in connector.model_dump().values()):
-            row = self.store.connector_health.setdefault(marks.integration_account_id, dict(identity))
+            row = self.store.connector_health.setdefault(
+                marks.integration_account_id, dict(identity)
+            )
             _advance(row, "last_received_at", connector.received_at)
             _advance(row, "last_accepted_at", connector.accepted_at)
             _advance_pair(
@@ -693,7 +723,11 @@ class FakeIngestStateRepository:
                 connector.quarantine_reason,
             )
             _advance_pair(
-                row, "last_fenced_at", connector.fenced_at, "last_fence_reason", connector.fence_reason
+                row,
+                "last_fenced_at",
+                connector.fenced_at,
+                "last_fence_reason",
+                connector.fence_reason,
             )
 
     async def get_connector_health(

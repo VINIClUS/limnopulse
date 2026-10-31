@@ -35,6 +35,15 @@ class _RedactedValidationRoute(APIRoute):
         return redacted_handler
 
 
+def _redacted_loc(loc: Sequence[str | int], error_type: str) -> list[str | int]:
+    """Locations name only schema fields: client-chosen keys (an unknown field, a
+    `source_metadata` key) are cut off, so the body never echoes them."""
+    redacted = list(loc[:-1] if error_type == "extra_forbidden" else loc)
+    if "source_metadata" in redacted:
+        redacted = redacted[: redacted.index("source_metadata") + 1]
+    return redacted
+
+
 def redacted_validation_detail(
     exc: ValidationError, *, loc_prefix: Sequence[str | int] = ("body",)
 ) -> list[dict[str, Any]]:
@@ -42,7 +51,7 @@ def redacted_validation_detail(
     errors = exc.errors(include_input=False, include_context=False, include_url=False)
     return [
         {
-            "loc": [*loc_prefix, *error["loc"]],
+            "loc": [*loc_prefix, *_redacted_loc(error["loc"], error["type"])],
             "msg": _FIXED_MESSAGES.get(error["type"], _DEFAULT_MESSAGE),
             "type": error["type"],
         }

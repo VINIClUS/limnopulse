@@ -303,9 +303,10 @@ def idempotency_receipt_to_item(receipt: IdempotencyReceipt) -> dict[str, Any]:
         "request_hash": receipt.request_hash,
         "response_snapshot_json": receipt.response_snapshot_json,
         "created_at": canonical_timestamp_key(receipt.created_at),
-        # Numeric TTL attribute; only receipts (this one and the P3 ingress receipt) and P3
-        # quarantine rows may carry it. Rounded up so TTL deletion and the overwrite condition
-        # never act before the exact 24-hour deadline.
+        # Numeric TTL attribute (epoch seconds, rounded up); only receipts and the P3 quarantine
+        # rows may carry it. Rounded up so TTL deletion and this receipt's overwrite condition
+        # never act before the exact 24-hour deadline. P3 ingress receipts decide liveness on
+        # `created_at_us`, and quarantine rows on `created_at`; TTL is only cleanup there.
         "expires_at": math.ceil(receipt.expires_at.timestamp()),
     }
 

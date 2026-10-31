@@ -253,7 +253,7 @@ class IngestCredential(V2VersionedEntity):
     ingest_credential_id: IngestCredentialId
     integration_account_id: SafeId
     slot: Literal[1, 2]
-    secret_sha256: Sha256Hex
+    secret_sha256: Sha256Hex = Field(repr=False)  # never in reprs, tracebacks or logs
     fingerprint: Annotated[str, Field(pattern=_FINGERPRINT_PATTERN)]
     status: IngestCredentialStatus
     revoked_at: datetime | None = None
@@ -323,7 +323,14 @@ def _observation_payload(observation: SourceObservation) -> dict[str, Any]:
 
 
 class IngressEnvelope(_Frozen):
-    """`telemetry-ingress@1`: compact queue body of opaque ids; never a secret or raw identity."""
+    """`telemetry-ingress@1`: compact queue body of opaque ids; never a secret or raw identity.
+
+    `to_json()` is the wire form; `model_dump`/`model_dump_json` also use the `schema` key, so
+    any dump validates back."""
+
+    model_config = ConfigDict(
+        frozen=True, extra="forbid", validate_by_name=True, serialize_by_alias=True
+    )
 
     schema_: Literal["telemetry-ingress@1"] = Field(alias="schema")
     ingress_id: IngressId
@@ -342,6 +349,12 @@ class IngressEnvelope(_Frozen):
     observations: tuple[SourceObservation, ...] = Field(
         min_length=1, max_length=MAX_INGEST_OBSERVATIONS
     )
+
+    @model_validator(mode="after")
+    def validate_replay(self) -> "IngressEnvelope":
+        if self.replay_of is not None and not self.replay:
+            raise ValueError("replay_of is only set on replay envelopes")
+        return self
 
     def to_json(self) -> str:
         """Compact UTF-8-preserving wire form. `None` and default values are omitted, except
@@ -477,7 +490,8 @@ def decide_receipt_replay(
 class IngressFence(_Frozen):
     reason: IngressFenceReason
     # Whether an authoritative IntegrationAccount row exists for the envelope's tenant and account.
-    account_verified: bool = True
+    # Required: a forgotten flag must never default to "verified" and write rows for a forgery.
+    account_verified: bool
 
 
 class IngressDefer(_Frozen):
@@ -527,7 +541,7 @@ def _device_matches(device: DeviceV2 | None, integration: DeviceIntegration) -> 
 def classify_admission(
     source: AuthenticatedSource,
     integration: DeviceIntegration | None,
-    account: IntegrationAccount,
+    account: IntegrationAccount | None,
     device: DeviceV2 | None,
 ) -> IngressAdmissionDenied | None:
     """The `admit` column of the condition -> enum table; the first failure wins."""
@@ -597,11 +611,11 @@ def classify_fence(
         account.status == IntegrationAccountStatus.REVOKED
         or account.provider_key not in HTTPS_PROVIDER_KEYS
     ):
-        return IngressFence(reason=IngressFenceReason.ACCOUNT_REVOKED)
+        return IngressFence(reason=IngressFenceReason.ACCOUNT_REVOKED, account_verified=True)
     if account.status != IntegrationAccountStatus.ACTIVE:
         return IngressDefer(reason=IngressDeferReason.ACCOUNT_NOT_ACTIVE)
     if not _device_matches(device, integration) or device.status == DeviceStatus.DECOMMISSIONED:
-        return IngressFence(reason=IngressFenceReason.DEVICE_DECOMMISSIONED)
+        return IngressFence(reason=IngressFenceReason.DEVICE_DECOMMISSIONED, account_verified=True)
     if device.status != DeviceStatus.ACTIVE:
         return IngressDefer(reason=IngressDeferReason.DEVICE_NOT_ACTIVE)
     return None
@@ -686,8 +700,8 @@ class QuarantineEntry(V2VersionedEntity):
     provider_key: ProviderKey
     external_identity_hash: Sha256Hex
     source_type: SourceType
-    connector_version: str | None
-    device_integration_id: SafeId
+    connector_version: ConnectorVersion | None
+    device_integration_id: IntegrationId
     device_id: DeviceId
     received_at: TelemetryDatetime
     mapping_versions: NormalizationVersions
@@ -702,6 +716,18 @@ class QuarantineEntry(V2VersionedEntity):
 
     @model_validator(mode="after")
     def validate_entry(self) -> "QuarantineEntry":
+        if (self.status == QuarantineEntryStatus.REPLAYED) != (
+            self.replayed_ingress_id is not None
+        ):
+            raise ValueError("replayed_ingress_id is set exactly when the entry was replayed")
+        if (self.kind == QuarantineEntryKind.OBSERVATION) != (self.observation is not None):
+            raise ValueError("only observation rows carry the quarantined observation")
+        if (self.kind == QuarantineEntryKind.FENCED_MESSAGE) != (
+            self.envelope_excerpt_json is not None
+        ):
+            raise ValueError("only fenced_message rows carry the envelope excerpt")
+        if self.kind == QuarantineEntryKind.FENCED_MESSAGE and self.source_observation_json:
+            raise ValueError("fenced_message rows carry no source observation")
         _utf8_bounded(self.source_observation_json, "source_observation_json")
         _utf8_bounded(self.envelope_excerpt_json, "envelope_excerpt_json")
         if self.expires_at != self.created_at + QUARANTINE_TTL:
@@ -852,6 +878,7 @@ def ingest_audit_item(
     tenant, resource, statuses and the credential fingerprint only; never a token or digest."""
     if action not in _AUDIT_RESOURCE_TYPES:
         raise ValueError("unknown ingest audit action")
+    require_utc(now, "now")
     if fingerprint is not None and re.fullmatch(_FINGERPRINT_PATTERN, fingerprint) is None:
         raise ValueError("fingerprint must be 8 lowercase hex characters")
     event_id = f"audit_{uuid4().hex}"
@@ -924,6 +951,12 @@ class IngestMarks(_Frozen):
     component_marks: tuple[ComponentMark, ...] = ()
     device_mark: DeviceMark | None = None
     connector_mark: ConnectorMark = Field(default_factory=ConnectorMark)
+
+    @model_validator(mode="after")
+    def validate_device(self) -> "IngestMarks":
+        if self.device_id is None and (self.component_marks or self.device_mark is not None):
+            raise ValueError("component and device marks need the verified device_id")
+        return self
 
 
 class ComponentIngestState(_Frozen):
