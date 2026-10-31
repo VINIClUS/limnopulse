@@ -101,6 +101,8 @@ resource "aws_sqs_queue_policy" "telemetry_ingress_dlq" {
 }
 
 # API principal (iam_runtime.tf's aws_iam_user.api): send-only on ingress.
+# IAM cannot restrict an item action to use inside TransactWriteItems, so the
+# DeleteItem and audit PutItem grants are also usable standalone.
 # TransactWriteItems sub-operations are authorized per item action, so the
 # credential and lifecycle transactions need explicit DeleteItem and
 # ConditionCheckItem on the domain table, and PutItem on the audit table for
@@ -264,7 +266,7 @@ resource "aws_cloudwatch_metric_alarm" "telemetry_ingress_age" {
   dimensions          = { QueueName = aws_sqs_queue.telemetry_ingress[0].name }
   statistic           = "Maximum"
   period              = 60
-  evaluation_periods  = 5
+  evaluation_periods  = 1
   comparison_operator = "GreaterThanThreshold"
   threshold           = var.telemetry_ingress_age_alarm_threshold_seconds
   treat_missing_data  = "notBreaching"

@@ -185,12 +185,22 @@ variable "telemetry_ingress_age_alarm_threshold_seconds" {
   description = "ApproximateAgeOfOldestMessage alarm threshold for the telemetry ingress queue."
   type        = number
   default     = 300
+
+  validation {
+    condition     = var.telemetry_ingress_age_alarm_threshold_seconds > 0
+    error_message = "telemetry_ingress_age_alarm_threshold_seconds must be greater than zero."
+  }
 }
 
 variable "telemetry_ingress_depth_alarm_threshold" {
   description = "ApproximateNumberOfMessagesVisible alarm threshold for the telemetry ingress queue."
   type        = number
   default     = 1000
+
+  validation {
+    condition     = var.telemetry_ingress_depth_alarm_threshold > 0
+    error_message = "telemetry_ingress_depth_alarm_threshold must be greater than zero."
+  }
 }
 
 variable "telemetry_ingress_alarm_actions" {
