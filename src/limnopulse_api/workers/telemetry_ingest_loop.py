@@ -263,14 +263,21 @@ async def _stop_heartbeat(heartbeat: asyncio.Task[None]) -> None:
     action, and a cancelled message gets no final action at all.
     """
     heartbeat.cancel()
-    cancelled = False
-    while not heartbeat.done():
-        try:
-            await asyncio.wait({heartbeat})
-        except asyncio.CancelledError:
-            cancelled = True
-    if cancelled:
-        raise asyncio.CancelledError
+    try:
+        await asyncio.shield(heartbeat)
+    except asyncio.CancelledError:
+        current = asyncio.current_task()
+        if current is None or current.cancelling() == 0:
+            return  # only the heartbeat itself was cancelled
+        await _until_done(heartbeat)
+        raise
+
+
+async def _until_done(task: asyncio.Task[None]) -> None:
+    """Wait for `task` to finish, even through further cancellations of the caller."""
+    while not task.done():
+        with contextlib.suppress(asyncio.CancelledError):
+            await asyncio.wait({task})
 
 
 def _metric_failed(name: str, error: Exception) -> None:
