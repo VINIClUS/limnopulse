@@ -13,6 +13,7 @@ from __future__ import annotations
 import asyncio
 import io
 import json
+import threading
 from collections.abc import Callable, Sequence
 from datetime import UTC, datetime, timedelta
 from typing import Any
@@ -50,6 +51,30 @@ from tests.support.ingestion_harness import (
 )
 
 QueueFactory = Callable[..., IngestionQueuePair]
+CLI_TIMEOUT_SECONDS = 120
+
+
+def _bounded(main: Callable[..., int], argv: list[str], **kwargs: Any) -> int:
+    """Runs a CLI `main` in a daemon thread, so a runaway scan fails the gate instead of hanging."""
+    result: list[int] = []
+    errors: list[BaseException] = []
+
+    def target() -> None:
+        try:
+            result.append(main(argv, **kwargs))
+        except BaseException as error:  # noqa: BLE001 - re-raised in the test thread
+            errors.append(error)
+
+    worker = threading.Thread(target=target, daemon=True)
+    worker.start()
+    worker.join(CLI_TIMEOUT_SECONDS)
+    if worker.is_alive():
+        raise AssertionError(f"the CLI did not finish within {CLI_TIMEOUT_SECONDS}s")
+    if errors:
+        raise errors[0]
+    return result[0]
+
+
 PINNED_VERSIONS = NormalizationVersions(
     catalog_version="catalog@pinned",
     unit_mapping_version="units@pinned",
@@ -148,7 +173,8 @@ def test_quarantine_replay_puts_the_expected_envelope_on_the_ingress_queue(
     metrics = RecordingTelemetryMetrics()
     out = io.StringIO()
 
-    dry_code = telemetry_quarantine.main(
+    dry_code = _bounded(
+        telemetry_quarantine.main,
         ["replay", "--tenant", TENANT, "--entry", *keys],
         settings=_settings(ingestion_tables, pair),
         dynamodb_client=dynamodb,
@@ -160,7 +186,8 @@ def test_quarantine_replay_puts_the_expected_envelope_on_the_ingress_queue(
     assert dry_code == 0
     assert _drain(sqs, pair.source_url, expected=0, attempts=2) == []
 
-    code = telemetry_quarantine.main(
+    code = _bounded(
+        telemetry_quarantine.main,
         ["replay", "--tenant", TENANT, "--entry", *keys, "--apply"],
         settings=_settings(ingestion_tables, pair),
         dynamodb_client=dynamodb,
@@ -189,7 +216,8 @@ def test_quarantine_replay_puts_the_expected_envelope_on_the_ingress_queue(
     assert replayed == 3
 
     # A rerun skips the now-replayed rows and sends nothing more.
-    rerun = telemetry_quarantine.main(
+    rerun = _bounded(
+        telemetry_quarantine.main,
         ["replay", "--tenant", TENANT, "--entry", *keys, "--apply"],
         settings=_settings(ingestion_tables, pair),
         dynamodb_client=dynamodb,
@@ -213,7 +241,8 @@ def test_dlq_redrive_moves_n_messages_and_preserves_their_bodies(
 
     sample_out = io.StringIO()
     assert (
-        telemetry_dlq.main(
+        _bounded(
+            telemetry_dlq.main,
             ["sample"],
             settings=_settings(None, pair),
             sqs_client=sqs,
@@ -228,7 +257,8 @@ def test_dlq_redrive_moves_n_messages_and_preserves_their_bodies(
     assert "not json" not in sample_out.getvalue()
 
     assert (
-        telemetry_dlq.main(
+        _bounded(
+            telemetry_dlq.main,
             ["redrive"],
             settings=_settings(None, pair),
             sqs_client=sqs,
@@ -240,7 +270,8 @@ def test_dlq_redrive_moves_n_messages_and_preserves_their_bodies(
     )
 
     out = io.StringIO()
-    code = telemetry_dlq.main(
+    code = _bounded(
+        telemetry_dlq.main,
         ["redrive", "--apply", "--max", str(len(DLQ_BODIES))],
         settings=_settings(None, pair),
         sqs_client=sqs,

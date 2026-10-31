@@ -19,7 +19,11 @@ and sends one NEW `telemetry-ingress@1` envelope per group: `ingress_id = replay
 entry keys)`, `replay_of` the root original ingress id (`entry.replay_of or entry.ingress_id`),
 `replay=true`, the first `received_at`, the stored mapping versions and provider fields, and the
 stored source observations in entry-key order. Each entry is marked `replayed` (with that id) only
-after its group's send succeeded.
+after its group's send succeeded. Repeated `--entry` keys count once. A post-send conflict on
+one row fails that row (`reason=conflict`); any other store error aborts the run with exit 1.
+`list --limit` accepts 1..1000 (default 50) and `--status` defaults to `open`. Replay metrics are
+one `ingress_quarantine_replayed_total` increment per applied entry; a dry run and `dismiss` emit
+none.
 """
 
 import io
@@ -44,10 +48,18 @@ from limnopulse_api.domain.ingestion import (
     QuarantineEntryStatus,
     build_quarantine_entries,
 )
-from limnopulse_api.domain.telemetry_v2 import SourceObservation
+from limnopulse_api.domain.telemetry_v2 import (
+    QuarantinedObservation,
+    QuarantineReason,
+    SourceObservation,
+)
+from limnopulse_api.services.telemetry_pipeline import PipelineOutcome
+from limnopulse_api.services.telemetry_v2_writes import TelemetryWriteOutcome
 from scripts.admin import telemetry_quarantine
 from tests.support.ingestion_contract_kits import (
     ACCOUNT,
+    COMPONENT,
+    DEVICE,
     INGRESS,
     INTEGRATION,
     OBSERVED,
@@ -184,6 +196,41 @@ def _fenced(
     return replayable, summary
 
 
+def _normalizer_rows(*, truncated: bool) -> list[QuarantineEntry]:
+    """`kind=observation` rows (normalizer quarantine); a truncated excerpt is not replayable."""
+    observation = source_observation(value=7.25, sequence=4)
+    excerpt = observation.model_dump_json(exclude_none=True, exclude_defaults=True)
+    if truncated:
+        excerpt = excerpt[:-5]
+    quarantined = QuarantinedObservation(
+        reason=QuarantineReason.UNIT_UNSUPPORTED,
+        tenant_id=TENANT,
+        device_id=DEVICE,
+        component_id=COMPONENT,
+        metric_key="temperature",
+        observed_at=OBSERVED,
+        received_at=RECEIVED,
+        source_event_id=None,
+        detail="quarantined",
+        source_excerpt_json=excerpt,
+        truncated=truncated,
+    )
+    outcome = PipelineOutcome(
+        written=TelemetryWriteOutcome(v2_points=0, legacy_points=0, legacy_excluded=0),
+        quarantined=(quarantined,),
+        counts={},
+    )
+    message = envelope(
+        ingress_id=OTHER_INGRESS if truncated else INGRESS,
+        mapping_versions=PINNED_VERSIONS,
+        observations=[observation],
+    )
+    rows = list(build_quarantine_entries(message, outcome=outcome, now=RECEIVED))
+    assert [row.kind for row in rows] == [QuarantineEntryKind.OBSERVATION]
+    assert rows[0].replayable is (not truncated)
+    return rows
+
+
 def _keys(entries: Sequence[QuarantineEntry]) -> list[str]:
     return [entry.entry_key for entry in entries]
 
@@ -221,6 +268,8 @@ def _expected_envelope(entries: Sequence[QuarantineEntry]) -> IngressEnvelope:
 @pytest.mark.asyncio
 async def test_replay_apply_sends_one_new_envelope_with_the_stored_fields(harness) -> None:
     entries, _ = _fenced(3)
+    # One row was touched before (version 3): the transition must use the version it read.
+    entries[1] = entries[1].model_copy(update={"version": 3})
     await harness.seed(entries)
 
     code = await harness.run("replay", "--tenant", TENANT, "--entry", *_keys(entries), "--apply")
@@ -289,10 +338,11 @@ async def test_replay_id_is_deterministic_and_reused_by_a_rerun(harness) -> None
     await harness.seed(entries)
     keys = _keys(entries)
     # Crash after the send and before any row is marked: the store dies on the first write.
-    harness.faults.fail_next("transition_quarantine_entry", RuntimeError("store down"))
+    harness.faults.fail_next("transition_quarantine_entry", RuntimeError(SENTINEL))
 
     first_code = await harness.run("replay", "--tenant", TENANT, "--entry", *keys, "--apply")
     assert first_code == telemetry_quarantine.EXIT_ERROR == 1
+    assert SENTINEL not in harness.out.getvalue()
     assert {harness.row(entry).status for entry in entries} == {QuarantineEntryStatus.OPEN}
     rerun_code = await harness.run(
         "replay", "--tenant", TENANT, "--entry", *reversed(keys), "--apply"
@@ -313,11 +363,12 @@ async def test_replay_id_is_deterministic_and_reused_by_a_rerun(harness) -> None
 async def test_replay_reports_a_row_that_changed_after_the_send_as_failed(harness) -> None:
     entries, _ = _fenced(2)
     await harness.seed(entries)
-    harness.faults.fail_next("transition_quarantine_entry", ConflictError("raced"))
+    harness.faults.fail_next("transition_quarantine_entry", ConflictError(SENTINEL))
 
     code = await harness.run("replay", "--tenant", TENANT, "--entry", *_keys(entries), "--apply")
 
     assert code == telemetry_quarantine.EXIT_PARTIAL == 3
+    assert SENTINEL not in harness.out.getvalue()
     assert len(harness.sent()) == 1
     results = sorted(line["result"] for line in harness.entry_lines())
     assert results == ["failed", "replayed"]
@@ -340,8 +391,47 @@ async def test_replay_of_a_replayed_message_points_at_the_root_original(harness)
     assert sent.ingress_id == replay_ingress_id(_keys(entries))
 
 
+@pytest.mark.asyncio
+async def test_replay_sends_a_normalizer_quarantined_row_and_skips_a_truncated_one(harness) -> None:
+    (row,) = await harness.seed(_normalizer_rows(truncated=False))
+    (truncated,) = await harness.seed(_normalizer_rows(truncated=True))
+
+    code = await harness.run(
+        "replay", "--tenant", TENANT, "--entry", row.entry_key, truncated.entry_key, "--apply"
+    )
+
+    assert code == 3
+    assert harness.sent() == [_expected_envelope([row])]
+    assert harness.sent()[0].observations[0].value == 7.25
+    results = {line["entry_key"]: line for line in harness.entry_lines()}
+    assert results[row.entry_key]["result"] == "replayed"
+    assert results[truncated.entry_key] == {
+        **results[truncated.entry_key],
+        "result": "skipped",
+        "reason": "not_replayable",
+    }
+    assert harness.row(truncated).status == QuarantineEntryStatus.OPEN
+
+
+@pytest.mark.asyncio
+async def test_replay_counts_a_repeated_entry_key_once(harness) -> None:
+    entries, _ = _fenced(2)
+    await harness.seed(entries)
+    keys = _keys(entries)
+
+    code = await harness.run(
+        "replay", "--tenant", TENANT, "--entry", *keys, keys[0], keys[1], "--apply"
+    )
+
+    assert code == 0
+    assert harness.sent() == [_expected_envelope(entries)]
+    assert len(harness.sent()[0].observations) == 2
+    assert sorted(line["entry_key"] for line in harness.entry_lines()) == sorted(keys)
+    assert harness.metric_total("replayed") == 2
+
+
 @pytest.mark.parametrize(
-    "error", [IngressQueueError("down", retryable=True), IngressMessageTooLarge("big")]
+    "error", [IngressQueueError(SENTINEL, retryable=True), IngressMessageTooLarge(SENTINEL)]
 )
 @pytest.mark.asyncio
 async def test_replay_marks_nothing_when_the_send_fails(harness, error) -> None:
@@ -354,6 +444,7 @@ async def test_replay_marks_nothing_when_the_send_fails(harness, error) -> None:
     code = await harness.run("replay", "--tenant", TENANT, "--entry", *keys, "--apply")
 
     assert code == 3
+    assert SENTINEL not in harness.out.getvalue()
     sent = harness.sent()
     assert len(sent) == 1
     failed_group = (
@@ -479,11 +570,13 @@ async def test_replay_store_failure_exits_1_without_sending_or_leaking(harness) 
 @pytest.mark.asyncio
 async def test_dismiss_apply_transitions_with_the_read_version(harness) -> None:
     entries, _ = _fenced(2)
+    entries[0] = entries[0].model_copy(update={"version": 3})
     await harness.seed(entries)
 
     code = await harness.run("dismiss", "--tenant", TENANT, "--entry", *_keys(entries), "--apply")
 
     assert code == 0
+    assert harness.metrics.records == []  # dismiss emits no replay metric
     for entry in entries:
         row = harness.row(entry)
         assert row.status == QuarantineEntryStatus.DISMISSED
@@ -521,7 +614,9 @@ class StaleReadQuarantine:
 
 @pytest.mark.asyncio
 async def test_dismiss_is_versioned_and_a_concurrent_change_fails(harness) -> None:
-    raced, fresh = await harness.seed(_fenced(2)[0])
+    raced, fresh = _fenced(2)[0]
+    fresh = fresh.model_copy(update={"version": 3})
+    await harness.seed([raced, fresh])
     # Another operator bumps `raced` to version 2 by changing it after this CLI read version 1:
     # the fake row is rewritten at version 2 but still open, so only the version can fence it.
     harness.store.quarantine[(TENANT, raced.entry_key)] = raced.model_copy(update={"version": 2})
@@ -534,7 +629,8 @@ async def test_dismiss_is_versioned_and_a_concurrent_change_fails(harness) -> No
     assert code == 3
     by_key = {item["entry_key"]: item for item in harness.quarantine.transitions}
     assert by_key[raced.entry_key]["expected_version"] == 1
-    assert by_key[fresh.entry_key]["expected_version"] == fresh.version
+    assert by_key[fresh.entry_key]["expected_version"] == fresh.version == 3
+    assert harness.row(fresh).version == 4
     assert by_key[fresh.entry_key]["target"] == QuarantineEntryStatus.DISMISSED
     assert harness.row(raced).status == QuarantineEntryStatus.OPEN
     assert harness.row(fresh).status == QuarantineEntryStatus.DISMISSED
@@ -577,11 +673,20 @@ async def test_dismiss_apply_skips_terminal_rows_as_partial(harness) -> None:
         TENANT, entries[0].entry_key, QuarantineEntryStatus.DISMISSED, expected_version=1, at=NOW
     )
 
-    code = await harness.run("dismiss", "--tenant", TENANT, "--entry", *_keys(entries), "--apply")
+    (foreign,) = await harness.seed(_fenced(1, ingress_id=ROOT_INGRESS, tenant_id=OTHER_TENANT)[0])
+    missing_key = RECEIVED.strftime("%Y-%m-%dT%H:%M:%S.%fZ") + "#qtn_" + "0" * 32
+    keys = [*_keys(entries), foreign.entry_key, missing_key]
+
+    code = await harness.run("dismiss", "--tenant", TENANT, "--entry", *keys, "--apply")
 
     assert code == 3
     assert harness.row(entries[0]).version == 2  # not written again
     assert harness.row(entries[1]).status == QuarantineEntryStatus.DISMISSED
+    assert harness.row(foreign).status == QuarantineEntryStatus.OPEN
+    results = {line["entry_key"]: line for line in harness.entry_lines()}
+    assert results[foreign.entry_key]["reason"] == results[missing_key]["reason"] == "not_found"
+    summary = harness.summary()
+    assert (summary["dismissed"], summary["skipped"], summary["failed"]) == (1, 3, 0)
 
 
 # List ------------------------------------------------------------------------------------------
@@ -599,7 +704,9 @@ async def test_list_pages_by_sk_lower_bound_and_defaults_to_open(harness) -> Non
 
     seen: list[str] = []
     after: list[str] = []
+    pages = 0
     for _ in range(10):
+        pages += 1
         assert await harness.run("list", "--tenant", TENANT, "--limit", "2", *after) == 0
         page = [line["entry_key"] for line in harness.entry_lines()]
         assert len(page) <= 2
@@ -611,6 +718,7 @@ async def test_list_pages_by_sk_lower_bound_and_defaults_to_open(harness) -> Non
         assert summary["next_after"] == page[-1]
         after = ["--after", summary["next_after"]]
     assert seen == open_keys
+    assert len(open_keys) == 6 and pages == 3  # a full last page already says next_after=None
     assert {line["status"] for line in harness.entry_lines()} <= {"open"}
 
 
@@ -748,17 +856,20 @@ async def test_output_never_carries_raw_identifiers_or_excerpts(harness) -> None
 def test_usage_errors_exit_1_without_echoing_argv(argv, capsys) -> None:
     out, err = io.StringIO(), io.StringIO()
 
+    dynamodb, sqs = IngestionDynamoClient(), RecordingSqsClient()
+
     code = telemetry_quarantine.main(
         list(argv),
-        settings=Settings(_env_file=None),
-        dynamodb_client=IngestionDynamoClient(),
-        sqs_client=RecordingSqsClient(),
+        settings=_settings(),
+        dynamodb_client=dynamodb,
+        sqs_client=sqs,
         metrics=RecordingTelemetryMetrics(),
         out=out,
         err=err,
     )
 
     assert code == 1
+    assert sqs.sent == [] and dynamodb.items == {}
     captured = capsys.readouterr()
     assert SENTINEL not in out.getvalue() + err.getvalue() + captured.out + captured.err
 
@@ -901,3 +1012,36 @@ async def _main_in_thread(argv: list[str], **kwargs: Any) -> int:
     import asyncio
 
     return await asyncio.to_thread(telemetry_quarantine.main, argv, **kwargs)
+
+
+def test_main_builds_its_own_clients_from_settings(monkeypatch) -> None:
+    built: list[dict[str, Any]] = []
+    dynamodb, sqs = IngestionDynamoClient(), RecordingSqsClient()
+
+    def client(service: str, **kwargs: Any) -> Any:
+        built.append({"service": service, **kwargs})
+        return dynamodb if service == "dynamodb" else sqs
+
+    monkeypatch.setattr(telemetry_quarantine.boto3, "client", client)
+    settings = _settings(
+        aws_region="sa-east-1",
+        dynamodb_endpoint_url="http://dynamodb.local:8001",
+        sqs_endpoint_url="http://sqs.local:9324",
+    )
+
+    code = telemetry_quarantine.main(
+        ["list", "--tenant", TENANT],
+        settings=settings,
+        metrics=RecordingTelemetryMetrics(),
+        out=io.StringIO(),
+        err=io.StringIO(),
+        clock=lambda: NOW,
+    )
+
+    assert code == 0
+    by_service = {item["service"]: item for item in built}
+    assert by_service["dynamodb"]["region_name"] == "sa-east-1"
+    assert by_service["dynamodb"]["endpoint_url"] == "http://dynamodb.local:8001"
+    if "sqs" in by_service:
+        assert by_service["sqs"]["region_name"] == "sa-east-1"
+        assert by_service["sqs"]["endpoint_url"] == "http://sqs.local:9324"

@@ -14,6 +14,8 @@ receipt handle. It counts each message once and releases every message it saw (v
 `redrive [--max 100] [--apply]` delegates to the P3-05 `redrive_dlq` core; dry run is the default.
 Exit codes: 0 ok (a dry run included), 1 error, 3 partial (an applied redrive with failures).
 Nothing in the CLI consumes the DLQ unless an operator runs a subcommand.
+Bounds: `sample --limit` 1..1000, `redrive --max` 1..10000. Applied redrive metrics carry the
+report's `redriven` and `failed` counts; a dry run and `sample` emit none.
 """
 
 import asyncio
@@ -303,6 +305,17 @@ async def test_sample_respects_the_limit_and_counts_each_message_once(harness) -
 
 
 @pytest.mark.asyncio
+async def test_sample_defaults_to_ten_messages(harness) -> None:
+    await harness.fill([*BODIES, *BODIES, *BODIES, *BODIES])  # 12
+
+    assert await harness.run("sample") == 0
+
+    assert len([line for line in harness.lines() if "command" not in line]) == 10
+    assert harness.summary()["sampled"] == 10
+    assert len(harness.dlq.bodies()) == 12
+
+
+@pytest.mark.asyncio
 async def test_sample_of_an_empty_dlq_is_ok(harness) -> None:
     assert await harness.run("sample") == 0
     assert harness.summary() == {"command": "sample", "sampled": 0}
@@ -527,3 +540,27 @@ def test_usage_errors_exit_1_without_echoing_argv(argv, capsys) -> None:
     assert client.calls == []
     captured = capsys.readouterr()
     assert SENTINEL not in out.getvalue() + err.getvalue() + captured.out + captured.err
+
+
+def test_main_builds_its_own_sqs_client_from_settings(monkeypatch) -> None:
+    built: list[dict[str, Any]] = []
+    client = InMemorySqsClient()
+
+    def factory(service: str, **kwargs: Any) -> Any:
+        built.append({"service": service, **kwargs})
+        return client
+
+    monkeypatch.setattr(telemetry_dlq.boto3, "client", factory)
+
+    code = telemetry_dlq.main(
+        ["sample"],
+        settings=_settings(aws_region="sa-east-1", sqs_endpoint_url="http://sqs.local:9324"),
+        metrics=RecordingTelemetryMetrics(),
+        out=io.StringIO(),
+        err=io.StringIO(),
+    )
+
+    assert code == 0
+    assert built == [
+        {"service": "sqs", "region_name": "sa-east-1", "endpoint_url": "http://sqs.local:9324"}
+    ]
