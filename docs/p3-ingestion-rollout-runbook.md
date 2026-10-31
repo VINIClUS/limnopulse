@@ -32,9 +32,10 @@ runbook](p2-telemetry-rollout-runbook.md).
     of opaque ids only: never a token, an `Idempotency-Key`, an `Authorization` header or a raw
     `external_device_id`;
   - least privilege: the API principal may only send to the source queue; the worker runs as its
-    own `telemetry_ingest` IAM user (receive, delete, change visibility on the source queue, and its
-    DynamoDB rows); the operator policy (`telemetry-ingress-operator`, attached to no principal by
-    default) covers DLQ redrive and quarantine reconciliation.
+    own `telemetry_ingest` IAM user (receive, delete, change visibility and read the attributes of the
+    source queue; `GetItem`, `PutItem`, `Query` and `UpdateItem` on the domain table, without a
+    leading-key condition); the operator policy (`<project>-<env>-telemetry-ingress-operator`,
+    attached to no principal by default) covers DLQ redrive and quarantine reconciliation.
 - **Alarms** exist and route to an on-call target (`telemetry_ingress_alarm_actions`), see
   [Alarms and deadlines](#alarms-and-deadlines).
 
@@ -64,7 +65,7 @@ Each step is a separate change. Verify each one before moving to the next.
 5. **Divergence checks.** For every pilot that also reports through the legacy path, run the P2 keyed
    divergence checks between `observation_numeric` and `water_quality` over the pilot window; they
    must report nothing (G15 proves the HTTPS path matches the independent legacy writer).
-6. **Legacy dual write.** Set `TELEMETRY_LEGACY_DUAL_WRITE_ENABLED` to `true` on the worker only after G7
+6. **Legacy dual write.** Set `TELEMETRY_LEGACY_DUAL_WRITE_ENABLED` to `true` (shared `.env`, restart the worker and the API) only after G7
    (the durable DLQ redrive gate) has passed on `main` and the DLQ drill below has been rehearsed in
    this environment.
 7. **Remaining P2 steps.** Continue with the [P2 telemetry rollout
@@ -105,8 +106,13 @@ the API-only secrets.
   | `TELEMETRY_LEGACY_DUAL_WRITE_ENABLED` | `false` until step 6 |
   | `TELEMETRY_INGEST_WORKER_CONCURRENCY`, `TELEMETRY_INGEST_WORKER_MAX_MESSAGES`, `TELEMETRY_INGEST_WORKER_VISIBILITY_SECONDS`, `TELEMETRY_INGEST_PROCESSING_DEADLINE_SECONDS`, `TELEMETRY_INGEST_RETRY_BASE_SECONDS`, `TELEMETRY_INGEST_RETRY_CAP_SECONDS` | optional tuning; compose supplies the defaults (4, 10, 60, 45, 30, 900) when unset |
 
-- **The API** additionally needs `INGEST_V2_ENABLED`, `SQS_TELEMETRY_INGRESS_QUEUE_URL` (and
-  `SQS_TELEMETRY_INGRESS_DLQ_URL` for operators running the CLIs) in its own `.env`.
+- **One shared `.env`.** The API loads the same `.env` through its `env_file`, so every switch set
+  there reaches the API on its next restart as well. For the ingest route the API also needs
+  `API_V2_ENABLED=true`, `TELEMETRY_V2_WRITE_ENABLED=true`, `INGEST_V2_ENABLED` and
+  `SQS_TELEMETRY_INGRESS_QUEUE_URL`; operators running the CLIs also set
+  `SQS_TELEMETRY_INGRESS_DLQ_URL`. The API reads `TELEMETRY_V2_WRITE_ENABLED` and
+  `TELEMETRY_LEGACY_DUAL_WRITE_ENABLED` too (for its own write service), so restart both services
+  after changing either.
 - **`stop_grace_period`.** The worker's `stop_grace_period` (90 s in both compose files) must exceed
   drain + wait + 5 s (A47): `TELEMETRY_INGEST_DRAIN_SECONDS` 30 + `TELEMETRY_INGEST_WORKER_WAIT_SECONDS`
   20 + the 5 s poll grace, more than 55 s at the defaults. SIGTERM first finishes the in-flight long
@@ -131,9 +137,11 @@ the API-only secrets.
   roughly 20–45 minutes moves the backlog to the DLQ. That is expected and loses nothing: recovery
   is the DLQ redrive drill, alerted by the DLQ alarm. A permanent failure (an invalid envelope, a
   forged envelope) is retried every 60 s until it reaches the DLQ.
-- **Reconciliation deadline: 14 days.** Data that already got a `202` and then failed is kept in
-  two places, each for 14 days: the DLQ (14 days minus the time spent in the source queue) and the
-  quarantine rows (TTL 14 days). Reconcile (redrive, replay or dismiss) within 14 days of the original
+- **Reconciliation deadline: 14 days.** Data that already got a `202` and then failed ends up in
+  one of two places, each kept for 14 days: a message that kept failing (an outage, an invalid or
+  forged body) in the DLQ (14 days minus the time spent in the source queue), and a quarantined or
+  fenced observation in the quarantine rows (TTL 14 days). A message waiting for a stopped worker
+  stays only 4 days in the source queue. Reconcile (redrive, replay or dismiss) within 14 days of the original
   request; after that the data is gone for good.
 
 ## DLQ drill
@@ -145,10 +153,10 @@ the redrive the worker reproduces the exact v2 and legacy point set of the no-fa
 drill ran locally against ElasticMQ, DynamoDB Local and InfluxDB 2.7.11 (recorded on #103).
 
 Run from an operator checkout with the operator policy's credentials, `SQS_TELEMETRY_INGRESS_QUEUE_URL`
-and `SQS_TELEMETRY_INGRESS_DLQ_URL` set. Both subcommands are a dry run unless `--apply` is given,
-and nothing touches the DLQ unless an operator runs a subcommand (there is no automatic DLQ consumer).
+and `SQS_TELEMETRY_INGRESS_DLQ_URL` set. `sample` only reads and releases; `redrive` is a dry run
+unless `--apply` is given, and nothing touches the DLQ unless an operator runs a subcommand (there is no automatic DLQ consumer).
 
-1. **Sample.** Print metadata (message id, receive count, age, a diagnosis of the body as a
+1. **Sample.** Print metadata (message id, receive count, `sent_at`, a diagnosis of the body as a
    `telemetry-ingress@1` envelope) for up to 10 messages; it never prints a body and releases every
    message it saw:
 
@@ -158,8 +166,10 @@ uv run --locked python scripts/admin/telemetry_dlq.py sample --limit 10
 
 2. **Diagnose.** Fix the cause before redriving: an InfluxDB or DynamoDB outage is over, a worker
    bug is fixed and deployed, or a fenced or deferred DeviceIntegration, account or Device is in the
-   intended state. Bodies that fail to parse (`envelope_invalid`) or are forged will fail again;
-   leave them in the DLQ for investigation (they expire after 14 days).
+   intended state. Bodies that fail to parse (`envelope_invalid`) or are forged will fail again.
+   `redrive` has no filter: it moves every message it receives, up to `--max`. A redriven bad body
+   cycles back to the DLQ after about 8 × 60 s as a new message, so its 14-day expiry restarts. When
+   such bodies are present, redrive deliberately with a small `--max`, and expect them back.
 3. **Dry run.** Count what a redrive would move:
 
 ```bash
@@ -216,9 +226,11 @@ uv run --locked python scripts/admin/telemetry_quarantine.py dismiss --tenant <t
 ```
 
 - **Reruns.** The replay id is derived from the group's entry keys, so a rerun after a crash before
-  any row was marked reuses the same replay id. After a partial mark (exit code 3: some rows of the
-  group were marked `replayed`, then a conflict stopped the rest), the rerun skips the marked rows and
-  its group has different entry keys, so it gets a new replay id (P3-09, see #116). The observations
+  any row was marked reuses the same replay id. After a partial mark (exit code 3: each row is
+  marked on its own, and some rows of the group failed with a conflict or a store error), a rerun
+  skips the rows already `replayed` and its group has different entry keys, so it gets a new replay
+  id (P3-09, see #116). A rerun with the same `--entry` list reports the skipped rows as `not_open`
+  and therefore exits 3 even when everything it attempted succeeded; check the per-entry lines. The observations
   that were already sent may be written twice; that is safe because points are idempotent by
   `event_id`.
 
@@ -261,8 +273,8 @@ uv run --locked python scripts/admin/telemetry_quarantine.py dismiss --tenant <t
 Rollback follows §24: route pilots back, disable the endpoint, retain the queued messages.
 
 1. **Route pilots back** to their previous (legacy) path, so they stop calling the HTTPS endpoint.
-2. **Stop legacy dual write:** set `TELEMETRY_LEGACY_DUAL_WRITE_ENABLED=false` on the worker and
-   restart it, if it was on.
+2. **Stop legacy dual write:** set `TELEMETRY_LEGACY_DUAL_WRITE_ENABLED=false` in the shared `.env`
+   and restart the worker (and the API, which reads it too), if it was on.
 3. **Disable the endpoint:** set `INGEST_V2_ENABLED=false` and restart the API. New requests get
    `404`; everything already accepted stays queued.
 4. **Let the worker drain** the source queue (queue depth and age back to zero), unless the worker

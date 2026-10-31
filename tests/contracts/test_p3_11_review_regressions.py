@@ -51,3 +51,51 @@ def test_runbook_suspended_device_is_its_own_bullet() -> None:
     assert "suspended" not in account
     (device,) = [b for b in bullets if b.startswith("**Suspended Device.**")]
     assert re.search(r"temporary fence", device) and re.search(r"DLQ", device)
+
+
+def _runbook() -> str:
+    return " ".join(RUNBOOK.read_text(encoding="utf-8").split())
+
+
+def test_runbook_least_privilege_matches_the_worker_grants() -> None:
+    """The worker's DynamoDB grant is table-wide, and it may read queue attributes."""
+    tofu = (ROOT / "infra/opentofu/ingestion_queues.tf").read_text(encoding="utf-8")
+    assert '"sqs:GetQueueAttributes"' in tofu
+    text = _section("Preconditions")
+    assert "its DynamoDB rows" not in text
+    assert re.search(r"read the attributes of the source queue", text)
+    assert re.search(r"without a leading-key condition", text)
+    assert "`<project>-<env>-telemetry-ingress-operator`" in text
+
+
+def test_runbook_production_env_is_one_shared_file() -> None:
+    text = _section("Production environment")
+    assert "in its own `.env`" not in text
+    assert re.search(r"One shared `\.env`", text)
+    for name in ("API_V2_ENABLED=true", "TELEMETRY_V2_WRITE_ENABLED=true"):
+        assert f"`{name}`" in text, name
+    assert "on the worker and restart it" not in _section("Rollback")
+
+
+def test_runbook_dlq_drill_states_what_sample_and_redrive_really_do() -> None:
+    text = _section("DLQ drill")
+    assert "Both subcommands are a dry run" not in text
+    assert re.search(r"`sample` only reads and releases", text)
+    assert re.search(r"`sent_at`", text) and "receive count, age," not in text
+    assert "leave them in the DLQ" not in text
+    assert re.search(r"`redrive` has no filter", text)
+
+
+def test_runbook_partial_mark_and_rerun_exit_codes() -> None:
+    text = _section("Quarantine reconciliation drill")
+    assert "a conflict stopped the rest" not in text
+    assert re.search(r"each row is marked on its own", text)
+    assert re.search(r"`not_open`.{0,40}exits 3", text)
+
+
+def test_runbook_deadline_says_one_place_and_the_four_day_source_limit() -> None:
+    text = _section("Alarms and deadlines")
+    assert "kept in two places" not in text
+    assert re.search(r"one of two places", text)
+    assert re.search(r"4 days in the source queue", text)
+    assert "telemetry_dlq.py" in _runbook()
