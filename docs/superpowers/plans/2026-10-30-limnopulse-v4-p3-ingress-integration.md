@@ -166,19 +166,19 @@ Epic #15's entry decision is to freeze generic ingress/HTTPS first; a non-AWS ge
 | D7 | Worker runtime | **Runtime.**<br>• Python (§7.2): a long-running asyncio loop, with boto3 calls in `asyncio.to_thread`.<br>• It uses its own composition function, not `create_app`, so the API's cache client is not built.<br>• It runs from the API image with an entrypoint override: `python -m limnopulse_api.workers.telemetry_ingest`. There is no new image and no build-matrix change.<br>**Credentials.** It runs as the dedicated **`telemetry_ingest`** IAM principal, never the api principal or the shared `workers` user (see **IAM**).<br>**Start guard.** It refuses to start (exit 2) unless `TELEMETRY_V2_WRITE_ENABLED=true`, so it can never delete a message it did not write. Settings also reject `INGEST_V2_ENABLED=true` without `TELEMETRY_V2_WRITE_ENABLED=true`, because the API and worker share one environment file.<br>**Compose.** `restart: "no"` locally and a bounded `on-failure` restart in production. A queue-age alarm and a runbook step cover a stopped worker. |
 | D8 | Processing, ack and failure table | **Order of operations:**<br>1. Parse and validate the envelope.<br>2. Re-resolve and **fence** (ADR-001). All of the following must hold:<br>   – the re-resolved DeviceIntegration's `tenant_id`, `integration_account_id`, `provider_key`, `device_integration_id` and `device_id` equal the envelope's;<br>   – the IntegrationAccount re-read by `(di.tenant_id, envelope.integration_account_id)` is `active` and has an HTTPS provider key;<br>   – the Device is `active` (all three reads are consistent).<br>3. `TelemetryPipeline.ingest`.<br>4. Persist quarantine rows.<br>5. Apply monotone state updates.<br>6. Emit metrics.<br>7. Delete the message.<br>**Failures.** Each class follows the frozen **worker failure table**.<br>**Fenced messages.** These have already been answered 202, so they are never silently dropped. Each fence reason belongs to one class:<br>• **Terminal fences:** `INTEGRATION_DECOMMISSIONED`, `ACCOUNT_REVOKED`, `DEVICE_DECOMMISSIONED`, `INTEGRATION_MISMATCH` and `IDENTITY_UNRESOLVED`. Persist one **replayable** `kind=observation` row per envelope observation, with reason `fenced_<reason>`, plus one `fenced_message` summary row. Only then delete the message.<br>• **Temporary fences:** a DeviceIntegration or IntegrationAccount in `error` or `pending`, and a Device that is `provisioning` or `suspended`. These are **retryable**: `change_visibility(backoff(n))`. If the condition outlasts `maxReceiveCount`, the message lands in the DLQ, where it can be redriven.<br>• **Forged envelopes:** fenced rows and fence marks are written only when an authoritative IntegrationAccount row exists for `(envelope.tenant_id, envelope.integration_account_id)`. Otherwise the worker writes nothing, emits `ingress_fenced_total{reason}`, and uses permanent visibility, so the message ends up in the DLQ. |
 | D9 | Quarantine persistence | **Rows.** One row per quarantined or fenced observation, plus one `fenced_message` summary row per fenced message, under the dedicated partition `QUARANTINE#<tenant_id>`. The SK is `<received_at_key>#<qtn_id>`, so listings are time-ordered.<br>**Id.** `quarantine_id = qtn_ + uuid5(NAMESPACE_URL, f"limnopulse:quarantine:{ingress_id}:{ordinal}:{sha256(excerpt)}").hex`.<br>• `ordinal` counts the earlier rows with an identical excerpt in the same message, in outcome order, so two identical (or identically truncated) excerpts never collide.<br>• The `fenced_message` summary row uses `ordinal = -1`.<br>• The id is content-derived and stable across redelivery, because the message body is byte-identical.<br>**Writes.** Each row is created with `attribute_not_exists(PK)`. A conditional failure counts as success, so a redelivery never resets `replayed` or `dismissed` back to `open`.<br>**TTL** 14 days.<br>**Status transitions.** `open → replayed` or `open → dismissed`; both are terminal.<br>**Contents.** The row stores the mapping versions the worker actually used (`envelope.mapping_versions`, which admission always pins).<br>**Replayable rule.** A row is replayable iff its kind is `observation`, its excerpt is not truncated, and the excerpt parses as a `SourceObservation`.<br>**Replay inputs.** Each row also stores what a replay envelope needs: `provider_key`, `external_identity_hash`, `source_type` and `connector_version`.<br>**Deadline.** The quarantine TTL and the DLQ retention are both 14 days. Together they set the hard reconciliation deadline for data that got a 202, and the runbook states both. |
-| D10 | Operator reconciliation | **Admin CLIs** in `scripts/admin/`. They run from an operator checkout and are dry-run by default; `--apply` executes.<br>**`telemetry_quarantine.py`** has `list`, `replay` and `dismiss`.<br>• `replay` builds a **new** envelope: a deterministic `ingress_id = ing_ + uuid5("limnopulse:replay:" + ",".join(sorted(entry_keys))).hex` (so a rerun after a crash reuses it), `replay_of=<original ingress_id>`, `replay=true`, the first `received_at`, the stored mapping versions and the stored source observations. It groups entries by `(ingress_id, device_integration_id)`, one envelope per group.<br>• It enqueues that envelope through the normal producer, and only after the send succeeds does it mark the rows `replayed`.<br>**`telemetry_dlq.py`** has `sample` and `redrive`. `redrive` sends the raw body unchanged to the source queue and then deletes it from the DLQ. A duplicate is safe.<br>**Never** an automatic DLQ consumer (`docs/notifications-phase-3c-a.md` precedent). |
+| D10 | Operator reconciliation | **Admin CLIs** in `scripts/admin/`. They run from an operator checkout and are dry-run by default; `--apply` executes.<br>**`telemetry_quarantine.py`** has `list`, `replay` and `dismiss`.<br>• `replay` builds a **new** envelope: a deterministic `ingress_id = ing_ + uuid5(NAMESPACE_URL, "limnopulse:replay:" + ",".join(sorted(entry_keys))).hex`, where `entry_key` is the quarantine SK `<received_at_key>#<qtn_id>` (so a rerun after a crash reuses it), `replay_of=<original ingress_id>`, `replay=true`, the first `received_at`, the stored mapping versions and the stored source observations. It groups entries by `(ingress_id, device_integration_id)`, one envelope per group.<br>• It enqueues that envelope through the normal producer, and only after the send succeeds does it mark the rows `replayed`.<br>**`telemetry_dlq.py`** has `sample` and `redrive`. `redrive` sends the raw body unchanged to the source queue and then deletes it from the DLQ. A duplicate is safe.<br>**Never** an automatic DLQ consumer (`docs/notifications-phase-3c-a.md` precedent). |
 | D11 | Ingest state and connector health | **Rows.**<br>• Per Component: `COMPONENT#<c>/INGEST_STATE#CURRENT`.<br>• Per Device: `DEVICE#<d>/INGEST_STATE#CURRENT`.<br>• Per IntegrationAccount: `INTEGRATION_ACCOUNT#<ia>/CONNECTOR_HEALTH#CURRENT`, a partition of its own, not the tenant partition.<br>• `HEALTH#CURRENT` is reserved for P6.<br>**Update rule.** Every attribute is a **monotone high-water mark**, written with a conditional `UpdateItem` (`attribute_not_exists(x) OR x < :t`), with no read-modify-write and no version. Updates are therefore idempotent and order-independent under concurrent workers and redelivery.<br>**Replay.** Replay messages (`replay=true`) never update state.<br>**Last-seen.** For P6, last-seen means `last_received_at`. `last_ingested_at` is diagnostic and may advance on a DLQ redrive.<br>**Device-controlled marks.** `(last_observed_at, last_observed_sequence)` advances only for accepted observations that meet all three conditions:<br>• they have a non-null `sequence`;<br>• they carry neither `clock_skew_future` nor `clock_skew_past_extreme`;<br>• they passed normalizer ownership.<br>Every other mark uses server time: the first-receipt `received_at`, or the worker clock for `last_ingested_at`. A device clock therefore cannot pin a mark.<br>**Ties.** On equal timestamps the lexicographically greater tie-breaker wins: `sequence` for observed marks, `reason` for quarantine and fence marks. This makes the final row independent of order.<br>**Sequence events.** `classify_component_sequence` (the frozen truth table) classifies sequence events against the state read once per message, and the result goes **only to metrics**. These metrics are **best-effort** and are classified only when the message is not a replay and `ApproximateReceiveCount == 1`:<br>• a first attempt that fails loses its events;<br>• a redriven message (CLI or `StartMessageMoveTask`) comes back with `ApproximateReceiveCount = 1`, is classified again (usually LATE), and may double-count;<br>• reordering between messages can produce a false GAP.<br>Gates assert state rows and pure truth-table vectors, never exact event counts under redelivery. |
 | D12 | Point quality flags | `DUPLICATE`, `SEQUENCE_GAP` and `SEQUENCE_REGRESSION` stay reserved for P6. A state-dependent flag would flip on redelivery and break P2 D4 determinism. `quality-policy@1` is unchanged. |
 | D13 | Rate limits and entitlements | **Rate limits.**<br>• An in-process token bucket per IntegrationAccount (default 120 requests/minute, burst 20). It runs after authentication and before the body is read.<br>• Two pre-auth buckets run before any DynamoDB read, in this order: a **process-global** bucket (default 600/minute), then a bucket keyed by the parsed `ic_` id (default 60/minute). Random `ic_` ids therefore cannot amplify store reads.<br>• No distributed cache is involved (ADR-019). With N API replicas the bound is N × limit, which is bounded and documented.<br>**Entitlements.**<br>• `IngressEntitlementCheck` is a hook. Its default `AllowDirectIngressEntitlements` allows, because direct HTTPS is on every tier (§18.3).<br>• Enforcement against EntitlementSnapshot is **DEFERRED → #20 (P4)**.<br>**Store outage.** If the authoritative stores are unavailable, the request fails closed with 503. |
 | D14 | Metrics | **Port.** `TelemetryMetrics`, a port with `increment(name, value=1, **labels)` and `observe(name, value, **labels)`.<br>**Names.** Closed `*_total` and `*_seconds` names drawn from §23.2 (see **Metrics**).<br>**Labels.** Only closed-enum values, never a tenant, account, device, component or identity.<br>**Adapter.** A structured-JSON log line on logger `limnopulse.telemetry.metrics`, shaped so that an OTLP adapter can follow without renaming. No new dependency.<br>**Queue age.** Taken from `SentTimestamp`.<br>**Alarms.** CloudWatch age, depth and DLQ alarms (P3-02).<br>**Not in P3.** Stale/offline device views, connector sync lag and calibration metrics belong to P6/P9. |
 | D15 | Switches and routes | **`INGEST_V2_ENABLED`** (default `false`).<br>• Requires `API_V2_ENABLED=true`, `TELEMETRY_V2_WRITE_ENABLED=true` and a non-empty `SQS_TELEMETRY_INGRESS_QUEUE_URL`.<br>• Mounts exactly `POST /ingest/v2/observations` plus the **5 tenant routes** of the credential and lifecycle routers (see **Routes**).<br>**`API_V2_ENABLED` alone** still mounts exactly the 53 M1 tenant routes.<br>**Router placement.** The lifecycle routes go in a new router file, `api/v2/routers/integration_lifecycle.py`. The existing integrations router is not extended. |
-| D16 | Ships dark; legacy-device coverage | **Dark by default.** With every switch off, nothing produces canonical telemetry in production. All production switch flips are owner actions in the runbook.<br>**The D16 read-switch precondition stays open after P3.** That precondition is "a producer writes every legacy device to `observation_numeric`" (P2 D16). Legacy devices publish MQTT, which the HTTPS path cannot carry. The gate moves to a Backlog issue, `[Backlog][P3 follow-up] Producer path for legacy MQTT devices`. That is issue #104, created together with the task issues, and it is the single owner. It will be decomposed as the separately approved MQTT slice. The P3-11 runbook links it.<br>**P3's contribution: G15.** With `TELEMETRY_LEGACY_DUAL_WRITE_ENABLED=false`, the keyed divergence check between `observation_numeric` (written by the P3 worker) and `water_quality` (written independently by the legacy writer, for the same readings) reports zero differences. |
+| D16 | Ships dark; legacy-device coverage | **Dark by default.** With every switch off, nothing produces canonical telemetry in production. All production switch flips are owner actions in the runbook.<br>**The D16 read-switch precondition stays open after P3.** That precondition is "a producer writes every legacy device to `observation_numeric`" (P2 D16). Legacy devices publish MQTT, which the HTTPS path cannot carry. The gate moves to a Backlog issue, `[Backlog][P3 follow-up] Producer path for legacy MQTT devices (D16 read-switch gate)`. That is issue #104, created together with the task issues, and it is the single owner. It is decomposed only after its open producer-path decision is approved: HTTPS firmware, an approved MQTT bridge, or P5 AWS IoT. The P3-11 runbook links it.<br>**P3's contribution: G15.** With `TELEMETRY_LEGACY_DUAL_WRITE_ENABLED=false`, the keyed divergence check between `observation_numeric` (written by the P3 worker) and `water_quality` (written independently by the legacy writer, for the same readings) reports zero differences. |
 | D17 | Storage | No Scan, no GSI, no new table. A test checks the new keys against existing listing prefixes. |
 | D18 | Dependencies | No new dependency and no lockfile change. |
 | D19 | ADR recording | **What P3-11 appends.** A `**Phase split (P3).**` paragraph at the end of `## Implementation gate`, with no new heading, in ADR-006, ADR-007 and ADR-016.<br>**Changes to the P2 test.** P3-11 relaxes `tests/contracts/test_p2_acceptance_gate.py`:<br>• the P2 paragraph must be immediately followed by **at most** the P3 paragraph;<br>• every pre-existing hash stays pinned;<br>• a new P3 test checks for the P3 paragraph.<br>**Constraints on the ADR-016 text.** It must avoid the forbidden regexes in `test_architecture_inventory.py:646-659`.<br>**Required content, pinned by the new P3 test:**<br>• **ADR-006** mentions `P3`, `P6`, `#17`, `quarantine`, `connector health` and `INGEST_STATE`.<br>• **ADR-007** mentions `P3`, `redrive`, `D16`, `Backlog` and `G15`.<br>• **ADR-016** mentions `P3`, `Idempotency-Key`, `entitlement`, `#20` and `DLQ redrive`. It states that entitlement enforcement is P4 (#20) and that P3 ships the pre-enqueue hook.<br>• **Every one** links `../p3-ingestion-rollout-runbook.md`. |
 | D20 | Spec deltas | See the table below. |
 | D21 | Production compose | P3-10 adds a `telemetry-ingest-worker` service in profile `ingestion` to both `compose.yaml` and `compose.production.yaml`. The default deploy does not start it. |
-| D23 | Security audit events (§22.3) | Credential issue and revoke, and IntegrationAccount and DeviceIntegration status transitions, each write **one** audit item into `LimnopulseAudit`.<br>• The audit item is part of the same `TransactWriteItems` as the change, following the `adapters/alert_rules.py` pattern (`AuditContext`, actions `ingest_credential.issued`, `ingest_credential.revoked`, `integration_account.status_changed` and `device_integration.status_changed`).<br>• Each item carries the actor, tenant, resource ids, before and after status, and the credential `fingerprint` only: never a token, secret or digest.<br>• The adapters take `audit_table_name`. P3-02 confirms that the API principal can `PutItem` on the audit table. |
+| D23 | Security audit events (§22.3) | Credential issue and revoke, and IntegrationAccount and DeviceIntegration status transitions, each write **one** audit item into `LimnopulseAudit`.<br>• The audit item is part of the same `TransactWriteItems` as the change, following the `adapters/alert_rules.py` pattern (`AuditContext`, actions `ingest_credential.issued`, `ingest_credential.revoked`, `integration_account.status_changed` and `device_integration.status_changed`).<br>• Each item carries the actor, tenant, resource ids, before and after status, and the credential `fingerprint` only: never a token, secret or digest.<br>• The adapters take `audit_table_name`. P3-02 grants the API principal `PutItem` on the audit table (absent today). |
 | D22 | Device re-claim and decommission | **Releasing an identity.** Decommissioning a DeviceIntegration does not release its external identity in P3. The `EXTERNAL_ID` row keeps the identity claimed, with `status=decommissioned`.<br>**Effect on new and queued data.** New admissions get 403, and queued messages are fenced.<br>**Re-claimed identities.** Because the identity is never released, the `INTEGRATION_MISMATCH` fence can only be triggered by a forged or corrupted envelope. Tests use a forged envelope whose DeviceIntegration id differs from the resolved one.<br>**DeviceIntegrations created under `https_direct` before P3-04.** They carry the global hash. They never resolve, so admission fails closed with 403, and they must be re-created.<br>**Deployment edits.** If a Deployment interval is edited between a first write and a redelivery or replay, a second series is written for the same `event_id`, because `site_id`, `asset_id` and `deployment_id` are tags. This is documented and not prevented. |
 
 ### Spec deltas (V4 → this plan)
@@ -489,7 +489,7 @@ Observations without a sequence produce no event. Sequences are interpreted per 
 | `ingress_dlq_redriven_total` | `result ∈ {redriven, failed}` | CLI |
 | `ingress_quarantine_replayed_total` | `result ∈ {replayed, skipped, failed}` | CLI |
 
-The structured-log adapter emits one JSON object per flush: `{"metric": name, "value": n, "labels": {...}}`.
+The structured-log adapter emits one JSON object per `increment`/`observe` call: `{"metric": name, "value": n, "labels": {...}}`.
 
 **Never logged:** `Authorization`, any token or secret or digest, a raw `Idempotency-Key`, a raw `external_device_id`, or request bodies.
 
@@ -497,7 +497,7 @@ The structured-log adapter emits one JSON object per flush: `{"metric": name, "v
 
 | Principal | SQS | DynamoDB (domain table) |
 |---|---|---|
-| `api` user (existing) | `SendMessage` on ingress | adds explicit `dynamodb:DeleteItem` and `dynamodb:ConditionCheckItem` to the existing set, and confirms (or adds) `dynamodb:PutItem` on `LimnopulseAudit` for the D23 audit items. A transaction's sub-operations are authorized per item action. |
+| `api` user (existing) | `SendMessage` on ingress | adds explicit `dynamodb:DeleteItem` and `dynamodb:ConditionCheckItem` to the existing set, and adds `dynamodb:PutItem` on `LimnopulseAudit` for the D23 audit items. Today `iam_runtime.tf` grants only `TransactWriteItems` there, and transactions need the per-item actions. A transaction's sub-operations are authorized per item action. |
 | `telemetry_ingest` user (**new, dedicated**) | `ReceiveMessage`, `DeleteMessage`, `ChangeMessageVisibility`, `GetQueueAttributes` on ingress | `GetItem`, `Query`, `PutItem`, `UpdateItem` |
 | operator policy (managed, **not attached**) | `ReceiveMessage`, `DeleteMessage`, `ChangeMessageVisibility`, `GetQueueAttributes` on the DLQ; `SendMessage` on ingress | `Query`, `GetItem`, `UpdateItem` |
 
@@ -543,16 +543,20 @@ These are 5 tenant routes, all owner/admin (`require_tenant_role(*WRITE_ROLES)`;
 class IngestCredentialRepository(Protocol):
     async def get_ingest_credential(self, ingest_credential_id: str) -> IngestCredential | None: ...
     async def list_ingest_credentials(self, tenant_id: str, integration_account_id: str) -> list[IngestCredential]: ...
-    async def create_ingest_credential(self, credential: IngestCredential) -> IngestCredential: ...   # ConflictError when slot taken
+    async def create_ingest_credential(self, credential: IngestCredential, audit: AuditContext) -> IngestCredential: ...   # ConflictError when slot taken
     async def revoke_ingest_credential(self, tenant_id: str, integration_account_id: str, ingest_credential_id: str,
-                                       *, expected_version: int, revoked_at: datetime) -> IngestCredential: ...
+                                       *, expected_version: int, revoked_at: datetime, audit: AuditContext) -> IngestCredential: ...
 class ConnectorAuthenticator(Protocol):
     async def authenticate(self, token: str) -> AuthenticatedSource | None: ...   # None -> 401
 class ExternalIdentityResolver(Protocol):
     async def resolve_external_identity(self, provider_key: str, external_identity_hash: str) -> DeviceIntegration | None: ...
 class IntegrationLifecycleRepository(Protocol):
-    async def transition_integration_account(self, tenant_id, integration_account_id, target, *, expected_version, updated_at) -> IntegrationAccount: ...
-    async def transition_device_integration(self, tenant_id, device_integration_id, target, *, expected_version, updated_at) -> DeviceIntegration: ...
+    async def transition_integration_account(self, tenant_id, integration_account_id, target, *, expected_version, updated_at, audit: AuditContext) -> IntegrationAccount: ...
+    async def transition_device_integration(self, tenant_id, device_integration_id, target, *, expected_version, updated_at, audit: AuditContext) -> DeviceIntegration: ...
+class ConsistentDeviceReader(Protocol):     # P3 port; the M1 DeviceReader stays frozen
+    async def get_device(self, tenant_id: str, device_id: str, *, consistent: bool) -> DeviceV2 | None: ...
+class DeviceComponentLister(Protocol):     # bounded per Device (PK=DEVICE#<d>-scoped query or the device's component index)
+    async def list_device_components(self, tenant_id: str, device_id: str, *, limit: int = 100) -> list[DeviceComponent]: ...
 class TrustedMapping(Protocol):
     async def admit(self, source: AuthenticatedSource, batch: IngestObservationBatch) -> IngressAdmission | IngressDenial: ...
     async def fence(self, envelope: IngressEnvelope) -> TrustedIngress | IngressFence | IngressDefer: ...
@@ -587,8 +591,23 @@ class TelemetryMetrics(Protocol):
 ```
 - **`IngressQueueMessage`** is frozen: `message_id`, `receipt_handle`, `body`, `receive_count`, `sent_at`.
 - **`IngressAdmission`**: `source`, `device_integration`, `device`, and resolved `observations: tuple[SourceObservation, ...]`.
-- **`IngressDenial`**: `reason: IngressAdmissionDenied`.
+- **`IngressDenial`**: `reason: IngressAdmissionDenied`, `observation_index: int | None`. The index is set for `COMPONENT_REQUIRED`/`COMPONENT_INVALID`, so that route step 10 can build `loc`.
+- **`AuditContext`** is the existing `domain/alerts.py` model (`actor_id`, `ip`, `user_agent`). The adapters write the D23 audit item from it inside the same transaction.
 - **`TrustedIngress`**: `context: TrustedSourceContext` and `observations`.
+- **Condition → enum table.** P3-00 freezes this table as vectors. The checks run in this order, and the first failure wins.
+
+  | Condition | `admit` → `IngressAdmissionDenied` | `fence` → result |
+  |---|---|---|
+  | No `EXTERNAL_ID` row, or the DI row is missing or inconsistent. Under the account-scoped hash this includes another account's identity. | `IDENTITY_UNRESOLVED` | `IngressFence(IDENTITY_UNRESOLVED)` |
+  | DI tenant, account, provider, DI id or device ≠ the authenticated source (admit) or the envelope (fence) | `INTEGRATION_MISMATCH` | `IngressFence(INTEGRATION_MISMATCH)` |
+  | DI `decommissioned` | `INTEGRATION_INACTIVE` | `IngressFence(INTEGRATION_DECOMMISSIONED)` |
+  | DI `provisioning` or `error` | `INTEGRATION_INACTIVE` | `IngressDefer(INTEGRATION_NOT_ACTIVE)` |
+  | IA missing | (unreachable: auth is 401) | `IngressFence(IDENTITY_UNRESOLVED, account_verified=False)` |
+  | IA `revoked`, or its provider key is not HTTPS | `ACCOUNT_INACTIVE` | `IngressFence(ACCOUNT_REVOKED)` |
+  | IA `pending` or `error` | `ACCOUNT_INACTIVE` | `IngressDefer(ACCOUNT_NOT_ACTIVE)` |
+  | Device missing or `decommissioned` | `DEVICE_INACTIVE` | `IngressFence(DEVICE_DECOMMISSIONED)` |
+  | Device `provisioning` or `suspended` | `DEVICE_INACTIVE` | `IngressDefer(DEVICE_NOT_ACTIVE)` |
+  | Component rule fails (admit only) | `COMPONENT_REQUIRED` / `COMPONENT_INVALID` | — |
 - **`IngressFence`**: `reason: IngressFenceReason`, `account_verified: bool` (whether an authoritative IntegrationAccount row exists for the envelope's tenant and account).
 - **`IngressDefer`**: `reason: IngressDeferReason`.
 - **Rate limiter and metrics signatures.** `IngressRateLimiter.try_acquire(key, *, now)` takes `now` from the caller, which reads an injected monotonic clock. `TelemetryMetrics.increment(name, value=1, **labels)` is the only metrics signature. These are the signatures; any other wording in this plan defers to them.
@@ -612,7 +631,7 @@ class TelemetryMetrics(Protocol):
 | P3-01 | `scripts/dev/run_local_{elasticmq,dynamodb}.sh`, `tests/support/ingestion_harness.py`, `tests/ingestion/conftest.py` and the harness smoke tests, the Makefile `verify-ingestion` target, the `verify.yml` `ingestion` job, `tests/unit/test_ci_contract.py`, `docs/verification.md` | No production code. CI and the Makefile belong to P3-01 only. |
 | P3-02 | `infra/elasticmq/elasticmq.conf`, `infra/opentofu/ingestion_queues.tf` (all P3 IAM incl. the dedicated `telemetry_ingest` user; `iam_runtime.tf` untouched), ingestion entries in `variables.tf`, `outputs.tf`, `env/cloud.tfvars.example` and `infra/opentofu/README.md`, the IAM attachments for P3 actions, `tests/unit/test_opentofu_infra.py`, `tests/unit/test_phase3c_local_runtime.py` | No Python production code. Existing `queues.tf` resources are unchanged. |
 | P3-03 | `services/ingest_credentials.py`, `services/connector_auth.py`, `adapters/dynamodb_ingest_credentials.py`, `api/v2/routers/ingest_credentials.py`, `api/v2/schemas/ingest_credentials.py` | Router unmounted; no edit to `api/v2/router.py` or `main.py`. |
-| P3-04 | Resolver and transitions in `adapters/dynamodb_integrations.py`; the account-scoped hash in `services/integrations.py`; `services/integration_lifecycle.py`; `services/trusted_mapping.py`; `api/v2/routers/integration_lifecycle.py` and its schemas; the capability gate in `services/telemetry_normalizer.py` | Router unmounted. P2 normalizer tests stay green and unedited, unless an edit is approved as a regression of D4. |
+| P3-04 | Resolver and transitions in `adapters/dynamodb_integrations.py`; the account-scoped hash in `services/integrations.py`; `services/integration_lifecycle.py`; `services/trusted_mapping.py`; `api/v2/routers/integration_lifecycle.py` and its schemas; the capability gate in `services/telemetry_normalizer.py`; the adapter-only consistent `get_device` and a bounded `list_device_components` in `adapters/dynamodb_devices_v2.py` | Router unmounted. P2 normalizer tests stay green and unedited. |
 | P3-05 | `adapters/sqs_ingestion.py` (producer, consumer, heartbeat helper), `services/ingress_redrive.py` | No settings or composition. |
 | P3-06 | `adapters/dynamodb_quarantine.py`, `adapters/dynamodb_ingest_state.py`, `services/ingest_state.py` (wraps the P3-00 `build_ingest_marks` and `classify_component_sequence`) | — |
 | P3-07 | `services/ingestion.py`, `services/ingress_rate_limit.py`, `services/ingress_entitlements.py`, `adapters/dynamodb_ingress_receipts.py`, `api/ingest_v2.py` | Router unmounted. |
@@ -641,7 +660,7 @@ class TelemetryMetrics(Protocol):
 
 **Interfaces:** It produces everything in **Locked Cross-Task Contracts**. It also produces:
 - the pure function `classify_component_sequence(state: ComponentIngestState | None, pairs: Sequence[tuple[datetime, int]]) -> tuple[SequenceEvent, ...]`;
-- the pure function `build_ingest_marks(envelope, outcome, *, ingested_at) -> IngestMarks`;
+- the pure function `build_ingest_marks(envelope, outcome: PipelineOutcome | None, *, fence: IngressFence | None = None, ingested_at) -> IngestMarks`;
 - the additive `PipelineOutcome.accepted`.
 
 - [ ] **Step 1: Write failing contract tests.**
@@ -674,7 +693,8 @@ class TelemetryMetrics(Protocol):
     - the observed pair advances only on accepted observations with a non-null sequence and no clock-skew flag;
     - tie-breakers;
     - per-message maxima;
-    - a replay produces no marks.
+    - a replay produces no marks;
+    - a fenced message (`outcome=None`, `fence` set) produces only the connector `last_fenced_at`/`last_fence_reason` and device `last_received_at` marks.
   - **Sequence truth table.** Use vectors for every row of the table. Also cover:
     - collapsing multi-metric pairs;
     - `None` sequences;
@@ -690,10 +710,12 @@ class TelemetryMetrics(Protocol):
       - **Conditions:**
         - `attribute_not_exists(PK)`;
         - `attribute_not_exists(PK) OR #a <= :n`;
-        - `attribute_exists(PK) AND #status IN (...)`;
+        - `attribute_exists(PK) AND #status IN (...)`, optionally `AND #a = :v …`. This covers the issuance check `#status IN (:pending,:active) AND provider_key = :https`;
         - `#version = :v`;
         - `#a = :v AND #b = :w …` (conjunctions of equalities);
-        - `attribute_not_exists(#m) OR #m < :t OR (#m = :t AND #tb < :tb)`.
+        - `attribute_not_exists(#m) OR #m < :t`, the simple mark;
+        - `attribute_not_exists(#m) OR #m < :t OR (#m = :t AND #tb < :tb)`, the paired mark.
+      - **Failure detail:** `ReturnValuesOnConditionCheckFailure=ALL_OLD` on Put, Update and Delete, and in transaction items. Adapters use it, together with `CancellationReasons`, to tell 404 from 409.
       - **Update actions:** `SET` with `if_not_exists`, and `REMOVE`.
       - The kits never assert the error returned for the same item appearing twice in one transaction, because DynamoDB Local and AWS differ there.
   - **Dependencies and the moved route class.**
@@ -761,7 +783,7 @@ class TelemetryMetrics(Protocol):
     - A conditional Put with `attribute_not_exists` fails on the second write.
     - `attribute_not_exists(x) OR x < :t` behaves as a monotone mark.
     - A `TransactWriteItems` with a failing `ConditionCheck` reports the index.
-    - The P3-00 Dynamo-fake expression vectors run unchanged against DynamoDB Local once P3-00 is merged. If P3-00 merges after this task, they run in P3-03/P3-04/P3-06 instead.
+    - The P3-00 Dynamo-fake expression vectors run unchanged against DynamoDB Local once P3-00 is merged. If P3-00 merges after this task, P3-06 owns running them against DynamoDB Local (its Step 1).
   - **Proxy.** `ToggleableTcpProxy.down()` makes an Influx write raise a retryable `TelemetryWriteError` through `InfluxObservationWriter`, and `up()` restores it.
   - **Skip rule.** `tests/ingestion` skips cleanly without `RUN_INGESTION_INTEGRATION=1`.
 - [ ] **Step 2: Update the CI contract test deliberately.** Keep every existing invariant:
@@ -817,7 +839,7 @@ class TelemetryMetrics(Protocol):
 - **Outputs.** `telemetry_ingress_queue_url` (description `SQS_TELEMETRY_INGRESS_QUEUE_URL`) and `telemetry_ingress_dlq_url` (description `SQS_TELEMETRY_INGRESS_DLQ_URL`). Both are null when the flag is off.
 
 - [ ] **Step 1: Write failing infrastructure tests.**
-  - **ElasticMQ.** Assert the exact ElasticMQ blocks. Update the notification-queue count test so it asserts per-queue redrive, not a global count of 3.
+  - **ElasticMQ.** Assert the exact ElasticMQ blocks. Convert `tests/unit/test_phase3c_local_runtime.py:44` (`maxReceiveCount = 8` count == 3 in `elasticmq.conf`) to per-queue redrive asserts. `test_opentofu_infra.py:179` (`queues.tf`) stays at 3.
   - **New `test_ingestion_queues_tf_*` functions:**
     - the count gate;
     - SSE on both queues;
@@ -830,7 +852,8 @@ class TelemetryMetrics(Protocol):
     - variables are declared and present in `env/cloud.tfvars.example`;
     - no forbidden infrastructure words;
     - no secrets.
-  - `queues.tf` counts stay unchanged.
+  - `max_message_size` on both queues, the SecureTransport-deny policies, and the IAM actions per principal as exact sets.
+  - `queues.tf` counts stay unchanged: 7 SSE and 3 `maxReceiveCount = 8`.
   - The SHA-256 of `iam_runtime.tf` is pinned unchanged, and the operator policy has no attachment.
 - [ ] **Step 2: Run red, commit, test gate,** then implement after approval.
 - [ ] **Step 3: Run the shared gates and the infrastructure checks.** That means `make verify-tofu` (install tofu 1.12.6 locally if needed) and `make verify-compose`.
@@ -860,14 +883,14 @@ class TelemetryMetrics(Protocol):
 
   The account must exist in the tenant, its provider key must be in `HTTPS_PROVIDER_KEYS`, and its status must be `pending|active`. Otherwise the service raises `IntegrationInputError` (422) or `NotFound` (404) in the existing style. When both slots are taken it returns 409.
 - `IngestCredentialAuthenticator(*, credentials, integrations)` implements `ConnectorAuthenticator`.
-- `DynamoIngestCredentialRepository` implements `IngestCredentialRepository`: slot transactions and revoke (D2), plus the slot delete builder.
+- `DynamoIngestCredentialRepository(table_name, client, *, clock, audit_table_name)` implements `IngestCredentialRepository`. Issue and revoke use the D2 transactions (slot, listing, authoritative row, IntegrationAccount `ConditionCheck`, D23 audit Put), plus the slot delete builder. The service methods take `audit: AuditContext`.
 - The router follows **Routes** and stays unmounted. It uses `api/redacted_validation.py` and `require_tenant_role(*WRITE_ROLES)`.
 - Revoke and issuance carry the D2 transaction conditions.
 
 - [ ] **Step 1: Write failing tests.**
   - **Issuance and storage.**
     - The issued token matches the grammar.
-    - The stored row holds only the digest and fingerprint. A test serializes every written item and asserts that the secret and the token are absent.
+    - The stored rows hold only the digest and fingerprint. A test serializes every written item, the audit item included, and asserts that the secret, the token and the digest are absent everywhere except `secret_sha256` on the authoritative row.
     - A third active credential gets 409.
     - A revoke frees its slot, and the next issue reuses that slot.
     - Two concurrent issues against one free slot: exactly one wins (fake, then DynamoDB Local).
@@ -887,7 +910,10 @@ class TelemetryMetrics(Protocol):
     - `GET` never shows the digest.
     - Revoke needs `expected_version`; a stale version gets 409.
     - A cross-tenant revoke, using tenant A's path with tenant B's `ic_` id, gets 404, and B's row is unchanged.
-    - Issuing for an account whose status or provider changed concurrently fails the `ConditionCheck`.
+    - Issuing for an account whose status or provider changed concurrently fails the `ConditionCheck` with 409.
+    - Revoking an already-revoked credential gets 409.
+    - The adapter tells 404 from 409 using `CancellationReasons` indexes plus `ReturnValuesOnConditionCheckFailure=ALL_OLD`.
+    - No store read happens before the grammar check. Member and viewer get 403.
     - Issue and revoke each write exactly one D23 audit item in the same transaction. The item holds the fingerprint but no token, secret or digest. An audit write failure aborts the change.
     - A 422 never echoes input.
   - **Contract kits.** The kit passes against the in-memory Dynamo fake and against DynamoDB Local.
@@ -897,7 +923,8 @@ class TelemetryMetrics(Protocol):
 **Acceptance criteria:**
 - [ ] ADR-016: missing, invalid or mismatched credentials are rejected.
 - [ ] No plaintext secret is persisted.
-- [ ] Rotation works with two slots, and revocation is immediate.
+- [ ] Rotation works with two slots, and revocation is immediate and bound to the tenant and account.
+- [ ] §22.3 audit events cover credential issuance and revocation (D23).
 
 **Rollback:** Revert. The router stays unmounted.
 
@@ -916,9 +943,11 @@ class TelemetryMetrics(Protocol):
 - **`DynamoIntegrationRepository` additions:**
   - `resolve_external_identity`: two consistent `GetItem`s. It returns `None` if either row is missing or if the rows disagree on tenant, device or DI id.
   - `transition_integration_account`: a `TransactWriteItems` of one version-conditioned `Update` (only the changed fields, never a full `Put`) plus the D23 audit `Put`, guarded by `ensure_integration_account_transition`.
-  - `transition_device_integration`: a transaction that updates the DI row and the `EXTERNAL_ID` row's `status`/`version`, conditioned on version.
+  - `transition_device_integration`: a transaction that updates the DI row and the `EXTERNAL_ID` row's `status`/`version`, conditioned on version, plus the D23 audit Put.
+  - The constructor takes an optional `audit_table_name`.
 - **`IntegrationService`.** For accounts whose provider key is in `HTTPS_PROVIDER_KEYS`, it hashes with `account_scoped_identity_hash`. Other providers keep `external_identity_hash`, with no behavior change (M1 tests stay green).
-- **`TrustedMappingService(*, resolver, integrations, devices: DeviceReader, components: ComponentReader)`** implements `TrustedMapping`:
+- **`TrustedMappingService(*, resolver, integrations, devices: ConsistentDeviceReader, components: ComponentReader, device_components: DeviceComponentLister)`** implements `TrustedMapping`. It follows the frozen **condition → enum table**.
+- **Bounded component listing.** `DynamoDeviceComponentRepository` gains an adapter-only `get_device(..., consistent=True)` and a bounded `list_device_components(tenant, device, limit=100)`. The existing `list_components` scans the tenant's `COMPONENT#` prefix, so it is not used here.
   - `admit`: D4, plus the component rule and default fill;
   - `fence`: re-resolve and apply the D8 step-2 equalities and statuses. It returns:
     - `IngressFence` for terminal reasons, with `account_verified`;
@@ -951,7 +980,8 @@ class TelemetryMetrics(Protocol):
     - The account transition does not erase any other attribute: an unknown attribute seeded on the item survives.
     - Each transition writes one D23 audit item in the same transaction.
   - **API.**
-    - Roles: owner/admin for every route.
+    - Roles: owner/admin for every route; member and viewer get 403.
+    - The DeviceIntegration status route returns 404 when the path device differs.
     - A 422 is redacted.
   - **Capability gate.**
     - A metric outside a non-empty key set is quarantined as `component_not_measuring`.
@@ -965,6 +995,7 @@ class TelemetryMetrics(Protocol):
 - [ ] ADR-016: an IntegrationAccount cannot claim another tenant or account. Payload ownership never overrides the mapping.
 - [ ] ADR-001: inactive targets are denied at admission. At consumption, decommissioned or revoked targets are fenced, and suspended, pending or error targets are deferred.
 - [ ] P2 D14 capability gating is delivered for declared probes.
+- [ ] §22.3 audit events cover IA and DI status changes (D23).
 
 **Rollback:** Revert. The router stays unmounted, and the M1 hash is unchanged for non-HTTPS providers. DeviceIntegrations created under `https_direct` accounts before P3-04 never resolve and fail closed (D22).
 
@@ -982,9 +1013,10 @@ class TelemetryMetrics(Protocol):
 - **`SqsIngressQueue(*, client, queue_url)`** implements `IngressQueueProducer` and `IngressQueueConsumer`.
   - **Send.** `send` serializes compactly and enforces the size guard: `len(body.encode("utf-8")) + INGRESS_SCHEMA_ATTRIBUTE_BYTES > MAX_INGRESS_MESSAGE_BYTES` raises `IngressMessageTooLarge`. It sets the message attribute `schema=telemetry-ingress@1`, and requires a `MessageId` in the response, raising `IngressQueueError(retryable=True)` otherwise. Every client call goes through `asyncio.to_thread`.
   - **Receive.** `receive` requests `MessageSystemAttributeNames=["ApproximateReceiveCount", "SentTimestamp"]`. `AttributeNames` is deprecated.
-  - **Errors.** A `ReceiptHandleIsInvalid` or other failure in `delete` or `change_visibility` is logged and counted by the caller, never raised past the loop.
+  - **Errors.** A `ReceiptHandleIsInvalid` or other failure in `delete` or `change_visibility` raises `IngressQueueError(retryable=False)`. The P3-08 loop logs and counts it, and never raises it further.
+  - **`send_raw(body)`** (redrive) sets `schema=telemetry-ingress@1` and applies the same size guard.
   - **Visibility.** `change_visibility` clamps to `[0, 43200]`. `heartbeat(message, seconds)` is a thin helper over it.
-- **Redrive.** `redrive_dlq(*, dlq: IngressQueueConsumer, source: IngressQueueProducer, max_messages, apply) -> RedriveReport(seen, redriven, failed)` lives in `services/ingress_redrive.py`.
+- **Redrive.** `redrive_dlq(*, dlq: IngressQueueConsumer, source: IngressQueueProducer, max_messages, apply: bool = False) -> RedriveReport(seen, redriven, failed)` lives in `services/ingress_redrive.py`.
   - With `apply`, it sends the raw body unchanged, then deletes the message from the DLQ.
   - In dry-run it only counts, and calls `change_visibility(0)` to release each message.
   - A failed send never deletes the message.
@@ -994,7 +1026,9 @@ class TelemetryMetrics(Protocol):
     - the exact request parameters;
     - the size guard at the boundary, in UTF-8 bytes plus attribute bytes. Over the limit, the stub records no `send_message` call; the ElasticMQ test also asserts that `ApproximateNumberOfMessages` stays 0;
     - a missing `MessageId`, and botocore errors mapped to `IngressQueueError(retryable=True)`;
-    - visibility clamping;
+    - visibility clamping, and the `heartbeat` helper;
+    - the `receive` mapping, including `sent_at` from `SentTimestamp` milliseconds as a UTC datetime;
+    - the delete and visibility failure type;
     - the redrive ordering (send before delete; no delete after a failed send);
     - dry-run releases each message.
   - **ElasticMQ tests:**
@@ -1039,7 +1073,10 @@ class TelemetryMetrics(Protocol):
     - The list is time-ordered and pages correctly from `after_sk`.
     - The reason and status filters work.
     - The TTL attribute is the ceiling of the epoch.
+    - Two entries with identical excerpts but distinct ids both persist.
+    - With the clock advanced past 14 days from `created_at`, an entry is excluded from `list`, and get and transition treat it as absent (logical expiry).
     - Illegal transitions are rejected, and a stale version gets 409.
+    - If P3-00 merged after P3-01, the P3-00 Dynamo-fake expression vectors run against DynamoDB Local here.
   - **State.**
     - Applying N shuffled message marks in any order, with duplicates, gives the same final row, **including ties** (resolved by the tie-breaker). Equality excludes `last_ingested_at`. This is tested against the fake and against DynamoDB Local with concurrent tasks.
     - A future-skewed observation never advances the observed pair.
@@ -1128,6 +1165,11 @@ class TelemetryMetrics(Protocol):
 - **`IngestMessageProcessor`**
   - Inputs: `mapping`, `pipeline: TelemetryPipeline`, `quarantine`, `state: IngestStateService`, `metrics`, `clock`, and `retry: RetryPolicy`. The mapping versions always come from `envelope.mapping_versions`.
   - `async process(message) -> ProcessDecision(action: delete|visibility, seconds, category)`, following the D8 order and the **worker failure table**.
+  - It **builds** the `QuarantineEntry` rows:
+    - the ids from `quarantine_entry_id(ingress_id, ordinal, excerpt)`, with the ordinal counted per identical excerpt in outcome order;
+    - the `fenced_message` summary row with ordinal −1;
+    - the D9 `replayable` flag;
+    - the envelope linkage fields.
 - **`RetryPolicy(base, cap, permanent_visibility, random)`** implements the backoff formula.
 - **`IngestWorkerLoop`**
   - Inputs: `consumer`, `processor`, `config`, `metrics` and `clock`.
@@ -1142,7 +1184,10 @@ class TelemetryMetrics(Protocol):
     - A temporary fence changes visibility with backoff and writes nothing.
     - An unverified fence (forged envelope) writes nothing and uses permanent visibility.
     - Data that already got a 202 never vanishes silently.
-  - **Context.** The `TrustedSourceContext` is rebuilt from the re-resolved DI with the envelope's `received_at`, `replay` and `mapping_versions`. A replay envelope reproduces the pinned versions and the same `event_id`.
+  - **Context.** The `TrustedSourceContext` is rebuilt from the re-resolved DI with the envelope's `received_at`, `replay` and `mapping_versions`.
+    - A replay envelope reproduces the pinned versions and the same `event_id`.
+    - A forged envelope with a foreign `component_id` is quarantined as `component_not_owned`.
+  - **Quarantine rows.** Identical excerpts get distinct ordinals, and the summary row uses ordinal −1.
   - **Backoff.** Matches the formula at n = 1..10, with an injected random source.
   - **Loop.**
     - The concurrency bound is respected.
@@ -1163,11 +1208,12 @@ class TelemetryMetrics(Protocol):
     - the message is deleted.
   - **At-least-once and order.** Duplicate and shuffled delivery of N messages leave the point set and the state rows identical. Points are keyed by (measurement, tag set, timestamp) and compared on every field except `ingested_at_ns`. State is compared without `last_ingested_at`.
 - [ ] **Step 2: Run red, commit, test gate,** then implement after approval.
-- [ ] **Step 3: Run the shared gates.** That includes `make verify-ingestion`.
+- [ ] **Step 3: Run the shared gates.** That includes `make verify-ingestion`, with `scripts/dev/run_local_influxd.sh` running.
 
 **Acceptance criteria:**
 - [ ] The P2 ack contract is honored: a message is deleted only after the durable writes and the quarantine persistence.
 - [ ] The §8.2 sequence is implemented: resolve, normalize, write, health, delete.
+- [ ] ADR-001: queued ingest is fenced after decommission, and temporary conditions defer rather than drop.
 - [ ] §23.2 metrics are emitted with closed labels.
 
 **Rollback:** Revert. There is no entrypoint until P3-10.
@@ -1253,7 +1299,7 @@ class TelemetryMetrics(Protocol):
 - **Compose.**
   - The `telemetry-ingest-worker` service uses profile `ingestion` and builds `Dockerfile.api`.
   - Its entrypoint override is `python -m limnopulse_api.workers.telemetry_ingest`.
-  - It depends on `elasticmq` (healthy) and `dynamodb-local`.
+  - It depends on `elasticmq` (healthy), `dynamodb-local` and `influxdb`.
   - It uses local dummy AWS credentials.
   - Its restart policy is `"no"` locally.
   - **In `compose.production.yaml`:**
@@ -1266,15 +1312,19 @@ class TelemetryMetrics(Protocol):
 - **`seed_ingest_local.py`.** It creates an active `https_direct` account plus a DI for `local-device-001`, issues a credential and prints the token to stdout once. Nothing is committed.
 
 - [ ] **Step 1: Write failing tests.**
-  - **Switch matrix.** With `INGEST_V2_ENABLED` off, every route set and the OpenAPI equal `main`. With it on, exactly the D15 routes are added, and the `/v1` golden is identical in every combination.
+  - **Switch matrix.** With `INGEST_V2_ENABLED` off, every route set and the OpenAPI equal `main`. With it on, exactly the D15 routes are added. The `/v1` golden is identical in every combination, and no new component name equals a `/v1` component name.
   - **Settings validator** behavior is pinned from the app side.
   - **Lifespan** builds nothing when the switch is off, and the guard tuple works with pre-set state.
   - **Worker entrypoint** exits 2 when guarded, and builds a loop when configured (with injected client factories).
-  - **Compose.** `docker compose config` parses with and without the profile. The worker uses the API image with the entrypoint override, and production hardening matches the other services.
+  - **Compose.**
+    - `docker compose config` parses with and without the profile.
+    - The worker uses the API image with the entrypoint override.
+    - Production hardening matches the other services.
+    - The worker never receives the API credential variables.
   - **`.env.example`** lists every P3 variable, all default off or empty.
 - [ ] **Step 2: Run red, commit, test gate,** then implement after approval.
-- [ ] **Step 3: Run the shared gates.** That includes `make verify-compose`, `make verify-compose-production` and a local rehearsal:
-  1. `seed_ingest_local.py`;
+- [ ] **Step 3: Run the shared gates.** That includes `make verify-compose`, `make verify-compose-production`, `make verify-ingestion` and `make verify-influx`, plus a local rehearsal:
+  1. start the local runners, then run `init_dynamodb.py`, `seed_local.py`, the M1 backfill and `seed_ingest_local.py`;
   2. `POST /ingest/v2/observations`;
   3. the worker;
   4. `observation_numeric`.
@@ -1332,7 +1382,11 @@ class TelemetryMetrics(Protocol):
   - credential rotation and revocation;
   - decommissioning;
   - rollback (§24: route pilots back, disable the endpoint, retain the queued messages);
-  - the D16 open gate and its Backlog owner;
+  - the D16 open gate and its owner #104;
+  - the production switch flips and the required status checks, both owner actions;
+  - outage-to-DLQ timing and the 14-day reconciliation deadline;
+  - lost-issuance slots;
+  - re-creating DIs made before P3-04 (D22);
   - the ADR gate map.
 - [ ] **Step 3: Write the ADR phase-split paragraphs and the P2 relaxation (D19).** Append the ADR-006/007/016 paragraphs and relax the P2 test.
 - [ ] **Step 4: Implement any fixes the gates prove necessary.** Each one needs re-approval.
@@ -1341,6 +1395,7 @@ class TelemetryMetrics(Protocol):
 **Acceptance criteria:**
 - [ ] Every row of the **Final Acceptance Matrix** is green or explicitly DEFERRED with an owner.
 - [ ] The runbook drills ran locally against real services.
+- [ ] Post-merge `main` CI is green.
 
 **Rollback:** Revert the documentation and the tests. Runtime behavior is unchanged.
 
@@ -1508,3 +1563,6 @@ Applied inline. Sources:
 | A33 | X | Facts confirmed:<br>• the redrive moves on the receive after `maxReceiveCount`, and the DLQ copy keeps the body and `SentTimestamp`;<br>• `StartMessageMoveTask` is supported, and moved messages reset to `ApproximateReceiveCount = 1`;<br>• per-item IAM actions are required inside transactions;<br>• monotone marks, slot races and SK-lower-bound paging behave as specified;<br>• canonical timestamp formatting is required. |
 | A34 | C | A plan-wide consistency pass (22 stale spots) aligns the body text with A1–A33: the IAM principal, the audit table, the limiter names, mapping versions, fence wording, ties, the replay id and the size wording. |
 | A35 | Codex | The receipt stores the first envelope's `mapping_versions`. Pending retries and claim-race losers reuse them (ADR-005 across deploys). |
+| A36 | issue audit | The ports take `audit: AuditContext`. New: the `IngressDenial.observation_index` field, the `ConsistentDeviceReader` and `DeviceComponentLister` ports, a condition → enum table, a wider fake subset (issuance check, simple mark, `ALL_OLD`), and the `build_ingest_marks` fence input. |
+| A37 | issue audit | Ownership changes: P3-08 builds the quarantine rows and ordinals. Test changes: quarantine logical expiry; the fallback vectors are owned by P3-06. |
+| A38 | issue audit | Task text aligned with the issues:<br>• P3-02 audit `PutItem` (absent today), plus the exact test names;<br>• the P3-03 statuses and redaction scope;<br>• the P3-04 audit, path check and roles;<br>• the P3-05 error type, `send_raw` and tests;<br>• the P3-08 acceptance and InfluxDB requirement;<br>• the P3-10 rehearsal and the worker's InfluxDB dependency;<br>• the P3-11 runbook items and the post-merge CI check.<br>Also: the metrics emission unit, the replay id namespace, and the D16 decision wording. |
