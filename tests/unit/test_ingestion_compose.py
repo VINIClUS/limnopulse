@@ -327,6 +327,7 @@ def test_production_worker_gets_its_queue_and_a_dedicated_influx_write_token() -
     ):
         assert re.fullmatch(rf"\$\{{{variable}(:?\?[^}}]*)?\}}", environment[name]), name
     assert environment["INFLUXDB_URL"] == "http://influxdb:8086"
+    # Deliberately no INGEST_V2_ENABLED: the worker's guard is writes plus queue only (D7).
     assert "SQS_ENDPOINT_URL" not in environment
     assert "DYNAMODB_ENDPOINT_URL" not in environment
 
@@ -471,13 +472,25 @@ def _seconds(duration: str) -> float:
     return int(match.group("m") or 0) * 60 + int(match.group("s") or 0)
 
 
-@pytest.mark.parametrize("path", [COMPOSE, PRODUCTION_COMPOSE], ids=["local", "production"])
-def test_worker_stop_grace_outlasts_the_default_drain(path: Path) -> None:
-    """Docker's default 10 s before SIGKILL would cut the 30 s SIGTERM drain short."""
-    worker = _services(path)[WORKER]
-    drain = Settings(_env_file=None, app_env="test", auth_mode="dev").telemetry_ingest_drain_seconds
+# Mirrors `_POLL_GRACE_SECONDS` in `workers/telemetry_ingest_loop.py`: how long past
+# `wait_seconds` a stop waits for an in-flight long poll before the drain starts.
+POLL_GRACE_SECONDS = 5
 
-    assert _seconds(worker["stop_grace_period"]) > drain
+
+@pytest.mark.parametrize("path", [COMPOSE, PRODUCTION_COMPOSE], ids=["local", "production"])
+def test_worker_stop_grace_outlasts_the_poll_grace_plus_the_drain(path: Path) -> None:
+    """A47: the P3-08 shutdown is sequential. An in-flight long poll may take up to
+    `wait_seconds + POLL_GRACE_SECONDS`, then in-flight messages get `drain_seconds`; Docker's
+    SIGKILL after `stop_grace_period` must come later (more than 55 s at the defaults)."""
+    worker = _services(path)[WORKER]
+    defaults = Settings(_env_file=None, app_env="test", auth_mode="dev")
+    bound = (
+        defaults.telemetry_ingest_drain_seconds
+        + defaults.telemetry_ingest_worker_wait_seconds
+        + POLL_GRACE_SECONDS
+    )
+
+    assert _seconds(worker["stop_grace_period"]) > bound
 
 
 # --- Env examples --------------------------------------------------------------------------------
@@ -497,6 +510,21 @@ def test_env_example_lists_every_p3_setting_once_at_its_default() -> None:
     assert assignments["INGEST_V2_ENABLED"] == "false"
     for env_name in EMPTY_BY_DEFAULT:
         assert assignments[env_name] == "", env_name
+
+
+def test_env_example_adds_only_the_p3_settings_and_no_worker_credentials() -> None:
+    assignments = _assignments(ENV_EXAMPLE)
+    p3_names = {
+        name
+        for name in assignments
+        if name.startswith(("INGEST_", "SQS_TELEMETRY_", "TELEMETRY_INGEST_"))
+    }
+
+    assert p3_names == set(P3_SETTINGS)
+    # The worker credentials and write token are production-only placeholders.
+    text = ENV_EXAMPLE.read_text(encoding="utf-8")
+    for name in WORKER_PLACEHOLDERS:
+        assert name not in text, name
 
 
 def test_env_example_keeps_a_single_sqs_endpoint_line() -> None:

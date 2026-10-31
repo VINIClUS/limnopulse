@@ -476,7 +476,14 @@ def test_lifespan_with_ingest_on_builds_every_frozen_port(runtime: Runtime) -> N
 def test_lifespan_producer_sends_to_the_configured_queue_through_the_sqs_client(
     runtime: Runtime,
 ) -> None:
-    app = create_app(_settings(**INGEST_ON, sqs_endpoint_url=SQS_ENDPOINT))
+    # The DLQ URL is set too: admission must enqueue on the ingress queue, never the DLQ.
+    app = create_app(
+        _settings(
+            **INGEST_ON,
+            sqs_endpoint_url=SQS_ENDPOINT,
+            sqs_telemetry_ingress_dlq_url=QUEUE_URL + "-dlq",
+        )
+    )
 
     with TestClient(app):
         message_id = asyncio.run(app.state.ingress_queue_producer.send_raw("{}"))

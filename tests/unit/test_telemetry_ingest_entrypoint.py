@@ -14,7 +14,6 @@ from typing import Any
 import pytest
 from botocore.config import Config
 from influxdb_client.client.write_api import SYNCHRONOUS, WriteOptions, WriteType
-from limnopulse_api.workers.telemetry_ingest import build_worker, main
 
 from limnopulse_api.adapters.dynamodb_deployments import DynamoDeploymentRepository
 from limnopulse_api.adapters.dynamodb_devices_v2 import DynamoDeviceComponentRepository
@@ -33,9 +32,11 @@ from limnopulse_api.services.telemetry_pipeline import TelemetryPipeline
 from limnopulse_api.services.telemetry_v2_writes import ObservationWriteService
 from limnopulse_api.services.trusted_mapping import TrustedMappingService
 from limnopulse_api.workers import telemetry_ingest
+from limnopulse_api.workers.telemetry_ingest import build_worker, main
 from limnopulse_api.workers.telemetry_ingest_loop import IngestWorkerConfig, IngestWorkerLoop
 
 QUEUE_URL = "http://localhost:9324/000000000000/limnopulse-telemetry-ingress"
+DLQ_URL = "http://localhost:9324/000000000000/limnopulse-telemetry-ingress-dlq"
 SQS_ENDPOINT = "http://localhost:9324"
 DYNAMO_ENDPOINT = "http://localhost:8001"
 DOMAIN_TABLE = "DomainUnderTest"
@@ -249,10 +250,15 @@ def test_build_worker_sets_explicit_finite_botocore_timeouts(service_name: str) 
 
     configured = factories.kwargs(service_name).get("config")
     assert isinstance(configured, Config)
-    provided = configured._user_provided_options
-    assert {"connect_timeout", "read_timeout"} <= set(provided)
+    # botocore keeps the explicitly passed options in a private mapping; fall back to "set at
+    # all" if a botocore upgrade renames it.
+    provided = getattr(configured, "_user_provided_options", None)
+    if provided is not None:
+        assert {"connect_timeout", "read_timeout"} <= set(provided)
     for timeout in (configured.connect_timeout, configured.read_timeout):
         assert isinstance(timeout, (int, float)) and not isinstance(timeout, bool)
+        # The 120 s ceiling is a test choice: well above the 20 s long poll, yet short enough
+        # that a hung call cannot hold the drain for long. The plan pins only "finite" (A46).
         assert 0 < timeout <= 120 and math.isfinite(timeout)
     if service_name == "sqs":
         # A long poll must finish inside the read timeout, or every idle receive would fail.
@@ -260,7 +266,8 @@ def test_build_worker_sets_explicit_finite_botocore_timeouts(service_name: str) 
 
 
 def test_build_worker_consumes_the_configured_queue_through_the_sqs_client() -> None:
-    loop, factories = _build(_settings())
+    # The DLQ URL is set too: the worker must consume the ingress queue, never the DLQ (D10).
+    loop, factories = _build(_settings(sqs_telemetry_ingress_dlq_url=DLQ_URL))
 
     assert isinstance(loop.consumer, SqsIngressQueue)
     messages = asyncio.run(
@@ -439,17 +446,30 @@ def test_module_execution_exits_2_when_v2_writes_are_off(tmp_path: Path) -> None
 
 
 class FakeLoop:
+    """Stands in for `IngestWorkerLoop.run`: after `stop` it still drains (async work), the way
+    the P3-08 loop releases its poll and waits for in-flight messages."""
+
     def __init__(self, signum: int | None) -> None:
         self.signum = signum
         self.stop_seen: asyncio.Event | None = None
         self.stopped = False
+        self.drained = False
+        self.cancelled = False
 
     async def run(self, stop: asyncio.Event) -> None:
         self.stop_seen = stop
-        if self.signum is not None:
-            os.kill(os.getpid(), self.signum)
-        await asyncio.wait_for(stop.wait(), timeout=5)
-        self.stopped = stop.is_set()
+        try:
+            if self.signum is not None:
+                os.kill(os.getpid(), self.signum)
+            await asyncio.wait_for(stop.wait(), timeout=5)
+            self.stopped = stop.is_set()
+            for _ in range(3):
+                await asyncio.sleep(0)
+            await asyncio.sleep(0.05)
+            self.drained = True
+        except asyncio.CancelledError:
+            self.cancelled = True
+            raise
 
 
 def _configure_environment(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -489,6 +509,9 @@ def test_main_runs_the_built_loop_and_a_signal_sets_stop(
 
     assert main() == 0
     assert fake.stopped is True
+    # A signal only sets `stop`: `run()` is allowed to finish its drain, never cancelled.
+    assert fake.drained is True
+    assert fake.cancelled is False
     assert fallback_signal_handlers == []
     (settings,) = built
     assert settings.telemetry_v2_write_enabled is True
