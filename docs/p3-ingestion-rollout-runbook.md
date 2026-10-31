@@ -76,7 +76,24 @@ Each step is a separate change. Verify each one before moving to the next.
    ingest credential for it (the token is shown once), create the DeviceIntegration for the pilot
    device under that account, then move the account and the DeviceIntegration to `active` through the
    lifecycle routes. Hand the token to the pilot over a secure channel and watch the first
-   `202` and the worker's `ingress_messages_total{outcome="processed"}`.
+   `202` and the worker's `ingress_messages_total{outcome="processed"}`. Also watch
+   `ingress_observations_total{result="accepted"}`: `processed` is logged for quarantined
+   observations too. The production metrics are JSON log lines (`docker compose ... logs`), not a
+   scrape endpoint.
+   - **The pilot device needs a v2 Device with a Deployment.** While
+     `V1_POND_DEVICE_PROJECTION_ENABLED` is off, a Device created through `/v1` has no v2 Device until
+     the M1 backfill runs for its tenant (dry run, `--apply`, idempotency rerun). The `scripts/`
+     directory is not in the API image, so in production run `DefaultSiteAssetMigrator` from
+     `limnopulse_api.migrations.default_site_asset` inside the `api` container. A backfilled device
+     keeps its legacy default Component, so the connector may omit `component_id`, and is deployed
+     from its `created_at`. Only legacy default Components are dual-written (D7), so a pilot meant to
+     exercise step 6 must be a backfilled `/v1` device, not a native `/v2` one.
+   - **A connector on the production host itself** (the simulated pilot in
+     [`ops/vps/pilot-sim/`](../ops/vps/pilot-sim/README.md)) needs no hand-over: issue the credential
+     with `IngestCredentialService.issue` inside the `api` container and redirect its stdout straight
+     into a root-owned 0600 file (`umask 077`, `set -o noclobber`), so the token is never printed.
+     Record the audit actor you used (for example `operator:pilot-onboarding`), because this path
+     bypasses the route's membership check.
 5. **Divergence checks.** For every pilot that also reports through the legacy path, run the P2 keyed
    divergence checks between `observation_numeric` and `water_quality` over the pilot window; they
    must report nothing (G15 proves the HTTPS path matches the independent legacy writer).
@@ -180,6 +197,19 @@ Rehearsed end to end on real services by G7,
 an InfluxDB outage after acceptance moves the messages to the DLQ without deleting them, and after
 the redrive the worker reproduces the exact v2 and legacy point set of the no-fault baseline. The
 drill ran locally against ElasticMQ, DynamoDB Local and InfluxDB 2.7.11 (recorded on #103).
+
+**Rehearsing it in an environment** (required before step 6) needs messages in the DLQ. An empty
+DLQ proves nothing. To fail only the worker, recreate it with an invalid InfluxDB token, which
+leaves InfluxDB and the API untouched. The shell value wins over `--env-file` in compose
+interpolation:
+`TELEMETRY_INGEST_INFLUXDB_TOKEN=drill-invalid docker compose --env-file .env --env-file .env.image -f compose.production.yaml --profile ingestion up -d telemetry-ingest-worker`.
+
+- **Why it reaches the DLQ.** InfluxDB answers `401`, which is classified `write_permanent`. A
+  permanent failure keeps the message and only hides it for 60 s. After `maxReceiveCount` (8)
+  receives, about 8 minutes, SQS moves it to the DLQ, and the DLQ alarm fires.
+- **What to send.** Send a few batches while the worker is failing, and note their `ingress_id`s
+  and `observed_at`s.
+- **Restore before redriving.** Recreate the worker without the override, then run the steps below.
 
 Run from an operator checkout with the operator policy's credentials, `SQS_TELEMETRY_INGRESS_QUEUE_URL`
 and `SQS_TELEMETRY_INGRESS_DLQ_URL` set. `sample` only reads and releases; `redrive` is a dry run
