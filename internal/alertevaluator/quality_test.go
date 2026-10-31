@@ -403,20 +403,23 @@ func TestOutOfRangeAggregateIsInvalidAndAbsent(t *testing.T) {
 	}
 }
 
-func TestWindowMeasurementIsPresentOnlyForSufficientQuality(t *testing.T) {
+func TestWindowMeasurementIsPresentOnlyForSufficientWindowsWithPoints(t *testing.T) {
 	tests := []struct {
 		result      WindowResult
 		wantPresent bool
 	}{
-		{WindowResult{Quality: QualitySufficient, Value: 0}, true},
-		{WindowResult{Quality: QualitySufficient, Value: -3.5}, true},
-		{WindowResult{Quality: QualityStaleData, Value: 9.9}, false},
+		{WindowResult{Quality: QualitySufficient, ValidPointCount: 1, Value: 0}, true},
+		{WindowResult{Quality: QualitySufficient, ValidPointCount: 6, Value: -3.5}, true},
+		{WindowResult{Quality: QualityStaleData, ValidPointCount: 3, Value: 9.9}, false},
 		{WindowResult{Quality: QualityInsufficientData}, false},
-		{WindowResult{Quality: QualityQueryError, Value: 1}, false},
+		{WindowResult{Quality: QualityQueryError, ValidPointCount: 1, Value: 1}, false},
 		{WindowResult{}, false},
-		{WindowResult{Quality: QualitySufficient, Value: math.Inf(1)}, false},
-		{WindowResult{Quality: QualitySufficient, Value: math.NaN()}, false},
-		{WindowResult{Quality: QualitySufficient, Value: 1e200}, false},
+		// A sufficient result that counted no point carries no value, not zero.
+		{WindowResult{Quality: QualitySufficient}, false},
+		{WindowResult{Quality: QualitySufficient, Value: 4.2}, false},
+		{WindowResult{Quality: QualitySufficient, ValidPointCount: 1, Value: math.Inf(1)}, false},
+		{WindowResult{Quality: QualitySufficient, ValidPointCount: 1, Value: math.NaN()}, false},
+		{WindowResult{Quality: QualitySufficient, ValidPointCount: 1, Value: 1e200}, false},
 	}
 	for _, test := range tests {
 		value, ok := test.result.Measurement().Get()

@@ -59,7 +59,7 @@ An evaluation is **determinate** when `Quality == sufficient` and `Value` is pre
 - a sufficient evaluation without a value becomes `insufficient_data`;
 - any indeterminate evaluation drops its value and its `Breached` flag.
 
-The runner, `Decide` and the store's `Commit` all normalize before they use an evaluation, so the store cannot record `last_evaluation_quality = sufficient` without a value. In a normal run, "sufficient but absent" can only come from a caller bug; the normalization is defense in depth. It also keeps the property that the legacy decode relies on: an old evaluator that sees `LastQuality == sufficient` really had a value.
+The runner, `Decide` and the store's `Commit` all normalize before they use an evaluation, so the store cannot record `last_evaluation_quality = sufficient` without a value. `Decide` writes `LastQuality` and, for a determinate evaluation, `LastValue` together, so its next state never claims a sufficient quality without a value. `statePut` trusts that invariant rather than refusing the commit: a check there would wedge the rule over a field that no decision reads. A test pins it across every quality, value and starting state. In a normal run, "sufficient but absent" can only come from a caller bug; the normalization is defense in depth. It also keeps the property that the legacy decode relies on: an old evaluator that sees `LastQuality == sufficient` really had a value.
 
 An indeterminate evaluation:
 - never opens, never resolves, and never adds confirmation progress;
@@ -75,8 +75,8 @@ The runner computes `Breached` only from a present value, and the store writes v
 |---|---|
 | `Evaluation.Value` | `float64` → `Measurement`. Present exactly when the evaluation is determinate. |
 | `State.LastValue` | `float64` → `Measurement`. Holds the last determinate value and is kept across indeterminate evaluations (PR #5 semantics). Absent until the first determinate evaluation, or when a legacy record is ambiguous (section 5). |
-| `WindowResult.Value` | **Stays `float64`, as an interim boundary.** It is a raw diagnostic aggregate, meaningful only when `Quality == sufficient`: `EvaluateSamples` also fills it for stale windows. Changing its type would edit the InfluxDB adapter tests (`influx/query*_test.go`, `client_v2_test.go`, `parity_integration_test.go`), which another change owns right now. Instead `WindowResult.Measurement()` is present only when `Quality == sufficient` and `Measured(Value)` is present. The runner is the only consumer, and it reads only that projection. **Known gap:** a future `WindowReader` that returns `{Quality: sufficient}` without setting `Value` would read as a present zero. Every reader today goes through `EvaluateSamples`, so this cannot happen now. Making the window value presence-aware is a follow-up once the InfluxDB changes land. |
-| `EvaluateSamples` | An aggregate that `Measured` rejects (NaN, ±Inf, or outside the persistable range) is an invalid aggregation. It returns `insufficient_data`, like an aggregation that produced no value. Stale classification comes after this check, so an overflowing stale window also reports `insufficient_data`. **This is an intentional lifecycle change.** Before, `+Inf` counted as sufficient and then made `json.Marshal(state)` fail at commit. `NaN` (for example `+Inf` and `-Inf` buckets in one mean) counted as clean, because `compare(NaN)` is false, so it resolved an active incident. |
+| `WindowResult.Value` | **Stays `float64`, as an interim boundary.** It is a raw diagnostic aggregate, meaningful only when `Quality == sufficient`: `EvaluateSamples` also fills it for stale windows. Changing its type would edit the InfluxDB adapter tests (`influx/query*_test.go`, `client_v2_test.go`, `parity_integration_test.go`), which another change owns right now. Instead `WindowResult.Measurement()` is present only when `Quality == sufficient`, `ValidPointCount > 0` and `Measured(Value)` is present. A sufficient window always counted at least one point, so a bare `{Quality: sufficient}` from a future `WindowReader` reads as absent, not as zero. The runner is the only consumer, and it reads only that projection. **Known gap:** a reader that counts points but forgets to set `Value` would still read as a present zero. Every reader today goes through `EvaluateSamples`, which sets both, so this cannot happen now. Making the window value presence-aware is a follow-up once the InfluxDB changes land. |
+| `EvaluateSamples` | An aggregate that `Measured` rejects (NaN, ±Inf, or outside the persistable range) is an invalid aggregation. It returns `insufficient_data`, like an aggregation that produced no value. Stale classification comes after this check, so an overflowing stale window also reports `insufficient_data`. **This is an intentional lifecycle change.** Before, a non-finite aggregate counted as sufficient and reached `Decide`. `NaN` (for example `+Inf` and `-Inf` buckets in one mean) compared as clean, because `compare(NaN)` is false, so `Decide` moved toward recovery. Either way the commit then failed, because `json.Marshal(state)` rejects NaN and ±Inf, and it failed again on every run until the sample left the window. The rule was wedged, not resolved. Nothing records an invalid aggregate apart from `insufficient_data`; a dedicated signal is a follow-up. |
 | Runner | On a window error, including a per-rule timeout (the reader returns the `PerRuleTimeout` context error), the evaluation is `query_error` with an absent value, whatever the reader returned. Otherwise `Value = window.Measurement()` and `Breached` is computed from it. The evaluation is then normalized (section 2), so a reader that reports `sufficient` without a usable value yields `insufficient_data`. |
 
 `Sample.Value` (raw telemetry) and rule thresholds stay `float64`.
@@ -121,7 +121,7 @@ Absent always means **no attribute**: omitted on `Put`, `REMOVE` on `Update`. It
 - Any other `SchemaVersion` (for example 3, or a negative number) fails `LoadState` with `ErrUnsupportedStateSchema` (fail closed). A tolerant reader would be worse: `statePut` would write the document back through `State` and silently drop the fields a newer writer added.
   - **Operational effect:** the runner treats it like any state read failure. The rule is counted as fatal with the distinct error category `state_schema`, its lease expires and is not released, `next_evaluation_at` does not advance, and the run exits 1.
   - Rolling a future v3 writer back to a v2 binary would make every affected rule blind (no opens, no recoveries) until the rollback is reverted. A future version must therefore ship reader support first, in a separate deploy, before any writer emits it.
-- A marker that is not an integer (a string, or a fraction such as `2.5`) is malformed rather than an unsupported version. So is a malformed `LastValue` (a string, an object). Both fail `LoadState` under the `state_read` category, as a malformed `LastValue` already did for `float64`.
+- A marker that is not an integer literal that fits Go's `int` is malformed rather than an unsupported version: a string, a fraction such as `2.5`, an integral number written as `2.0` or `2e0`, or an integer that overflows. No writer emits those forms. Python keeps an integer an integer, so a rewrite cannot produce them. So is a malformed `LastValue` (a string, an object). Both fail `LoadState` under the `state_read` category, as a malformed `LastValue` already did for `float64`.
 
 ### 6. Migration and backfill
 
@@ -163,8 +163,8 @@ The Python `value % 1 == 0` normalization raises for numbers of 1e28 and above. 
 The type system now carries absence. A forgotten assignment yields an absent value, and present values are always persistable. `state_json` gains one key. Old evaluators stay compatible in both directions, and Python needs no deployment ordering. The legacy decode rule may drop a retained zero once per legacy record, with no effect on any decision.
 
 Two lifecycle behaviors change on purpose:
-- non-finite and out-of-range aggregates no longer count as sufficient;
-- a `NaN` aggregate can no longer resolve an incident.
+- non-finite and out-of-range aggregates no longer count as sufficient, so they report `insufficient_data` instead of failing every commit;
+- a sufficient window that counted no point is indeterminate rather than a present zero.
 
 `WindowResult.Value` remains a raw `float64` until the InfluxDB adapter tests can move (known gap, section 3). A rule stuck on out-of-range data reports `insufficient_data`, like ordinary missing data.
 
@@ -178,14 +178,14 @@ Shared vectors in `testdata/alert_evaluation_value_vectors.json` must be consume
 - present zero, positive and negative values;
 - absent values, both `null` and a missing key;
 - every legacy decode case, including `-0` and an empty or missing `LastQuality`;
-- unknown and malformed versions;
+- unknown and malformed versions, including `2.0`, `2e0` and an overflowing integer;
 - the Python-rewritten documents.
 
 Go tests must also prove:
 - the exact `state_json` bytes, and the DynamoDB attribute presence and type for each item kind;
 - the old-shape round trip: new JSON decoded into a `float64` struct, re-marshalled, then read by the new decoder, applies the legacy rule;
 - the persistable range: `1e26`, `1e200`, `5e-324` and `1e-101` are absent, and the boundaries `1e25` and `1e-100` are present;
-- that "sufficient but absent", `NaN` and `±Inf` inputs never open, confirm or resolve an incident, while a present zero does;
+- that "sufficient but absent", a sufficient window without points, `NaN` and `±Inf` inputs never open, confirm or resolve an incident, while a present zero does;
 - that normalization records `insufficient_data` for "sufficient but absent";
 - that the coalesced-gap reset still applies to an indeterminate evaluation of a pending rule;
 - that a per-rule timeout yields an absent `query_error`;

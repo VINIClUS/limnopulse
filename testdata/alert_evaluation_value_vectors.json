@@ -339,6 +339,21 @@
       "stored_state_json": "{\"SchemaVersion\":2.5,\"Mode\":\"active\",\"LastQuality\":\"sufficient\",\"LastValue\":4.2}"
     },
     {
+      "name": "float_formatted_version",
+      "expected_error": "malformed",
+      "stored_state_json": "{\"SchemaVersion\":2.0,\"Mode\":\"active\",\"LastQuality\":\"sufficient\",\"LastValue\":4.2}"
+    },
+    {
+      "name": "exponent_version",
+      "expected_error": "malformed",
+      "stored_state_json": "{\"SchemaVersion\":2e0,\"Mode\":\"active\",\"LastQuality\":\"sufficient\",\"LastValue\":4.2}"
+    },
+    {
+      "name": "overflowing_version",
+      "expected_error": "malformed",
+      "stored_state_json": "{\"SchemaVersion\":9223372036854775808,\"Mode\":\"active\",\"LastQuality\":\"sufficient\",\"LastValue\":4.2}"
+    },
+    {
       "name": "legacy_string_value",
       "expected_error": "malformed",
       "stored_state_json": "{\"Mode\":\"active\",\"LastQuality\":\"sufficient\",\"LastValue\":\"0\"}"

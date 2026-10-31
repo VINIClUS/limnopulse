@@ -115,10 +115,11 @@ func EvaluateSamples(spec WindowSpec, samples []Sample) WindowResult {
 	return result
 }
 
-// Measurement returns the window value only when the window is sufficient and
-// the value is a valid measurement.
+// Measurement returns the window value only when the window is sufficient,
+// counted at least one valid point, and the value is a valid measurement. A
+// bare sufficient result therefore reads as absent rather than as zero.
 func (result WindowResult) Measurement() Measurement {
-	if result.Quality != QualitySufficient {
+	if result.Quality != QualitySufficient || result.ValidPointCount == 0 {
 		return Measurement{}
 	}
 	return Measured(result.Value)

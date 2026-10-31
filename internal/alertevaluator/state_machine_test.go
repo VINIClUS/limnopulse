@@ -330,3 +330,29 @@ func TestIndeterminateSlotBreaksTheConfirmationChain(t *testing.T) {
 		}
 	}
 }
+
+func TestDecideNeverRecordsSufficientQualityWithoutAValue(t *testing.T) {
+	// statePut trusts this invariant instead of checking it, so a failure here
+	// would write a record whose quality claims a value it does not carry.
+	rule := testRule()
+	pending := Decide(rule, State{}, sufficient(testSlot, true), time.Minute).Next
+	active := Decide(rule, pending, sufficient(testSlot.Add(time.Minute), true), time.Minute).Next
+	legacyAbsent := State{Mode: ModeActive, ActiveEventID: "alert_1", ActiveStatus: StatusOpen, LastQuality: QualitySufficient}
+	slot := testSlot.Add(2 * time.Minute)
+	for _, current := range []State{{}, pending, active, legacyAbsent} {
+		for _, quality := range []Quality{QualitySufficient, QualityInsufficientData, QualityStaleData, QualityQueryError, ""} {
+			for _, value := range []Measurement{{}, Measured(0), Measured(7)} {
+				for _, breached := range []bool{false, true} {
+					evaluation := Evaluation{Slot: slot, Quality: quality, Value: value, Breached: breached}
+					next := Decide(rule, current, evaluation, time.Minute).Next
+					if next.LastQuality == QualitySufficient && !next.LastValue.IsPresent() {
+						t.Fatalf("Decide(%#v, %#v) recorded sufficient without a value: %#v", current, evaluation, next)
+					}
+					if evaluation.IsDeterminate() && next.LastValue != value {
+						t.Fatalf("Decide(%#v) kept %v, want the determinate value %v", evaluation, next.LastValue, value)
+					}
+				}
+			}
+		}
+	}
+}

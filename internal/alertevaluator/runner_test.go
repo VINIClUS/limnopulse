@@ -138,7 +138,7 @@ func TestRunnerProcessesOneRuleAndCommitsStableSlot(t *testing.T) {
 		work:       map[string]Work{"rule_1": work},
 		states:     map[string]VersionedState{},
 	}
-	runner := Runner{Store: store, Windows: fakeWindowReader{result: WindowResult{Quality: QualitySufficient, Value: 4.2}}}
+	runner := Runner{Store: store, Windows: fakeWindowReader{result: WindowResult{Quality: QualitySufficient, ValidPointCount: 1, Value: 4.2}}}
 
 	summary := runner.Run(context.Background(), runnableConfig(evaluationTime))
 
@@ -160,7 +160,7 @@ func TestRunnerCoalescesMissedSlotsAndRestartsPending(t *testing.T) {
 		work:       map[string]Work{"rule_1": work},
 		states:     map[string]VersionedState{"rule_1": {State: State{Mode: ModePending, ConfirmedSlots: 1, PendingSince: slot.Add(-4 * time.Minute), LastBreachSlot: slot.Add(-4 * time.Minute)}, Revision: 2}},
 	}
-	runner := Runner{Store: store, Windows: fakeWindowReader{result: WindowResult{Quality: QualitySufficient, Value: 4.2}}}
+	runner := Runner{Store: store, Windows: fakeWindowReader{result: WindowResult{Quality: QualitySufficient, ValidPointCount: 1, Value: 4.2}}}
 
 	summary := runner.Run(context.Background(), runnableConfig(evaluationTime))
 
@@ -245,7 +245,7 @@ func runSingleRule(t *testing.T, work func(time.Time) Work, reader WindowReader,
 
 func TestRunnerTreatsSufficientZeroAsPresentAndBreached(t *testing.T) {
 	summary, commit := runSingleRule(t, runnableWork,
-		fakeWindowReader{result: WindowResult{Quality: QualitySufficient, Value: 0}}, VersionedState{})
+		fakeWindowReader{result: WindowResult{Quality: QualitySufficient, ValidPointCount: 1, Value: 0}}, VersionedState{})
 
 	value, ok := commit.Evaluation.Value.Get()
 	if !ok || value != 0 || !commit.Evaluation.Breached || commit.Evaluation.Quality != QualitySufficient {
@@ -263,7 +263,7 @@ func TestRunnerComparesPresentZeroAgainstThreshold(t *testing.T) {
 		return rule
 	}
 	_, commit := runSingleRule(t, work,
-		fakeWindowReader{result: WindowResult{Quality: QualitySufficient, Value: 0}}, VersionedState{})
+		fakeWindowReader{result: WindowResult{Quality: QualitySufficient, ValidPointCount: 1, Value: 0}}, VersionedState{})
 
 	if value, ok := commit.Evaluation.Value.Get(); !ok || value != 0 || commit.Evaluation.Breached {
 		t.Fatalf("evaluation = %#v, want present clean 0 for operator < -1", commit.Evaluation)
@@ -289,7 +289,7 @@ func TestRunnerDropsStaleWindowAggregate(t *testing.T) {
 
 func TestRunnerDropsWindowValueOnQueryError(t *testing.T) {
 	// The reader also returns a sufficient breaching window; the error wins.
-	reader := fakeWindowReader{result: WindowResult{Quality: QualitySufficient, Value: 1}, err: errors.New("influx timeout")}
+	reader := fakeWindowReader{result: WindowResult{Quality: QualitySufficient, ValidPointCount: 1, Value: 1}, err: errors.New("influx timeout")}
 	work := func(slot time.Time) Work {
 		rule := runnableWork(slot)
 		rule.Rule.Duration = 2 * time.Minute
@@ -314,7 +314,7 @@ func TestRunnerKeepsMissedSlotsOnIndeterminateEvaluations(t *testing.T) {
 	for name, reader := range map[string]fakeWindowReader{
 		"query error": {err: errors.New("influx timeout")},
 		"stale":       {result: WindowResult{Quality: QualityStaleData, Value: 1}},
-		"downgraded":  {result: WindowResult{Quality: QualitySufficient, Value: math.NaN()}},
+		"downgraded":  {result: WindowResult{Quality: QualitySufficient, ValidPointCount: 1, Value: math.NaN()}},
 	} {
 		evaluationTime := time.Date(2026, 7, 15, 12, 4, 0, 0, time.UTC)
 		slot := LatestCompleteSlot(evaluationTime, time.Minute, 15*time.Second)
@@ -340,15 +340,16 @@ func TestRunnerKeepsMissedSlotsOnIndeterminateEvaluations(t *testing.T) {
 }
 
 func TestRunnerDowngradesSufficientWindowWithoutUsableValue(t *testing.T) {
-	// NaN compares as clean for "<", so before the value became optional a NaN
-	// aggregate resolved the active incident.
+	// Before the value became optional these aggregates reached Decide as plain
+	// numbers: NaN and ±Inf made json.Marshal fail the commit on every run, and
+	// 1e200 and 5e-324 lie outside DynamoDB's number range.
 	active := VersionedState{State: State{
 		Mode: ModeActive, ActiveEventID: "alert_1", ActiveStatus: StatusOpen,
 		OpeningOutboxes: map[Channel]string{ChannelEmail: "outbox_open_email"}, LastValue: Measured(4.2),
 	}, Revision: 3}
 	for _, invalid := range []float64{math.NaN(), math.Inf(1), math.Inf(-1), 1e200, -1e26, 5e-324} {
 		_, commit := runSingleRule(t, runnableWork,
-			fakeWindowReader{result: WindowResult{Quality: QualitySufficient, Value: invalid}}, active)
+			fakeWindowReader{result: WindowResult{Quality: QualitySufficient, ValidPointCount: 1, Value: invalid}}, active)
 
 		if commit.Evaluation.Quality != QualityInsufficientData || commit.Evaluation.Value.IsPresent() || commit.Evaluation.Breached {
 			t.Fatalf("value %v: evaluation = %#v, want absent insufficient_data", invalid, commit.Evaluation)
@@ -362,15 +363,28 @@ func TestRunnerDowngradesSufficientWindowWithoutUsableValue(t *testing.T) {
 	}
 }
 
+func TestRunnerNeverOpensOnSufficientWindowWithoutPoints(t *testing.T) {
+	// An unset Value reads as 0, which breaches "< 5" and would open.
+	summary, commit := runSingleRule(t, runnableWork,
+		fakeWindowReader{result: WindowResult{Quality: QualitySufficient}}, VersionedState{})
+
+	if commit.Evaluation.Quality != QualityInsufficientData || commit.Evaluation.Value.IsPresent() || commit.Evaluation.Breached {
+		t.Fatalf("evaluation = %#v, want absent insufficient_data", commit.Evaluation)
+	}
+	if commit.Decision.Transition != TransitionNone || summary.IncidentsFired != 0 {
+		t.Fatalf("bare sufficient window moved the rule: decision = %#v, summary = %#v", commit.Decision, summary)
+	}
+}
+
 type blockingWindowReader struct{}
 
 func (blockingWindowReader) Evaluate(ctx context.Context, _ EvaluationRule, _ WindowSpec) (WindowResult, error) {
 	select {
 	case <-ctx.Done():
-		return WindowResult{Quality: QualitySufficient, Value: 3}, ctx.Err()
+		return WindowResult{Quality: QualitySufficient, ValidPointCount: 1, Value: 3}, ctx.Err()
 	case <-time.After(2 * time.Second):
 		// Fails the test instead of hanging when PerRuleTimeout is not applied.
-		return WindowResult{Quality: QualitySufficient, Value: 3}, nil
+		return WindowResult{Quality: QualitySufficient, ValidPointCount: 1, Value: 3}, nil
 	}
 }
 
