@@ -15,6 +15,18 @@ runbook](p2-telemetry-rollout-runbook.md).
   `make verify-python`, `make verify-go`, `make verify-influx` and `make verify-ingestion` against
   ElasticMQ, DynamoDB Local and InfluxDB 2.7.11. The G7 DLQ drill and the G8 quarantine drill were rehearsed locally on
   real services and are recorded on #103.
+- **Production runs the P3 release.** The VPS has no clone of this repository
+  ([VPS bootstrap runbook](../ops/vps/README.md)), so merging changes nothing there. Before step 1:
+  back up `/opt/limnopulse/compose.production.yaml` and copy the current one over; reinstall
+  `ops/vps/limnopulse-deploy.sh` as `/usr/local/bin/limnopulse-deploy` (its recovery fixes apply only
+  once installed); then promote a `main-<sha>` tag at or after P3-10 through `deploy.yml` with every
+  switch off, and confirm the `/v1` OpenAPI is unchanged. A failed promotion restores the previous
+  image tag but not the compose file, so restore the compose backup by hand.
+- **M1 is enabled.** `INGEST_V2_ENABLED` requires `API_V2_ENABLED=true`, which mounts the M1 `/v2`
+  groups for every tenant the deployment serves. Before step 3, follow the
+  [M1 rollout sequence](m1-acceptance-runbook.md#rollout-sequence) through its step 6: migrate every
+  served tenant, then enable `API_V2_ENABLED`. Ingestion does not need
+  `V1_POND_DEVICE_PROJECTION_ENABLED`.
 - **Dark by default.** P3 ships dark: with every switch off, the API behaves exactly as before P3, and nothing
   produces canonical telemetry in production (D16). The `/v1` OpenAPI is identical in every switch
   combination (G13).
@@ -84,20 +96,28 @@ the API-only secrets.
 
 - **Worker principal.** Create an access key for the IAM user named by the OpenTofu output
   `telemetry_ingest_iam_user_name` and store it as `TELEMETRY_INGEST_AWS_ACCESS_KEY_ID` /
-  `TELEMETRY_INGEST_AWS_SECRET_ACCESS_KEY` in `.env`. Never reuse the API keys. Rotate the access key
-  like any IAM key: create the second key, recreate the worker, then delete the old key.
+  `TELEMETRY_INGEST_AWS_SECRET_ACCESS_KEY` in `.env`. Never reuse the API keys. Pipe
+  `aws iam create-access-key --user-name <user> --query 'AccessKey.[AccessKeyId,SecretAccessKey]' --output text`
+  straight into the `.env` update on the host, so the secret never reaches a terminal or a log. Rotate
+  the access key like any IAM key: create the second key, recreate the worker, then delete the old key.
 - **Worker InfluxDB token.** Create a dedicated write token scoped to the raw bucket only
   (`influx auth create --org <org> --write-bucket <bucket_id> --description telemetry-ingest`) and
   store it as `TELEMETRY_INGEST_INFLUXDB_TOKEN`. Never use the bootstrap admin token or the API's
-  token for the worker.
+  token for the worker. In production the `influx` CLI runs inside the `influxdb` container
+  (`docker compose ... exec -T influxdb`). Give the bootstrap admin token
+  (`INFLUX_TOKEN=$DOCKER_INFLUXDB_INIT_ADMIN_TOKEN`) to those two commands only. Find the bucket id with
+  `influx bucket list --org <org> --name <bucket> --hide-headers`. Create the token with `--json`, and
+  write its `token` field straight into `.env` without printing it.
 - **Every interpolated name must be defined.** An empty interpolation is passed to the container as
   an empty string and overrides the Settings default. Outside `local`/`test` the worker refuses to
   start with exit 2 when its AWS keys or InfluxDB token are empty, so a missing variable fails fast
-  instead of polling forever. Define each of these in the production `.env` (or `.env.image`):
+  instead of polling forever. Define each of these in the production `.env`, never in `.env.image`:
+  every promotion through the deploy script rewrites `.env.image` with `IMAGE_TAG` alone, so anything
+  else there is gone after the next deploy:
 
   | Variable | Value |
   |---|---|
-  | `IMAGE_TAG` | the deployed image, the same as the API |
+  | `IMAGE_TAG` | the deployed image, the same as the API (written to `.env.image` by the deploy script) |
   | `APP_ENV`, `AUTH_MODE` | as for the API |
   | `AWS_REGION` | the queues' region |
   | `TELEMETRY_INGEST_AWS_ACCESS_KEY_ID`, `TELEMETRY_INGEST_AWS_SECRET_ACCESS_KEY` | the `telemetry_ingest` user's access key |
