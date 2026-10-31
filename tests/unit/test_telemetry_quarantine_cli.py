@@ -259,7 +259,11 @@ async def test_replay_apply_sends_one_new_envelope_with_the_stored_fields(harnes
 async def test_replay_groups_by_ingress_id_and_device_integration(harness) -> None:
     first, _ = _fenced(2)
     other_ingress, _ = _fenced(1, ingress_id=OTHER_INGRESS)
-    other_integration, _ = _fenced(2, integration_id=OTHER_INTEGRATION)
+    # Same ingress id, different integration (a forged pair): distinct excerpts keep ids apart.
+    other_integration, _ = _fenced(
+        2, integration_id=OTHER_INTEGRATION, metadata={"firmware_version": "other"}
+    )
+    assert not set(_keys(first)) & set(_keys(other_integration))
     await harness.seed([*first, *other_ingress, *other_integration])
 
     keys = _keys([*other_integration, *first, *other_ingress])
@@ -284,25 +288,42 @@ async def test_replay_id_is_deterministic_and_reused_by_a_rerun(harness) -> None
     entries, _ = _fenced(2)
     await harness.seed(entries)
     keys = _keys(entries)
-    # Crash after the send: the first row's status write fails, so it stays open.
-    harness.faults.fail_next("transition_quarantine_entry", ConflictError("raced"))
+    # Crash after the send and before any row is marked: the store dies on the first write.
+    harness.faults.fail_next("transition_quarantine_entry", RuntimeError("store down"))
 
     first_code = await harness.run("replay", "--tenant", TENANT, "--entry", *keys, "--apply")
-    first_lines = {line["entry_key"]: line for line in harness.entry_lines()}
+    assert first_code == telemetry_quarantine.EXIT_ERROR == 1
+    assert {harness.row(entry).status for entry in entries} == {QuarantineEntryStatus.OPEN}
     rerun_code = await harness.run(
         "replay", "--tenant", TENANT, "--entry", *reversed(keys), "--apply"
     )
 
-    assert first_code == telemetry_quarantine.EXIT_PARTIAL == 3
-    assert sorted(line["result"] for line in first_lines.values()) == ["failed", "replayed"]
     assert rerun_code == 0
     sent = harness.sent()
     assert len(sent) == 2
-    assert sent[0].ingress_id == sent[1].ingress_id == replay_ingress_id(keys)
+    assert sent[0] == sent[1] == _expected_envelope(entries)
+    assert sent[0].ingress_id == replay_ingress_id(keys)
     assert {harness.row(entry).status for entry in entries} == {QuarantineEntryStatus.REPLAYED}
     assert {harness.row(entry).replayed_ingress_id for entry in entries} == {
         replay_ingress_id(keys)
     }
+
+
+@pytest.mark.asyncio
+async def test_replay_reports_a_row_that_changed_after_the_send_as_failed(harness) -> None:
+    entries, _ = _fenced(2)
+    await harness.seed(entries)
+    harness.faults.fail_next("transition_quarantine_entry", ConflictError("raced"))
+
+    code = await harness.run("replay", "--tenant", TENANT, "--entry", *_keys(entries), "--apply")
+
+    assert code == telemetry_quarantine.EXIT_PARTIAL == 3
+    assert len(harness.sent()) == 1
+    results = sorted(line["result"] for line in harness.entry_lines())
+    assert results == ["failed", "replayed"]
+    failed = next(line for line in harness.entry_lines() if line["result"] == "failed")
+    assert failed["reason"] == "conflict"
+    assert harness.metric_total("failed") == 1 and harness.metric_total("replayed") == 1
 
 
 @pytest.mark.asyncio
