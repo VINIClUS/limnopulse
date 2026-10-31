@@ -10,6 +10,10 @@ by exactly one DeviceIntegration. Consequently a create that collides with anoth
 claim returns 409 "external identity already claimed": an accepted existence oracle, limited to
 authenticated tenant writers who already know the raw provider identity.
 
+HTTPS providers (`HTTPS_PROVIDER_KEYS`) hash the identity scoped to the IntegrationAccount
+(`account_scoped_identity_hash`, P3 D4), so the lookup key is unique per account and one tenant
+cannot squat another's namespace; every other provider keeps the M1 global hash.
+
 Parent status is checked twice: the service reads the Device and IntegrationAccount for precise
 404/409 answers, and the repository fences both statuses at commit time with ConditionChecks in
 the same transaction, so a parent decommissioned or revoked in between still yields 409.
@@ -21,6 +25,7 @@ from datetime import datetime
 from typing import Any
 
 from limnopulse_api.adapters.dynamodb_v2 import (
+    account_scoped_identity_hash,
     canonical_request_hash,
     external_identity_hash,
     idempotency_key_hash,
@@ -35,6 +40,7 @@ from limnopulse_api.api.v2.schemas.integrations import (
 from limnopulse_api.core.errors import ConflictError, LimnopulseError, NotFoundError
 from limnopulse_api.domain.devices_v2 import DeviceStatus, DeviceV2
 from limnopulse_api.domain.ids import new_device_integration_id, new_integration_account_id
+from limnopulse_api.domain.ingestion import HTTPS_PROVIDER_KEYS
 from limnopulse_api.domain.integrations import (
     DeviceIntegration,
     DeviceIntegrationStatus,
@@ -63,9 +69,13 @@ def _key_hash(idempotency_key: str) -> str:
         raise IntegrationInputError("invalid Idempotency-Key") from exc
 
 
-def _identity_hash(provider_key: str, external_identity: str) -> str:
+def _identity_hash(account: IntegrationAccount, external_identity: str) -> str:
     try:
-        return external_identity_hash(provider_key, external_identity)
+        if account.provider_key in HTTPS_PROVIDER_KEYS:
+            return account_scoped_identity_hash(
+                account.provider_key, account.integration_account_id, external_identity
+            )
+        return external_identity_hash(account.provider_key, external_identity)
     except ValueError as exc:
         raise IntegrationInputError("invalid external identity") from exc
 
@@ -191,7 +201,7 @@ class IntegrationService:
             raise ConflictError(f"integration account is {account.status.value}")
 
         # The provider comes from the tenant's account; the client cannot choose it.
-        identity_hash = _identity_hash(account.provider_key, payload.external_identity)
+        identity_hash = _identity_hash(account, payload.external_identity)
         now = self.clock()
         integration = DeviceIntegration(
             tenant_id=tenant_id,
