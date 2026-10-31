@@ -55,7 +55,8 @@ Also `docs/superpowers/specs/2026-08-25-limnopulse-v4-parallel-execution-design.
 
 **Planning baseline:** `main@d8c2a99` (P2 complete). `make verify-python` gives 3900 passed / 64 skipped; `go test -race ./...` is green.
 
-**Revision:** r2.
+**Revision:** r2.1.
+- r2.1 applies the ElasticMQ 1.6.16 and DynamoDB Local 3.3.2 experiment session (A30–A33).
 - r2 applies the findings of three local auditors and the independent audit sessions. The local auditors covered security and tenant isolation; durability and replay; and contract consistency and collisions. Each change is listed in **Audit amendments (r2)** at the end of this plan and is already applied inline.
 - r1 folds in a design stress-test that ran against the code before this plan was written. Among other things it covers:
   - a P2 ADR "last paragraph" test that P3 must relax;
@@ -99,7 +100,7 @@ Also `docs/superpowers/specs/2026-08-25-limnopulse-v4-parallel-execution-design.
 - **No Scan, GSI or table.** P3 adds no DynamoDB `Scan`, no new GSI and no new table. Every new row lives in `LimnopulseDomain` and is listed in the **Key schema** table.
 - **Listing prefixes.** No new SK may start with an existing listing prefix in the same partition. Those prefixes are `SITE#`, `ASSET#`, `DEVICE#`, `COMPONENT#`, `CAPABILITY#`, `INTEGRATION_ACCOUNT#`, `DEVICE_INTEGRATION#`, `DEPLOYMENT#`, `POND#` and `IDEMPOTENCY#`. A P3-00 test enforces this rule.
 - **TTL.** TTL uses the existing `expires_at` attribute: epoch seconds, rounded up. Expiry is always also checked logically against `created_at`.
-- **No test depends on DynamoDB Local deleting expired items.**
+- **Expiry tests.** No test depends on DynamoDB Local deleting **or retaining** expired items. With TTL enabled, DynamoDB Local 3.3.2 deletes expired items within seconds, which experiments confirmed. The harness `ingestion_table()` therefore creates the key schema and GSIs but does **not** enable TTL. Expiry paths are tested by advancing the injected clock.
 
 ### Guards inherited from M1/P2
 - **M1 protocols.** The M1 protocols in `repositories/v2_contracts.py` are frozen (`tests/unit/test_v2_repository_protocols.py`). P3 protocols go in `repositories/ingestion.py`. Adapters may add methods beyond their protocols.
@@ -166,7 +167,7 @@ Epic #15's entry decision is to freeze generic ingress/HTTPS first; a non-AWS ge
 | D8 | Processing, ack and failure table | **Order of operations:**<br>1. Parse and validate the envelope.<br>2. Re-resolve and **fence** (ADR-001). All of the following must hold:<br>   – the re-resolved DeviceIntegration's `tenant_id`, `integration_account_id`, `provider_key`, `device_integration_id` and `device_id` equal the envelope's;<br>   – the IntegrationAccount re-read by `(di.tenant_id, envelope.integration_account_id)` is `active` and has an HTTPS provider key;<br>   – the Device is `active` (all three reads are consistent).<br>3. `TelemetryPipeline.ingest`.<br>4. Persist quarantine rows.<br>5. Apply monotone state updates.<br>6. Emit metrics.<br>7. Delete the message.<br>**Failures.** Each class follows the frozen **worker failure table**.<br>**Fenced messages.** These have already been answered 202, so they are never silently dropped. Each fence reason belongs to one class:<br>• **Terminal fences:** `INTEGRATION_DECOMMISSIONED`, `ACCOUNT_REVOKED`, `DEVICE_DECOMMISSIONED`, `INTEGRATION_MISMATCH` and `IDENTITY_UNRESOLVED`. Persist one **replayable** `kind=observation` row per envelope observation, with reason `fenced_<reason>`, plus one `fenced_message` summary row. Only then delete the message.<br>• **Temporary fences:** a DeviceIntegration or IntegrationAccount in `error` or `pending`, and a Device that is `provisioning` or `suspended`. These are **retryable**: `change_visibility(backoff(n))`. If the condition outlasts `maxReceiveCount`, the message lands in the DLQ, where it can be redriven.<br>• **Forged envelopes:** fenced rows and fence marks are written only when an authoritative IntegrationAccount row exists for `(envelope.tenant_id, envelope.integration_account_id)`. Otherwise the worker writes nothing, emits `ingress_fenced_total{reason}`, and uses permanent visibility, so the message ends up in the DLQ. |
 | D9 | Quarantine persistence | **Rows.** One row per quarantined observation, plus one row per fenced message, under the dedicated partition `QUARANTINE#<tenant_id>`. The SK is `<received_at_key>#<qtn_id>`, so listings are time-ordered.<br>**Id.** `quarantine_id = qtn_ + uuid5(NAMESPACE_URL, f"limnopulse:quarantine:{ingress_id}:{ordinal}:{sha256(excerpt)}").hex`.<br>• `ordinal` counts the earlier rows with an identical excerpt in the same message, in outcome order, so two identical (or identically truncated) excerpts never collide.<br>• The `fenced_message` summary row uses `ordinal = -1`.<br>• The id is content-derived and stable across redelivery, because the message body is byte-identical.<br>**Writes.** Each row is created with `attribute_not_exists(PK)`. A conditional failure counts as success, so a redelivery never resets `replayed` or `dismissed` back to `open`.<br>**TTL** 14 days.<br>**Status transitions.** `open → replayed` or `open → dismissed`; both are terminal.<br>**Contents.** The row stores the mapping versions the worker actually used (`envelope.mapping_versions or normalizer.default_versions`).<br>**Replayable rule.** A row is replayable iff its kind is `observation`, its excerpt is not truncated, and the excerpt parses as a `SourceObservation`.<br>**Replay inputs.** Each row also stores what a replay envelope needs: `provider_key`, `external_identity_hash`, `source_type` and `connector_version`.<br>**Deadline.** The quarantine TTL and the DLQ retention are both 14 days. Together they set the hard reconciliation deadline for data that got a 202, and the runbook states both. |
 | D10 | Operator reconciliation | **Admin CLIs** in `scripts/admin/`. They run from an operator checkout and are dry-run by default; `--apply` executes.<br>**`telemetry_quarantine.py`** has `list`, `replay` and `dismiss`.<br>• `replay` builds a **new** envelope: a deterministic `ingress_id = ing_ + uuid5("limnopulse:replay:" + ",".join(sorted(entry_keys))).hex` (so a rerun after a crash reuses it), `replay_of=<original ingress_id>`, `replay=true`, the first `received_at`, the stored mapping versions and the stored source observations. It groups entries by `(ingress_id, device_integration_id)`, one envelope per group.<br>• It enqueues that envelope through the normal producer, and only after the send succeeds does it mark the rows `replayed`.<br>**`telemetry_dlq.py`** has `sample` and `redrive`. `redrive` sends the raw body unchanged to the source queue and then deletes it from the DLQ. A duplicate is safe.<br>**Never** an automatic DLQ consumer (`docs/notifications-phase-3c-a.md` precedent). |
-| D11 | Ingest state and connector health | **Rows.**<br>• Per Component: `COMPONENT#<c>/INGEST_STATE#CURRENT`.<br>• Per Device: `DEVICE#<d>/INGEST_STATE#CURRENT`.<br>• Per IntegrationAccount: `INTEGRATION_ACCOUNT#<ia>/CONNECTOR_HEALTH#CURRENT`, a partition of its own, not the tenant partition.<br>• `HEALTH#CURRENT` is reserved for P6.<br>**Update rule.** Every attribute is a **monotone high-water mark**, written with a conditional `UpdateItem` (`attribute_not_exists(x) OR x < :t`), with no read-modify-write and no version. Updates are therefore idempotent and order-independent under concurrent workers and redelivery.<br>**Replay.** Replay messages (`replay=true`) never update state.<br>**Last-seen.** For P6, last-seen means `last_received_at`. `last_ingested_at` is diagnostic and may advance on a DLQ redrive.<br>**Device-controlled marks.** `(last_observed_at, last_observed_sequence)` advances only for accepted observations that meet all three conditions:<br>• they have a non-null `sequence`;<br>• they carry neither `clock_skew_future` nor `clock_skew_past_extreme`;<br>• they passed normalizer ownership.<br>Every other mark uses server time: the first-receipt `received_at`, or the worker clock for `last_ingested_at`. A device clock therefore cannot pin a mark.<br>**Ties.** On equal timestamps the lexicographically greater tie-breaker wins: `sequence` for observed marks, `reason` for quarantine and fence marks. This makes the final row independent of order.<br>**Sequence events.** `classify_component_sequence` (the frozen truth table) classifies sequence events against the state read once per message, and the result goes **only to metrics**. These metrics are **best-effort** and are classified only when the message is not a replay and `ApproximateReceiveCount == 1`:<br>• a first attempt that fails loses its events;<br>• a DLQ-redriven message classifies as LATE;<br>• reordering between messages can produce a false GAP.<br>Gates assert state rows and pure truth-table vectors, never exact event counts under redelivery. |
+| D11 | Ingest state and connector health | **Rows.**<br>• Per Component: `COMPONENT#<c>/INGEST_STATE#CURRENT`.<br>• Per Device: `DEVICE#<d>/INGEST_STATE#CURRENT`.<br>• Per IntegrationAccount: `INTEGRATION_ACCOUNT#<ia>/CONNECTOR_HEALTH#CURRENT`, a partition of its own, not the tenant partition.<br>• `HEALTH#CURRENT` is reserved for P6.<br>**Update rule.** Every attribute is a **monotone high-water mark**, written with a conditional `UpdateItem` (`attribute_not_exists(x) OR x < :t`), with no read-modify-write and no version. Updates are therefore idempotent and order-independent under concurrent workers and redelivery.<br>**Replay.** Replay messages (`replay=true`) never update state.<br>**Last-seen.** For P6, last-seen means `last_received_at`. `last_ingested_at` is diagnostic and may advance on a DLQ redrive.<br>**Device-controlled marks.** `(last_observed_at, last_observed_sequence)` advances only for accepted observations that meet all three conditions:<br>• they have a non-null `sequence`;<br>• they carry neither `clock_skew_future` nor `clock_skew_past_extreme`;<br>• they passed normalizer ownership.<br>Every other mark uses server time: the first-receipt `received_at`, or the worker clock for `last_ingested_at`. A device clock therefore cannot pin a mark.<br>**Ties.** On equal timestamps the lexicographically greater tie-breaker wins: `sequence` for observed marks, `reason` for quarantine and fence marks. This makes the final row independent of order.<br>**Sequence events.** `classify_component_sequence` (the frozen truth table) classifies sequence events against the state read once per message, and the result goes **only to metrics**. These metrics are **best-effort** and are classified only when the message is not a replay and `ApproximateReceiveCount == 1`:<br>• a first attempt that fails loses its events;<br>• a redriven message (CLI or `StartMessageMoveTask`) comes back with `ApproximateReceiveCount = 1`, is classified again (usually LATE), and may double-count;<br>• reordering between messages can produce a false GAP.<br>Gates assert state rows and pure truth-table vectors, never exact event counts under redelivery. |
 | D12 | Point quality flags | `DUPLICATE`, `SEQUENCE_GAP` and `SEQUENCE_REGRESSION` stay reserved for P6. A state-dependent flag would flip on redelivery and break P2 D4 determinism. `quality-policy@1` is unchanged. |
 | D13 | Rate limits and entitlements | **Rate limits.**<br>• An in-process token bucket per IntegrationAccount (default 120 requests/minute, burst 20). It runs after authentication and before the body is read.<br>• Two pre-auth buckets run before any DynamoDB read, in this order: a **process-global** bucket (default 600/minute), then a bucket keyed by the parsed `ic_` id (default 60/minute). Random `ic_` ids therefore cannot amplify store reads.<br>• No distributed cache is involved (ADR-019). With N API replicas the bound is N × limit, which is bounded and documented.<br>**Entitlements.**<br>• `IngressEntitlementCheck` is a hook. Its default `AllowDirectIngressEntitlements` allows, because direct HTTPS is on every tier (§18.3).<br>• Enforcement against EntitlementSnapshot is **DEFERRED → #20 (P4)**.<br>**Store outage.** If the authoritative stores are unavailable, the request fails closed with 503. |
 | D14 | Metrics | **Port.** `TelemetryMetrics`, a port with `increment(name, labels)` and `observe(name, value, labels)`.<br>**Names.** Closed `*_total` and `*_seconds` names drawn from §23.2 (see **Metrics**).<br>**Labels.** Only closed-enum values, never a tenant, account, device, component or identity.<br>**Adapter.** A structured-JSON log line on logger `limnopulse.telemetry.metrics`, shaped so that an OTLP adapter can follow without renaming. No new dependency.<br>**Queue age.** Taken from `SentTimestamp`.<br>**Alarms.** CloudWatch age, depth and DLQ alarms (P3-02).<br>**Not in P3.** Stale/offline device views, connector sync lag and calibration metrics belong to P6/P9. |
@@ -256,7 +257,8 @@ INGRESS_ENVELOPE_SCHEMA = "telemetry-ingress@1"
 HTTPS_PROVIDER_KEYS = frozenset({"https_direct"})
 MAX_INGEST_BODY_BYTES = 163_840            # 160 KiB, bounded streaming read
 MAX_INGEST_OBSERVATIONS = 1_000            # == MAX_OBSERVATIONS_PER_BATCH (P2)
-MAX_INGRESS_MESSAGE_BYTES = 262_144        # SQS limit; guard -> 413
+MAX_INGRESS_MESSAGE_BYTES = 262_144        # our guard (stricter than SQS's 1 MiB); UTF-8 body + attribute bytes -> 413
+INGRESS_SCHEMA_ATTRIBUTE_BYTES = 31       # len("schema") + len("String") + len("telemetry-ingress@1")
 MAX_VALIDATION_ERRORS = 20                 # 422 detail entries
 MAX_ENVELOPE_EXCERPT_BYTES = 2_048         # fenced-message quarantine excerpt
 INGRESS_RECEIPT_TTL = timedelta(hours=24)
@@ -424,7 +426,7 @@ Receipt keys use `idempotency_key_hash` on the raw key, scoped to the authentica
   - `(last_fenced_at, last_fence_reason)` is written together on `last_fenced_at`.
 
   The condition is `attribute_not_exists(#m) OR #m < :t OR (#m = :t AND #tb < :tb)`, where the tie-breaker `#tb` is the sequence or the reason. The final row is therefore independent of write order. Within one message, the mark is the maximum `(observed_at, sequence)` pair and, for quarantine and fence marks, the lexicographically greatest reason at the maximum timestamp.
-- **Timestamps.** They use the canonical `YYYY-MM-DDTHH:MM:SS.ffffffZ` string (lexicographic order is chronological). `last_ingested_at` uses the worker clock. Every other mark uses the envelope `received_at` or the observation's `observed_at`.
+- **Timestamps.** They use the canonical `YYYY-MM-DDTHH:MM:SS.ffffffZ` string (`%Y-%m-%dT%H:%M:%S.%fZ`), so lexicographic order is chronological. `isoformat()` is forbidden, because without microseconds `…00Z` sorts after `…00.000001Z`. P3-00 adds a vector for this. `last_ingested_at` uses the worker clock. Every other mark uses the envelope `received_at` or the observation's `observed_at`.
 
 ### Sequence truth table (`classify_component_sequence(state, pairs) -> tuple[SequenceEvent, ...]`, pure)
 `pairs` are the **distinct** `(observed_at, sequence)` pairs of a Component's accepted observations whose `sequence` is not `None`. A multi-metric reading collapses to one pair. They are sorted by `(observed_at, sequence)`. Let `prev = (state.last_observed_at, state.last_observed_sequence)`, updated after each pair that is not LATE.
@@ -688,6 +690,7 @@ class TelemetryMetrics(Protocol):
         - `#a = :v AND #b = :w …` (conjunctions of equalities);
         - `attribute_not_exists(#m) OR #m < :t OR (#m = :t AND #tb < :tb)`.
       - **Update actions:** `SET` with `if_not_exists`, and `REMOVE`.
+      - The kits never assert the error returned for the same item appearing twice in one transaction, because DynamoDB Local and AWS differ there.
   - **Dependencies and the moved route class.**
     - Each `api/ingestion_dependencies.py` getter returns 503 when its `app.state` attribute is missing.
     - `_RedactedValidationRoute` behaves byte-identically in its new location: the existing `tests/api/test_v2_integrations*` tests stay green unedited.
@@ -714,7 +717,11 @@ class TelemetryMetrics(Protocol):
 **Interfaces:**
 - **Local runners.**
   - **ElasticMQ runner.** Downloads `elasticmq-server-1.6.16.jar` with a pinned SHA-256 into the user cache. It starts the server with a generated config that binds `127.0.0.1:${ELASTICMQ_PORT:-9324}` and sets `node-address.host = "127.0.0.1"`. It has no pre-declared queues, waits for `ListQueues`, and is idempotent.
-  - **DynamoDB Local runner.** Pins the DynamoDB Local release by SHA-256 and runs `-inMemory -port ${DYNAMODB_LOCAL_PORT:-8001}`.
+  - **DynamoDB Local runner.**
+    - It downloads `v2.x/dynamodb_local_latest.tar.gz` and verifies SHA-256 `7a94eb65f81aee270738751a4e5e3e6a7ad02a5d25194f55b83e08ec2ba6342b` (DynamoDB Local 3.3.2). The URL is mutable, so on a mismatch the runner fails with a re-pin message.
+    - It runs `-inMemory -port ${DYNAMODB_LOCAL_PORT:-8001}`.
+    - CI uses `amazon/dynamodb-local:3.3.2@sha256:<digest>`.
+  - **ElasticMQ JAR.** Its SHA-256 is `30a81f56a40b670fafc3f32b0f09f3baf59ad2645edaf17bc2e79170c75479f2`. The runner config sets `sqs-limits = strict`.
   - Both are linux/amd64 and Java 17+ only (the sessions have Java 21). Follow `run_local_influxd.sh`.
 - **Harness** (`tests/support/ingestion_harness.py`):
   - **Fixtures.**
@@ -739,9 +746,12 @@ class TelemetryMetrics(Protocol):
   Every digest is resolved and pinned by this task.
 
 - [ ] **Step 1: Write failing harness tests.** Each of these must fail before the harness exists:
-  - **SQS redrive.** A message received `max_receive_count` times without deletion moves to the DLQ. `ApproximateReceiveCount` increments.
+  - **SQS redrive.** A message received `max_receive_count` times without deletion moves to the DLQ on the next receive. `ApproximateReceiveCount` increments, and the DLQ copy keeps the body and the original `SentTimestamp`.
   - **Visibility.** `ChangeMessageVisibility(0)` makes a message visible again.
-  - **Timestamps and size.** `SentTimestamp` is returned. A 262,145-byte body is rejected.
+  - **Timestamps and size.**
+    - `SentTimestamp` is returned.
+    - The smoke test records the emulator limit: 1,048,577 characters → `MessageTooLong`.
+    - ElasticMQ 1.6.16 enforces only a character-counted 1 MiB limit and ignores `MaximumMessageSize`. The 262,144-byte guard is therefore proven in the P3-05 adapter, not in the emulator.
   - **DynamoDB conditions.**
     - A conditional Put with `attribute_not_exists` fails on the second write.
     - `attribute_not_exists(x) OR x < :t` behaves as a monotone mark.
@@ -781,8 +791,9 @@ class TelemetryMetrics(Protocol):
 - **ElasticMQ.** Add `limnopulse-telemetry-ingress-dlq` (receive wait 0 s) and `limnopulse-telemetry-ingress`. The ingress queue has visibility 60 s, receive wait 20 s and `deadLettersQueue` with `maxReceiveCount = 8`.
 - **OpenTofu feature flag.** `variable "telemetry_ingress"` (bool, default `false`). Every new resource uses `count` on it.
 - **Queues.**
-  - `aws_sqs_queue.telemetry_ingress_dlq`: retention 1209600, SSE.
-  - `aws_sqs_queue.telemetry_ingress`: visibility 60, retention 345600, wait 20, SSE, redrive `maxReceiveCount = 8`.
+  - `aws_sqs_queue.telemetry_ingress_dlq`: retention 1209600, `sqs_managed_sse_enabled = true`, `max_message_size = 262144`.
+  - `aws_sqs_queue.telemetry_ingress`: visibility 60, retention 345600, wait 20, `sqs_managed_sse_enabled = true`, `max_message_size = 262144`, redrive `maxReceiveCount = 8`.
+  - `RedriveAllowPolicy` exists only in OpenTofu, because ElasticMQ rejects the attribute.
   - `aws_sqs_queue_redrive_allow_policy` (`byQueue`).
 - **IAM.** Everything in the **IAM** table goes in `ingestion_queues.tf`:
   - the new dedicated `telemetry_ingest` user;
@@ -962,8 +973,9 @@ class TelemetryMetrics(Protocol):
 
 **Interfaces:**
 - **`SqsIngressQueue(*, client, queue_url)`** implements `IngressQueueProducer` and `IngressQueueConsumer`.
-  - **Send.** `send` serializes compactly and enforces the size guard (`IngressMessageTooLarge`). It sets the message attribute `schema=telemetry-ingress@1`, and requires a `MessageId` in the response, raising `IngressQueueError(retryable=True)` otherwise. Every client call goes through `asyncio.to_thread`.
-  - **Receive.** `receive` requests `ApproximateReceiveCount` and `SentTimestamp`.
+  - **Send.** `send` serializes compactly and enforces the size guard: `len(body.encode("utf-8")) + INGRESS_SCHEMA_ATTRIBUTE_BYTES > MAX_INGRESS_MESSAGE_BYTES` raises `IngressMessageTooLarge`. It sets the message attribute `schema=telemetry-ingress@1`, and requires a `MessageId` in the response, raising `IngressQueueError(retryable=True)` otherwise. Every client call goes through `asyncio.to_thread`.
+  - **Receive.** `receive` requests `MessageSystemAttributeNames=["ApproximateReceiveCount", "SentTimestamp"]`. `AttributeNames` is deprecated.
+  - **Errors.** A `ReceiptHandleIsInvalid` or other failure in `delete` or `change_visibility` is logged and counted by the caller, never raised past the loop.
   - **Visibility.** `change_visibility` clamps to `[0, 43200]`. `heartbeat(message, seconds)` is a thin helper over it.
 - **Redrive.** `redrive_dlq(*, dlq: IngressQueueConsumer, source: IngressQueueProducer, max_messages, apply) -> RedriveReport(seen, redriven, failed)` lives in `services/ingress_redrive.py`.
   - With `apply`, it sends the raw body unchanged, then deletes the message from the DLQ.
@@ -973,7 +985,7 @@ class TelemetryMetrics(Protocol):
 - [ ] **Step 1: Write failing tests.**
   - **Unit tests, with a stubbed client:**
     - the exact request parameters;
-    - the size guard at the boundary;
+    - the size guard at the boundary, in UTF-8 bytes plus attribute bytes. Over the limit, nothing is sent: ElasticMQ's `ApproximateNumberOfMessages` stays 0;
     - a missing `MessageId`, and botocore errors mapped to `IngressQueueError(retryable=True)`;
     - visibility clamping;
     - the redrive ordering (send before delete; no delete after a failed send);
@@ -1483,3 +1495,7 @@ Applied inline. Sources:
 | A27 | E | The quarantine id includes an ordinal, so identical or truncated excerpts never collide. |
 | A28 | E | The G15 fixture is defined. Last-seen means `last_received_at`. `request_sha256` inputs are exact. |
 | A29 | E | The `connector-health` GET route is cut as a P6 view. It becomes a P3-09 `health` CLI subcommand, and the tenant routes total 53 + 5. |
+| A30 | X | ElasticMQ 1.6.16 enforces a character-counted 1 MiB limit and ignores `MaximumMessageSize`. The 256 KiB guard is therefore proven in the adapter, measuring UTF-8 body bytes plus the 31 attribute bytes. OpenTofu pins `max_message_size = 262144`. |
+| A31 | X | DynamoDB Local deletes expired items within seconds once TTL is on. The harness table has TTL off, and expiry is tested only through the injected clock. |
+| A32 | X | Pinned artifacts:<br>• ElasticMQ JAR SHA-256 `30a81f56…479f2`;<br>• DynamoDB Local 3.3.2 SHA-256 `7a94eb65…6342b`, from a mutable URL, so a mismatch fails with a re-pin message.<br>Also: `MessageSystemAttributeNames`, and `ReceiptHandleIsInvalid` is never raised. |
+| A33 | X | Facts confirmed:<br>• the redrive moves on the receive after `maxReceiveCount`, and the DLQ copy keeps the body and `SentTimestamp`;<br>• `StartMessageMoveTask` is supported, and moved messages reset to `ApproximateReceiveCount = 1`;<br>• per-item IAM actions are required inside transactions;<br>• monotone marks, slot races and SK-lower-bound paging behave as specified;<br>• canonical timestamp formatting is required. |
