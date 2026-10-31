@@ -396,7 +396,7 @@ async def test_bucket_is_always_a_helper_escaped_literal(bucket: str) -> None:
         assert f"from(bucket: {flux_string_literal(bucket)})" in query
         assert_no_unescaped_interpolation(query)
     if bucket == "raw$archive":
-        assert '"raw$archive"' in query
+        assert '"raw\\x24archive"' in query
 
 
 @pytest.mark.asyncio

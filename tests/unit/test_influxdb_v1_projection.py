@@ -364,7 +364,7 @@ async def test_tenant_latest_with_no_safe_pond_queries_nothing() -> None:
 @pytest.mark.parametrize("method", METHODS)
 @pytest.mark.parametrize(
     ("bucket", "literal"),
-    [("raw${x}", '"raw\\${x}"'), ("raw$archive", '"raw$archive"')],
+    [("raw${x}", '"raw\\x24{x}"'), ("raw$archive", '"raw\\x24archive"')],
 )
 async def test_bucket_literal_is_escaped(method: str, bucket: str, literal: str) -> None:
     query_api = FakeQueryApi(*one_row(method))
