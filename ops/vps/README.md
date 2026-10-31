@@ -125,12 +125,20 @@ docker exec cnesdata-caddy-1 caddy validate --config /etc/caddy/Caddyfile --adap
 docker exec cnesdata-caddy-1 caddy reload  --config /etc/caddy/Caddyfile --adapter caddyfile
 ```
 
-Then confirm `cnesdata` itself is unaffected before moving on:
+Then confirm `cnesdata` itself is unaffected before moving on. Run this from outside the VPS (from
+the VPS itself the hosts may not answer), and compare with the same request made before the
+reload:
 
 ```bash
-curl -sSI https://cnesdata.vinisantana.com/ | head -3
-curl -sSI https://api.vinisantana.com/api/  | head -3
+for u in https://cnesdata.com.br/ https://dev.cnesdata.com.br/ https://api.cnesdata.com.br/ https://api.dev.cnesdata.com.br/; do
+  printf '%s %s\n' "$(curl -s -o /dev/null -w '%{http_code}' "$u")" "$u"
+done
 ```
+
+To change a block later, for example adding a route, edit the live file **in place**. It is a
+single-file bind mount, so `sed -i` or an editor that writes a new file leaves the container on the
+old inode. Back it up first, rewrite it through the same file handle, and check that `stat -c %i`
+is unchanged. Then run `caddy validate` and `caddy reload` as above.
 
 DNS: add an A record for `influx.limnopulse.com` -> `103.199.184.166`
 (DNS-only, matching the existing `limnopulse.com`/`api.limnopulse.com`
