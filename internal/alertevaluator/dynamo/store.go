@@ -165,7 +165,6 @@ func (store Store) Commit(ctx context.Context, request alertevaluator.CommitRequ
 }
 
 func (store Store) commitItems(request alertevaluator.CommitRequest) ([]types.TransactWriteItem, error) {
-	request.Evaluation = request.Evaluation.Normalized()
 	ruleUpdate, err := store.ruleScheduleUpdate(request)
 	if err != nil {
 		return nil, err
