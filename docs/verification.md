@@ -106,6 +106,91 @@ relative-window code paths are tested with data seeded relative to a `now`
 captured once per test, and every comparison asserts the result is non-empty
 first.
 
+## Ingestion integration gate
+
+`make verify-ingestion` runs the P3 ingestion harness tests in `tests/ingestion/`
+against ElasticMQ 1.6.16 (an SQS emulator), DynamoDB Local 3.3.2 and InfluxDB
+2.7.11. It sets both `RUN_INGESTION_INTEGRATION=1` and
+`RUN_INFLUX_INTEGRATION=1`: the reused `influx_bucket` fixture skips without the
+second flag, so the Influx-backed tests would otherwise be skipped silently.
+Under the gate, `tests/ingestion/conftest.py` turns any skip in that directory
+into a failure. `make verify-ingestion` is not part of `make verify`, and the
+default `make verify-python` skips `tests/ingestion` cleanly without
+`RUN_INGESTION_INTEGRATION=1`, so it never needs these services.
+
+The CI `ingestion` job runs the target against three throwaway service
+containers, each pinned by digest:
+
+- `softwaremill/elasticmq-native:1.6.16@sha256:8383f29ad746c12981ca2128f689a4b4a93815235f1a7851d2f165316503d132`, on port 9324;
+- `amazon/dynamodb-local:3.3.2@sha256:6ada631ec7aa5fc83446855eb17233e3dad184fec47477e8140c6c569cfe0c86`,
+  mapped `8001:8000` to match the harness default;
+- the same InfluxDB 2.7.11 digest and onboarding as the `influx` job.
+
+No credentials are involved: the harness clients carry dummy credentials set in
+code, so the workflow names no AWS credential variable.
+
+The harness, `tests/support/ingestion_harness.py`, reads
+`INGESTION_SQS_URL` (default `http://127.0.0.1:9324`) and
+`INGESTION_DYNAMODB_URL` (default `http://127.0.0.1:8001`); an empty value
+counts as unset. The InfluxDB variables are those of the InfluxDB gate above. It
+provides:
+
+- `sqs_client()`, `dynamodb_client()` and `wait_until_ready()`. Tests that use
+  the services wait once for both emulators to answer before their first call.
+- The `ingestion_queue_pair` factory fixture. `make(max_receive_count=2,
+  visibility_seconds=2)` creates a uniquely named source queue whose
+  `RedrivePolicy` points at its own DLQ, and both are deleted at teardown.
+- The `ingestion_tables` fixture: a uniquely named domain and audit table pair.
+  They have exactly the key schemas and GSIs of `scripts/dev/init_dynamodb.py`,
+  built by its `table_request()`, and are deleted at teardown. TTL is **not**
+  enabled on them (`ensure_table(..., enable_ttl=False)`), because DynamoDB
+  Local deletes expired items within seconds once TTL is on. Expiry is tested by
+  advancing an injected clock, never by waiting for the emulator.
+- `ToggleableTcpProxy`, a loopback TCP forwarder placed in front of InfluxDB to
+  simulate an outage without stopping a service. `down()` closes the listener,
+  so new connections are refused at once, and resets every established
+  forwarded socket, so pooled keep-alive connections cannot bypass it. `up()`
+  listens again on the same port.
+
+ElasticMQ 1.6.16 counts message size in characters (1,048,576 at most) and
+ignores `MaximumMessageSize`. The 262,144-byte SQS limit is therefore enforced
+and tested in the P3 adapter, not in the emulator.
+
+To run the gate locally without Docker (Linux x86_64, Java 17 or newer):
+
+```
+scripts/dev/run_local_elasticmq.sh
+scripts/dev/run_local_dynamodb.sh
+scripts/dev/run_local_influxd.sh
+make verify-ingestion
+```
+
+`scripts/dev/run_local_elasticmq.sh` downloads `elasticmq-server-1.6.16.jar`,
+checks its SHA-256
+`30a81f56a40b670fafc3f32b0f09f3baf59ad2645edaf17bc2e79170c75479f2` and starts
+it on `127.0.0.1:${ELASTICMQ_PORT:-9324}`. Its generated config uses strict SQS
+limits and declares no queues. It waits for `ListQueues` to answer.
+
+`scripts/dev/run_local_dynamodb.sh` downloads
+`v2.x/dynamodb_local_latest.tar.gz`, checks its SHA-256
+`7a94eb65f81aee270738751a4e5e3e6a7ad02a5d25194f55b83e08ec2ba6342b`
+(DynamoDB Local 3.3.2) and starts it with `-inMemory` on port
+`${DYNAMODB_LOCAL_PORT:-8001}`. That URL always serves the latest release, so a
+checksum mismatch stops the script with a message asking for a deliberate
+re-pin of the checksum, the CI digest and this page.
+
+Both runners keep their files (download, PID, port and log) under
+`${XDG_CACHE_HOME:-$HOME/.cache}/limnopulse/`, leave the server running in the
+background, and reuse the instance they started on a re-run. They refuse to
+start when another server already answers on the port. With a non-default
+`ELASTICMQ_PORT` or `DYNAMODB_LOCAL_PORT`, also set `INGESTION_SQS_URL` or
+`INGESTION_DYNAMODB_URL` for the tests. Stop a runner with
+`kill "$(cat "${XDG_CACHE_HOME:-$HOME/.cache}/limnopulse/elasticmq/elasticmq.pid")"`,
+or the same with `dynamodb-local/dynamodb-local.pid`.
+
+Every ingestion integration test creates its own queues, tables and buckets and
+removes them afterwards.
+
 ## Safety and readiness boundary
 
 These gates use no AWS credentials. OpenTofu initialization has its backend
