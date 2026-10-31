@@ -10,7 +10,6 @@ from collections.abc import Callable
 from typing import Any
 
 import pytest
-from limnopulse_api.services.trusted_mapping import TrustedMappingService
 
 from limnopulse_api.adapters.dynamodb_v2 import account_scoped_identity_hash
 from limnopulse_api.domain.devices_v2 import ComponentStatus
@@ -26,6 +25,7 @@ from limnopulse_api.domain.ingestion import (
 )
 from limnopulse_api.domain.telemetry_v2 import SourceObservation
 from limnopulse_api.repositories import ingestion as ports
+from limnopulse_api.services.trusted_mapping import TrustedMappingService
 from tests.support.ingestion_contract_kits import (
     COMPONENT,
     CREDENTIAL,
@@ -48,6 +48,7 @@ from tests.support.ingestion_contract_kits import (
     envelope,
     integration_account,
     kit_ids,
+    store_errors,
 )
 from tests.unit.test_dynamodb_integration_resolver import DynamoIngestionSubject, fake_subject
 
@@ -225,6 +226,21 @@ async def test_admission_never_writes() -> None:
     await subject.mapping.fence(envelope())
 
     assert {call.operation for call in subject.client.calls} <= {"get_item"}
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("error", store_errors(), ids=lambda error: type(error).__name__)
+async def test_admit_propagates_an_account_read_failure(error: BaseException) -> None:
+    # A store fault on the IntegrationAccount read is a 503, never ACCOUNT_INACTIVE (403).
+    subject = mapping_subject()
+    await seed_full(subject)
+    subject.fail_next("get_integration_account", error)
+
+    with pytest.raises(type(error)) as caught:
+        await subject.mapping.admit(SOURCE, batch(COMPONENT))
+
+    assert caught.value is error
+    assert isinstance(await subject.mapping.admit(SOURCE, batch(COMPONENT)), IngressAdmission)
 
 
 # Admission: component rule ----------------------------------------------------------------

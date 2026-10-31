@@ -15,7 +15,8 @@ import pytest
 
 from limnopulse_api.adapters.dynamodb_v2 import account_scoped_identity_hash
 from limnopulse_api.api.v2.schemas.integrations import DeviceIntegrationCreate
-from limnopulse_api.core.errors import ConflictError
+from limnopulse_api.core.errors import ConflictError, NotFoundError
+from limnopulse_api.domain.ingestion import IngressAdmission
 from limnopulse_api.domain.integrations import DeviceIntegrationStatus, IntegrationAccountStatus
 from limnopulse_api.services.integrations import IntegrationService
 from tests.support.ingestion_contract_kits import (
@@ -32,12 +33,16 @@ from tests.support.ingestion_contract_kits import (
     OTHER_TENANT,
     PROVIDER,
     RECEIVED,
+    SOURCE,
     TENANT,
     TRUSTED_MAPPING_CONTRACT,
+    batch,
+    component,
     device,
     device_integration,
     integration_account,
     kit_ids,
+    store_errors,
 )
 from tests.support.ingestion_harness import IngestionTables, dynamodb_client
 from tests.unit.test_dynamodb_integration_resolver import (
@@ -211,3 +216,61 @@ async def test_https_namespace_on_dynamodb_local(subject: DynamoIngestionSubject
     assert theirs["external_identity_hash"] == account_scoped_identity_hash(
         PROVIDER, OTHER_ACCOUNT, "pond-1"
     )
+
+
+@pytest.mark.parametrize("error", store_errors(), ids=lambda error: type(error).__name__)
+async def test_admit_propagates_an_account_read_failure_on_dynamodb_local(
+    subject: DynamoIngestionSubject, error: BaseException
+) -> None:
+    await subject.seed_account(integration_account())
+    await subject.seed_device_integration(device_integration())
+    await subject.seed_device(device())
+    await subject.seed_component(component())
+    subject.fail_next("get_integration_account", error)
+
+    with pytest.raises(type(error)) as caught:
+        await subject.mapping.admit(SOURCE, batch())
+
+    assert caught.value is error
+    assert isinstance(await subject.mapping.admit(SOURCE, batch()), IngressAdmission)
+
+
+@pytest.mark.parametrize("kind", ["account", "integration"])
+async def test_a_concurrent_write_is_a_conflict_on_dynamodb_local(
+    subject: DynamoIngestionSubject, kind: str
+) -> None:
+    # The version condition must hold at commit on the real store; the audit item rolls back.
+    keys = subject.integrations.keys
+    if kind == "account":
+        await subject.seed_account(integration_account())
+        key = keys.integration_account(TENANT, ACCOUNT)
+    else:
+        await subject.seed_device_integration(device_integration())
+        key = keys.device_integration(TENANT, INTEGRATION)
+    subject.client.before_next(
+        "transact_write_items", lambda: subject.put({**subject.item(key), "version": 2})
+    )
+
+    with pytest.raises(ConflictError) as caught:
+        if kind == "account":
+            await subject.repository.transition_integration_account(
+                TENANT,
+                ACCOUNT,
+                IntegrationAccountStatus.ERROR,
+                expected_version=1,
+                updated_at=RECEIVED,
+                audit=AUDIT,
+            )
+        else:
+            await subject.repository.transition_device_integration(
+                TENANT,
+                INTEGRATION,
+                DeviceIntegrationStatus.ERROR,
+                expected_version=1,
+                updated_at=RECEIVED,
+                audit=AUDIT,
+            )
+
+    assert not isinstance(caught.value, NotFoundError)
+    assert subject.item(key)["status"] == "active"
+    assert subject.audit_items() == []

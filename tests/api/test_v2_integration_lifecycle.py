@@ -345,3 +345,17 @@ async def test_store_failures_are_503() -> None:
 
     assert response.status_code == 503
     assert subject.audit_items() == []
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("path", [ACCOUNT_PATH, INTEGRATION_PATH], ids=["account", "integration"])
+async def test_missing_lifecycle_repository_state_is_503(path: str) -> None:
+    subject = await _seeded()
+    client = client_for(subject)
+    del client.app.state.integration_lifecycle_repository
+
+    response = client.post(path, json={"status": "active", "expected_version": 1})
+
+    assert response.status_code == 503
+    assert response.json() == {"detail": "service unavailable"}
+    assert _writes(subject) == []

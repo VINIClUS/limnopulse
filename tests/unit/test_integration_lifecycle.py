@@ -9,7 +9,6 @@ from datetime import UTC, datetime, timedelta
 from typing import Any
 
 import pytest
-from limnopulse_api.services.integration_lifecycle import IntegrationLifecycleService
 
 from limnopulse_api.adapters.dynamodb_integrations import (
     device_integration_from_item,
@@ -24,6 +23,7 @@ from limnopulse_api.domain.integrations import (
     ensure_integration_account_transition,
 )
 from limnopulse_api.repositories import ingestion as ports
+from limnopulse_api.services.integration_lifecycle import IntegrationLifecycleService
 from tests.support.ingestion_contract_kits import (
     ACCOUNT,
     AUDIT,
