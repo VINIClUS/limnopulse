@@ -30,6 +30,8 @@ Phase 3 HTTPS normalization must resolve site, asset, deployment, and component 
 
 Any future EventBridge consumer must prove duplicate- and order-independent idempotent handling before adoption; no consumer may assume exactly-once delivery or ordering.
 
+**Phase split (P3).** P3 proves the HTTPS ingress half of this gate (#15): a request is accepted only after the durable SQS write, the provider credential is authenticated before the mapping is resolved, an IntegrationAccount cannot claim another tenant, payload ownership identifiers are rejected, an `Idempotency-Key` retry after a lost response creates no second canonical observation, at-least-once redelivery and shuffling converge, and DLQ redrive is tested end to end against real services. The request size and per-IntegrationAccount rate limits run before enqueue. Entitlement enforcement against the EntitlementSnapshot is P4 (#20); P3 ships the pre-enqueue entitlement hook, whose default allows direct HTTPS on every tier. See the [P3 ingestion rollout runbook](../p3-ingestion-rollout-runbook.md).
+
 ## Non-goals
 
 This record does not make EventBridge a ledger, queue, ordering guarantee, or mandatory transport between all internal components.

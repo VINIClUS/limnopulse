@@ -1250,10 +1250,14 @@ def test_adr_implementation_gate_ends_with_the_p2_phase_split(
     section = markdown_section(text, "Implementation gate")
     paragraphs = [p.strip() for p in section.strip().split("\n\n") if p.strip()]
     assert len(paragraphs) >= 2, "the original gate paragraph must stay"
-    assert paragraphs[-1].startswith("**Phase split (P2).**")
-    original = "\n\n".join(paragraphs[:-1])
+    # D19 (P3-11): the P2 paragraph may be followed by at most the P3 paragraph.
+    (p2_index,) = [i for i, p in enumerate(paragraphs) if p.startswith("**Phase split (P2).**")]
+    following = paragraphs[p2_index + 1 :]
+    assert len(following) <= 1, "only the P3 paragraph may follow the P2 paragraph"
+    assert all(p.startswith("**Phase split (P3).**") for p in following)
+    original = "\n\n".join(paragraphs[:p2_index])
     assert hashlib.sha256(original.encode("utf-8")).hexdigest() == ADR_ORIGINAL_GATE_SHA256[adr]
-    phase_split = " ".join(paragraphs[-1].split())
+    phase_split = " ".join(paragraphs[p2_index].split())
     for reference in references:
         assert re.search(reference, phase_split), reference
     # ADRs live in docs/adr/, so the runbook link is relative to it.

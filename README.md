@@ -248,7 +248,7 @@ docker compose --profile ingestion up telemetry-ingest-worker
 
 The worker uses `restart: on-failure:5` in production, which may leave it stopped after a Docker daemon restart or host reboot, and the default deploy (`up -d` without `--profile ingestion`) does not recreate it with a new `IMAGE_TAG`. Once ingestion is enabled, start it again after a reboot and redeploy it with the profile so the API (producer) and worker (consumer) run the same image. The queue-age alarm covers a stopped worker.
 
-**Rollback:** unset `INGEST_V2_ENABLED` (restart the API) and stop the `ingestion` profile. Queued messages stay in the queue and the DLQ until the worker runs again. The rollout sequence, owner flips and drills are in the [P3 ingestion rollout runbook](docs/p3-ingestion-rollout-runbook.md) (added by P3-11).
+**Rollback:** unset `INGEST_V2_ENABLED` (restart the API) and stop the `ingestion` profile. Queued messages stay in the queue and the DLQ until the worker runs again. The rollout sequence, owner flips and drills are in the [P3 ingestion rollout runbook](docs/p3-ingestion-rollout-runbook.md).
 
 ## Local Telemetry Ingestion
 
