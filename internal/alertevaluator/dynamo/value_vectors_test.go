@@ -32,6 +32,7 @@ type valueVectors struct {
 		StoredStateJSON           string       `json:"stored_state_json"`
 		ExpectedLastValue         vectorValue  `json:"expected_last_value"`
 		PythonResolvedStateJSON   string       `json:"python_resolved_state_json"`
+		PythonResetStateJSON      string       `json:"python_pending_reset_state_json"`
 		ExpectedAfterOldGoRewrite *vectorValue `json:"expected_after_old_go_rewrite"`
 		GoEncode                  *struct {
 			LastQuality string      `json:"last_quality"`
@@ -126,6 +127,15 @@ func TestStateVectorsDecodeThePythonRewrittenDocument(t *testing.T) {
 		if state.Mode != alertevaluator.ModeHealthy || state.ActiveEventID != "" {
 			t.Fatalf("%s: Python rewrite lifecycle = %#v", vector.Name, state)
 		}
+
+		reset, err := decodeStateJSON(vector.PythonResetStateJSON)
+		if err != nil {
+			t.Fatalf("%s: decode Python pending reset: %v", vector.Name, err)
+		}
+		assertMeasurement(t, vector.Name+" python pending reset", reset.LastValue, vector.ExpectedLastValue)
+		if reset.Mode != alertevaluator.ModeHealthy || reset.ConfirmedSlots != 0 || reset.LastQuality != state.LastQuality {
+			t.Fatalf("%s: Python pending reset lifecycle = %#v", vector.Name, reset)
+		}
 	}
 }
 
@@ -162,7 +172,7 @@ func TestStateVectorsPinTheGoWriterBytes(t *testing.T) {
 }
 
 // mainBranchState is the evaluator state struct as it was before the value
-// became optional. An old evaluator's LoadState decodes into it with a plain
+// became optional (copied field for field, in order, from main at ec2624b). An old evaluator's LoadState decodes into it with a plain
 // json.Unmarshal and its statePut re-encodes it with json.Marshal, which drops
 // SchemaVersion and turns null into 0.
 type mainBranchState struct {

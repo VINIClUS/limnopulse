@@ -107,6 +107,7 @@ def test_pending_reset_preserves_the_value_keys(vector: dict[str, Any]) -> None:
 
     assert reset is not None
     updated, _ = reset
+    assert updated["state_json"] == vector["python_pending_reset_state_json"]
     after = json.loads(updated["state_json"])
     assert after["Mode"] == "healthy"
     _assert_value_keys_preserved(pending, after)

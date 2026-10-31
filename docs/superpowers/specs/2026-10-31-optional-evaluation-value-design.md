@@ -45,7 +45,12 @@ func (m *Measurement) UnmarshalJSON([]byte) error    // null → absent; number 
   - a DynamoDB number must lie in about [1e-130, 9.99e125] in magnitude, or `TransactWriteItems` rejects the whole commit;
   - the Python adapters normalize DynamoDB numbers with `value % 1 == 0` in a 28-digit `Decimal` context, which raises for magnitudes of 1e28 and above.
 
-  The bounds keep a margin inside both limits, and no water-quality measurement comes near them. A value outside them is an invalid aggregation, so it is absent. Before this change, such a value wedged the rule: the commit failed every minute until the sample left the window. `Measured` enforces the same range for every caller.
+  The bounds keep a margin inside both limits, and no water-quality measurement comes near them. A value outside them is an invalid aggregation, so it is absent and the evaluation records `insufficient_data`. Before this change the effect depended on the magnitude:
+  - beyond DynamoDB's range, the commit failed every minute until the sample left the window, which wedged the rule;
+  - from 1e28 up to that range, the commit succeeded but the Python readers raised on the stored value;
+  - from 1e25 to 1e28, the value was stored and read normally. Reporting `insufficient_data` there is a deliberate change: such a reading is a sensor or aggregation fault, not water quality.
+
+  `Measured` enforces the same range for every caller.
 - `-0` is normalized to `+0`. Python reads the JSON `-0` as the integer `0`, so after this change Go never writes a `-0` token. `-0 == +0` under all four operators, so threshold comparisons are unchanged.
 - `MarshalJSON` has a value receiver. `json.Marshal` of a non-addressable `State` would skip a pointer-receiver method and write `{}`, which an old evaluator cannot decode into `float64`. Present values encode through `json.Marshal(float64)`, so they are byte-identical to the legacy output.
 - `*float64` is rejected. `attributevalue` encodes a nil pointer as a DynamoDB `NULL` attribute rather than omitting it, and pointers alias across `cloneState` copies.
@@ -137,7 +142,7 @@ Old binary means current `main`; new binary means this design.
 | Old Go → new Go | Legacy decode (section 5). |
 | New Go → Python → either Go | Python's `json.loads`/`state.update`/`json.dumps(sort_keys=True)` preserves the *values* of `SchemaVersion`, `LastValue` and `LastQuality`, so the record stays version 2. The integers, `null` and the marker keep their exact text. Float text may change: `1e-7` becomes `1e-07` and `0.000001` becomes `1e-06`. Key order changes too. Go decodes the rewritten text to the same `float64`, so the vectors compare decoded values, not bytes. |
 | Old Go → Python → new Go | Python preserves the legacy record; new Go applies the legacy rule. |
-| Any Go → DynamoDB → Python / relay | Unchanged attribute semantics. `N "0"` deserializes to `0`, never `None`; a missing attribute to `None`. |
+| Any Go → DynamoDB → Python / relay | Unchanged attribute semantics. `N "0"` deserializes to `0`, never `None`; a missing attribute to `None`. The Python reader is pinned against the shared vectors. The relay readers (`*float64`) are unchanged and behave the same, but binding them to the vectors is a follow-up in the notifications package. |
 
 Rollback needs no contract step: old binaries read version 2 records.
 
@@ -153,7 +158,7 @@ So a mixed deployment cannot cause `IdempotentParameterMismatch`. The token is c
 The Python adapters treat `state_json` as an opaque document and update only the lifecycle keys they own. No Python production change is needed. The contract is pinned by tests:
 
 - Python preserves the values of `SchemaVersion`, `LastValue` and `LastQuality` through `resolved_evaluator_state` and `reset_pending_evaluator_state`. Its exact output is pinned in the vectors.
-- Go decodes the document Python writes.
+- Go decodes the documents Python writes, for both the resolution and the pending reset.
 - `AlertEvent.last_evaluation_value` reads `N "0"` as `0.0`, not `None`, and reads a missing attribute as `None`.
 
 The Python `value % 1 == 0` normalization raises for numbers of 1e28 and above. It appears in several adapters. This predates this design and is out of scope here. The persistable range in section 1 keeps every value the evaluator writes far below that limit. Fixing the Python normalization itself is a separate follow-up.

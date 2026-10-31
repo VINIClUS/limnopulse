@@ -163,6 +163,12 @@ data, query errors, timeouts and invalid or out-of-range aggregates have no
 value: DynamoDB value attributes are omitted or removed, never written as `0`.
 The evaluator state document (`state_json`) carries `"SchemaVersion":2`.
 
+An aggregate is out of range when it is NaN, infinite, or a non-zero value whose
+magnitude lies outside [1e-100, 1e25]. Such a window never opens, confirms or
+resolves an incident, and is recorded as `insufficient_data`. That quality is
+the only trace: a rule that stops firing on a sensor glitch such as 1e30 shows
+`insufficient_data`, not an error.
+
 Old and new evaluator binaries can overlap or roll back in either order. An
 unknown state schema version fails the rule closed under the `state_schema`
 error category, so a future version must ship its reader before any writer.
