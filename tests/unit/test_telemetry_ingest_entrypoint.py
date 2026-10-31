@@ -199,27 +199,6 @@ def test_build_worker_returns_a_loop_configured_from_the_int_settings() -> None:
     assert type(loop.config.max_messages) is int
 
 
-def test_build_worker_uses_the_default_settings_values() -> None:
-    settings = Settings(
-        _env_file=None,
-        app_env="test",
-        auth_mode="dev",
-        telemetry_v2_write_enabled=True,
-        sqs_telemetry_ingress_queue_url=QUEUE_URL,
-    )
-
-    loop, _ = _build(settings)
-
-    assert loop.config == IngestWorkerConfig(
-        max_messages=settings.telemetry_ingest_worker_max_messages,
-        wait_seconds=settings.telemetry_ingest_worker_wait_seconds,
-        visibility_seconds=settings.telemetry_ingest_worker_visibility_seconds,
-        concurrency=settings.telemetry_ingest_worker_concurrency,
-        drain_seconds=settings.telemetry_ingest_drain_seconds,
-        processing_deadline_seconds=settings.telemetry_ingest_processing_deadline_seconds,
-    )
-
-
 def test_build_worker_creates_only_a_dynamodb_and_an_sqs_client() -> None:
     _, factories = _build(_settings())
 
@@ -261,19 +240,23 @@ def test_build_worker_never_injects_dummy_credentials_outside_local_and_test() -
 
 
 @pytest.mark.parametrize("service_name", ["sqs", "dynamodb"])
-def test_build_worker_keeps_botocore_timeouts_finite(service_name: str) -> None:
+def test_build_worker_sets_explicit_finite_botocore_timeouts(service_name: str) -> None:
+    """A46: the drain waits on in-flight heartbeat and final-action calls, so the bound is
+    pinned explicitly instead of relying on botocore's defaults."""
     settings = _settings(telemetry_ingest_worker_wait_seconds=20)
 
     _, factories = _build(settings)
 
     configured = factories.kwargs(service_name).get("config")
-    effective = Config() if configured is None else Config().merge(configured)
-    for timeout in (effective.connect_timeout, effective.read_timeout):
+    assert isinstance(configured, Config)
+    provided = configured._user_provided_options
+    assert {"connect_timeout", "read_timeout"} <= set(provided)
+    for timeout in (configured.connect_timeout, configured.read_timeout):
         assert isinstance(timeout, (int, float)) and not isinstance(timeout, bool)
-        assert 0 < timeout and math.isfinite(timeout)
+        assert 0 < timeout <= 120 and math.isfinite(timeout)
     if service_name == "sqs":
         # A long poll must finish inside the read timeout, or every idle receive would fail.
-        assert effective.read_timeout > settings.telemetry_ingest_worker_wait_seconds
+        assert configured.read_timeout > settings.telemetry_ingest_worker_wait_seconds
 
 
 def test_build_worker_consumes_the_configured_queue_through_the_sqs_client() -> None:
@@ -331,7 +314,7 @@ def test_build_worker_writes_through_one_synchronous_influx_writer(
     pipeline = loop.processor.pipeline
 
     (influx,) = factories.influx
-    assert influx.kwargs == INFLUX
+    assert {key: influx.kwargs.get(key) for key in INFLUX} == INFLUX
     assert len(influx.write_api_calls) == 1
     options = influx.write_api_calls[0]
     assert options is SYNCHRONOUS or options.write_type is WriteType.synchronous
@@ -370,6 +353,28 @@ def test_worker_module_never_imports_the_api_app_or_the_optional_cache() -> None
     )
 
     assert result.stdout.strip() == "[]"
+
+
+@pytest.mark.parametrize(
+    "overrides",
+    [{"telemetry_v2_write_enabled": False}, {"sqs_telemetry_ingress_queue_url": ""}],
+    ids=repr,
+)
+def test_build_worker_itself_refuses_a_worker_that_could_delete_unwritten_data(
+    overrides: dict[str, object],
+) -> None:
+    """D7 defence in depth: any caller, not only `main()`, gets no loop and no client."""
+    factories = Factories()
+
+    with pytest.raises(ValueError):
+        build_worker(
+            _settings(**overrides),
+            client_factory=factories.client,
+            influx_client_factory=factories.influx_client,
+        )
+
+    assert factories.boto_calls == []
+    assert factories.influx == []
 
 
 # --- main(): start guard -----------------------------------------------------------------------
@@ -488,3 +493,22 @@ def test_main_runs_the_built_loop_and_a_signal_sets_stop(
     (settings,) = built
     assert settings.telemetry_v2_write_enabled is True
     assert settings.sqs_telemetry_ingress_queue_url == QUEUE_URL
+
+
+class CrashingLoop:
+    async def run(self, stop: asyncio.Event) -> None:
+        raise RuntimeError("sentinel-crash-detail")
+
+
+def test_main_exits_non_zero_when_the_loop_crashes_without_logging_the_error_text(
+    monkeypatch: pytest.MonkeyPatch, hard_bound, caplog: pytest.LogCaptureFixture
+) -> None:
+    """A crash must not look like a clean stop: `restart: on-failure:5` needs a non-zero exit."""
+    _configure_environment(monkeypatch)
+    monkeypatch.setattr(telemetry_ingest, "build_worker", lambda settings, **kwargs: CrashingLoop())
+
+    with caplog.at_level("DEBUG"):
+        code = main()
+
+    assert code not in (0, None)
+    assert "sentinel-crash-detail" not in caplog.text

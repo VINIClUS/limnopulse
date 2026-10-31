@@ -25,8 +25,8 @@ ENTRYPOINT = ["python", "-m", "limnopulse_api.workers.telemetry_ingest"]
 IMAGE_TAG = "main-0000000000000000000000000000000000000000"
 API_IMAGE = "ghcr.io/viniclus/limnopulse/api:${IMAGE_TAG}"
 WORKER_CREDENTIALS = {
-    "AWS_ACCESS_KEY_ID": "${TELEMETRY_INGEST_AWS_ACCESS_KEY_ID}",
-    "AWS_SECRET_ACCESS_KEY": "${TELEMETRY_INGEST_AWS_SECRET_ACCESS_KEY}",
+    "AWS_ACCESS_KEY_ID": "TELEMETRY_INGEST_AWS_ACCESS_KEY_ID",
+    "AWS_SECRET_ACCESS_KEY": "TELEMETRY_INGEST_AWS_SECRET_ACCESS_KEY",
 }
 WORKER_PLACEHOLDERS = (
     "TELEMETRY_INGEST_AWS_ACCESS_KEY_ID",
@@ -71,14 +71,38 @@ P3_SETTINGS = {
 EMPTY_BY_DEFAULT = ("SQS_TELEMETRY_INGRESS_QUEUE_URL", "SQS_TELEMETRY_INGRESS_DLQ_URL")
 INTERPOLATION = re.compile(r"\$\{(?P<name>[A-Z0-9_]+)(?:(?P<op>:?[-?])(?P<arg>[^}]*))?\}")
 
+
+def _docker_compose_available() -> bool:
+    if shutil.which("docker") is None:
+        return False
+    try:
+        result = subprocess.run(
+            ["docker", "compose", "version"], capture_output=True, check=False, timeout=30
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        return False
+    return result.returncode == 0
+
+
 requires_docker = pytest.mark.skipif(
-    shutil.which("docker") is None, reason="the docker CLI renders compose files"
+    not _docker_compose_available(), reason="the docker compose CLI renders compose files"
 )
+
+
+def _compose_environment(**extra: str) -> dict[str, str]:
+    """The process environment without ambient `COMPOSE_*` (e.g. `COMPOSE_PROFILES`)."""
+    environment = {k: v for k, v in os.environ.items() if not k.startswith("COMPOSE_")}
+    environment.update(extra)
+    return environment
 
 
 @pytest.fixture(autouse=True)
 def _isolate_environment(monkeypatch: pytest.MonkeyPatch) -> None:
-    for name in (*P3_SETTINGS, "SQS_ENDPOINT_URL", "API_V2_ENABLED", "TELEMETRY_V2_WRITE_ENABLED"):
+    """No setting leaks in from a developer shell: every name either example or the
+    Settings model knows is cleared."""
+    names = {*_assignments(ENV_EXAMPLE), *_assignments(PRODUCTION_ENV_EXAMPLE)}
+    names |= {field.upper() for field in Settings.model_fields}
+    for name in names:
         monkeypatch.delenv(name, raising=False)
 
 
@@ -196,17 +220,27 @@ def test_local_worker_environment_passes_the_worker_start_guard(
 
 
 @requires_docker
-def test_local_compose_config_parses_with_and_without_the_ingestion_profile() -> None:
-    base = ["docker", "compose", "-f", str(COMPOSE)]
+def test_local_compose_config_parses_with_and_without_the_ingestion_profile(
+    tmp_path: Path,
+) -> None:
+    empty = tmp_path / "empty.env"  # never a developer's repo-root `.env`
+    empty.write_text("", encoding="utf-8")
+    base = ["docker", "compose", "--env-file", str(empty), "-f", str(COMPOSE)]
 
     default = subprocess.run(
-        [*base, "config", "--services"], capture_output=True, text=True, check=True, timeout=60
+        [*base, "config", "--services"],
+        capture_output=True,
+        text=True,
+        check=True,
+        env=_compose_environment(),
+        timeout=60,
     )
     profiled = subprocess.run(
         [*base, "--profile", PROFILE, "config", "--services"],
         capture_output=True,
         text=True,
         check=True,
+        env=_compose_environment(),
         timeout=60,
     )
 
@@ -262,18 +296,36 @@ def test_production_worker_runs_as_its_own_principal() -> None:
 
     # The shared `.env` carries the API principal's AWS keys, so the worker must not load it.
     assert "env_file" not in worker
-    for name, value in WORKER_CREDENTIALS.items():
-        assert environment[name] == value, name
+    for name, variable in WORKER_CREDENTIALS.items():
+        # `${VAR}`, optionally with a `:?` required-variable guard.
+        assert re.fullmatch(rf"\$\{{{variable}(:?\?[^}}]*)?\}}", environment[name]), name
     raw = json.dumps(worker)
     assert "${AWS_ACCESS_KEY_ID" not in raw
     assert "${AWS_SECRET_ACCESS_KEY" not in raw
 
 
+API_ONLY_VARIABLES = re.compile(
+    r"^(AWS_ACCESS_KEY_ID|AWS_SECRET_ACCESS_KEY|AWS_SESSION_TOKEN|INFLUXDB_TOKEN|INFLUXDB_INIT_.*"
+    r"|COGNITO_.*|TELEGRAM_.*|REDIS_.*)$"
+)
+
+
+def test_production_worker_interpolates_no_api_only_variable() -> None:
+    worker = _services(PRODUCTION_COMPOSE)[WORKER]
+
+    referenced = {match.group("name") for match in INTERPOLATION.finditer(json.dumps(worker))}
+    assert referenced, "the worker interpolates its settings"
+    assert not {name for name in referenced if API_ONLY_VARIABLES.match(name)}
+
+
 def test_production_worker_gets_its_queue_and_a_dedicated_influx_write_token() -> None:
     environment = _environment(_services(PRODUCTION_COMPOSE)[WORKER])
 
-    assert environment["SQS_TELEMETRY_INGRESS_QUEUE_URL"] == "${SQS_TELEMETRY_INGRESS_QUEUE_URL}"
-    assert environment["INFLUXDB_TOKEN"] == "${TELEMETRY_INGEST_INFLUXDB_TOKEN}"
+    for name, variable in (
+        ("SQS_TELEMETRY_INGRESS_QUEUE_URL", "SQS_TELEMETRY_INGRESS_QUEUE_URL"),
+        ("INFLUXDB_TOKEN", "TELEMETRY_INGEST_INFLUXDB_TOKEN"),
+    ):
+        assert re.fullmatch(rf"\$\{{{variable}(:?\?[^}}]*)?\}}", environment[name]), name
     assert environment["INFLUXDB_URL"] == "http://influxdb:8086"
     assert "SQS_ENDPOINT_URL" not in environment
     assert "DYNAMODB_ENDPOINT_URL" not in environment
@@ -299,6 +351,12 @@ def test_production_worker_environment_validates_from_the_production_example(
     assert settings.telemetry_v2_write_enabled is True
     assert settings.sqs_telemetry_ingress_queue_url == variables["SQS_TELEMETRY_INGRESS_QUEUE_URL"]
     assert settings.dynamodb_domain_table == variables["DYNAMODB_DOMAIN_TABLE"]
+    assert settings.dynamodb_audit_table == variables["DYNAMODB_AUDIT_TABLE"]
+    assert settings.aws_region == variables["AWS_REGION"]
+    assert settings.influxdb_url == "http://influxdb:8086"
+    assert settings.influxdb_org == variables["INFLUXDB_ORG"]
+    assert settings.influxdb_bucket_raw == variables["INFLUXDB_BUCKET_RAW"]
+    assert settings.influxdb_token == variables["TELEMETRY_INGEST_INFLUXDB_TOKEN"]
     assert settings.dynamodb_endpoint_url is None
     assert settings.sqs_endpoint_url is None
     assert environment["AWS_ACCESS_KEY_ID"] == variables["TELEMETRY_INGEST_AWS_ACCESS_KEY_ID"]
@@ -313,6 +371,14 @@ def test_production_worker_writes_stay_off_until_the_owner_flips_them() -> None:
     }
 
     assert environment.get("TELEMETRY_V2_WRITE_ENABLED", "false") == "false"
+    # The worker follows the shared legacy dual-write switch, off by default.
+    assert environment.get("TELEMETRY_LEGACY_DUAL_WRITE_ENABLED", "false") == "false"
+    variables["TELEMETRY_LEGACY_DUAL_WRITE_ENABLED"] = "true"
+    flipped = {
+        name: _interpolate(value, variables)
+        for name, value in _environment(_services(PRODUCTION_COMPOSE)[WORKER]).items()
+    }
+    assert flipped["TELEMETRY_LEGACY_DUAL_WRITE_ENABLED"] == "true"
 
 
 @requires_docker
@@ -330,8 +396,9 @@ def test_rendered_production_worker_never_receives_the_api_credentials(tmp_path:
     )
     env_file = tmp_path / ".env"
     env_file.write_text("".join(f"{k}={v}\n" for k, v in variables.items()), encoding="utf-8")
-    environment = {k: v for k, v in os.environ.items() if k not in variables}
-    environment["IMAGE_TAG"] = IMAGE_TAG
+    environment = {
+        k: v for k, v in _compose_environment(IMAGE_TAG=IMAGE_TAG).items() if k not in variables
+    }
 
     result = subprocess.run(
         [
@@ -384,7 +451,7 @@ def test_production_compose_config_parses_with_and_without_the_profile(
     ]
     if profile is not None:
         command += ["--profile", profile]
-    environment = {**os.environ, "IMAGE_TAG": IMAGE_TAG}
+    environment = _compose_environment(IMAGE_TAG=IMAGE_TAG)
 
     result = subprocess.run(
         [*command, "config", "--services"],
@@ -396,6 +463,21 @@ def test_production_compose_config_parses_with_and_without_the_profile(
     )
 
     assert (WORKER in result.stdout.split()) is (profile is not None)
+
+
+def _seconds(duration: str) -> float:
+    match = re.fullmatch(r"(?:(?P<m>[0-9]+)m)?(?:(?P<s>[0-9]+)s)?", str(duration))
+    assert match is not None and duration, duration
+    return int(match.group("m") or 0) * 60 + int(match.group("s") or 0)
+
+
+@pytest.mark.parametrize("path", [COMPOSE, PRODUCTION_COMPOSE], ids=["local", "production"])
+def test_worker_stop_grace_outlasts_the_default_drain(path: Path) -> None:
+    """Docker's default 10 s before SIGKILL would cut the 30 s SIGTERM drain short."""
+    worker = _services(path)[WORKER]
+    drain = Settings(_env_file=None, app_env="test", auth_mode="dev").telemetry_ingest_drain_seconds
+
+    assert _seconds(worker["stop_grace_period"]) > drain
 
 
 # --- Env examples --------------------------------------------------------------------------------

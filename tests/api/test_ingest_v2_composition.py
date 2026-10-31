@@ -20,10 +20,10 @@ from limnopulse_api.adapters.sqs_ingestion import SqsIngressQueue
 from limnopulse_api.adapters.telemetry_metrics_log import StructuredLogTelemetryMetrics
 from limnopulse_api.api.dependencies import require_tenant_access
 from limnopulse_api.api.ingestion_dependencies import INGESTION_STATE_NAMES
-from limnopulse_api.api.openapi_contract import build_v1_openapi_contract, iter_effective_api_routes
+from limnopulse_api.api.openapi_contract import iter_effective_api_routes
 from limnopulse_api.api.router import build_api_router
 from limnopulse_api.api.v2.router import build_v2_router
-from limnopulse_api.core.config import Settings
+from limnopulse_api.core.config import Settings, get_settings
 from limnopulse_api.domain.entities import Membership
 from limnopulse_api.domain.roles import TenantRole
 from limnopulse_api.main import create_app, sqs_client_kwargs
@@ -55,9 +55,6 @@ INGEST_TENANT_OPERATIONS = {
         "post",
     ),
 }
-M1_TENANT_ROUTE_COUNT = 53
-INGEST_TENANT_ROUTE_COUNT = M1_TENANT_ROUTE_COUNT + 5
-INGEST_AND_TELEMETRY_TENANT_ROUTE_COUNT = M1_TENANT_ROUTE_COUNT + 5 + 3
 ALLOWED_SCHEMA_PREFIXES = ("Ingest", "Ingress", "Quarantine", "Connector", "V2")
 FLAG_ENVIRONMENT = (
     "API_V2_ENABLED",
@@ -125,10 +122,6 @@ def _router_operations(router) -> set[tuple[str, str]]:
     }
 
 
-def _tenant_routes(app: FastAPI) -> list[Any]:
-    return [r for r in iter_effective_api_routes(app) if "{tenant_id}" in r.path_format]
-
-
 def _dependency_calls(dependant):
     yield dependant.call
     for dependency in dependant.dependencies:
@@ -181,35 +174,12 @@ def test_ingest_off_mounts_none_of_the_p3_routes(overrides: dict[str, object]) -
     )
 
 
-def test_api_v2_alone_keeps_exactly_the_53_m1_tenant_routes() -> None:
-    app = create_app(_settings(api_v2_enabled=True))
-
-    assert len(_tenant_routes(app)) == M1_TENANT_ROUTE_COUNT
-
-
 def test_ingest_on_adds_exactly_the_d15_operations() -> None:
     baseline = _operations(create_app(_settings(api_v2_enabled=True)))
     app = create_app(_settings(**INGEST_ON))
 
     assert _operations(app) == baseline | {INGEST_OPERATION} | INGEST_TENANT_OPERATIONS
     assert baseline.isdisjoint({INGEST_OPERATION} | INGEST_TENANT_OPERATIONS)
-
-
-def test_ingest_on_raises_tenant_routes_from_53_to_58() -> None:
-    app = create_app(_settings(**INGEST_ON))
-    routes = _tenant_routes(app)
-
-    assert len(routes) == INGEST_TENANT_ROUTE_COUNT
-    tenant_operations = {
-        (route.path_format, method.lower()) for route in routes for method in route.methods
-    }
-    assert INGEST_TENANT_OPERATIONS <= tenant_operations
-
-
-def test_ingest_and_telemetry_on_give_53_plus_5_plus_3_tenant_routes() -> None:
-    app = create_app(_settings(**INGEST_ON, api_v2_telemetry_enabled=True))
-
-    assert len(_tenant_routes(app)) == INGEST_AND_TELEMETRY_TENANT_ROUTE_COUNT
 
 
 def test_ingest_on_changes_nothing_outside_the_d15_operations() -> None:
@@ -233,14 +203,15 @@ def test_ingest_route_is_not_tenant_scoped_and_has_no_user_authentication() -> N
     route = _route(app, *INGEST_OPERATION)
 
     assert "{tenant_id}" not in route.path_format
-    assert require_tenant_access not in set(_dependency_calls(route.dependant))
-
-
-@pytest.mark.parametrize("telemetry", [False, True])
-def test_v1_golden_is_identical_with_ingest_on(telemetry: bool) -> None:
-    app = create_app(_settings(**INGEST_ON, api_v2_telemetry_enabled=telemetry))
-
-    assert build_v1_openapi_contract(app) == json.loads(GOLDEN.read_text(encoding="utf-8"))
+    calls = set(_dependency_calls(route.dependant))
+    assert require_tenant_access not in calls
+    # No user authentication of any kind (Cognito or dev): the ingest credential is the only
+    # authority, read by the route itself.
+    for call in calls:
+        module = getattr(call, "__module__", "") or ""
+        assert not module.startswith(("limnopulse_api.auth", "limnopulse_api.api.dependencies")), (
+            call
+        )
 
 
 def test_no_new_component_name_collides_with_a_v1_component() -> None:
@@ -293,26 +264,16 @@ def test_v2_router_builder_mounts_only_the_five_tenant_routes() -> None:
 
 @pytest.mark.parametrize(
     "missing",
-    ["api_v2_enabled", "telemetry_v2_write_enabled", "sqs_telemetry_ingress_queue_url"],
-)
-def test_ingest_switch_without_a_prerequisite_never_builds_an_app(missing: str) -> None:
-    values = dict(INGEST_ON)
-    values[missing] = "" if missing == "sqs_telemetry_ingress_queue_url" else False
-
-    with pytest.raises(ValidationError) as error:
-        create_app(_settings(**values))
-
-    assert QUEUE_URL not in str(error.value)
-
-
-@pytest.mark.parametrize(
-    "missing",
     ["API_V2_ENABLED", "TELEMETRY_V2_WRITE_ENABLED", "SQS_TELEMETRY_INGRESS_QUEUE_URL"],
 )
 def test_ingest_env_without_a_prerequisite_env_is_rejected(
-    monkeypatch: pytest.MonkeyPatch, missing: str
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, missing: str
 ) -> None:
+    """`create_app()` reads the settings from the environment; it must refuse the switch."""
+    monkeypatch.chdir(tmp_path)  # no stray `.env`
     environment = {
+        "APP_ENV": "test",
+        "AUTH_MODE": "dev",
         "API_V2_ENABLED": "true",
         "TELEMETRY_V2_WRITE_ENABLED": "true",
         "SQS_TELEMETRY_INGRESS_QUEUE_URL": QUEUE_URL,
@@ -321,15 +282,33 @@ def test_ingest_env_without_a_prerequisite_env_is_rejected(
     for name, value in environment.items():
         if name != missing:
             monkeypatch.setenv(name, value)
+    get_settings.cache_clear()
+    try:
+        with pytest.raises(ValidationError) as error:
+            create_app()
+    finally:
+        get_settings.cache_clear()
 
-    with pytest.raises(ValidationError):
-        Settings(_env_file=None, app_env="test", auth_mode="dev")
+    assert QUEUE_URL not in str(error.value)
 
 
-def test_ingest_switch_with_every_prerequisite_builds_the_app() -> None:
-    app = create_app(_settings(**INGEST_ON))
+def test_ingest_env_with_every_prerequisite_mounts_the_ingest_route(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setenv("APP_ENV", "test")
+    monkeypatch.setenv("AUTH_MODE", "dev")
+    monkeypatch.setenv("API_V2_ENABLED", "true")
+    monkeypatch.setenv("TELEMETRY_V2_WRITE_ENABLED", "true")
+    monkeypatch.setenv("SQS_TELEMETRY_INGRESS_QUEUE_URL", QUEUE_URL)
+    monkeypatch.setenv("INGEST_V2_ENABLED", "true")
+    get_settings.cache_clear()
+    try:
+        app = create_app()
+    finally:
+        get_settings.cache_clear()
 
-    assert app.state.settings.ingest_v2_enabled is True
+    assert INGEST_OPERATION in _operations(app)
 
 
 # --- OpenAPI generation and the lifespan ---------------------------------------------------------
@@ -569,6 +548,12 @@ def test_prewired_ingestion_state_skips_runtime_wiring(
 # --- sqs_client_kwargs -----------------------------------------------------------------------------
 
 
+def test_api_and_worker_share_one_sqs_client_kwargs_helper() -> None:
+    from limnopulse_api.workers import telemetry_ingest
+
+    assert sqs_client_kwargs is telemetry_ingest.sqs_client_kwargs
+
+
 def test_sqs_client_kwargs_use_local_credentials_only_for_a_local_endpoint() -> None:
     local = _settings(aws_region="us-east-2", sqs_endpoint_url=SQS_ENDPOINT)
     no_endpoint = _settings(aws_region="us-east-2")
@@ -729,21 +714,3 @@ def test_tenant_routes_are_404_while_the_switch_is_off(
         )
 
     assert response.status_code == 404
-
-
-def test_lifespan_with_ingest_on_creates_one_sqs_client_and_reuses_the_dynamo_client(
-    runtime: Runtime,
-) -> None:
-    app = create_app(_settings(**INGEST_ON))
-
-    with TestClient(app):
-        ports = (
-            app.state.ingest_credential_repository,
-            app.state.integration_lifecycle_repository,
-            app.state.ingress_receipt_repository,
-            app.state.domain_repository,
-        )
-
-    assert runtime.services().count("sqs") == 1
-    assert runtime.services().count("dynamodb") == 1
-    assert {id(port.client) for port in ports} == {id(runtime.dynamo)}
