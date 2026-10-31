@@ -23,7 +23,7 @@ from limnopulse_api.adapters.dynamodb_integrations import (
     external_identity_lookup_to_item,
     integration_account_to_item,
 )
-from limnopulse_api.adapters.dynamodb_v2 import account_scoped_identity_hash
+from limnopulse_api.adapters.dynamodb_v2 import external_identity_hash
 from limnopulse_api.domain.devices_v2 import DeviceComponent, DeviceV2
 from limnopulse_api.domain.integrations import (
     DeviceIntegration,
@@ -108,6 +108,7 @@ class FaultingClient:
         self.inner = inner
         self.calls: list[StoreCall] = []
         self._faults: list[tuple[str, str | None, str | None, BaseException]] = []
+        self._before: dict[str, list[Callable[[], None]]] = {}
 
     def fail_next(
         self,
@@ -118,6 +119,11 @@ class FaultingClient:
         sk_prefix: str | None = None,
     ) -> None:
         self._faults.append((operation, pk_prefix, sk_prefix, exc))
+
+    def before_next(self, operation: str, action: Callable[[], None]) -> None:
+        """Run `action` once just before the next `operation` reaches the store (for example a
+        concurrent writer bumping a version between an adapter's read and its write)."""
+        self._before.setdefault(operation, []).append(action)
 
     def _raise_armed(self, operation: str, keys: Sequence[tuple[str | None, str | None]]) -> None:
         for index, (wanted, pk_prefix, sk_prefix, exc) in enumerate(self._faults):
@@ -141,6 +147,9 @@ class FaultingClient:
                 StoreCall(name, keys, bool(request.get("ConsistentRead", False)), request)
             )
             self._raise_armed(name, keys)
+            pending = self._before.get(name)
+            if pending:
+                pending.pop(0)()
             return attribute(**request)
 
         return call
@@ -295,7 +304,7 @@ def _lookup(integration: DeviceIntegration, **overrides: Any) -> dict[str, Any]:
 
 INCONSISTENT_ROWS: tuple[tuple[str, dict[str, Any], dict[str, Any]], ...] = (
     # (case, lookup-row overrides, DI-row overrides)
-    ("lookup names another tenant", {"tenant_id": OTHER_TENANT}, {}),
+    ("lookup names another tenant", {"tenant_id": OTHER_TENANT}, {}),  # row exists there too
     ("lookup names another device", {"device_id": OTHER_DEVICE}, {}),
     ("lookup names another integration", {"device_integration_id": OTHER_INTEGRATION}, {}),
     ("integration row carries another hash", {}, {"external_identity_hash": "e" * 64}),
@@ -318,6 +327,10 @@ async def test_resolve_rejects_inconsistent_rows(
     integration = device_integration()
     keys = subject.integrations.keys
     subject.put({**device_integration_to_item(integration, keys), **row_overrides})
+    if "tenant_id" in lookup_overrides:
+        # A row exists at the other tenant's key, but it still belongs to this tenant.
+        other = device_integration(tenant_id=OTHER_TENANT)
+        subject.put({**device_integration_to_item(other, keys), "tenant_id": TENANT})
     if "device_integration_id" in lookup_overrides:
         # The lookup points at a second row whose stored id disagrees with its key.
         other = device_integration(device_integration_id=OTHER_INTEGRATION)
@@ -349,12 +362,14 @@ async def test_resolve_ignores_a_row_of_another_entity_type_at_the_integration_k
 
 
 @pytest.mark.asyncio
-async def test_resolve_never_falls_back_to_the_global_hash() -> None:
+async def test_a_pre_p3_04_global_hash_row_is_not_the_account_scoped_identity() -> None:
+    # D22: a DeviceIntegration stored under the M1 global hash never answers the scoped hash.
     subject = fake_subject()
-    await subject.seed_device_integration(device_integration())
-    scoped = account_scoped_identity_hash(PROVIDER, "ia_" + "0" * 32, EXTERNAL_DEVICE)
+    await subject.seed_device_integration(
+        device_integration(external_identity_hash=external_identity_hash(PROVIDER, EXTERNAL_DEVICE))
+    )
 
-    assert await subject.resolver.resolve_external_identity(PROVIDER, scoped) is None
+    assert await subject.resolver.resolve_external_identity(PROVIDER, IDENTITY_HASH) is None
 
 
 @pytest.mark.asyncio

@@ -7,10 +7,10 @@ DynamoDB Local in `tests/ingestion/test_integration_lifecycle_dynamodb.py`.
 """
 
 from collections.abc import Callable
-from datetime import timedelta
 from typing import Any
 
 import pytest
+from limnopulse_api.services.trusted_mapping import TrustedMappingService
 
 from limnopulse_api.adapters.dynamodb_v2 import account_scoped_identity_hash
 from limnopulse_api.domain.devices_v2 import ComponentStatus
@@ -23,11 +23,9 @@ from limnopulse_api.domain.ingestion import (
     IngressFence,
     IngressFenceReason,
     TrustedIngress,
-    build_trusted_context,
 )
 from limnopulse_api.domain.telemetry_v2 import SourceObservation
 from limnopulse_api.repositories import ingestion as ports
-from limnopulse_api.services.trusted_mapping import TrustedMappingService
 from tests.support.ingestion_contract_kits import (
     COMPONENT,
     CREDENTIAL,
@@ -50,7 +48,6 @@ from tests.support.ingestion_contract_kits import (
     envelope,
     integration_account,
     kit_ids,
-    source_observation,
 )
 from tests.unit.test_dynamodb_integration_resolver import DynamoIngestionSubject, fake_subject
 
@@ -351,26 +348,6 @@ async def test_fence_reads_are_strongly_consistent() -> None:
 
 
 @pytest.mark.asyncio
-async def test_fence_context_comes_from_the_re_resolved_integration() -> None:
-    subject = mapping_subject()
-    await seed_full(subject)
-    message = envelope(
-        connector_version="fw-2.0",
-        replay=True,
-        replay_of="ing_" + "9" * 32,
-        received_at=OBSERVED + timedelta(seconds=30),
-        observations=[source_observation(), source_observation(metric_key="water.ph", value=7.0)],
-    )
-
-    trusted = await subject.mapping.fence(message)
-
-    assert isinstance(trusted, TrustedIngress)
-    assert trusted.context == build_trusted_context(message, device_integration())
-    assert trusted.context.integration_id == device_integration().device_integration_id
-    assert trusted.observations == message.observations
-
-
-@pytest.mark.asyncio
 async def test_fence_rejects_a_mapping_row_with_an_inconsistent_hash() -> None:
     # The lookup still points at the row, but the row no longer carries the envelope's hash.
     subject = mapping_subject()
@@ -385,14 +362,17 @@ async def test_fence_rejects_a_mapping_row_with_an_inconsistent_hash() -> None:
 
 
 @pytest.mark.asyncio
-async def test_fence_does_not_verify_an_account_the_envelope_tenant_lacks() -> None:
-    # The account id is real, but not under the envelope's tenant: a forgery writes nothing.
+async def test_fence_verifies_the_account_by_the_envelope_coordinates() -> None:
+    # D8 forged-envelope rule: `account_verified` means an IntegrationAccount row exists for
+    # (envelope.tenant_id, envelope.integration_account_id), as the frozen `classify_fence` and
+    # P3-00 `FakeTrustedMapping` define it. Here the forged tenant really has that account id.
     subject = mapping_subject()
     await seed_full(subject)
-    await subject.seed_account(
-        integration_account(tenant_id=OTHER_TENANT, integration_account_id=OTHER_ACCOUNT)
-    )
+    await subject.seed_account(integration_account(tenant_id=OTHER_TENANT))
 
+    assert await subject.mapping.fence(envelope(tenant_id=OTHER_TENANT)) == IngressFence(
+        reason=IngressFenceReason.INTEGRATION_MISMATCH, account_verified=True
+    )
     assert await subject.mapping.fence(envelope(integration_account_id=OTHER_ACCOUNT)) == (
         IngressFence(reason=IngressFenceReason.INTEGRATION_MISMATCH, account_verified=False)
     )

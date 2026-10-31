@@ -34,6 +34,7 @@ GATED = "cmp_" + "1" * 32
 UNGATED = "cmp_" + "2" * 32
 HYBRID = "cmp_" + "3" * 32
 GATED_HYBRID = "cmp_" + "4" * 32
+CASED = "cmp_" + "5" * 32
 
 
 def probe(component_id: str, keys: tuple[str, ...], *, kind: ComponentKind) -> DeviceComponent:
@@ -62,6 +63,7 @@ COMPONENTS = {
     UNGATED: probe(UNGATED, (), kind=ComponentKind.PROBE),
     HYBRID: probe(HYBRID, (), kind=ComponentKind.HYBRID),
     GATED_HYBRID: probe(GATED_HYBRID, ("water.dissolved_oxygen",), kind=ComponentKind.HYBRID),
+    CASED: probe(CASED, ("Water.PH",), kind=ComponentKind.PROBE),
 }
 
 
@@ -206,6 +208,17 @@ async def test_the_gate_matches_metric_keys_exactly() -> None:
     )
 
     assert [item.observation.metric_key for item in result.accepted] == ["water.ph"]
+    assert [item.reason for item in result.quarantined] == [
+        QuarantineReason.COMPONENT_NOT_MEASURING
+    ]
+
+
+@pytest.mark.asyncio
+async def test_a_case_variant_declaration_does_not_admit_a_catalog_metric() -> None:
+    # `water.ph` is in the catalog, so only an exact-match gate quarantines it here.
+    result = await normalizer().normalize(CONTEXT, [observation(CASED, "water.ph")])
+
+    assert result.accepted == ()
     assert [item.reason for item in result.quarantined] == [
         QuarantineReason.COMPONENT_NOT_MEASURING
     ]

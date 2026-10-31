@@ -92,11 +92,6 @@ async def create(
     return json.loads(result.snapshot_json)
 
 
-def test_https_direct_is_the_https_provider() -> None:
-    assert HTTPS in HTTPS_PROVIDER_KEYS
-    assert VENDOR not in HTTPS_PROVIDER_KEYS
-
-
 @pytest.mark.asyncio
 async def test_two_tenants_https_accounts_each_claim_the_same_external_id() -> None:
     subject = fake_subject()
@@ -146,6 +141,19 @@ async def test_non_https_providers_keep_the_global_hash() -> None:
     assert created["external_identity_hash"] == external_identity_hash(VENDOR, POND)
     with pytest.raises(ConflictError, match="external identity already claimed"):
         await create(subject, OTHER_TENANT, OTHER_DEVICE, OTHER_ACCOUNT, key="namespace-key-02")
+
+
+@pytest.mark.asyncio
+async def test_only_providers_in_the_https_set_are_account_scoped() -> None:
+    # Membership in HTTPS_PROVIDER_KEYS decides, never a name that merely looks like HTTPS.
+    lookalike = "https_legacy"
+    assert lookalike not in HTTPS_PROVIDER_KEYS
+    subject = fake_subject()
+    await seed_world(subject, provider_key=lookalike)
+
+    created = await create(subject, TENANT, DEVICE, ACCOUNT)
+
+    assert created["external_identity_hash"] == external_identity_hash(lookalike, POND)
 
 
 @pytest.mark.asyncio

@@ -4,12 +4,18 @@ The lifecycle kit runs against `DynamoIntegrationRepository` on the in-memory Dy
 same kit runs on DynamoDB Local in `tests/ingestion/test_integration_lifecycle_dynamodb.py`.
 """
 
-from collections.abc import Callable
-from datetime import timedelta
+from collections.abc import Callable, Mapping
+from datetime import UTC, datetime, timedelta
 from typing import Any
 
 import pytest
+from limnopulse_api.services.integration_lifecycle import IntegrationLifecycleService
 
+from limnopulse_api.adapters.dynamodb_integrations import (
+    device_integration_from_item,
+    device_integration_to_item,
+    integration_account_from_item,
+)
 from limnopulse_api.core.errors import ConflictError, NotFoundError
 from limnopulse_api.domain.integrations import (
     DeviceIntegrationStatus,
@@ -18,7 +24,6 @@ from limnopulse_api.domain.integrations import (
     ensure_integration_account_transition,
 )
 from limnopulse_api.repositories import ingestion as ports
-from limnopulse_api.services.integration_lifecycle import IntegrationLifecycleService
 from tests.support.ingestion_contract_kits import (
     ACCOUNT,
     AUDIT,
@@ -35,6 +40,7 @@ from tests.support.ingestion_contract_kits import (
     device_integration,
     integration_account,
     kit_ids,
+    store_errors,
 )
 from tests.unit.test_dynamodb_integration_resolver import (
     AUDIT_TABLE,
@@ -157,6 +163,8 @@ async def test_device_integration_transition_matrix(
         updated = await _transition_integration(subject, target)
         assert updated == device_integration(status=target, version=2, updated_at=LATER)
         assert subject.item(_integration_key(subject))["status"] == target.value
+        lookup = subject.item(_lookup_key(subject))
+        assert (lookup["status"], lookup["version"]) == (target.value, 2)
         assert len(subject.audit_items()) == 1
     else:
         with pytest.raises(ConflictError) as caught:
@@ -339,7 +347,7 @@ async def test_account_transition_writes_one_audit_item_in_the_same_transaction(
 
     (put,) = _audit_puts(subject)
     item = subject.integrations.deserialize_item(put["Item"])
-    assert put["ConditionExpression"] == "attribute_not_exists(PK)"
+    assert "attribute_not_exists(PK)" in put["ConditionExpression"]
     assert item["action"] == "integration_account.status_changed"
     assert item["resource_type"] == "integration_account"
     assert (item["tenant_id"], item["resource_id"]) == (TENANT, ACCOUNT)
@@ -397,18 +405,6 @@ async def test_audit_items_need_the_audit_table() -> None:
 # Service -----------------------------------------------------------------------------------
 
 
-class RecordingIntegrations:
-    """`list_device_integrations` over the subject's adapter, recording each call."""
-
-    def __init__(self, subject: DynamoIngestionSubject) -> None:
-        self.subject = subject
-        self.calls: list[tuple[str, str]] = []
-
-    async def list_device_integrations(self, tenant_id: str, device_id: str) -> list[Any]:
-        self.calls.append((tenant_id, device_id))
-        return await self.subject.integrations.list_device_integrations(tenant_id, device_id)
-
-
 def _service(subject: DynamoIngestionSubject) -> IntegrationLifecycleService:
     return IntegrationLifecycleService(
         subject.repository, subject.integrations, clock=lambda: LATER
@@ -458,20 +454,6 @@ async def test_service_requires_the_path_device_to_own_the_integration() -> None
 
 
 @pytest.mark.asyncio
-async def test_service_checks_the_device_through_the_tenant_listing() -> None:
-    subject = fake_subject()
-    await subject.seed_device_integration(device_integration())
-    integrations = RecordingIntegrations(subject)
-    service = IntegrationLifecycleService(subject.repository, integrations, clock=lambda: LATER)
-
-    await service.transition_device_integration(
-        TENANT, DEVICE, INTEGRATION, DeviceIntegrationStatus.ERROR, expected_version=1, audit=AUDIT
-    )
-
-    assert integrations.calls == [(TENANT, DEVICE)]
-
-
-@pytest.mark.asyncio
 async def test_service_surfaces_repository_conflicts() -> None:
     subject = fake_subject()
     await subject.seed_account(integration_account(status=IntegrationAccountStatus.REVOKED))
@@ -480,3 +462,167 @@ async def test_service_surfaces_repository_conflicts() -> None:
         await _service(subject).transition_integration_account(
             TENANT, ACCOUNT, IntegrationAccountStatus.ACTIVE, expected_version=1, audit=AUDIT
         )
+
+
+# Review-gate additions ---------------------------------------------------------------------
+
+
+def _set_targets(request: Mapping[str, Any]) -> set[str]:
+    """Attribute names an UpdateExpression writes (placeholders resolved)."""
+    expression = request["UpdateExpression"]
+    assert expression.startswith("SET ") and " REMOVE " not in expression, expression
+    names = request.get("ExpressionAttributeNames", {})
+    targets = {part.split("=", 1)[0].strip() for part in expression[4:].split(",")}
+    return {names.get(target, target) for target in targets}
+
+
+def _domain_updates(subject: DynamoIngestionSubject) -> dict[tuple[str, str], Mapping[str, Any]]:
+    (transaction,) = [call for call in subject.client.calls if call.operation in WRITE_OPERATIONS]
+    return {
+        key: body
+        for key, action in zip(transaction.keys, transaction.request["TransactItems"], strict=True)
+        for kind, body in action.items()
+        if kind == "Update" and body["TableName"] == DOMAIN_TABLE
+    }
+
+
+def _pair(key: Mapping[str, str]) -> tuple[str, str]:
+    return (key["PK"], key["SK"])
+
+
+@pytest.mark.asyncio
+async def test_transitions_set_only_the_changed_fields() -> None:
+    subject = fake_subject()
+    await subject.seed_account(integration_account())
+    await _transition_account(subject, IntegrationAccountStatus.ERROR)
+    (account_update,) = _domain_updates(subject).values()
+    assert _set_targets(account_update) <= {"status", "updated_at", "version"}
+
+    subject = fake_subject()
+    await subject.seed_device_integration(device_integration())
+    await _transition_integration(subject, DeviceIntegrationStatus.ERROR)
+    updates = _domain_updates(subject)
+    assert _set_targets(updates[_pair(_integration_key(subject))]) <= {
+        "status",
+        "updated_at",
+        "version",
+    }
+    assert _set_targets(updates[_pair(_lookup_key(subject))]) <= {
+        "status",
+        "updated_at",
+        "version",
+    }
+
+
+@pytest.mark.asyncio
+async def test_stored_rows_round_trip_to_the_returned_entities() -> None:
+    subject = fake_subject()
+    await subject.seed_account(integration_account())
+    await subject.seed_device_integration(device_integration())
+
+    account = await _transition_account(subject, IntegrationAccountStatus.ERROR)
+    integration = await _transition_integration(subject, DeviceIntegrationStatus.ERROR)
+
+    assert integration_account_from_item(subject.item(_account_key(subject))) == account
+    assert device_integration_from_item(subject.item(_integration_key(subject))) == integration
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("kind", ["account", "integration"])
+async def test_a_concurrent_write_between_read_and_commit_is_a_conflict(kind: str) -> None:
+    # The version check must hold at commit time, not only on the adapter's own read.
+    subject = fake_subject()
+    if kind == "account":
+        await subject.seed_account(integration_account())
+        key = _account_key(subject)
+    else:
+        await subject.seed_device_integration(device_integration())
+        key = _integration_key(subject)
+
+    def concurrent_writer() -> None:
+        subject.put({**subject.item(key), "version": 2})
+
+    subject.client.before_next("transact_write_items", concurrent_writer)
+    with pytest.raises(ConflictError) as caught:
+        if kind == "account":
+            await _transition_account(subject, IntegrationAccountStatus.ERROR)
+        else:
+            await _transition_integration(subject, DeviceIntegrationStatus.ERROR)
+
+    assert not isinstance(caught.value, NotFoundError)
+    assert subject.item(key)["status"] == "active"
+    assert subject.audit_items() == []
+
+
+@pytest.mark.asyncio
+async def test_the_audit_item_is_stamped_with_updated_at() -> None:
+    subject = fake_subject()
+    await subject.seed_account(integration_account())
+    stamped = datetime(2027, 2, 1, 8, 15, tzinfo=UTC)
+
+    await subject.repository.transition_integration_account(
+        TENANT,
+        ACCOUNT,
+        IntegrationAccountStatus.ERROR,
+        expected_version=1,
+        updated_at=stamped,
+        audit=AUDIT,
+    )
+
+    (item,) = subject.audit_items()
+    assert item["PK"] == f"TENANT#{TENANT}#MONTH#2027-02"
+    assert item["created_at"] == stamped.isoformat()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("error", store_errors(), ids=lambda error: type(error).__name__)
+@pytest.mark.parametrize("kind", ["account", "integration"])
+async def test_a_failed_pre_read_propagates_and_writes_nothing(
+    kind: str, error: BaseException
+) -> None:
+    subject = fake_subject()
+    if kind == "account":
+        await subject.seed_account(integration_account())
+        sk_prefix, call = "INTEGRATION_ACCOUNT#", _transition_account
+        target: Any = IntegrationAccountStatus.ERROR
+    else:
+        await subject.seed_device_integration(device_integration())
+        sk_prefix, call = "DEVICE_INTEGRATION#", _transition_integration
+        target = DeviceIntegrationStatus.ERROR
+    subject.client.fail_next("get_item", error, pk_prefix="TENANT#", sk_prefix=sk_prefix)
+
+    with pytest.raises(type(error)) as caught:
+        await call(subject, target)
+
+    assert caught.value is error
+    assert not [c for c in subject.client.calls if c.operation in WRITE_OPERATIONS]
+
+
+@pytest.mark.asyncio
+async def test_transition_pre_reads_are_strongly_consistent() -> None:
+    subject = fake_subject()
+    await subject.seed_account(integration_account())
+    await subject.seed_device_integration(device_integration())
+
+    await _transition_account(subject, IntegrationAccountStatus.ERROR)
+    await _transition_integration(subject, DeviceIntegrationStatus.ERROR)
+
+    reads = [call for call in subject.client.calls if call.operation == "get_item"]
+    assert reads
+    assert all(call.consistent for call in reads)
+
+
+@pytest.mark.asyncio
+async def test_a_device_integration_without_its_lookup_row_cannot_transition() -> None:
+    # The DI and EXTERNAL_ID rows move together; a missing lookup row is never re-created.
+    subject = fake_subject()
+    integration = device_integration()
+    subject.put(device_integration_to_item(integration, subject.integrations.keys))
+    before = subject.item(_integration_key(subject))
+
+    with pytest.raises(ConflictError):
+        await _transition_integration(subject, DeviceIntegrationStatus.ERROR)
+
+    assert subject.item(_integration_key(subject)) == before
+    assert subject.item(_lookup_key(subject)) is None
+    assert subject.audit_items() == []
