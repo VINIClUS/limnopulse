@@ -13,6 +13,7 @@ from limnopulse_api.core.errors import IngressQueueError
 from limnopulse_api.domain.ids import replay_ingress_id
 from limnopulse_api.domain.ingestion import (
     ComponentMark,
+    IngestCredentialStatus,
     IngestMarks,
     IngestObservationBatch,
     IngressEnvelope,
@@ -41,6 +42,9 @@ from tests.support.ingestion_contract_kits import (
 )
 from tests.support.ingestion_dynamo_fake import IngestionDynamoClient
 from tests.support.ingestion_fakes import (
+    FakeIngressQueue,
+    Faults,
+    credential_subject,
     quarantine_subject,
     queue_subject,
     trusted_mapping_subject,
@@ -305,3 +309,121 @@ def test_fence_rows_bound_oversized_observations() -> None:
     assert (oversized.truncated, oversized.replayable) == (True, False)
     json.loads(oversized.source_observation_json)  # still valid JSON
     assert (regular.truncated, regular.replayable) == (False, True)
+
+
+# Orchestrator PR audit (21a3fd9) --------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "parameters",
+    [
+        {"max_messages": 0, "wait_seconds": 0, "visibility_seconds": 30},
+        {"max_messages": 11, "wait_seconds": 0, "visibility_seconds": 30},
+        {"max_messages": 1, "wait_seconds": 21, "visibility_seconds": 30},
+        {"max_messages": 1, "wait_seconds": -1, "visibility_seconds": 30},
+        {"max_messages": 1, "wait_seconds": 0, "visibility_seconds": 43_201},
+        {"max_messages": 1, "wait_seconds": 0, "visibility_seconds": -1},
+    ],
+    ids=["max-0", "max-11", "wait-21", "wait-neg", "visibility-high", "visibility-neg"],
+)
+async def test_fake_queue_rejects_out_of_range_receive_parameters(parameters: dict) -> None:
+    subject = queue_subject()
+    await subject.producer.send(envelope())
+
+    with pytest.raises(IngressQueueError) as exc_info:
+        await subject.consumer.receive(**parameters)
+
+    assert exc_info.value.retryable is False
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("seconds", [-5, 43_201, 99_999])
+async def test_fake_queue_rejects_out_of_range_visibility_changes(seconds: int) -> None:
+    subject = queue_subject()
+    await subject.producer.send(envelope())
+    (message,) = await subject.consumer.receive(
+        max_messages=1, wait_seconds=0, visibility_seconds=30
+    )
+
+    with pytest.raises(IngressQueueError):
+        await subject.consumer.change_visibility(message, seconds)
+    await subject.consumer.change_visibility(message, 43_200)
+
+
+@pytest.mark.asyncio
+async def test_fake_queue_refuses_heartbeats_after_visibility_lapsed() -> None:
+    clock = [100.0]
+    queue = FakeIngressQueue(Faults(), clock=lambda: clock[0])
+    await queue.send(envelope())
+    (message,) = await queue.receive(max_messages=1, wait_seconds=0, visibility_seconds=30)
+
+    await queue.change_visibility(message, 30)  # in flight: extends to 130
+    clock[0] = 131.0
+    with pytest.raises(IngressQueueError) as exc_info:
+        await queue.change_visibility(message, 30)
+
+    assert exc_info.value.retryable is False
+
+
+@pytest.mark.asyncio
+async def test_fake_credentials_issue_only_active_credentials() -> None:
+    subject = credential_subject()
+    await subject.seed_account(integration_account())
+    revoked = credential(
+        status=IngestCredentialStatus.REVOKED, revoked_at=RECEIVED, updated_at=RECEIVED
+    )
+
+    with pytest.raises(ValueError):
+        await subject.repository.create_ingest_credential(revoked, AUDIT)
+
+    assert await subject.repository.get_ingest_credential(revoked.ingest_credential_id) is None
+    assert subject.audit_items() == []
+
+
+@pytest.mark.asyncio
+async def test_fake_revoke_frees_only_its_own_slot() -> None:
+    subject = credential_subject()
+    await subject.seed_account(integration_account())
+    # A seeded credential claims slot 1 without owning the slot row (the row is someone else's).
+    stray = credential()
+    await subject.seed_credential(stray)
+    other = "ic_" + "c" * 32
+    subject.store.slots[(TENANT, ACCOUNT, 1)] = other
+
+    await subject.repository.revoke_ingest_credential(
+        TENANT,
+        ACCOUNT,
+        stray.ingest_credential_id,
+        expected_version=1,
+        revoked_at=RECEIVED,
+        audit=AUDIT,
+    )
+
+    assert subject.store.slots[(TENANT, ACCOUNT, 1)] == other
+
+
+def test_fake_faults_reject_unknown_operations() -> None:
+    subject = credential_subject()
+
+    with pytest.raises(ValueError):
+        subject.fail_next("get_credential_typo", RuntimeError("x"))
+    subject.fail_next("get_ingest_credential", RuntimeError("x"))
+    subject.fail_next("get_component", RuntimeError("x"))
+
+
+def test_dynamo_transaction_fault_matches_any_item() -> None:
+    client = IngestionDynamoClient()
+    error = EndpointConnectionError(endpoint_url="http://dynamodb.invalid")
+    client.fail_next("transact_write_items", error, pk_prefix="AUDIT#")
+
+    with pytest.raises(EndpointConnectionError) as exc_info:
+        client.transact_write_items(
+            TransactItems=[
+                {"Put": {"TableName": "t", "Item": _encode({"PK": "TENANT#t", "SK": "A"})}},
+                {"Put": {"TableName": "t", "Item": _encode({"PK": "AUDIT#t", "SK": "B"})}},
+            ]
+        )
+
+    assert exc_info.value is error
+    assert client.items == {}

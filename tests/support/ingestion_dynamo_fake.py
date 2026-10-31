@@ -57,12 +57,12 @@ class IngestionDynamoClient(ConditionalDynamoClient):
         "transact_write_items") whose partition key starts with `pk_prefix`, if given."""
         self._faults[operation].append((pk_prefix, exc))
 
-    def _check_fault(self, operation: str, pk: str | None) -> None:
+    def _check_fault(self, operation: str, *pks: str | None) -> None:
         pending = self._faults.get(operation)
         if not pending:
             return
         for index, (prefix, exc) in enumerate(pending):
-            if prefix is None or (pk is not None and pk.startswith(prefix)):
+            if prefix is None or any(pk is not None and pk.startswith(prefix) for pk in pks):
                 del pending[index]
                 raise exc
 
@@ -135,8 +135,15 @@ class IngestionDynamoClient(ConditionalDynamoClient):
         for action in actions:
             for body in action.values():
                 _assert_placeholders_used(body)
-        first = next(iter(actions[0].values())) if actions else {}
-        self._check_fault("transact_write_items", self._pk(first.get("Item") or first.get("Key")))
+        # A partition-scoped fault fires when ANY item of the transaction is in that partition.
+        self._check_fault(
+            "transact_write_items",
+            *(
+                self._pk(body.get("Item") or body.get("Key"))
+                for action in actions
+                for body in action.values()
+            ),
+        )
         with self.lock:
             self.write_calls += 1
             self.transactions.append(actions)

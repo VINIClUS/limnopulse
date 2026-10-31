@@ -29,6 +29,7 @@ from limnopulse_api.domain.ids import default_component_id_for_legacy_device
 from limnopulse_api.domain.ingestion import (
     HTTPS_PROVIDER_KEYS,
     MAX_INGRESS_MESSAGE_BYTES,
+    MAX_VISIBILITY_SECONDS,
     AuthenticatedSource,
     ComponentIngestState,
     ConnectorHealth,
@@ -69,6 +70,8 @@ from limnopulse_api.domain.integrations import (
     ensure_integration_account_transition,
 )
 from limnopulse_api.domain.telemetry_v2 import SourceObservation
+from limnopulse_api.repositories import ingestion as ingestion_ports
+from tests.support.ingestion_contract_kits import STORE_READS
 
 _ISSUABLE = frozenset({IntegrationAccountStatus.PENDING, IntegrationAccountStatus.ACTIVE})
 _DUMMY_DIGEST = "0" * 64
@@ -78,6 +81,20 @@ def _now() -> datetime:
     return datetime.now(UTC)
 
 
+def _known_operations() -> frozenset[str]:
+    """Every P3 port method name plus the named store reads (`STORE_READS`)."""
+    operations = set(STORE_READS)
+    for value in vars(ingestion_ports).values():
+        if isinstance(value, type) and getattr(value, "_is_protocol", False):
+            if value.__module__ == ingestion_ports.__name__:
+                operations.update(
+                    name
+                    for name, member in vars(value).items()
+                    if not name.startswith("_") and callable(member)
+                )
+    return frozenset(operations)
+
+
 class Faults:
     """One-shot failures keyed by operation name."""
 
@@ -85,12 +102,17 @@ class Faults:
         self._pending: dict[str, list[BaseException]] = defaultdict(list)
 
     def fail_next(self, operation: str, exc: BaseException) -> None:
+        if operation not in KNOWN_OPERATIONS:
+            raise ValueError(f"unknown fault operation: {operation}")
         self._pending[operation].append(exc)
 
     def check(self, operation: str) -> None:
         pending = self._pending.get(operation)
         if pending:
             raise pending.pop(0)
+
+
+KNOWN_OPERATIONS = _known_operations()
 
 
 class IngestionStore:
@@ -183,6 +205,8 @@ class FakeIngestCredentialRepository:
             raise NotFoundError("integration account not found")
         if account.status not in _ISSUABLE or account.provider_key not in HTTPS_PROVIDER_KEYS:
             raise ConflictError("integration account cannot issue ingest credentials")
+        if credential.status != IngestCredentialStatus.ACTIVE or credential.revoked_at is not None:
+            raise ValueError("a new ingest credential must be active")
         slot = (credential.tenant_id, credential.integration_account_id, credential.slot)
         if slot in self.store.slots or credential.ingest_credential_id in self.store.credentials:
             raise ConflictError("ingest credential slot is taken")
@@ -233,7 +257,10 @@ class FakeIngestCredentialRepository:
             }
         )
         self.store.credentials[ingest_credential_id] = revoked
-        self.store.slots.pop((tenant_id, integration_account_id, current.slot), None)
+        slot = (tenant_id, integration_account_id, current.slot)
+        # The D2 slot Delete is conditioned on `ingest_credential_id = :ic`.
+        if self.store.slots.get(slot) == ingest_credential_id:
+            del self.store.slots[slot]
         self.store.audit.append(
             ingest_audit_item(
                 action="ingest_credential.revoked",
@@ -529,6 +556,9 @@ class FakeIngressQueue:
         self, *, max_messages: int, wait_seconds: int, visibility_seconds: int
     ) -> list[IngressQueueMessage]:
         self.faults.check("receive")
+        _require_range("max_messages", max_messages, 1, 10)
+        _require_range("wait_seconds", wait_seconds, 0, 20)
+        _require_range("visibility_seconds", visibility_seconds, 0, MAX_VISIBILITY_SECONDS)
         now = self.clock()
         received: list[IngressQueueMessage] = []
         for message_id, message in self.messages.items():
@@ -562,8 +592,13 @@ class FakeIngressQueue:
         stored = self.messages.get(message.message_id)
         if stored is None:
             raise IngressQueueError("message is no longer on the queue", retryable=False)
+        _require_range("seconds", seconds, 0, MAX_VISIBILITY_SECONDS)
         self._require_current_handle(stored, message)
-        stored["visible_at"] = self.clock() + seconds
+        now = self.clock()
+        if stored["visible_at"] <= now:
+            # Like SQS `MessageNotInflight`: a late heartbeat must not re-hide a lapsed message.
+            raise IngressQueueError("message is not in flight", retryable=False)
+        stored["visible_at"] = now + seconds
 
     @staticmethod
     def _require_current_handle(stored: dict[str, Any], message: IngressQueueMessage) -> None:
@@ -582,6 +617,12 @@ class FakeIngressQueue:
             "receipt_handle": "",
         }
         return message_id
+
+
+def _require_range(name: str, value: int, low: int, high: int) -> None:
+    """SQS rejects these parameters out of range; so does the fake."""
+    if isinstance(value, bool) or not isinstance(value, int) or not low <= value <= high:
+        raise IngressQueueError(f"{name} must be within [{low}, {high}]", retryable=False)
 
 
 class FakeQuarantineRepository:

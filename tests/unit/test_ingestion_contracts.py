@@ -264,7 +264,8 @@ def test_quarantine_entry_id_is_deterministic() -> None:
 
     assert quarantine_entry_id(INGRESS, 0, excerpt) == expected
     assert expected == "qtn_" + uuid5(NAMESPACE_URL, discriminator).hex
-    assert quarantine_entry_id(INGRESS, 0, excerpt) == quarantine_entry_id(INGRESS, 0, excerpt)
+    first, second = (quarantine_entry_id(INGRESS, 0, excerpt) for _ in range(2))
+    assert first == second
     assert quarantine_entry_id(INGRESS, 1, excerpt) != expected
     assert quarantine_entry_id(INGRESS, -1, excerpt) != expected
     assert quarantine_entry_id(INGRESS, 0, '{"a":2}') != expected
