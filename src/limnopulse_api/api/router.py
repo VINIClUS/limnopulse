@@ -1,6 +1,6 @@
 from fastapi import APIRouter
 
-from limnopulse_api.api import telegram_webhook
+from limnopulse_api.api import ingest_v2, telegram_webhook
 from limnopulse_api.api.v1.routers import (
     alert_events,
     alert_rules,
@@ -22,6 +22,7 @@ def build_api_router(
     telegram_webhook_enabled: bool = True,
     enable_v2: bool = False,
     enable_v2_telemetry: bool = False,
+    enable_ingest: bool = False,
 ) -> APIRouter:
     api_router = APIRouter()
     if telegram_webhook_enabled:
@@ -40,6 +41,10 @@ def build_api_router(
     api_router.include_router(leads.router, prefix="/v1")
     if enable_v2:
         api_router.include_router(
-            build_v2_router(enable_telemetry=enable_v2_telemetry), prefix=V2_PREFIX
+            build_v2_router(enable_telemetry=enable_v2_telemetry, enable_ingest=enable_ingest),
+            prefix=V2_PREFIX,
         )
+    if enable_ingest:
+        # Not tenant-scoped: the ingest credential is the route's only authority (D15).
+        api_router.include_router(ingest_v2.router)
     return api_router

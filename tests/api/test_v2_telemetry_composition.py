@@ -69,6 +69,10 @@ TELEMETRY_SCHEMAS = {
 }
 M1_TENANT_ROUTE_COUNT = 53
 TELEMETRY_TENANT_ROUTE_COUNT = 56
+# P3-10 (D15): the ingest switch adds 5 tenant routes on top of either count.
+INGEST_TENANT_ROUTE_COUNT = M1_TENANT_ROUTE_COUNT + 5
+INGEST_AND_TELEMETRY_TENANT_ROUTE_COUNT = TELEMETRY_TENANT_ROUTE_COUNT + 5
+INGRESS_QUEUE_URL = "http://localhost:9324/000000000000/limnopulse-telemetry-ingress"
 FLAG_ENVIRONMENT = (
     "API_V2_ENABLED",
     "V1_POND_DEVICE_PROJECTION_ENABLED",
@@ -76,7 +80,17 @@ FLAG_ENVIRONMENT = (
     "TELEMETRY_LEGACY_DUAL_WRITE_ENABLED",
     "API_V2_TELEMETRY_ENABLED",
     "V1_TELEMETRY_READ_SOURCE",
+    "INGEST_V2_ENABLED",
+    "SQS_ENDPOINT_URL",
+    "SQS_TELEMETRY_INGRESS_QUEUE_URL",
+    "SQS_TELEMETRY_INGRESS_DLQ_URL",
 )
+INGEST_ON = {
+    "api_v2_enabled": True,
+    "telemetry_v2_write_enabled": True,
+    "ingest_v2_enabled": True,
+    "sqs_telemetry_ingress_queue_url": INGRESS_QUEUE_URL,
+}
 # Switches that must never change routing or any OpenAPI document.
 NON_ROUTING_SWITCHES = (
     {"telemetry_v2_write_enabled": True},
@@ -86,6 +100,13 @@ NON_ROUTING_SWITCHES = (
         "telemetry_v2_write_enabled": True,
         "telemetry_legacy_dual_write_enabled": True,
         "v1_telemetry_read_source": "v2",
+    },
+    # P3 settings without `INGEST_V2_ENABLED` never route anything either.
+    {
+        "telemetry_v2_write_enabled": True,
+        "sqs_telemetry_ingress_queue_url": INGRESS_QUEUE_URL,
+        "sqs_endpoint_url": "http://localhost:9324",
+        "ingest_rate_limit_per_minute": 240,
     },
 )
 SWITCH_COMBINATIONS = (
@@ -97,6 +118,15 @@ SWITCH_COMBINATIONS = (
         "api_v2_enabled": True,
         "api_v2_telemetry_enabled": True,
         "telemetry_v2_write_enabled": True,
+        "telemetry_legacy_dual_write_enabled": True,
+        "v1_telemetry_read_source": "v2",
+    },
+    INGEST_ON,
+    {**INGEST_ON, "api_v2_telemetry_enabled": True},
+    # Every switch on; the OpenAPI-without-lifespan test below uses this last entry.
+    {
+        **INGEST_ON,
+        "api_v2_telemetry_enabled": True,
         "telemetry_legacy_dual_write_enabled": True,
         "v1_telemetry_read_source": "v2",
     },
@@ -199,6 +229,22 @@ def test_api_v2_telemetry_raises_tenant_routes_from_53_to_56_all_requiring_membe
     assert telemetry == TELEMETRY_OPERATIONS
 
 
+@pytest.mark.parametrize(
+    ("overrides", "expected"),
+    [
+        ({"api_v2_enabled": True}, M1_TENANT_ROUTE_COUNT),
+        ({"api_v2_enabled": True, "api_v2_telemetry_enabled": True}, TELEMETRY_TENANT_ROUTE_COUNT),
+        (INGEST_ON, INGEST_TENANT_ROUTE_COUNT),
+        ({**INGEST_ON, "api_v2_telemetry_enabled": True}, INGEST_AND_TELEMETRY_TENANT_ROUTE_COUNT),
+    ],
+    ids=repr,
+)
+def test_tenant_route_count_per_switch_combination(
+    overrides: dict[str, object], expected: int
+) -> None:
+    assert len(_tenant_routes(create_app(_settings(**overrides)))) == expected
+
+
 def test_api_v2_telemetry_changes_nothing_outside_v2() -> None:
     off = create_app(_settings()).openapi()["paths"]
     on = create_app(_settings(api_v2_enabled=True, api_v2_telemetry_enabled=True)).openapi()[
@@ -280,6 +326,7 @@ def test_openapi_generation_with_every_switch_on_does_not_enter_lifespan(
     app = create_app(_settings(**SWITCH_COMBINATIONS[-1]))
 
     assert app.openapi()["paths"]
+    assert "/ingest/v2/observations" in app.openapi()["paths"]
     for name in ("observation_reader", "observation_writer", "observation_write_service"):
         assert not hasattr(app.state, name)
 

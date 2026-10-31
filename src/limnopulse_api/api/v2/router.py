@@ -1,6 +1,7 @@
 """Aggregate of the `/v2` routers; mounted under `/v2` only when `API_V2_ENABLED`.
 
-The P2 telemetry routers join only with `enable_telemetry` (`API_V2_TELEMETRY_ENABLED`).
+The P2 telemetry routers join only with `enable_telemetry` (`API_V2_TELEMETRY_ENABLED`); the P3
+ingest-credential and integration-lifecycle routers only with `enable_ingest` (`INGEST_V2_ENABLED`).
 """
 
 import math
@@ -18,6 +19,8 @@ from limnopulse_api.api.v2.routers import (
     components,
     deployments,
     devices,
+    ingest_credentials,
+    integration_lifecycle,
     integrations,
     metric_definitions,
     observations,
@@ -27,7 +30,7 @@ from limnopulse_api.api.v2.routers import (
 V2_PREFIX = "/v2"
 
 
-def build_v2_router(enable_telemetry: bool = False) -> APIRouter:
+def build_v2_router(enable_telemetry: bool = False, enable_ingest: bool = False) -> APIRouter:
     v2_router = APIRouter()
     v2_router.include_router(sites.router)
     v2_router.include_router(assets.router)
@@ -38,6 +41,9 @@ def build_v2_router(enable_telemetry: bool = False) -> APIRouter:
     if enable_telemetry:
         v2_router.include_router(metric_definitions.router)
         v2_router.include_router(observations.router)
+    if enable_ingest:
+        v2_router.include_router(ingest_credentials.router)
+        v2_router.include_router(integration_lifecycle.router)
     return v2_router
 
 

@@ -9,7 +9,6 @@ assumed. The ports are the P3-00 fakes, installed under the frozen `app.state` n
 import asyncio
 import json
 import logging
-from pathlib import Path
 from typing import Any
 
 import pytest
@@ -56,7 +55,6 @@ PATH = "/ingest/v2/observations"
 TOKEN = ingest_token(CREDENTIAL, SECRET)
 KEY = "route-key-0001-SENTINEL"
 SENTINEL = "SENTINELp307"
-SRC = Path(__file__).resolve().parents[2] / "src" / "limnopulse_api"
 STATE_NAMES = {
     "connector_authenticator": "authenticator",
     "trusted_mapping": "mapping",
@@ -250,10 +248,16 @@ def test_router_declares_no_body_or_header_parameters() -> None:
     assert seen >= 1
 
 
-def test_router_stays_unmounted() -> None:
-    for module in ("main.py", "api/router.py", "api/v2/router.py"):
-        source = (SRC / module).read_text(encoding="utf-8")
-        assert "ingest_v2" not in source, f"{module} must not mount the ingest router (P3-10)"
+def test_router_stays_unmounted_while_ingest_is_off(monkeypatch: pytest.MonkeyPatch) -> None:
+    """P3-10 mounts the router only behind `INGEST_V2_ENABLED` (D15); off, it is absent."""
+    from limnopulse_api.core.config import Settings
+    from limnopulse_api.main import create_app
+
+    monkeypatch.delenv("INGEST_V2_ENABLED", raising=False)
+    for overrides in ({}, {"api_v2_enabled": True}):
+        settings = Settings(_env_file=None, app_env="test", auth_mode="dev", **overrides)
+        paths = create_app(settings).openapi()["paths"]
+        assert ingest_v2.INGEST_OBSERVATIONS_PATH not in paths, overrides
 
 
 # Step 16 and the receipt replay table ------------------------------------------------------

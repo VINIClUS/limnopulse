@@ -197,6 +197,18 @@ GET /v2/tenants/{tenant_id}/observations/latest
 
 **Rollback:** switch the flags back to their defaults and restart. No data deletion; legacy `water_quality` writes and reads never depend on a P2 switch.
 
+## V4 P3 ingestion wiring (behind a disabled rollout switch)
+
+P3 composes the generic HTTPS ingress and the telemetry ingest worker. It ships dark (D16): `INGEST_V2_ENABLED` defaults off, and with every switch off the running application behaves like `main` before P3. Settings reject `INGEST_V2_ENABLED=true` unless `API_V2_ENABLED=true`, `TELEMETRY_V2_WRITE_ENABLED=true` and `SQS_TELEMETRY_INGRESS_QUEUE_URL` is non-empty.
+
+Composition (API lifespan, only when `INGEST_V2_ENABLED`): one boto3 SQS client (`sqs_client_kwargs`, mirroring the DynamoDB kwargs) backs `SqsIngressQueue` as `app.state.ingress_queue_producer`; the shared DynamoDB client backs the ingest-credential repository and the integration-lifecycle repository (both with the audit table for the D23 audit items), the connector authenticator, the receipts repository and `TrustedMappingService`. The three in-process token buckets (process-global pre-auth keyed `"*"`, per-credential pre-auth, per-account), `AllowDirectIngressEntitlements` and `StructuredLogTelemetryMetrics` complete the frozen `app.state` names of `api/ingestion_dependencies.py`, which are also part of the lifespan's pre-wired guard. OpenAPI generation creates no client.
+
+Routes (D15): `INGEST_V2_ENABLED` mounts `POST /ingest/v2/observations` (not tenant-scoped; the ingest credential is its only authority) and 5 owner/admin tenant routes: issue, list and revoke ingest credentials, and the IntegrationAccount and DeviceIntegration status transitions. `API_V2_ENABLED` alone keeps the 53 M1 tenant routes; with ingest on there are 58, and 61 with `API_V2_TELEMETRY_ENABLED` too. `/v1` and its OpenAPI golden are identical in every combination.
+
+Worker (D7): `python -m limnopulse_api.workers.telemetry_ingest` runs from the API image as the `telemetry-ingest-worker` compose service in profile `ingestion` (both compose files; the default deploy does not start it, `docker compose --profile ingestion` does). `build_worker(settings)` composes the DynamoDB and SQS clients (finite botocore timeouts; the SQS read timeout outlasts the long poll), a synchronous InfluxDB write API, the P2 normalizer, pipeline and write service, the P3 repositories, `IngestMessageProcessor` and `IngestWorkerLoop`; it never calls `create_app`, so no optional cache client exists. `main()` exits 2 unless `TELEMETRY_V2_WRITE_ENABLED=true` and the queue URL is set, so the worker can never delete a message it did not write, and SIGTERM/SIGINT set the loop's stop for a bounded drain. In production it runs as the dedicated `telemetry_ingest` IAM user, from `TELEMETRY_INGEST_AWS_ACCESS_KEY_ID` / `TELEMETRY_INGEST_AWS_SECRET_ACCESS_KEY` and its own InfluxDB write token, and never loads the API's env file or keys.
+
+**Rollback:** unset `INGEST_V2_ENABLED`, restart the API and stop the `ingestion` profile. Queued messages are kept in the queue and the DLQ. The rollout runbook is `docs/p3-ingestion-rollout-runbook.md` (P3-11).
+
 ## Authentication and tenant authorization
 
 The access token authenticates a user; it does not grant tenant access by itself. Every tenant route resolves an active DynamoDB membership and then enforces the required role.
