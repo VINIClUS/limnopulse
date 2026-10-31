@@ -720,6 +720,15 @@ class TelemetryMetrics(Protocol):
     - a replay produces no marks;
     - a fenced message (`outcome=None`, `fence` set) produces **only** the connector `last_fenced_at`/`last_fence_reason` marks, and only when `fence.account_verified`. It produces no device or component mark, because the envelope's device identity is unverified;
     - cross-tenant regression vector: a forged envelope with tenant A's account and tenant B's device produces no mark on B.
+  - **Other frozen builders and tables.** Add vectors for each of these:
+    - **`build_quarantine_entries`**: observation rows, fenced-observation rows, the summary row (ordinal −1, envelope truncated on a UTF-8 boundary), ordinals for identical excerpts, and the replayable flag.
+    - **`ingest_audit_item`**: the exact layout, holding the actor and fingerprint but no token, secret or digest.
+    - **The condition → enum table**, every row.
+    - **The envelope wire format:**
+      - all three `mapping_versions` strings appear literally, even when they equal the defaults;
+      - Unicode-expansion size: 1000 observations with emoji `firmware_version` stay within the bound under `ensure_ascii=False`.
+    - **The fixed 422 messages**: sentinel text in an unknown metadata key, a bad id or a bad unit never appears in the body.
+    - **The limiter shape**: capacity is `max(1, per_minute // 10)`, and `max_keys` evicts with LRU.
   - **Sequence truth table.** Use vectors for every row of the table. Also cover:
     - collapsing multi-metric pairs;
     - `None` sequences;
