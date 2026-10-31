@@ -62,8 +62,37 @@ def resolved_condition(request: dict[str, Any]) -> str:
     return " ".join(condition.split())
 
 
+def _unwrap(text: str) -> str:
+    """Remove one outer pair of parentheses, only when that pair encloses the whole text."""
+    text = text.strip()
+    if not (text.startswith("(") and text.endswith(")")):
+        return text
+    depth = 0
+    for index, char in enumerate(text):
+        depth += {"(": 1, ")": -1}.get(char, 0)
+        if depth == 0 and index < len(text) - 1:
+            return text  # the first "(" closes early: e.g. "attribute_exists(PK) AND (x)"
+    return text[1:-1].strip()
+
+
 def conjuncts(condition: str) -> set[str]:
-    return {part.strip().strip("()").strip() for part in condition.split(" AND ")}
+    return {_unwrap(part) for part in _unwrap(condition).split(" AND ")}
+
+
+def test_condition_helpers_keep_function_calls_intact() -> None:
+    request = {
+        "ConditionExpression": "(attribute_exists(PK) AND (#i = :i) AND #s = :p)",
+        "ExpressionAttributeNames": {"#i": "ingress_id", "#s": "state"},
+        "ExpressionAttributeValues": {":i": {"S": INGRESS}, ":p": {"S": "pending"}},
+    }
+
+    assert conjuncts(resolved_condition(request)) == {
+        "attribute_exists(PK)",
+        f"ingress_id = {INGRESS}",
+        "state = pending",
+    }
+    assert _unwrap("(a OR b)") == "a OR b"
+    assert _unwrap("(a) AND (b)") == "(a) AND (b)"
 
 
 class RecordingClient:
@@ -144,7 +173,9 @@ async def test_claim_uses_the_single_liveness_predicate(subject: DynamoReceiptSu
 
     (put,) = subject.calls("put_item")
     cutoff = ingress_receipt_cutoff_us(now)
-    assert resolved_condition(put) == f"attribute_not_exists(PK) OR created_at_us <= {cutoff}"
+    assert _unwrap(resolved_condition(put)) == (
+        f"attribute_not_exists(PK) OR created_at_us <= {cutoff}"
+    )
 
 
 @pytest.mark.asyncio

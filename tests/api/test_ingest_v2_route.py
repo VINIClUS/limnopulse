@@ -435,6 +435,7 @@ async def test_missing_state_is_503(route: Route) -> None:
         {"content_type": "application/x-www-form-urlencoded"},
         {"content_encoding": "gzip"},
         {"content_encoding": "br"},
+        {"content_encoding": ""},
     ],
 )
 async def test_step5_unsupported_media_is_415_without_reading_the_body(
@@ -542,7 +543,7 @@ async def test_step6_declared_length_over_the_limit_is_413_without_reading(route
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("value", ["abc", "-1", "1.5", "12abc", "", "0x10"])
+@pytest.mark.parametrize("value", ["abc", "-1", "1.5", "12abc", "", "0x10", "+10", " 10"])
 async def test_step6_malformed_content_length_is_413(route: Route, value: str) -> None:
     await route.seed()
 
@@ -678,6 +679,21 @@ async def test_step7_caps_the_detail_at_20_entries(route: Route) -> None:
     body = payload(*[reading(index, value="bad", source_unit="") for index in range(50)])
 
     response = await post(route.app, encode(body))
+
+    detail = _assert_redacted_422(response)
+    assert len(detail) == 20
+
+
+@pytest.mark.asyncio
+async def test_step7_caps_body_and_header_errors_together_at_20(route: Route) -> None:
+    await route.seed()
+    body = payload(*[reading(index, value="bad", source_unit="") for index in range(50)])
+
+    response = await post(
+        route.app,
+        encode(body),
+        header_map=headers(idempotency_key="short", x_connector_version="has space"),
+    )
 
     detail = _assert_redacted_422(response)
     assert len(detail) == 20

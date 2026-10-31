@@ -87,6 +87,8 @@ from tests.support.ingestion_fakes import (
 
 TOKEN = ingest_token(CREDENTIAL, SECRET)
 BEARER = f"Bearer {TOKEN}"
+REJECTED_SECRET = "Q" * 43
+REJECTED_TOKEN = ingest_token(CREDENTIAL, REJECTED_SECRET)  # grammar-valid, wrong secret
 IDEMPOTENCY_KEY = "idem-key-0001-SENTINEL"
 OTHER_KEY = "idem-key-0002-SENTINEL"
 CONNECTOR_VERSION = "fw-2.4.1"
@@ -206,10 +208,16 @@ class Ingress:
         self.service = IngressService(
             authenticator=Spy("authenticator", self.subject.authenticator, self.log),
             preauth_global_limiter=Spy(
-                "preauth_global", preauth_global or generous_limiter(), self.log
+                "preauth_global",
+                preauth_global if preauth_global is not None else generous_limiter(),
+                self.log,
             ),
-            preauth_limiter=Spy("preauth", preauth or generous_limiter(), self.log),
-            account_limiter=Spy("account", account or generous_limiter(), self.log),
+            preauth_limiter=Spy(
+                "preauth", preauth if preauth is not None else generous_limiter(), self.log
+            ),
+            account_limiter=Spy(
+                "account", account if account is not None else generous_limiter(), self.log
+            ),
             receipts=Spy("receipts", receipt_port, self.log),
             trusted_mapping=Spy("trusted_mapping", mapping_port, self.log),
             entitlements=Spy("entitlements", self.subject.entitlements, self.log),
@@ -902,7 +910,10 @@ async def test_mark_failure_after_a_send_is_still_202_and_the_retry_resends_the_
 
     first = await ingress.admit(batch)
 
-    assert any(record.levelno >= logging.WARNING for record in caplog.records)
+    assert any(
+        record.levelno >= logging.WARNING and record.name == "limnopulse_api.services.ingestion"
+        for record in caplog.records
+    )
 
     assert first == IngestAccepted(
         ingress_id=ingress.issued[0], accepted_observations=2, replayed=False
@@ -923,6 +934,9 @@ async def test_mark_failure_after_a_send_is_still_202_and_the_retry_resends_the_
 
 @pytest.mark.asyncio
 async def test_logical_expiry_uses_one_predicate_at_steps_8_and_13(ingress: Ingress) -> None:
+    """Design decision (approved at the test gate): the service reads the wall clock once per
+    request, so steps 8 and 13 judge liveness at the same instant and `received_at` and
+    `created_at` are that instant, even if the clock moves or steps back mid-request."""
     await ingress.seed()
     batch = make_batch()
     created = RECEIVED - timedelta(hours=24)
@@ -1085,6 +1099,9 @@ async def test_claim_race_lost_to_a_different_request_is_409() -> None:
 
 @pytest.mark.asyncio
 async def test_claim_race_lost_twice_is_503_without_a_loop() -> None:
+    # A pure-service model: the stub's "winner" is not live, which a correct adapter would not
+    # return; the service re-applies the full replay table (liveness included) and gives up after
+    # the second lost claim.
     batch = make_batch()
     stale = stored_receipt(
         batch, state=IngressReceiptState.PENDING, created_at=RECEIVED - timedelta(hours=30)
@@ -1102,17 +1119,22 @@ async def test_claim_race_lost_twice_is_503_without_a_loop() -> None:
 
 
 class BarrierReceipts:
-    """Holds every step-8 read until `parties` requests have read, and every claim until all
-    have claimed, so the loser sees a still-pending winner."""
+    """Holds each request's first step-8 read until `parties` requests have read, and every
+    claim until all have claimed, so the loser sees a still-pending winner. A later re-read (the
+    replay table's "re-read once" after a lost claim) passes straight through."""
 
     def __init__(self, inner: FakeIngressReceiptRepository, parties: int) -> None:
         self.inner = inner
         self.barrier = asyncio.Barrier(parties)
         self.after_claim = asyncio.Barrier(parties)
+        self.parties = parties
+        self.reads = 0
 
     async def get_ingress_receipt(self, integration_account_id: str, key_sha256: str) -> Any:
         found = await self.inner.get_ingress_receipt(integration_account_id, key_sha256)
-        await self.barrier.wait()
+        self.reads += 1
+        if self.reads <= self.parties:
+            await self.barrier.wait()
         return found
 
     async def claim_ingress_receipt(self, receipt: IngressReceipt, *, now: datetime) -> Any:
@@ -1411,7 +1433,7 @@ async def test_logs_metrics_bodies_and_receipts_never_carry_secrets_or_raw_ids(
         ingress.subject.fail_next(operation, error)
         with pytest.raises(IngestRejected):
             await ingress.admit(batch, key=OTHER_KEY)
-    for authorization in (BEARER + "x", f"Bearer {ingest_token(CREDENTIAL, 'Q' * 43)}"):
+    for authorization in (BEARER + "x", f"Bearer {REJECTED_TOKEN}"):
         with pytest.raises(IngestRejected):
             await ingress.service.authenticate(authorization)
     ingress.subject.fail_next("authenticate", store_errors()[0])
@@ -1434,6 +1456,8 @@ async def test_logs_metrics_bodies_and_receipts_never_carry_secrets_or_raw_ids(
         "external_device_id": EXTERNAL_DEVICE,
         "digest": credential().secret_sha256,
         "fingerprint": credential().fingerprint,
+        "rejected_token": REJECTED_TOKEN,
+        "rejected_secret": REJECTED_SECRET,
     }
     for surface, text in surfaces.items():
         for name, secret in secrets.items():
