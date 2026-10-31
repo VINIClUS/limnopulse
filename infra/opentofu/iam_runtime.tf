@@ -35,18 +35,33 @@ resource "aws_iam_user" "workers" {
   tags = local.common_tags
 }
 
-# DynamoDB actions match what the adapters actually call (see
-# src/limnopulse_api/adapters/*.py): GetItem, PutItem, Query,
-# TransactWriteItems, UpdateItem on the domain table. The audit table is
-# API-only — grep confirms every Go binary (cmd/notifications,
-# cmd/alert-evaluator, internal/notifications/**) reads
+# DynamoDB authorizes every item of a TransactWriteItems call on its own:
+# a Put item needs dynamodb:PutItem, an Update dynamodb:UpdateItem, a
+# Delete dynamodb:DeleteItem and a ConditionCheck
+# dynamodb:ConditionCheckItem, each on the ARN of the table the item names.
+# IAM has no dynamodb:TransactWriteItems action, so granting it authorizes
+# nothing. tests/unit/test_iam_runtime_transactions.py derives every
+# transaction item and standalone write from the API and worker sources and
+# checks it against the grants below.
+#
+# API (src/limnopulse_api/adapters/*.py): GetItem, PutItem, Query and
+# UpdateItem on the domain table, plus the ConditionCheckItem and
+# DeleteItem items its transactions carry (ending a deployment and revoking
+# an ingest credential each delete a row inside their transaction).
+# ingestion_queues.tf grants the API the same item actions again behind its
+# feature flag; these base grants no longer depend on that flag.
+#
+# The audit table is API-only — grep confirms every Go binary
+# (cmd/notifications, cmd/alert-evaluator, internal/notifications/**) reads
 # DYNAMODB_DOMAIN_TABLE and never DYNAMODB_AUDIT_TABLE, so the workers
-# policy (below) omits it entirely. The API itself never issues a
-# standalone Get/Put/Query/Update against the audit table either — every
-# write goes through _conditioned_put() as a TransactWriteItems "Put"
-# element (adapters/alert_rules.py, alert_events.py,
-# notification_preferences.py) — so its audit-table grant is narrower
-# than its domain-table grant too.
+# policy (below) omits it entirely. The API never reads, updates or deletes
+# an audit item: every audit write is a conditioned Put item inside the
+# transaction of the change it records (adapters/alert_rules.py,
+# alert_events.py, notification_preferences.py,
+# dynamodb_ingest_credentials.py, dynamodb_integrations.py), so its
+# audit-table grant is PutItem alone. The policy description below still
+# says "transactional-write-only" because changing an aws_iam_policy
+# description forces the policy to be replaced.
 data "aws_iam_policy_document" "dynamodb_domain_access" {
   statement {
     sid    = "DomainTableAccess"
@@ -55,7 +70,6 @@ data "aws_iam_policy_document" "dynamodb_domain_access" {
       "dynamodb:GetItem",
       "dynamodb:PutItem",
       "dynamodb:Query",
-      "dynamodb:TransactWriteItems",
       "dynamodb:UpdateItem",
     ]
     resources = [
@@ -64,10 +78,21 @@ data "aws_iam_policy_document" "dynamodb_domain_access" {
     ]
   }
 
+  # Item actions are authorized against the table, never an index.
   statement {
-    sid       = "AuditTableTransactionalWritesOnly"
+    sid    = "DomainTableTransactionItems"
+    effect = "Allow"
+    actions = [
+      "dynamodb:ConditionCheckItem",
+      "dynamodb:DeleteItem",
+    ]
+    resources = [aws_dynamodb_table.domain.arn]
+  }
+
+  statement {
+    sid       = "AuditTablePutOnly"
     effect    = "Allow"
-    actions   = ["dynamodb:TransactWriteItems"]
+    actions   = ["dynamodb:PutItem"]
     resources = [aws_dynamodb_table.audit.arn]
   }
 }
@@ -89,19 +114,29 @@ data "aws_iam_policy_document" "dynamodb_domain_access_workers" {
   statement {
     sid    = "DomainTableAccess"
     effect = "Allow"
-    # No dynamodb:PutItem: grep across cmd/ and internal/ confirms the Go
-    # workers never call PutItem directly - their writes go through
-    # UpdateItem or a TransactWriteItems Put, both already covered.
     actions = [
       "dynamodb:GetItem",
       "dynamodb:Query",
-      "dynamodb:TransactWriteItems",
       "dynamodb:UpdateItem",
     ]
     resources = [
       aws_dynamodb_table.domain.arn,
       "${aws_dynamodb_table.domain.arn}/index/*",
     ]
+  }
+
+  # The Go workers never call PutItem directly, but their transactions carry
+  # Put and ConditionCheck items (alert-evaluator commits, notification
+  # attempts and feedback, relay recovery fences), and each item needs its
+  # own action on the table. No DeleteItem: no worker deletes an item.
+  statement {
+    sid    = "DomainTableTransactionItems"
+    effect = "Allow"
+    actions = [
+      "dynamodb:ConditionCheckItem",
+      "dynamodb:PutItem",
+    ]
+    resources = [aws_dynamodb_table.domain.arn]
   }
 }
 

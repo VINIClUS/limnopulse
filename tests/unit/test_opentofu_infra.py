@@ -427,7 +427,7 @@ INGESTION_GATE = "var.telemetry_ingress ? 1 : 0"
 ALARM_EMAIL_GATE = 'var.telemetry_ingress && var.telemetry_ingress_alarm_email != "" ? 1 : 0'
 ALARM_TOPIC = "aws_sns_topic.telemetry_ingress_alarms[0]"
 UNCHANGED_FILE_SHA256 = {
-    "iam_runtime.tf": "1b928edce92709b8a3790e207edb2a0d442dc7d710af608a7e0a606b7d879fa1",
+    "iam_runtime.tf": "458ea8fa76021f596a357a33b07456ad4fa745a2d67765818838f73aca691aa7",
     "queues.tf": "d85972d656c951d6a728fecfe4f762f0e96dc1e4687ee39d068edbea74ad9425",
 }
 # Digest of every pre-P3 block in variables.tf and outputs.tf (see _pre_p3_digest): P3-02
