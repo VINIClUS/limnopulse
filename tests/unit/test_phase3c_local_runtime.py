@@ -25,20 +25,36 @@ REDRIVEN_QUEUES = {
 }
 
 
-def _elasticmq_queue_lines(config: str, queue: str) -> list[str]:
-    """Return the normalized body lines of one ElasticMQ queue block."""
-    matches = list(re.finditer(rf'^\s*"{re.escape(queue)}"\s*\{{', config, re.MULTILINE))
-    assert len(matches) == 1, queue
-    depth, index = 0, matches[0].end() - 1
+def _block_body(text: str, header: re.Match[str]) -> str:
+    depth, index = 0, header.end() - 1
     while True:
-        if config[index] == "{":
+        if text[index] == "{":
             depth += 1
-        elif config[index] == "}":
+        elif text[index] == "}":
             depth -= 1
             if depth == 0:
-                break
+                return text[header.end() : index]
         index += 1
-    body = config[matches[0].end() : index]
+
+
+def _elasticmq_queues_block(config: str) -> str:
+    headers = list(re.finditer(r"^queues\s*\{", config, re.MULTILINE))
+    assert len(headers) == 1
+    return _block_body(config, headers[0])
+
+
+def _elasticmq_queue_header(config: str, queue: str) -> re.Match[str]:
+    """Locate one queue declaration inside the top-level ``queues {}`` block."""
+    queues = _elasticmq_queues_block(config)
+    headers = list(re.finditer(rf'^\s*"{re.escape(queue)}"\s*\{{', queues, re.MULTILINE))
+    assert len(headers) == 1, queue
+    return headers[0]
+
+
+def _elasticmq_queue_lines(config: str, queue: str) -> list[str]:
+    """Return the normalized body lines of one ElasticMQ queue block."""
+    queues = _elasticmq_queues_block(config)
+    body = _block_body(queues, _elasticmq_queue_header(config, queue))
     return [line.strip() for line in body.splitlines() if line.strip()]
 
 
@@ -102,8 +118,9 @@ def test_elasticmq_defines_telemetry_ingress_queue_and_dlq_exactly() -> None:
     ]
     assert "RedriveAllowPolicy" not in config
     assert "redrive-allow" not in config.lower()
-    assert config.index('"limnopulse-telemetry-ingress-dlq"') < config.index(
-        '"limnopulse-telemetry-ingress" {'
+    assert (
+        _elasticmq_queue_header(config, "limnopulse-telemetry-ingress-dlq").start()
+        < _elasticmq_queue_header(config, "limnopulse-telemetry-ingress").start()
     )
 
 

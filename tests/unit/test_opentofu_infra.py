@@ -422,7 +422,29 @@ def test_opentofu_scaffold_avoids_local_only_and_disallowed_storage_stack() -> N
 # blocks without a new dependency. Attribute values stay raw expression text.
 
 INGESTION_GATE = "var.telemetry_ingress ? 1 : 0"
-IAM_RUNTIME_SHA256 = "1b928edce92709b8a3790e207edb2a0d442dc7d710af608a7e0a606b7d879fa1"
+UNCHANGED_FILE_SHA256 = {
+    "iam_runtime.tf": "1b928edce92709b8a3790e207edb2a0d442dc7d710af608a7e0a606b7d879fa1",
+    "queues.tf": "d85972d656c951d6a728fecfe4f762f0e96dc1e4687ee39d068edbea74ad9425",
+}
+# Digest of every pre-P3 block in variables.tf and outputs.tf (see _pre_p3_digest): P3-02
+# may only append telemetry_ingress* / telemetry_ingest* blocks to those files.
+PRE_P3_BLOCKS_SHA256 = {
+    "variables.tf": "05b652d1d9e61efd4622e0ba4593d517708ec5260ca2164e2c5938ac6bee9288",
+    "outputs.tf": "67f70e1569ba6bb1fc765025f92b8358101f8b90fc453272e8d46fd960aadda4",
+}
+MODULE_TF_FILES = {
+    "cognito.tf",
+    "dynamodb.tf",
+    "iam_runtime.tf",
+    "ingestion_queues.tf",
+    "outputs.tf",
+    "providers.tf",
+    "queues.tf",
+    "ses.tf",
+    "telegram.tf",
+    "variables.tf",
+    "versions.tf",
+}
 INGRESS_QUEUE = "aws_sqs_queue.telemetry_ingress[0]"
 DLQ_QUEUE = "aws_sqs_queue.telemetry_ingress_dlq[0]"
 TELEMETRY_VARIABLES = {
@@ -470,7 +492,10 @@ def _read_expression(text: str, index: int) -> tuple[str, int]:
         if text.startswith("<<", index):
             index = _skip_heredoc(text, index)
             continue
-        if char == "#":
+        if text.startswith("/*", index):
+            index = text.index("*/", index) + 2
+            continue
+        if char == "#" or text.startswith("//", index):
             if depth == 0:
                 break
             index = text.find("\n", index)
@@ -495,6 +520,9 @@ def _matching_brace(text: str, index: int) -> int:
         if text.startswith("<<", index):
             index = _skip_heredoc(text, index)
             continue
+        if text.startswith("/*", index):
+            index = text.index("*/", index) + 2
+            continue
         if char == "#" or text.startswith("//", index):
             index = text.find("\n", index)
             continue
@@ -511,14 +539,17 @@ def _matching_brace(text: str, index: int) -> int:
 def _parse_hcl_body(text: str) -> tuple[dict[str, str], list[_HclBlock]]:
     attrs: dict[str, str] = {}
     blocks: list[_HclBlock] = []
-    head = re.compile(r'\s*(?:(?:#|//)[^\n]*\n\s*)*([A-Za-z_][\w-]*)\s*((?:"[^"]*"\s*)*)(=|\{)')
+    head = re.compile(
+        r'\s*(?:(?:(?:#|//)[^\n]*\n|/\*.*?\*/)\s*)*([A-Za-z_][\w-]*)\s*((?:"[^"]*"\s*)*)(=|\{)',
+        re.DOTALL,
+    )
     index = 0
     while True:
         match = head.match(text, index)
         if match is None:
-            assert text[index:].strip() == "" or re.fullmatch(
-                r"(\s*(#|//)[^\n]*)*\s*", text[index:]
-            ), text[index : index + 80]
+            assert re.fullmatch(r"(\s*((#|//)[^\n]*|/\*.*?\*/))*\s*", text[index:], re.DOTALL), (
+                text[index : index + 80]
+            )
             return attrs, blocks
         name = match.group(1)
         if match.group(3) == "=":
@@ -534,6 +565,27 @@ def _parse_hcl_body(text: str) -> tuple[dict[str, str], list[_HclBlock]]:
 
 def _tofu_blocks(relative_path: str) -> list[_HclBlock]:
     return _parse_hcl_body(_read(relative_path))[1]
+
+
+def _block_signature(block: _HclBlock) -> list[object]:
+    attrs = sorted((name, re.sub(r"\s+", " ", value)) for name, value in block.attrs.items())
+    return [block.kind, list(block.labels), attrs, [_block_signature(b) for b in block.blocks]]
+
+
+def _pre_p3_digest(relative_path: str) -> str:
+    signatures = [
+        _block_signature(block)
+        for block in _tofu_blocks(relative_path)
+        if not (
+            block.labels and block.labels[0].startswith(("telemetry_ingress", "telemetry_ingest"))
+        )
+    ]
+    return hashlib.sha256(json.dumps(signatures).encode()).hexdigest()
+
+
+def _strip_comments(text: str) -> str:
+    text = re.sub(r"/\*.*?\*/", "", text, flags=re.DOTALL)
+    return re.sub(r"(?m)^\s*(#|//).*$", "", text)
 
 
 def _ingestion_blocks() -> list[_HclBlock]:
@@ -596,14 +648,20 @@ _RESOURCE_KINDS = {
 }
 
 
+def _assert_plain_document(document: _HclBlock) -> None:
+    # No dynamic statements and no source/override documents: every grant must be a literal
+    # statement this reader can see.
+    assert set(document.attrs) == {"count"}, document.labels
+    assert {block.kind for block in document.blocks} == {"statement"}, document.labels
+
+
 def _grants(document: _HclBlock) -> set[tuple[str, str, str]]:
+    _assert_plain_document(document)
     grants: set[tuple[str, str, str]] = set()
     for statement in document.nested("statement"):
+        assert set(statement.attrs) <= {"sid", "effect", "actions", "resources"}, statement.attrs
+        assert statement.blocks == []
         assert statement.attrs.get("effect", '"Allow"') == '"Allow"'
-        assert statement.nested("principals") == []
-        assert statement.nested("condition") == []
-        assert "not_actions" not in statement.attrs
-        assert "not_resources" not in statement.attrs
         actions = [_unquote(item) for item in _list_items(statement.attrs["actions"])]
         for resource in _list_items(statement.attrs["resources"]):
             assert resource in _RESOURCE_KINDS, f"unexpected resource {resource}"
@@ -623,10 +681,18 @@ def _principal_grants() -> tuple[dict[str, set[tuple[str, str, str]]], set[str]]
     blocks = _ingestion_blocks()
     documents = _policy_documents(blocks)
     policies = _resources(blocks, "aws_iam_policy")
-    attachments = _resources(blocks, "aws_iam_user_policy_attachment")
     by_user: dict[str, set[tuple[str, str, str]]] = {}
     attached: set[str] = set()
-    for attachment in attachments.values():
+    for path in sorted(TOFU_ROOT.glob("*.tf")):
+        for block in _parse_hcl_body(path.read_text(encoding="utf-8"))[1]:
+            references = " ".join(block.attrs.values())
+            if block.kind != "resource" or not any(
+                f"aws_iam_policy.{name}" in references for name in policies
+            ):
+                continue
+            assert path.name == "ingestion_queues.tf", path
+            assert block.labels[0] == "aws_iam_user_policy_attachment", block.labels
+    for attachment in _resources(blocks, "aws_iam_user_policy_attachment").values():
         user = re.fullmatch(r"aws_iam_user\.(\w+)(?:\[0\])?\.name", attachment.attrs["user"])
         policy = re.fullmatch(r"aws_iam_policy\.(\w+)\[0\]\.arn", attachment.attrs["policy_arn"])
         assert user is not None and policy is not None
@@ -656,10 +722,12 @@ def test_ingestion_queues_tf_count_gate_covers_every_block() -> None:
         assert (block.kind, block.labels[0]) in allowed, block.labels
         assert block.attrs.get("count") == INGESTION_GATE, block.labels
 
-    text = _read("ingestion_queues.tf")
-    gated_names = {block.labels[1] for block in blocks}
-    for reference in re.finditer(r"\b(aws_[a-z0-9_]+)\.(\w+)(\[0\])?", text):
-        if reference.group(2) in gated_names:
+    text = _strip_comments(_read("ingestion_queues.tf"))
+    gated = {(block.labels[0], block.labels[1]) for block in blocks}
+    references = list(re.finditer(r"\b(aws_[a-z0-9_]+)\.(\w+)(\[0\])?", text))
+    assert references
+    for reference in references:
+        if (reference.group(1), reference.group(2)) in gated:
             assert reference.group(3) == "[0]", reference.group(0)
 
     variables = {
@@ -717,10 +785,10 @@ def test_ingestion_queues_tf_redrive_allow_policy_is_by_queue() -> None:
     assert len(policies) == 1
     (policy,) = policies.values()
     assert policy.attrs["queue_url"] == f"{DLQ_QUEUE}.id"
-    assert _jsonencode_fields(policy.attrs["redrive_allow_policy"]) == {
-        "redrivePermission": '"byQueue"',
-        "sourceQueueArns": f"[{INGRESS_QUEUE}.arn]",
-    }
+    fields = _jsonencode_fields(policy.attrs["redrive_allow_policy"])
+    assert set(fields) == {"redrivePermission", "sourceQueueArns"}
+    assert fields["redrivePermission"] == '"byQueue"'
+    assert _list_items(fields["sourceQueueArns"]) == [f"{INGRESS_QUEUE}.arn"]
 
 
 def test_ingestion_queues_tf_queue_policies_deny_insecure_transport() -> None:
@@ -735,14 +803,18 @@ def test_ingestion_queues_tf_queue_policies_deny_insecure_transport() -> None:
             r"data\.aws_iam_policy_document\.(\w+)\[0\]\.json", queue_policy.attrs["policy"]
         )
         assert queue is not None and document is not None
-        statements = documents[document.group(1)].nested("statement")
+        policy_document = documents[document.group(1)]
+        _assert_plain_document(policy_document)
+        statements = policy_document.nested("statement")
         assert len(statements) == 1
         (statement,) = statements
+        assert set(statement.attrs) <= {"sid", "effect", "actions", "resources"}
+        assert {block.kind for block in statement.blocks} == {"principals", "condition"}
         assert statement.attrs["effect"] == '"Deny"'
         assert _list_items(statement.attrs["actions"]) == ['"sqs:*"']
         assert _list_items(statement.attrs["resources"]) == [f"{queue.group(1)}.arn"]
         (principals,) = statement.nested("principals")
-        assert principals.attrs["type"] == '"*"'
+        assert principals.attrs["type"] in {'"*"', '"AWS"'}
         assert _list_items(principals.attrs["identifiers"]) == ['"*"']
         (condition,) = statement.nested("condition")
         assert condition.attrs["test"] == '"Bool"'
@@ -801,26 +873,21 @@ def test_ingestion_queues_tf_iam_actions_per_principal_are_exact() -> None:
 def test_ingestion_queues_tf_operator_policy_is_unattached_and_workers_not_widened() -> None:
     _, unattached = _principal_grants()
     (operator,) = unattached
-    attachment_types = {
-        "aws_iam_user_policy_attachment",
-        "aws_iam_role_policy_attachment",
-        "aws_iam_group_policy_attachment",
-        "aws_iam_policy_attachment",
-        "aws_iam_user_policy_attachments_exclusive",
-        "aws_iam_role_policy_attachments_exclusive",
-        "aws_iam_group_policy_attachments_exclusive",
-    }
 
-    for path in TOFU_ROOT.glob("*.tf"):
+    assert {path.name for path in TOFU_ROOT.glob("*.tf")} == MODULE_TF_FILES
+    api_references: list[str] = []
+    for path in sorted(TOFU_ROOT.glob("*.tf")):
+        if path.name in {"iam_runtime.tf", "outputs.tf"}:
+            continue
         for block in _parse_hcl_body(path.read_text(encoding="utf-8"))[1]:
-            if block.kind != "resource" or block.labels[0] not in attachment_types:
-                continue
             references = " ".join(block.attrs.values())
             assert f"aws_iam_policy.{operator}" not in references, path
-            if path.name != "iam_runtime.tf":
-                assert "aws_iam_user.workers" not in references, path
+            assert "aws_iam_user.workers" not in references, (path, block.labels)
+            if "aws_iam_user.api" in references:
+                api_references.append(f"{path.name}:{block.labels[0]}")
+    assert api_references == ["ingestion_queues.tf:aws_iam_user_policy_attachment"]
 
-    ingestion = _read("ingestion_queues.tf")
+    ingestion = _strip_comments(_read("ingestion_queues.tf"))
     assert "aws_iam_user.workers" not in ingestion
     for forbidden in (
         '"aws_iam_user_policy"',
@@ -828,11 +895,13 @@ def test_ingestion_queues_tf_operator_policy_is_unattached_and_workers_not_widen
         '"aws_iam_role',
         '"aws_iam_access_key"',
         '"aws_iam_user_group_membership"',
+        "attachments_exclusive",
     ):
         assert forbidden not in ingestion
-    assert hashlib.sha256((TOFU_ROOT / "iam_runtime.tf").read_bytes()).hexdigest() == (
-        IAM_RUNTIME_SHA256
-    )
+    for name, digest in UNCHANGED_FILE_SHA256.items():
+        assert hashlib.sha256((TOFU_ROOT / name).read_bytes()).hexdigest() == digest, name
+    for name, digest in PRE_P3_BLOCKS_SHA256.items():
+        assert _pre_p3_digest(name) == digest, name
 
 
 def test_ingestion_queues_tf_alarms_cover_age_dlq_and_depth() -> None:
@@ -841,12 +910,27 @@ def test_ingestion_queues_tf_alarms_cover_age_dlq_and_depth() -> None:
     observed: dict[tuple[str, str], tuple[str, str]] = {}
     for alarm in alarms.values():
         assert alarm.attrs["namespace"] == '"AWS/SQS"'
+        assert alarm.attrs["statistic"] == '"Maximum"'
+        assert alarm.attrs["treat_missing_data"] == '"notBreaching"'
+        assert alarm.attrs["period"] == "60"
+        assert int(alarm.attrs["evaluation_periods"]) >= 1
         assert alarm.attrs["alarm_actions"] == "var.telemetry_ingress_alarm_actions"
+        assert (
+            alarm.attrs.get("ok_actions", alarm.attrs["alarm_actions"])
+            == (alarm.attrs["alarm_actions"])
+        )
+        assert "insufficient_data_actions" not in alarm.attrs
+        assert "extended_statistic" not in alarm.attrs
+        assert alarm.blocks == []
         dimensions = re.fullmatch(r"\{\s*QueueName\s*=\s*(\S+)\s*\}", alarm.attrs["dimensions"])
         assert dimensions is not None, alarm.attrs["dimensions"]
         key = (_unquote(alarm.attrs["metric_name"]), dimensions.group(1))
         assert key not in observed
-        observed[key] = (_unquote(alarm.attrs["comparison_operator"]), alarm.attrs["threshold"])
+        operator = _unquote(alarm.attrs["comparison_operator"])
+        # Age/depth may fire at or above the threshold; the DLQ alarm must fire on any message.
+        if operator == "GreaterThanOrEqualToThreshold" and alarm.attrs["threshold"] != "0":
+            operator = "GreaterThanThreshold"
+        observed[key] = (operator, alarm.attrs["threshold"])
 
     assert observed == {
         ("ApproximateAgeOfOldestMessage", f"{INGRESS_QUEUE}.name"): (
@@ -876,6 +960,18 @@ def test_ingestion_queues_tf_outputs_and_descriptions() -> None:
     assert outputs["telemetry_ingress_dlq_url"].attrs == {
         "description": '"SQS_TELEMETRY_INGRESS_DLQ_URL"',
         "value": f"try({DLQ_QUEUE}.id, null)",
+    }
+    # Like api_iam_user_name / workers_iam_user_name: access keys are created out of band.
+    assert outputs["telemetry_ingest_iam_user_name"].attrs["value"] == (
+        "try(aws_iam_user.telemetry_ingest[0].name, null)"
+    )
+    new_outputs = {
+        name for name in outputs if name.startswith(("telemetry_ingress", "telemetry_ingest"))
+    }
+    assert new_outputs == {
+        "telemetry_ingress_queue_url",
+        "telemetry_ingress_dlq_url",
+        "telemetry_ingest_iam_user_name",
     }
 
 
@@ -918,3 +1014,12 @@ def test_ingestion_queues_tf_has_no_forbidden_words_or_secrets() -> None:
     assert secret.search(ingestion) is None
     assert "telemetry_ingress" not in _read("queues.tf")
     assert "telemetry_ingress" not in _read("iam_runtime.tf")
+    assert set(_resources(_tofu_blocks("queues.tf"), "aws_sqs_queue")) == {
+        "notification_jobs",
+        "notification_jobs_dlq",
+        "telegram_notification_jobs",
+        "telegram_notification_jobs_dlq",
+        "ses_events",
+        "ses_events_dlq",
+        "ses_events_routing_dlq",
+    }
