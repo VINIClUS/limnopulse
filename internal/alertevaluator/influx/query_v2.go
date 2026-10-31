@@ -66,10 +66,11 @@ func defaultComponentSamples(tenantID string, rows []V2Row) []alertevaluator.Sam
 }
 
 // BuildV2Query builds the observation_numeric window query for a /v1 rule.
-// Rule IDs are escaped rather than validated: /v1 IDs are plain strings that
-// the legacy reader accepts. Every literal goes through fluxV2String (P2 plan
-// D19), so in Flux it decodes to exactly its value and can neither interpolate
-// nor end early; a value that cannot round-trip is an error and nothing is sent.
+// Rule IDs are escaped rather than validated: /v1 IDs are plain strings, the
+// same model as the legacy reader. Every literal goes through fluxV2String
+// (P2 plan D19), so in Flux it decodes to exactly its value and can neither
+// interpolate nor end early; a value that cannot round-trip is an error and
+// nothing is sent.
 func BuildV2Query(bucket string, rule alertevaluator.EvaluationRule, spec alertevaluator.WindowSpec) (string, error) {
 	metricKey, ok := MetricKeyForLegacyMetric(rule.Metric)
 	if !ok {

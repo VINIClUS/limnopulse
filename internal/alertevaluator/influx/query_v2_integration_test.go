@@ -166,10 +166,18 @@ func TestInfluxIntegrationV2ReaderReadsFreeTextIDsAndBucket(t *testing.T) {
 		t.Fatalf("pond-wide v2 result = (%#v, %v), want both devices of the tenant", result, err)
 	}
 
-	// The documented D19 divergence: on a plain bucket, the unchanged legacy literals
-	// still cannot express these IDs (json.Marshal escapes `<&>` as \u003c, and `${a}` interpolates).
+	// The documented D19 divergence, ID by ID on a plain bucket: json.Marshal escapes
+	// `<&>` as \u003c and leaves `${a}` to interpolate, so the unchanged legacy reader
+	// fails where the v2 reader answers.
+	plainV2 := V2WindowReader{Bucket: scratch.Name, Querier: ClientV2Querier{API: client.QueryAPI(*scratch.OrgID)}}
 	legacy := WindowReader{Bucket: scratch.Name, Querier: ClientQuerier{API: client.QueryAPI(*scratch.OrgID)}}
-	if _, err := legacy.Evaluate(ctx, rule, spec); err == nil {
-		t.Fatal("legacy reader read the free-text IDs; the D19 divergence note is stale")
+	for _, tenantID := range []string{"${a}", "<&>"} {
+		idRule := alertevaluator.EvaluationRule{Rule: alertevaluator.Rule{TenantID: tenantID}, PondID: pond, Metric: "ph"}
+		if _, err := plainV2.Evaluate(ctx, idRule, spec); err != nil {
+			t.Fatalf("v2 reader with tenant %q: %v", tenantID, err)
+		}
+		if _, err := legacy.Evaluate(ctx, idRule, spec); err == nil {
+			t.Fatalf("legacy reader read tenant %q; the D19 divergence note is stale", tenantID)
+		}
 	}
 }
