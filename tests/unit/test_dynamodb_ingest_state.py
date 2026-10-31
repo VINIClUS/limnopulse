@@ -29,6 +29,7 @@ from tests.support.ingestion_contract_kits import (
     ACCOUNT,
     COMPONENT,
     DEVICE,
+    DYNAMO_EXPRESSION_VECTORS,
     INGEST_STATE_CONTRACT,
     OBSERVED,
     OTHER_COMPONENT,
@@ -175,14 +176,22 @@ async def test_identity_attributes_keep_the_first_writer(
 
 
 @pytest.mark.asyncio
-async def test_component_states_dedupe_and_skip_missing(subject: DynamoIngestStateSubject) -> None:
+async def test_component_states_read_each_distinct_component_once(
+    subject: DynamoIngestStateSubject,
+) -> None:
     await subject.repository.apply_ingest_marks(marks())
+    subject.client.reads.clear()
 
     states = await subject.repository.get_component_states(
-        TENANT, [COMPONENT, COMPONENT, OTHER_COMPONENT]
+        TENANT, [COMPONENT, OTHER_COMPONENT, COMPONENT]
     )
 
     assert list(states) == [COMPONENT]
+    component_reads = [pk for _, pk, _ in subject.client.reads]
+    assert sorted(component_reads) == sorted(
+        {f"COMPONENT#{COMPONENT}", f"COMPONENT#{OTHER_COMPONENT}"}
+    )
+    assert {kind for kind, _, _ in subject.client.reads} == {"get_item"}  # no Scan, no Query
     assert await subject.repository.get_component_states(TENANT, []) == {}
 
 
@@ -414,11 +423,11 @@ async def test_a_store_failure_propagates_unwrapped_on_a_later_write(
 ) -> None:
     error = store_errors()[0]
     original = subject.client.update_item
-    calls = {"n": 0}
+    sent: list[str] = []
 
     def fail_third(**kwargs: Any) -> dict[str, Any]:
-        calls["n"] += 1
-        if calls["n"] == 3:
+        sent.append(repr(sorted(kwargs.items())))
+        if len(sent) == 3:
             raise error
         return original(**kwargs)
 
@@ -427,4 +436,49 @@ async def test_a_store_failure_propagates_unwrapped_on_a_later_write(
     with pytest.raises(type(error)) as raised:
         await subject.repository.apply_ingest_marks(marks())
     assert raised.value is error
-    assert calls["n"] == 3  # no internal retry
+    assert len(sent) == len(set(sent))  # no request was re-sent (no internal retry)
+    subject.client.update_item = original  # type: ignore[method-assign]
+    await subject.repository.apply_ingest_marks(marks())  # a redelivery converges
+    state = (await subject.repository.get_component_states(TENANT, [COMPONENT]))[COMPONENT]
+    assert (state.last_received_at, state.last_observed_sequence) == (RECEIVED, 10)
+
+
+@pytest.mark.asyncio
+async def test_every_emitted_condition_is_a_frozen_dynamo_vector(
+    subject: DynamoIngestStateSubject,
+) -> None:
+    """The adapter's conditions are exactly the frozen monotone forms the P3-00 vectors pin on
+    the fake and on DynamoDB Local."""
+    emitted: set[str] = set()
+    original = subject.client.update_item
+
+    def spy(**kwargs: Any) -> dict[str, Any]:
+        emitted.add(kwargs["ConditionExpression"])
+        return original(**kwargs)
+
+    subject.client.update_item = spy  # type: ignore[method-assign]
+    full = marks(quarantined_at=RECEIVED, quarantine_reason="metric_unknown").model_copy(
+        update={
+            "connector_mark": ConnectorMark(
+                received_at=RECEIVED,
+                accepted_at=RECEIVED,
+                quarantined_at=RECEIVED,
+                quarantine_reason="metric_unknown",
+                fenced_at=RECEIVED,
+                fence_reason="account_revoked",
+            )
+        }
+    )
+    await subject.repository.apply_ingest_marks(full)
+    await subject.repository.apply_ingest_marks(full)  # every write now fails its condition
+
+    frozen = {
+        vector.request["ConditionExpression"]
+        for vector in DYNAMO_EXPRESSION_VECTORS
+        if "ConditionExpression" in vector.request
+    }
+    assert emitted == {
+        "attribute_not_exists(#m) OR #m < :t",
+        "attribute_not_exists(#m) OR #m < :t OR (#m = :t AND #tb < :tb)",
+    }
+    assert emitted <= frozen

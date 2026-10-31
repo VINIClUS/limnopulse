@@ -27,6 +27,7 @@ from limnopulse_api.services.telemetry_v2_writes import TelemetryWriteOutcome
 from tests.support.ingestion_contract_kits import (
     COMPONENT,
     DEVICE,
+    DYNAMO_EXPRESSION_VECTORS,
     OBSERVED,
     QUARANTINE_REPOSITORY_CONTRACT,
     RECEIVED,
@@ -199,10 +200,11 @@ async def test_every_write_is_a_single_item_conditional_put(
     subject.client.put_item = spy  # type: ignore[method-assign]
 
     await subject.repository.put_quarantine_entries(entries)
+    first_write = len(calls)
     await subject.repository.put_quarantine_entries(entries)
 
     assert subject.client.transactions == []
-    assert len(calls) == 2 * len(entries)
+    assert first_write == len(entries)  # one PutItem per row
     assert {call["ConditionExpression"] for call in calls} == {"attribute_not_exists(PK)"}
 
 
@@ -266,16 +268,27 @@ async def test_a_store_failure_mid_batch_propagates_and_a_retry_completes(
     subject: DynamoQuarantineSubject,
 ) -> None:
     entries = fenced_entries()
-    await subject.repository.put_quarantine_entries(entries[:1])
     error = store_errors()[0]
-    subject.client.fail_next("put_item", error)
+    original = subject.client.put_item
+    sent: list[str] = []
+
+    def fail_second(**kwargs: Any) -> dict[str, Any]:
+        sent.append(kwargs["Item"]["SK"]["S"])
+        if len(sent) == 2:
+            raise error
+        return original(**kwargs)
+
+    subject.client.put_item = fail_second  # type: ignore[method-assign]
 
     with pytest.raises(type(error)) as raised:
         await subject.repository.put_quarantine_entries(entries)
-    assert raised.value is error
 
-    await subject.repository.put_quarantine_entries(entries)
-    assert len(await _all(subject.repository, limit=10)) == len(entries)
+    assert raised.value is error  # neither swallowed nor re-wrapped
+    assert len(sent) == len(set(sent))  # no internal retry of the failed row
+    assert len(await _all(subject.repository, limit=10)) == 1  # the first row is persisted
+    await subject.repository.put_quarantine_entries(entries)  # the redelivery completes the rest
+    listed = await _all(subject.repository, limit=10)
+    assert sorted(item.entry_key for item in listed) == sorted(item.entry_key for item in entries)
 
 
 # TTL -----------------------------------------------------------------------------------------
@@ -431,6 +444,35 @@ async def test_expiry_is_decided_on_created_at_not_received_at(
         TENANT, late[0].entry_key, QuarantineEntryStatus.DISMISSED, expected_version=1, at=RECEIVED
     )
     assert dismissed.status == QuarantineEntryStatus.DISMISSED
+
+
+@pytest.mark.asyncio
+async def test_transition_expiry_boundary_is_created_at_plus_ttl(
+    subject: DynamoQuarantineSubject,
+) -> None:
+    entries = fenced_entries()
+    await subject.repository.put_quarantine_entries(entries)
+    deadline = entries[0].created_at + QUARANTINE_TTL
+
+    subject.set_now(deadline)
+    with pytest.raises(NotFoundError):
+        await subject.repository.transition_quarantine_entry(
+            TENANT,
+            entries[0].entry_key,
+            QuarantineEntryStatus.DISMISSED,
+            expected_version=1,
+            at=deadline,
+        )
+
+    subject.set_now(deadline - timedelta(microseconds=1))
+    dismissed = await subject.repository.transition_quarantine_entry(
+        TENANT,
+        entries[0].entry_key,
+        QuarantineEntryStatus.DISMISSED,
+        expected_version=1,
+        at=deadline,
+    )
+    assert (dismissed.status, dismissed.version) == (QuarantineEntryStatus.DISMISSED, 2)
 
 
 @pytest.mark.asyncio
@@ -622,3 +664,80 @@ async def test_a_concurrent_transition_never_double_applies(
     else:  # the adapter wrote before reading: no race happened
         assert succeeded
         assert (row["status"], row["version"]) == ("replayed", 2)
+
+
+# Request shape -------------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_list_queries_only_the_tenant_partition_without_exclusive_start_key(
+    subject: DynamoQuarantineSubject,
+) -> None:
+    await subject.repository.put_quarantine_entries(fenced_entries(5))
+    queries: list[dict[str, Any]] = []
+    original = subject.client.query
+
+    def spy(**kwargs: Any) -> dict[str, Any]:
+        queries.append(kwargs)
+        return original(**kwargs)
+
+    subject.client.query = spy  # type: ignore[method-assign]
+    listed = await _all(subject.repository, limit=2)
+
+    assert len(listed) == 6
+    assert queries
+    for query in queries:
+        assert "ExclusiveStartKey" not in query  # paging resumes from the SK lower bound
+        assert query["ExpressionAttributeValues"][":pk"] == {"S": f"QUARANTINE#{TENANT}"}
+    resumed = [q for q in queries if q is not queries[0]]
+    assert resumed and all(
+        q["KeyConditionExpression"] == "PK = :pk AND SK > :sk_lower" for q in resumed
+    )
+    assert {kind for kind, _, _ in subject.client.reads} <= {"query"}
+
+
+@pytest.mark.asyncio
+async def test_every_emitted_expression_is_a_frozen_dynamo_vector(
+    subject: DynamoQuarantineSubject,
+) -> None:
+    """Every condition this adapter sends is one the P3-00 vectors pin on the fake and (in
+    tests/ingestion) on DynamoDB Local, so fake and emulator agree on it."""
+    emitted: set[str] = set()
+    for operation in ("put_item", "update_item", "query"):
+        original = getattr(subject.client, operation)
+
+        def spy(*, _original: Any = original, **kwargs: Any) -> dict[str, Any]:
+            for name in ("ConditionExpression", "KeyConditionExpression"):
+                if name in kwargs:
+                    emitted.add(kwargs[name])
+            return _original(**kwargs)
+
+        setattr(subject.client, operation, spy)
+    entries = fenced_entries()
+    await subject.repository.put_quarantine_entries(entries)
+    await subject.repository.put_quarantine_entries(entries)
+    await _all(subject.repository, limit=1)
+    await subject.repository.get_quarantine_entry(TENANT, entries[0].entry_key)
+    await subject.repository.transition_quarantine_entry(
+        TENANT,
+        entries[0].entry_key,
+        QuarantineEntryStatus.DISMISSED,
+        expected_version=1,
+        at=RECEIVED,
+    )
+    with pytest.raises(ConflictError):
+        await subject.repository.transition_quarantine_entry(
+            TENANT,
+            entries[1].entry_key,
+            QuarantineEntryStatus.DISMISSED,
+            expected_version=7,
+            at=RECEIVED,
+        )
+
+    frozen = {
+        vector.request[name]
+        for vector in DYNAMO_EXPRESSION_VECTORS
+        for name in ("ConditionExpression", "KeyConditionExpression")
+        if name in vector.request
+    }
+    assert emitted and emitted <= frozen, sorted(emitted - frozen)

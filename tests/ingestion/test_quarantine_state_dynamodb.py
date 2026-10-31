@@ -7,9 +7,11 @@ import random
 from collections import defaultdict
 from collections.abc import Callable, Iterator
 from datetime import datetime, timedelta
+from decimal import Decimal
 from typing import Any
 
 import pytest
+from boto3.dynamodb.types import TypeDeserializer, TypeSerializer
 
 from limnopulse_api.adapters.dynamodb_ingest_state import DynamoIngestStateRepository
 from limnopulse_api.adapters.dynamodb_quarantine import DynamoQuarantineRepository
@@ -29,6 +31,7 @@ from limnopulse_api.domain.ingestion import (
     QuarantineEntryStatus,
     SequenceEvent,
 )
+from limnopulse_api.core.errors import ConflictError, NotFoundError
 from limnopulse_api.services.ingest_state import IngestStateService
 from limnopulse_api.services.telemetry_pipeline import PipelineOutcome
 from limnopulse_api.services.telemetry_v2_writes import TelemetryWriteOutcome
@@ -50,6 +53,22 @@ from tests.support.ingestion_contract_kits import (
 from tests.support.ingestion_harness import IngestionTables, dynamodb_client
 
 KEYS = DynamoV2KeyBuilder()
+_SERIALIZER = TypeSerializer()
+_DESERIALIZER = TypeDeserializer()
+
+
+def _encode(values: dict[str, Any]) -> dict[str, Any]:
+    return {key: _SERIALIZER.serialize(value) for key, value in values.items()}
+
+
+def _decode(values: dict[str, Any]) -> dict[str, Any]:
+    def plain(value: Any) -> Any:
+        if isinstance(value, Decimal):
+            return int(value) if value == value.to_integral_value() else value
+        return value
+
+    return {key: plain(_DESERIALIZER.deserialize(value)) for key, value in values.items()}
+
 
 _BOTO_OPERATION = {
     "put_quarantine_entries": "put_item",
@@ -90,6 +109,7 @@ class FaultingClient:
 class LocalSubject:
     def __init__(self, tables: IngestionTables) -> None:
         self.client = FaultingClient(dynamodb_client())
+        self.table = tables.domain
         self.now = RECEIVED
         self.quarantine = DynamoQuarantineRepository(
             tables.domain, self.client, clock=lambda: self.now
@@ -103,8 +123,14 @@ class LocalSubject:
     def fail_next(self, operation: str, exc: BaseException) -> None:
         self.client.fail_next(_BOTO_OPERATION[operation], exc)
 
+    def raw(self, key: dict[str, str]) -> dict[str, Any] | None:
+        """The stored row, read with the plain boto3 client (independent of the adapters)."""
+        response = self.client.get_item(TableName=self.table, Key=_encode(key), ConsistentRead=True)
+        item = response.get("Item")
+        return None if item is None else _decode(item)
+
     async def device_state(self, device_id: str) -> DeviceIngestState | None:
-        item = await self.state.get_item(KEYS.device_ingest_state(device_id), consistent=True)
+        item = self.raw(KEYS.device_ingest_state(device_id))
         return None if item is None else device_ingest_state_from_item(item)
 
 
@@ -139,9 +165,7 @@ async def test_quarantine_ttl_attribute_on_dynamodb_local(local: LocalSubject) -
     (entry, *_rest) = fenced_entries(1, now=now)
     await local.quarantine.put_quarantine_entries([entry])
 
-    item = await local.quarantine.get_item(
-        KEYS.quarantine_entry(TENANT, entry.received_at, entry.quarantine_id), consistent=True
-    )
+    item = local.raw(KEYS.quarantine_entry(TENANT, entry.received_at, entry.quarantine_id))
 
     assert item is not None
     assert item["expires_at"] == math.ceil((now + QUARANTINE_TTL).timestamp())
@@ -162,6 +186,42 @@ async def test_quarantine_redelivery_never_resets_on_dynamodb_local(local: Local
     await asyncio.gather(*(local.quarantine.put_quarantine_entries(entries) for _ in range(4)))
 
     assert await local.quarantine.get_quarantine_entry(TENANT, entries[0].entry_key) == dismissed
+
+
+@pytest.mark.asyncio
+async def test_quarantine_transition_conflicts_and_expiry_on_dynamodb_local(
+    local: LocalSubject,
+) -> None:
+    entries = fenced_entries()
+    await local.quarantine.put_quarantine_entries(entries)
+    first, second = entries[0].entry_key, entries[1].entry_key
+
+    with pytest.raises(ConflictError):  # stale version: the real ConditionalCheckFailed shape
+        await local.quarantine.transition_quarantine_entry(
+            TENANT, first, QuarantineEntryStatus.DISMISSED, expected_version=2, at=RECEIVED
+        )
+    replayed = await local.quarantine.transition_quarantine_entry(
+        TENANT,
+        first,
+        QuarantineEntryStatus.REPLAYED,
+        expected_version=1,
+        at=RECEIVED,
+        replayed_ingress_id="ing_" + "5" * 32,
+    )
+    with pytest.raises(ConflictError):  # terminal
+        await local.quarantine.transition_quarantine_entry(
+            TENANT, first, QuarantineEntryStatus.DISMISSED, expected_version=2, at=RECEIVED
+        )
+    assert await local.quarantine.get_quarantine_entry(TENANT, first) == replayed
+
+    local.set_now(entries[1].created_at + QUARANTINE_TTL)
+    with pytest.raises(NotFoundError):  # logically expired, although DynamoDB still holds it
+        await local.quarantine.transition_quarantine_entry(
+            TENANT, second, QuarantineEntryStatus.DISMISSED, expected_version=1, at=local.now
+        )
+    assert local.raw(
+        KEYS.quarantine_entry(TENANT, entries[1].received_at, entries[1].quarantine_id)
+    )
 
 
 # Order independence under real concurrency ---------------------------------------------------
@@ -193,7 +253,7 @@ def _message(rng: random.Random) -> IngestMarks:
         device_mark=DeviceMark(received_at=received, ingested_at=ingested),
         connector_mark=ConnectorMark(
             received_at=received,
-            accepted_at=received,
+            accepted_at=received if rng.random() < 0.7 else None,
             quarantined_at=received if quarantined else None,
             quarantine_reason=rng.choice(("metric_unknown", "value_invalid"))
             if quarantined
@@ -206,34 +266,52 @@ def _message(rng: random.Random) -> IngestMarks:
     )
 
 
-def _reference(messages: list[IngestMarks]) -> dict[str, Any]:
-    def best(pairs: list[tuple[Any, Any]]) -> tuple[Any, Any]:
-        present = [pair for pair in pairs if pair[0] is not None]
-        return max(present) if present else (None, None)
-
-    return {
-        component_id: best(
-            [
-                (mark.observed_at, mark.sequence)
-                for message in messages
+def _redelivered(message: IngestMarks, shift: timedelta) -> IngestMarks:
+    """The same message processed again later: only the worker clock (`ingested_at`) moves."""
+    return message.model_copy(
+        update={
+            "component_marks": tuple(
+                mark.model_copy(update={"ingested_at": mark.ingested_at + shift})
                 for mark in message.component_marks
-                if mark.component_id == component_id
-            ]
+            ),
+            "device_mark": message.device_mark.model_copy(
+                update={"ingested_at": message.device_mark.ingested_at + shift}
+            ),
+        }
+    )
+
+
+def _best(pairs: list[tuple[Any, Any]]) -> tuple[Any, Any]:
+    present = [pair for pair in pairs if pair[0] is not None]
+    return max(present) if present else (None, None)
+
+
+def _reference(messages: list[IngestMarks]) -> dict[str, Any]:
+    rows: dict[str, Any] = {}
+    for component_id in (COMPONENT, OTHER_COMPONENT):
+        component = [
+            mark
+            for message in messages
+            for mark in message.component_marks
+            if mark.component_id == component_id
+        ]
+        rows[component_id] = (
+            max(mark.received_at for mark in component),
+            max(mark.ingested_at for mark in component),
+            _best([(mark.observed_at, mark.sequence) for mark in component]),
         )
-        for component_id in (COMPONENT, OTHER_COMPONENT)
-    } | {
-        "received": max(message.device_mark.received_at for message in messages),
-        "ingested": max(message.device_mark.ingested_at for message in messages),
-        "quarantine": best(
-            [
-                (m.connector_mark.quarantined_at, m.connector_mark.quarantine_reason)
-                for m in messages
-            ]
-        ),
-        "fence": best(
-            [(m.connector_mark.fenced_at, m.connector_mark.fence_reason) for m in messages]
-        ),
-    }
+    connector = [message.connector_mark for message in messages]
+    rows["device"] = (
+        max(message.device_mark.received_at for message in messages),
+        max(message.device_mark.ingested_at for message in messages),
+    )
+    rows["connector"] = (
+        _best([(c.received_at, None) for c in connector])[0],
+        _best([(c.accepted_at, None) for c in connector])[0],
+        _best([(c.quarantined_at, c.quarantine_reason) for c in connector]),
+        _best([(c.fenced_at, c.fence_reason) for c in connector]),
+    )
+    return rows
 
 
 async def _observed(local: LocalSubject) -> dict[str, Any]:
@@ -241,15 +319,30 @@ async def _observed(local: LocalSubject) -> dict[str, Any]:
     health = await local.state.get_connector_health(TENANT, ACCOUNT)
     device = await local.device_state(DEVICE)
     assert health is not None and device is not None
-    return {
-        component_id: (state.last_observed_at, state.last_observed_sequence)
+    rows: dict[str, Any] = {
+        component_id: (
+            state.last_received_at,
+            state.last_ingested_at,
+            (state.last_observed_at, state.last_observed_sequence),
+        )
         for component_id, state in states.items()
-    } | {
-        "received": device.last_received_at,
-        "ingested": device.last_ingested_at,
-        "quarantine": (health.last_quarantined_at, health.last_quarantine_reason),
-        "fence": (health.last_fenced_at, health.last_fence_reason),
     }
+    rows["device"] = (device.last_received_at, device.last_ingested_at)
+    rows["connector"] = (
+        health.last_received_at,
+        health.last_accepted_at,
+        (health.last_quarantined_at, health.last_quarantine_reason),
+        (health.last_fenced_at, health.last_fence_reason),
+    )
+    return rows
+
+
+def _without_ingested(rows: dict[str, Any]) -> dict[str, Any]:
+    return {
+        key: value[::2] if key in (COMPONENT, OTHER_COMPONENT) else value
+        for key, value in rows.items()
+        if key != "device"
+    } | {"device": rows["device"][0]}
 
 
 @pytest.mark.asyncio
@@ -259,12 +352,17 @@ async def test_concurrent_shuffled_marks_converge_on_dynamodb_local(
 ) -> None:
     rng = random.Random(seed)
     messages = [_message(rng) for _ in range(8)]
-    deliveries = messages + [rng.choice(messages) for _ in range(8)]  # duplicates
+    deliveries = messages + [
+        _redelivered(rng.choice(messages), timedelta(seconds=rng.randint(1, 30))) for _ in range(8)
+    ]
     rng.shuffle(deliveries)
+    reference = _reference(deliveries)
 
     await asyncio.gather(*(local.state.apply_ingest_marks(item) for item in deliveries))
 
-    assert await _observed(local) == _reference(deliveries)
+    observed = await _observed(local)
+    assert _without_ingested(observed) == _without_ingested(reference)
+    assert observed == reference  # last_ingested_at is still the maximum seen
 
 
 @pytest.mark.asyncio

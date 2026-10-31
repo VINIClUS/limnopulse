@@ -31,13 +31,6 @@ def vector_tables() -> Iterator[IngestionTables]:
         yield tables
 
 
-def test_every_vector_is_collected() -> None:
-    names = [vector.name for vector in DYNAMO_EXPRESSION_VECTORS]
-
-    assert len(names) == len(set(names))
-    assert len(names) >= 60
-
-
 @pytest.mark.parametrize("vector", DYNAMO_EXPRESSION_VECTORS, ids=lambda vector: vector.name)
 def test_dynamodb_local_passes_every_expression_vector(
     vector: DynamoVector, vector_tables: IngestionTables

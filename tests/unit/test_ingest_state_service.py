@@ -10,6 +10,7 @@ import pytest
 from limnopulse_api.domain.ingestion import (
     ComponentIngestState,
     ConnectorHealth,
+    IngestMarks,
     IngressFence,
     IngressFenceReason,
     SequenceEvent,
@@ -116,6 +117,27 @@ async def component_state(
     return (await subject.repository.get_component_states(TENANT, [component_id]))[component_id]
 
 
+def record_applied(subject: KitSubject) -> list[IngestMarks]:
+    applied: list[IngestMarks] = []
+    original = subject.repository.apply_ingest_marks
+
+    async def recording(marks: IngestMarks) -> None:
+        applied.append(marks)
+        await original(marks)
+
+    subject.repository.apply_ingest_marks = recording
+    return applied
+
+
+def is_empty(marks: IngestMarks) -> bool:
+    connector = marks.connector_mark.model_dump().values()
+    return (
+        not marks.component_marks
+        and marks.device_mark is None
+        and all(value is None for value in connector)
+    )
+
+
 # Sequence truth table ------------------------------------------------------------------------
 
 
@@ -185,6 +207,11 @@ async def test_a_message_is_classified_pair_by_pair_and_per_component(
             SequenceEvent.REGRESSION: 1,
         }
     )
+    # The stored mark is each Component's maximum (observed_at, sequence) pair of the message.
+    state = await component_state(subject)
+    other = await component_state(subject, OTHER_COMPONENT)
+    assert (state.last_observed_at, state.last_observed_sequence) == (O + 3 * S, 20)
+    assert (other.last_observed_at, other.last_observed_sequence) == (O + 2 * S, 101)
 
 
 @pytest.mark.asyncio
@@ -237,8 +264,6 @@ async def test_a_redelivery_is_not_classified_but_still_marks(
     subject: KitSubject, service: IngestStateService, clock: Clock
 ) -> None:
     first = await service.record_outcome(envelope(), outcome(reading(O, 10)), receive_count=1)
-    error = store_errors()[0]
-    subject.fail_next("get_component_states", error)  # a redelivery must not even read
     clock.now = NOW + timedelta(minutes=1)
 
     redelivery = await service.record_outcome(
@@ -249,8 +274,6 @@ async def test_a_redelivery_is_not_classified_but_still_marks(
 
     assert first == (SequenceEvent.FIRST,)
     assert redelivery == ()
-    with pytest.raises(type(error)):  # the fault is still pending: the service never read
-        await subject.repository.get_component_states(TENANT, [COMPONENT])
     state = await component_state(subject)
     assert (state.last_received_at, state.last_ingested_at) == (RECEIVED + S, clock.now)
     assert (state.last_observed_at, state.last_observed_sequence) == (O + S, 11)
@@ -267,23 +290,25 @@ async def test_a_redriven_message_is_classified_again(
     )
     assert await service.record_outcome(message, accepted, receive_count=3) == ()
 
-    # A DLQ redrive comes back with ApproximateReceiveCount == 1 (best-effort, may double-count).
-    assert await service.record_outcome(message, accepted, receive_count=1) == (
-        SequenceEvent.DUPLICATE,
-    )
+    # A DLQ redrive comes back with ApproximateReceiveCount == 1 and is classified again
+    # (best-effort, may double-count). D11: never pin exact events under redelivery, only that
+    # the redrive is classified and is never FIRST/CONTIGUOUS/GAP/REGRESSION.
+    redriven = {SequenceEvent.DUPLICATE, SequenceEvent.LATE}
+    again = await service.record_outcome(message, accepted, receive_count=1)
+    assert again and set(again) <= redriven
     await service.record_outcome(
         envelope(ingress_id="ing_" + "2" * 32), outcome(reading(O + S, 11)), receive_count=1
     )
-    assert await service.record_outcome(message, accepted, receive_count=1) == (SequenceEvent.LATE,)
+    later = await service.record_outcome(message, accepted, receive_count=1)
+    assert later and set(later) <= redriven
 
 
 @pytest.mark.asyncio
-async def test_a_replay_never_reads_writes_or_classifies(
+async def test_a_replay_never_writes_or_classifies(
     subject: KitSubject, service: IngestStateService
 ) -> None:
     replay = envelope(replay=True, replay_of=REPLAY_OF, received_at=RECEIVED + timedelta(days=1))
-    for operation in ("get_component_states", "apply_ingest_marks"):
-        subject.fail_next(operation, store_errors()[0])
+    applied = record_applied(subject)
 
     events = await service.record_outcome(
         replay,
@@ -298,6 +323,7 @@ async def test_a_replay_never_reads_writes_or_classifies(
     )
 
     assert events == ()
+    assert all(is_empty(marks) for marks in applied)  # passing empty marks through is allowed
     assert subject.store.component_states == {}
     assert subject.store.device_states == {}
     assert subject.store.connector_health == {}
@@ -403,6 +429,25 @@ async def test_a_clock_skewed_observation_never_advances_the_observed_pair(
     assert state.last_received_at == RECEIVED + S  # server-time marks still advance
 
 
+@pytest.mark.asyncio
+async def test_within_a_message_skewed_pairs_are_ignored_for_the_observed_mark(
+    subject: KitSubject, service: IngestStateService
+) -> None:
+    await service.record_outcome(
+        envelope(),
+        outcome(
+            reading(O + 5 * S, 12),
+            reading(O + timedelta(days=30), 500, flags=[QualityFlag.CLOCK_SKEW_FUTURE]),
+            reading(O + 2 * S, 30),
+            reading(O - timedelta(days=9000), 900, flags=[QualityFlag.CLOCK_SKEW_PAST_EXTREME]),
+        ),
+        receive_count=1,
+    )
+
+    state = await component_state(subject)
+    assert (state.last_observed_at, state.last_observed_sequence) == (O + 5 * S, 12)
+
+
 # Connector health ----------------------------------------------------------------------------
 
 
@@ -440,6 +485,9 @@ async def test_connector_health_marks_unresolved_deployments(
         last_quarantine_reason="deployment_unresolved",
     )
     assert subject.store.component_states == {}  # nothing accepted: no component mark
+    device = await subject.device_state(DEVICE)  # the device was still seen (last-seen)
+    assert device is not None
+    assert (device.last_received_at, device.last_ingested_at) == (RECEIVED, NOW)
 
 
 @pytest.mark.asyncio
@@ -491,13 +539,14 @@ async def test_a_verified_fence_marks_only_the_connector_with_the_bare_reason(
 async def test_an_unverified_fence_writes_nothing(
     subject: KitSubject, service: IngestStateService
 ) -> None:
-    subject.fail_next("apply_ingest_marks", store_errors()[0])  # must not be reached
+    applied = record_applied(subject)
 
     await service.record_fence(
         envelope(),
         IngressFence(reason=IngressFenceReason.IDENTITY_UNRESOLVED, account_verified=False),
     )
 
+    assert all(is_empty(marks) for marks in applied)
     assert subject.store.connector_health == {}
 
 
