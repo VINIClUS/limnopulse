@@ -58,21 +58,21 @@ class DynamoQuarantineRepository(DynamoV2RepositoryBase):
         cursor = after_sk
         now = self.clock()
         while True:
-            items, more = await to_thread(self._page_sync, tenant_id, cursor, limit)
+            items, resume = await to_thread(self._page_sync, tenant_id, cursor, limit)
             for index, item in enumerate(items):
                 entry = quarantine_entry_from_item(item)
                 if not self._is_live(entry, now) or not _matches(entry, status, reason):
                     continue
                 entries.append(entry)
                 if len(entries) == limit:
-                    remaining = more or index < len(items) - 1
+                    remaining = resume is not None or index < len(items) - 1
                     return QuarantinePage(
                         entries=tuple(entries),
                         next_after_sk=entry.entry_key if remaining else None,
                     )
-            if not more:
+            if resume is None:
                 return QuarantinePage(entries=tuple(entries), next_after_sk=None)
-            cursor = items[-1]["SK"]
+            cursor = resume
 
     async def get_quarantine_entry(self, tenant_id: str, entry_key: str) -> QuarantineEntry | None:
         item = await self.get_item(self._key(tenant_id, entry_key), consistent=True)
@@ -147,8 +147,9 @@ class DynamoQuarantineRepository(DynamoV2RepositoryBase):
 
     def _page_sync(
         self, tenant_id: str, after_sk: str | None, limit: int
-    ) -> tuple[list[dict[str, Any]], bool]:
-        """One `Query` page of at most `limit` rows strictly after `after_sk`."""
+    ) -> tuple[list[dict[str, Any]], str | None]:
+        """One `Query` page of at most `limit` rows strictly after `after_sk`, plus the SK to
+        resume from (`LastEvaluatedKey`), or `None` when the partition is exhausted."""
         values = {
             ":pk": self.keys.quarantine_partition(tenant_id),
             ":sk_lower": _FIRST_KEY if after_sk is None else after_sk,
@@ -160,7 +161,8 @@ class DynamoQuarantineRepository(DynamoV2RepositoryBase):
             Limit=limit,
         )
         items = [self.deserialize_item(item) for item in response.get("Items", [])]
-        return items, "LastEvaluatedKey" in response
+        last = response.get("LastEvaluatedKey")
+        return items, None if last is None else self.deserialize_item(last)["SK"]
 
 
 def _matches(
