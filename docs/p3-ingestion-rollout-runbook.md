@@ -36,8 +36,11 @@ runbook](p2-telemetry-rollout-runbook.md).
     source queue; `GetItem`, `PutItem`, `Query` and `UpdateItem` on the domain table, without a
     leading-key condition); the operator policy (`<project>-<env>-telemetry-ingress-operator`,
     attached to no principal by default) covers DLQ redrive and quarantine reconciliation.
-- **Alarms** exist and route to an on-call target (`telemetry_ingress_alarm_actions`), see
-  [Alarms and deadlines](#alarms-and-deadlines).
+- **Alarms** exist and route to an on-call target: they publish to the module's KMS-encrypted SNS
+  topic (output `telemetry_ingress_alarm_topic_arn`), `telemetry_ingress_alarm_email` subscribes the
+  on-call mailbox, and `telemetry_ingress_alarm_actions` adds extra ARNs. The subscription stays
+  `PendingConfirmation` until the recipient confirms the email AWS sends; confirm it before step 2.
+  See [Alarms and deadlines](#alarms-and-deadlines).
 
 ## Enablement order
 
