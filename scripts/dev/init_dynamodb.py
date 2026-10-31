@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import time
+from copy import deepcopy
 from typing import Any
 
 import boto3
@@ -48,11 +49,46 @@ GSI_WAIT_DELAY_SECONDS = 20
 GSI_WAIT_MAX_ATTEMPTS = 30
 
 
+def table_request(table_name: str, *, include_alert_indexes: bool = False) -> dict[str, Any]:
+    """Return the CreateTable request for a LimnoPulse table; pure and freshly built each call."""
+    definitions = [
+        {"AttributeName": "PK", "AttributeType": "S"},
+        {"AttributeName": "SK", "AttributeType": "S"},
+    ]
+    if include_alert_indexes:
+        definitions.extend(
+            {"AttributeName": name, "AttributeType": "S"}
+            for name in (
+                "GSI1PK",
+                "GSI1SK",
+                "GSI2PK",
+                "GSI2SK",
+                "GSI3PK",
+                "GSI3SK",
+                "relay_gsi_pk",
+                "relay_gsi_sk",
+            )
+        )
+    request: dict[str, Any] = {
+        "TableName": table_name,
+        "KeySchema": [
+            {"AttributeName": "PK", "KeyType": "HASH"},
+            {"AttributeName": "SK", "KeyType": "RANGE"},
+        ],
+        "AttributeDefinitions": definitions,
+        "BillingMode": "PAY_PER_REQUEST",
+    }
+    if include_alert_indexes:
+        request["GlobalSecondaryIndexes"] = deepcopy(list(ALERT_INDEXES))
+    return request
+
+
 def ensure_table(
     client: boto3.client,
     table_name: str,
     *,
     include_alert_indexes: bool = False,
+    enable_ttl: bool = True,
 ) -> None:
     existing_tables = set(client.list_tables()["TableNames"])
     if table_name in existing_tables:
@@ -60,36 +96,9 @@ def ensure_table(
         if include_alert_indexes:
             ensure_alert_indexes(client, table_name)
     else:
-        definitions = [
-            {"AttributeName": "PK", "AttributeType": "S"},
-            {"AttributeName": "SK", "AttributeType": "S"},
-        ]
-        if include_alert_indexes:
-            definitions.extend(
-                {"AttributeName": name, "AttributeType": "S"}
-                for name in (
-                    "GSI1PK",
-                    "GSI1SK",
-                    "GSI2PK",
-                    "GSI2SK",
-                    "GSI3PK",
-                    "GSI3SK",
-                    "relay_gsi_pk",
-                    "relay_gsi_sk",
-                )
-            )
-        request = {
-            "TableName": table_name,
-            "KeySchema": [
-                {"AttributeName": "PK", "KeyType": "HASH"},
-                {"AttributeName": "SK", "KeyType": "RANGE"},
-            ],
-            "AttributeDefinitions": definitions,
-            "BillingMode": "PAY_PER_REQUEST",
-        }
-        if include_alert_indexes:
-            request["GlobalSecondaryIndexes"] = list(ALERT_INDEXES)
-        client.create_table(**request)
+        client.create_table(
+            **table_request(table_name, include_alert_indexes=include_alert_indexes)
+        )
         client.get_waiter("table_exists").wait(TableName=table_name)
         if include_alert_indexes:
             for index in ALERT_INDEXES:
@@ -98,7 +107,8 @@ def ensure_table(
                 print(f"Index {index_name} is ACTIVE on {table_name}")
         print(f"Created table {table_name}")
 
-    ensure_ttl(client, table_name)
+    if enable_ttl:
+        ensure_ttl(client, table_name)
 
 
 def ensure_alert_indexes(client: boto3.client, table_name: str) -> None:

@@ -13,6 +13,10 @@ This directory contains the OpenTofu scaffold for cloud infrastructure. Docker C
   DeliveryDelay, Bounce, Complaint, and Reject feedback.
 - Separate Telegram bot-token and webhook-secret containers with no secret
   versions in state, plus least-privilege worker and FastAPI IAM policies.
+- Telemetry ingress queue and DLQ (`telemetry_ingress`, default `false`): SSE,
+  256 KiB messages, redrive after eight receives, SecureTransport-deny queue
+  policies, age/depth/DLQ CloudWatch alarms, a dedicated `telemetry_ingest`
+  worker user, the API send grant and an unattached operator policy.
 - Placeholder variables for Redis and InfluxDB cloud endpoints.
 
 ## Not Included Yet
@@ -24,7 +28,8 @@ This directory contains the OpenTofu scaffold for cloud infrastructure. Docker C
   sandbox-recipient verification. `SES_FROM_EMAIL` is a runtime secret/config
   chosen per environment, not a generic stack default.
 - Container orchestration, the external 60-second relay/evaluator schedulers,
-  worker autoscaling, dashboards or alarms.
+  worker autoscaling, dashboards, or alarms other than the telemetry ingress
+  queue alarms.
 - Telegram container orchestration, webhook registration and secret values.
 - WhatsApp, SMS, or mobile push delivery.
 

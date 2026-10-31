@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import re
 from datetime import UTC, datetime
 from pathlib import Path
 
@@ -9,6 +10,52 @@ import yaml
 from scripts.dev.publish_ses_event import build_ses_event, publish_event
 
 ROOT = Path(__file__).resolve().parents[2]
+
+
+ELASTICMQ_CONF = ROOT / "infra" / "elasticmq" / "elasticmq.conf"
+QUEUE_DEFAULTS = (
+    "defaultVisibilityTimeout = 60 seconds",
+    "delay = 0 seconds",
+)
+REDRIVEN_QUEUES = {
+    "limnopulse-notification-jobs": "limnopulse-notification-jobs-dlq",
+    "limnopulse-telegram-notification-jobs": "limnopulse-telegram-notification-jobs-dlq",
+    "limnopulse-ses-events": "limnopulse-ses-events-dlq",
+    "limnopulse-telemetry-ingress": "limnopulse-telemetry-ingress-dlq",
+}
+
+
+def _block_body(text: str, header: re.Match[str]) -> str:
+    depth, index = 0, header.end() - 1
+    while True:
+        if text[index] == "{":
+            depth += 1
+        elif text[index] == "}":
+            depth -= 1
+            if depth == 0:
+                return text[header.end() : index]
+        index += 1
+
+
+def _elasticmq_queues_block(config: str) -> str:
+    headers = list(re.finditer(r"^queues\s*\{", config, re.MULTILINE))
+    assert len(headers) == 1
+    return _block_body(config, headers[0])
+
+
+def _elasticmq_queue_header(config: str, queue: str) -> re.Match[str]:
+    """Locate one queue declaration inside the top-level ``queues {}`` block."""
+    queues = _elasticmq_queues_block(config)
+    headers = list(re.finditer(rf'^\s*"{re.escape(queue)}"\s*\{{', queues, re.MULTILINE))
+    assert len(headers) == 1, queue
+    return headers[0]
+
+
+def _elasticmq_queue_lines(config: str, queue: str) -> list[str]:
+    """Return the normalized body lines of one ElasticMQ queue block."""
+    queues = _elasticmq_queues_block(config)
+    body = _block_body(queues, _elasticmq_queue_header(config, queue))
+    return [line.strip() for line in body.splitlines() if line.strip()]
 
 
 class FakeSQS:
@@ -41,7 +88,40 @@ def test_elasticmq_defines_notification_queues_and_redrive_deterministically() -
         "limnopulse-ses-events-routing-dlq",
     ):
         assert f'"{queue}"' in config
-    assert config.count("maxReceiveCount = 8") == 3
+    for queue, dlq in REDRIVEN_QUEUES.items():
+        lines = _elasticmq_queue_lines(config, queue)
+        assert lines[-4:] == [
+            "deadLettersQueue {",
+            f'name = "{dlq}"',
+            "maxReceiveCount = 8",
+            "}",
+        ], queue
+        assert sum("deadLettersQueue" in line for line in lines) == 1, queue
+        assert "deadLettersQueue" not in " ".join(_elasticmq_queue_lines(config, dlq)), dlq
+    assert config.count("maxReceiveCount = 8") == len(REDRIVEN_QUEUES)
+
+
+def test_elasticmq_defines_telemetry_ingress_queue_and_dlq_exactly() -> None:
+    config = ELASTICMQ_CONF.read_text(encoding="utf-8")
+
+    assert _elasticmq_queue_lines(config, "limnopulse-telemetry-ingress-dlq") == [
+        *QUEUE_DEFAULTS,
+        "receiveMessageWait = 0 seconds",
+    ]
+    assert _elasticmq_queue_lines(config, "limnopulse-telemetry-ingress") == [
+        *QUEUE_DEFAULTS,
+        "receiveMessageWait = 20 seconds",
+        "deadLettersQueue {",
+        'name = "limnopulse-telemetry-ingress-dlq"',
+        "maxReceiveCount = 8",
+        "}",
+    ]
+    assert "RedriveAllowPolicy" not in config
+    assert "redrive-allow" not in config.lower()
+    assert (
+        _elasticmq_queue_header(config, "limnopulse-telemetry-ingress-dlq").start()
+        < _elasticmq_queue_header(config, "limnopulse-telemetry-ingress").start()
+    )
 
 
 def test_notification_compose_processes_use_real_sdk_endpoints_and_safe_fake_sender() -> None:
