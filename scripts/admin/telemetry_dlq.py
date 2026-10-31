@@ -101,14 +101,14 @@ def _parser() -> _ArgumentParser:
 
 
 def _emit(out: TextIO, payload: dict[str, Any]) -> None:
-    out.write(json.dumps(payload, ensure_ascii=False, separators=(",", ":")) + "\n")
+    out.write(json.dumps(payload, separators=(",", ":")) + "\n")
 
 
 async def run(
     argv: Sequence[str],
     *,
     dlq: IngressQueueConsumer,
-    source: IngressQueueProducer,
+    source: IngressQueueProducer | None,
     metrics: TelemetryMetrics,
     out: TextIO,
 ) -> int:
@@ -120,6 +120,9 @@ async def run(
     try:
         if args.command == "sample":
             return await _sample(dlq, args.limit, out)
+        if source is None:
+            _emit(out, {"error": "queue_not_configured"})
+            return EXIT_ERROR
         return await _redrive(dlq, source, metrics, out, max_messages=args.max, apply=args.apply)
     except IngressQueueError:
         _emit(out, {"error": "queue_unavailable"})
@@ -165,7 +168,7 @@ def _diagnose(message: IngressQueueMessage) -> dict[str, Any]:
     }
     try:
         json.loads(message.body)
-    except ValueError:
+    except (ValueError, RecursionError):  # a deeply nested body is still just "not json"
         return {**line, "diagnosis": "not_json"}
     try:
         envelope = IngressEnvelope.model_validate_json(message.body)
@@ -192,9 +195,11 @@ async def _sample(dlq: IngressQueueConsumer, limit: int, out: TextIO) -> int:
             if not batch:
                 break
             for message in batch:
-                if message.message_id not in held:
-                    _emit(out, _diagnose(message))
+                first_seen = message.message_id not in held
+                # Held before anything else, so the finally block releases it whatever follows.
                 held[message.message_id] = message
+                if first_seen:
+                    _emit(out, _diagnose(message))
     finally:
         await _release(dlq, list(held.values()))
     _emit(out, {"command": "sample", "sampled": len(held)})
@@ -228,19 +233,23 @@ def main(
     except ValidationError:
         _emit(out, {"error": "settings"})
         return EXIT_ERROR
-    if not settings.sqs_telemetry_ingress_dlq_url or not settings.sqs_telemetry_ingress_queue_url:
+    if not settings.sqs_telemetry_ingress_dlq_url:
         _emit(out, {"error": "queue_not_configured"})
         return EXIT_ERROR
-    client = sqs_client or boto3.client(
-        "sqs", region_name=settings.aws_region, endpoint_url=settings.sqs_endpoint_url
-    )
+    try:
+        client = sqs_client or boto3.client(
+            "sqs", region_name=settings.aws_region, endpoint_url=settings.sqs_endpoint_url
+        )
+    except Exception:  # noqa: BLE001 - a bad endpoint error quotes the URL, which may hold a secret
+        _emit(out, {"error": "settings"})
+        return EXIT_ERROR
+    source_url = settings.sqs_telemetry_ingress_queue_url
     return asyncio.run(
         run(
             sys.argv[1:] if argv is None else argv,
             dlq=SqsIngressQueue(client=client, queue_url=settings.sqs_telemetry_ingress_dlq_url),
-            source=SqsIngressQueue(
-                client=client, queue_url=settings.sqs_telemetry_ingress_queue_url
-            ),
+            # `sample` needs only the DLQ; `redrive` refuses to run without the source queue.
+            source=SqsIngressQueue(client=client, queue_url=source_url) if source_url else None,
             metrics=metrics or JsonLinesMetrics(err),
             out=out,
         )

@@ -11,7 +11,7 @@ Run from an operator checkout (repository root, AWS credential chain):
 `replay` and `dismiss` are dry runs unless `--apply` is given. A replay groups the requested open,
 replayable rows by `(ingress_id, device_integration_id)` and sends one NEW `telemetry-ingress@1`
 envelope per group through the normal producer: a deterministic `ingress_id` derived from the
-group's entry keys (a rerun after a crash reuses it), `replay_of` the original ingress id,
+group's entry keys (a rerun after a crash before any row was marked reuses it), `replay_of` the original ingress id,
 `replay=true`, the first `received_at`, the stored mapping versions and the stored observations.
 Rows are marked `replayed` only after their group's send succeeded. `dismiss` is versioned on the
 row it read. `health` prints the D11 connector-health row and writes nothing.
@@ -134,7 +134,8 @@ def _parser() -> _ArgumentParser:
 
 
 def _emit(out: TextIO, payload: dict[str, Any]) -> None:
-    out.write(json.dumps(payload, ensure_ascii=False, separators=(",", ":")) + "\n")
+    # ASCII-escaped, so a non-UTF-8 stdout can never fail a listing halfway through.
+    out.write(json.dumps(payload, separators=(",", ":")) + "\n")
 
 
 def _error_category(error: BaseException) -> str:
@@ -313,7 +314,14 @@ async def _replay(args: argparse.Namespace, context: _Context) -> int:
     for _, group in sorted(groups.items()):
         group.sort(key=lambda entry: entry.entry_key)
         ingress_id = replay_ingress_id(entry.entry_key for entry in group)
-        envelope = _replay_envelope(group, ingress_id)
+        try:
+            envelope = _replay_envelope(group, ingress_id)
+        except ValidationError:  # rows that no longer form a valid envelope are never sent
+            for entry in group:
+                results.skip(entry.entry_key, "invalid_envelope")
+                if args.apply:
+                    context.metrics.increment(REPLAYED_METRIC, result="skipped")
+            continue
         if producer is None or not args.apply:
             for entry in group:
                 results.record(entry.entry_key, "would_replay", replay_ingress_id=ingress_id)
@@ -337,6 +345,10 @@ async def _replay(args: argparse.Namespace, context: _Context) -> int:
                 )
             except (ConflictError, NotFoundError):
                 results.record(entry.entry_key, "failed", reason="conflict")
+                context.metrics.increment(REPLAYED_METRIC, result="failed")
+            except (BotoCoreError, ClientError):
+                # Sent but not marked: the row stays open and a rerun sends it again (safe).
+                results.record(entry.entry_key, "failed", reason="store_unavailable")
                 context.metrics.increment(REPLAYED_METRIC, result="failed")
             else:
                 results.record(entry.entry_key, "replayed", replay_ingress_id=ingress_id)
@@ -400,15 +412,23 @@ def main(
         _emit(out, {"error": "settings"})
         return EXIT_ERROR
     clock = clock or utc_now
-    dynamodb = dynamodb_client or boto3.client(
-        "dynamodb", region_name=settings.aws_region, endpoint_url=settings.dynamodb_endpoint_url
-    )
-    producer: IngressQueueProducer | None = None
-    if settings.sqs_telemetry_ingress_queue_url:
-        sqs = sqs_client or boto3.client(
-            "sqs", region_name=settings.aws_region, endpoint_url=settings.sqs_endpoint_url
+    try:
+        dynamodb = dynamodb_client or boto3.client(
+            "dynamodb",
+            region_name=settings.aws_region,
+            endpoint_url=settings.dynamodb_endpoint_url,
         )
-        producer = SqsIngressQueue(client=sqs, queue_url=settings.sqs_telemetry_ingress_queue_url)
+        producer: IngressQueueProducer | None = None
+        if settings.sqs_telemetry_ingress_queue_url:
+            sqs = sqs_client or boto3.client(
+                "sqs", region_name=settings.aws_region, endpoint_url=settings.sqs_endpoint_url
+            )
+            producer = SqsIngressQueue(
+                client=sqs, queue_url=settings.sqs_telemetry_ingress_queue_url
+            )
+    except Exception:  # noqa: BLE001 - a bad endpoint error quotes the URL, which may hold a secret
+        _emit(out, {"error": "settings"})
+        return EXIT_ERROR
     table = settings.dynamodb_domain_table
     return asyncio.run(
         run(
