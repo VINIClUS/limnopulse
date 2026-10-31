@@ -41,3 +41,12 @@ influxdb_url = ""
 email_delivery    = false
 telegram_delivery = false
 telegram_webhook  = false
+
+# P3 telemetry ingress (ingestion_queues.tf). Stays false until the HTTPS
+# ingress rollout runbook is followed; alarm_actions takes SNS topic ARNs.
+telemetry_ingress                             = false
+telemetry_ingress_queue_name                  = "limnopulse-telemetry-ingress"
+telemetry_ingress_dlq_name                    = "limnopulse-telemetry-ingress-dlq"
+telemetry_ingress_age_alarm_threshold_seconds = 300
+telemetry_ingress_depth_alarm_threshold       = 1000
+telemetry_ingress_alarm_actions               = []
