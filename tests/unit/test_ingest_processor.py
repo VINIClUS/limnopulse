@@ -1107,3 +1107,5 @@ async def test_the_processor_logs_no_identifier(caplog: pytest.LogCaptureFixture
         text = record.getMessage()
         assert record.exc_info is None
         assert not any(identifier in text for identifier in IDENTIFIERS)
+    # Failures are logged by category (a closed value), never by identifier.
+    assert any("store_unavailable" in record.getMessage() for record in caplog.records)

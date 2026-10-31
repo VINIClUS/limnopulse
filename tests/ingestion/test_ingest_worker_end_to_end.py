@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import asyncio
 import random
+import signal
 from collections.abc import Iterator, Sequence
 from contextlib import contextmanager
 from dataclasses import dataclass
@@ -77,6 +78,24 @@ pytestmark = pytest.mark.asyncio
 TIME_MIN = "1970-01-01T00:00:00Z"
 TIME_MAX = "2262-01-01T00:00:00Z"
 GUARD_SECONDS = 60
+
+
+@pytest.fixture(autouse=True)
+def _hard_deadline() -> Iterator[None]:
+    """A SIGALRM bound that fires even when a busy loop never yields to the event loop."""
+
+    def expire(signum: int, frame: Any) -> None:
+        raise TimeoutError("test exceeded its hard deadline (busy loop?)")
+
+    previous = signal.signal(signal.SIGALRM, expire)
+    signal.setitimer(signal.ITIMER_REAL, 3 * GUARD_SECONDS)
+    try:
+        yield
+    finally:
+        signal.setitimer(signal.ITIMER_REAL, 0)
+        signal.signal(signal.SIGALRM, previous)
+
+
 DEPLOYMENT = Deployment(
     tenant_id=TENANT,
     deployment_id="dep_" + "c" * 32,

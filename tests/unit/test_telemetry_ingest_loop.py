@@ -11,8 +11,9 @@ import asyncio
 import contextlib
 import contextvars
 import logging
+import signal
 from collections import deque
-from collections.abc import Callable, Iterable
+from collections.abc import Callable, Iterable, Iterator
 from datetime import datetime, timedelta
 from typing import Any
 
@@ -34,6 +35,22 @@ pytestmark = pytest.mark.asyncio
 NOW = RECEIVED + timedelta(minutes=5)
 GUARD_SECONDS = 10
 RECEIPT_SECRET = "rh-SECRET-handle"
+
+
+@pytest.fixture(autouse=True)
+def _hard_deadline() -> Iterator[None]:
+    """A SIGALRM bound that fires even when a busy loop never yields to the event loop."""
+
+    def expire(signum: int, frame: Any) -> None:
+        raise TimeoutError("test exceeded its hard deadline (busy loop?)")
+
+    previous = signal.signal(signal.SIGALRM, expire)
+    signal.setitimer(signal.ITIMER_REAL, 3 * GUARD_SECONDS)
+    try:
+        yield
+    finally:
+        signal.setitimer(signal.ITIMER_REAL, 0)
+        signal.signal(signal.SIGALRM, previous)
 
 
 def make_message(index: int, *, receive_count: int = 1, sent_at: datetime = RECEIVED) -> Any:
@@ -370,14 +387,15 @@ async def test_the_concurrency_bound_is_respected_and_reached() -> None:
 
 async def test_the_heartbeat_extends_visibility_on_a_slow_message() -> None:
     consumer = ScriptedConsumer([make_message(1)])
-    processor = StubProcessor(consumer.events, delay=1.8)
-    loop, _ = make_loop(consumer, processor, visibility_seconds=1)
+    processor = StubProcessor(consumer.events, delay=2.6)
+    loop, _ = make_loop(consumer, processor, visibility_seconds=2)
 
     await run_until(loop, lambda: bool(consumer.named("delete")))
 
     beats = consumer.named("heartbeat_start")
     assert len(beats) >= 2  # every visibility_seconds / 2
-    assert all(beat == ("heartbeat_start", "m1", 1) for beat in beats)
+    # Each beat extends the visibility by the full visibility_seconds.
+    assert all(beat == ("heartbeat_start", "m1", 2) for beat in beats)
 
 
 async def test_a_fast_message_gets_no_heartbeat() -> None:
@@ -444,7 +462,7 @@ async def test_an_in_flight_heartbeat_is_awaited_before_the_final_action(scenari
 
 async def test_each_message_has_its_own_heartbeat() -> None:
     consumer = ScriptedConsumer([make_message(1), make_message(2)])
-    processor = StubProcessor(consumer.events, delays={"m1": 0.05, "m2": 1.3})
+    processor = StubProcessor(consumer.events, delays={"m1": 0.05, "m2": 1.8})
     loop, _ = make_loop(consumer, processor, visibility_seconds=1, max_messages=2)
 
     await run_until(loop, lambda: len(consumer.named("delete")) == 2)
@@ -461,12 +479,14 @@ async def test_a_heartbeat_failure_neither_stops_the_message_nor_the_loop(
     caplog.set_level(logging.DEBUG)
     consumer = ScriptedConsumer([make_message(1), make_message(2)])
     consumer.heartbeat_errors.append(_queue_error("change_visibility", 1))
-    processor = StubProcessor(consumer.events, delays={"m1": 1.3, "m2": 0.01})
+    processor = StubProcessor(consumer.events, delays={"m1": 1.8, "m2": 0.01})
     loop, _ = make_loop(consumer, processor, visibility_seconds=1, concurrency=1)
 
     await run_until(loop, lambda: len(consumer.named("delete")) == 2)
 
     assert processor.finished == ["m1", "m2"]
+    m1_beats = [e for e in consumer.events if e[:2] == ("heartbeat_start", "m1")]
+    assert len(m1_beats) >= 2  # the heartbeat keeps beating after a failed call
     _assert_redacted_logs(caplog)
 
 
@@ -529,6 +549,7 @@ async def test_a_delete_failure_is_counted_and_not_raised(
     assert loop.final_action_failures == 1
     assert len(messages_total(metrics)) == 2
     _assert_redacted_logs(caplog)
+    _assert_logged_category(caplog, "processed")
 
 
 async def test_a_visibility_failure_is_counted_and_not_raised(
@@ -549,6 +570,7 @@ async def test_a_visibility_failure_is_counted_and_not_raised(
 
     assert loop.final_action_failures == 1
     _assert_redacted_logs(caplog)
+    _assert_logged_category(caplog, "envelope_invalid")
 
 
 async def test_a_receive_failure_does_not_stop_the_loop(caplog: pytest.LogCaptureFixture) -> None:
@@ -564,6 +586,11 @@ async def test_a_receive_failure_does_not_stop_the_loop(caplog: pytest.LogCaptur
 
     assert len(consumer.receives) >= 2
     _assert_redacted_logs(caplog)
+
+
+def _assert_logged_category(caplog: pytest.LogCaptureFixture, category: str) -> None:
+    """The failure line names its category (a closed value), so operators can triage it."""
+    assert any(category in record.getMessage() for record in caplog.records)
 
 
 def _assert_redacted_logs(caplog: pytest.LogCaptureFixture) -> None:
