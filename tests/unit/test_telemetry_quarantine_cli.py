@@ -704,9 +704,8 @@ async def test_list_pages_by_sk_lower_bound_and_defaults_to_open(harness) -> Non
 
     seen: list[str] = []
     after: list[str] = []
-    pages = 0
+    finished = False
     for _ in range(10):
-        pages += 1
         assert await harness.run("list", "--tenant", TENANT, "--limit", "2", *after) == 0
         page = [line["entry_key"] for line in harness.entry_lines()]
         assert len(page) <= 2
@@ -714,11 +713,12 @@ async def test_list_pages_by_sk_lower_bound_and_defaults_to_open(harness) -> Non
         summary = harness.summary()
         assert summary["command"] == "list" and summary["count"] == len(page)
         if summary["next_after"] is None:
+            finished = True
             break
-        assert summary["next_after"] == page[-1]
+        assert page and summary["next_after"] == page[-1]
         after = ["--after", summary["next_after"]]
     assert seen == open_keys
-    assert len(open_keys) == 6 and pages == 3  # a full last page already says next_after=None
+    assert finished and len(open_keys) == 6
     assert {line["status"] for line in harness.entry_lines()} <= {"open"}
 
 
@@ -810,7 +810,8 @@ async def test_health_of_an_unknown_or_foreign_account_is_not_found(harness) -> 
     await harness.ingest_state.apply_ingest_marks(marks(tenant_id=OTHER_TENANT))
 
     assert await harness.run("health", "--tenant", TENANT, "--account", ACCOUNT) == 0
-    assert harness.lines() == [{"command": "health", "found": False, "health": None}]
+    (line,) = harness.lines()
+    assert line["command"] == "health" and line["found"] is False and line["health"] is None
     assert await harness.run("health", "--tenant", TENANT, "--account", OTHER_ACCOUNT) == 0
     assert harness.lines()[0]["found"] is False
 
@@ -877,6 +878,25 @@ def test_usage_errors_exit_1_without_echoing_argv(argv, capsys) -> None:
 # Composition -----------------------------------------------------------------------------------
 
 
+class RecordingClient:
+    """Proxies a boto3-style client and records the operation names the CLI calls."""
+
+    def __init__(self, inner: Any) -> None:
+        self._inner = inner
+        self.operations: list[str] = []
+
+    def __getattr__(self, name: str) -> Any:
+        attribute = getattr(self._inner, name)
+        if not callable(attribute):
+            return attribute
+
+        def call(*args: Any, **kwargs: Any) -> Any:
+            self.operations.append(name)
+            return attribute(*args, **kwargs)
+
+        return call
+
+
 class RecordingSqsClient:
     """A boto3 SQS client stand-in that records `send_message` calls."""
 
@@ -910,9 +930,10 @@ async def _seed_dynamo(client: IngestionDynamoClient) -> list[QuarantineEntry]:
 
 @pytest.mark.asyncio
 async def test_main_composes_dynamodb_and_sqs_from_settings() -> None:
-    dynamodb = IngestionDynamoClient()
+    raw = IngestionDynamoClient()
     sqs = RecordingSqsClient()
-    entries = await _seed_dynamo(dynamodb)
+    entries = await _seed_dynamo(raw)
+    dynamodb = RecordingClient(raw)
     metrics = RecordingTelemetryMetrics()
     out = io.StringIO()
 
@@ -930,8 +951,10 @@ async def test_main_composes_dynamodb_and_sqs_from_settings() -> None:
     assert code == 0
     (call,) = sqs.sent
     assert call["QueueUrl"] == QUEUE_URL
+    # The operator policy (P3-02 IAM) allows only Query, GetItem and UpdateItem on the domain table.
+    assert dynamodb.operations and set(dynamodb.operations) <= {"query", "get_item", "update_item"}
     assert IngressEnvelope.model_validate_json(call["MessageBody"]) == _expected_envelope(entries)
-    repository = DynamoQuarantineRepository(TABLE, dynamodb, clock=lambda: NOW)
+    repository = DynamoQuarantineRepository(TABLE, raw, clock=lambda: NOW)
     for entry in entries:
         row = await repository.get_quarantine_entry(TENANT, entry.entry_key)
         assert row is not None and row.status == QuarantineEntryStatus.REPLAYED

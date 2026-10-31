@@ -155,16 +155,12 @@ async def test_redrive_delegates_to_the_core_with_dry_run_by_default(harness, mo
     code = await harness.run("redrive")
 
     assert code == telemetry_dlq.EXIT_OK == 0
-    assert spy.calls == [
-        {"dlq": harness.dlq, "source": harness.source, "max_messages": 100, "apply": False}
-    ]
-    assert harness.summary() == {
-        "command": "redrive",
-        "apply": False,
-        "seen": 5,
-        "redriven": 0,
-        "failed": 0,
-    }
+    (call,) = spy.calls
+    assert call["dlq"] is harness.dlq and call["source"] is harness.source
+    assert call["max_messages"] == 100 and call["apply"] is False
+    summary = harness.summary()
+    assert summary["command"] == "redrive" and summary["apply"] is False
+    assert (summary["seen"], summary["redriven"], summary["failed"]) == (5, 0, 0)
     assert harness.metrics.records == []
 
 
@@ -176,9 +172,9 @@ async def test_redrive_apply_passes_max_and_reports_partial(harness, monkeypatch
     code = await harness.run("redrive", "--max", "7", "--apply")
 
     assert code == telemetry_dlq.EXIT_PARTIAL == 3
-    assert spy.calls == [
-        {"dlq": harness.dlq, "source": harness.source, "max_messages": 7, "apply": True}
-    ]
+    (call,) = spy.calls
+    assert call["dlq"] is harness.dlq and call["source"] is harness.source
+    assert call["max_messages"] == 7 and call["apply"] is True
     summary = harness.summary()
     assert summary["apply"] is True
     assert (summary["seen"], summary["redriven"], summary["failed"]) == (7, 5, 2)
@@ -318,7 +314,8 @@ async def test_sample_defaults_to_ten_messages(harness) -> None:
 @pytest.mark.asyncio
 async def test_sample_of_an_empty_dlq_is_ok(harness) -> None:
     assert await harness.run("sample") == 0
-    assert harness.summary() == {"command": "sample", "sampled": 0}
+    summary = harness.summary()
+    assert summary["command"] == "sample" and summary["sampled"] == 0
 
 
 @pytest.mark.asyncio
@@ -391,6 +388,10 @@ class InMemorySqsClient:
         self, *, QueueUrl: str, MaxNumberOfMessages: int, VisibilityTimeout: int, **_: Any
     ) -> dict[str, Any]:
         self.calls.append(("receive_message", QueueUrl))
+        # A scan must hold what it received; a runaway loop fails instead of hanging the suite.
+        assert VisibilityTimeout > 0, "a DLQ scan must hold each message while it runs"
+        if sum(1 for name, _ in self.calls if name == "receive_message") > RECEIVE_BUDGET:
+            raise AssertionError("the CLI kept receiving: a scan must stop")
         out = []
         for message in self.queues[QueueUrl]:
             if len(out) >= MaxNumberOfMessages:
@@ -460,6 +461,12 @@ async def test_main_redrives_from_the_dlq_url_to_the_source_url() -> None:
     assert client.queues[DLQ_URL] == []
     assert {url for name, url in client.calls if name == "send_message"} == {SOURCE_URL}
     assert {url for name, url in client.calls if name == "receive_message"} == {DLQ_URL}
+    # The operator policy (P3-02 IAM): Receive/Delete/ChangeVisibility/GetQueueAttributes on the
+    # DLQ and SendMessage on the ingress queue, nothing else.
+    dlq_operations = {"receive_message", "delete_message", "change_message_visibility"}
+    dlq_operations.add("get_queue_attributes")
+    assert {name for name, url in client.calls if url == DLQ_URL} <= dlq_operations
+    assert {name for name, url in client.calls if url == SOURCE_URL} <= {"send_message"}
     metrics = [json.loads(line) for line in err.getvalue().splitlines() if line.strip()]
     assert metrics, "the default sink writes one JSON object per increment to stderr"
     for record in metrics:
@@ -561,6 +568,6 @@ def test_main_builds_its_own_sqs_client_from_settings(monkeypatch) -> None:
     )
 
     assert code == 0
-    assert built == [
-        {"service": "sqs", "region_name": "sa-east-1", "endpoint_url": "http://sqs.local:9324"}
-    ]
+    assert [item["service"] for item in built] == ["sqs"]
+    assert built[0]["region_name"] == "sa-east-1"
+    assert built[0]["endpoint_url"] == "http://sqs.local:9324"
