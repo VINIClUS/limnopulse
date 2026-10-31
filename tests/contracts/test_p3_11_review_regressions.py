@@ -99,3 +99,32 @@ def test_runbook_deadline_says_one_place_and_the_four_day_source_limit() -> None
     assert re.search(r"one of two places", text)
     assert re.search(r"4 days in the source queue", text)
     assert "telemetry_dlq.py" in _runbook()
+
+
+# --- Codex review on PR #122 ---------------------------------------------------------------------
+
+
+def test_runbook_recreates_containers_instead_of_restarting_them() -> None:
+    """Compose keeps a container's environment across `restart`; a switch change needs `up -d`."""
+    text = _runbook()
+    assert re.search(r"recreate, never just restart", text)
+    assert re.search(r"compose\.production\.yaml up -d api", text)
+    assert re.search(r"--profile ingestion up -d telemetry-ingest-worker", text)
+    for name in ("Enablement order", "Rollback"):
+        assert not re.search(r"\brestart (the|it)\b", _section(name)), name
+    assert "restart both services" not in _section("Production environment")
+
+
+def test_runbook_does_not_promise_replay_for_terminal_fences() -> None:
+    """Decommissioned and revoked states are terminal, and a replay keeps the original ids."""
+    integrations = (ROOT / "src/limnopulse_api/domain/integrations.py").read_text(encoding="utf-8")
+    for terminal in (
+        "DeviceIntegrationStatus.DECOMMISSIONED: frozenset",
+        "IntegrationAccountStatus.REVOKED: frozenset",
+    ):
+        assert terminal not in integrations, terminal
+    drill = _section("Quarantine reconciliation drill")
+    assert "restore the DeviceIntegration, account or Device" not in drill
+    assert re.search(r"Dismiss fenced rows", drill)
+    assert re.search(r"fenced again", drill)
+    assert "persisted as replayable" not in _section("Decommissioning")

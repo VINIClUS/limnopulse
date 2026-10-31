@@ -55,7 +55,7 @@ Each step is a separate change. Verify each one before moving to the next.
    Confirm it logs `telemetry ingest worker started` and the queue-age alarm stays green.
 3. **Endpoint.** Set `INGEST_V2_ENABLED` to `true` (it requires `API_V2_ENABLED=true`,
    `TELEMETRY_V2_WRITE_ENABLED=true` and a non-empty `SQS_TELEMETRY_INGRESS_QUEUE_URL`; the API refuses
-   to start otherwise) and restart the API. Exactly `POST /ingest/v2/observations` and the five
+   to start otherwise) and recreate the API (see **Applying a change** below). Exactly `POST /ingest/v2/observations` and the five
    owner/admin tenant routes appear.
 4. **Pilot onboarding,** one pilot at a time: create the `https_direct` integration account, issue an
    ingest credential for it (the token is shown once), create the DeviceIntegration for the pilot
@@ -65,7 +65,7 @@ Each step is a separate change. Verify each one before moving to the next.
 5. **Divergence checks.** For every pilot that also reports through the legacy path, run the P2 keyed
    divergence checks between `observation_numeric` and `water_quality` over the pilot window; they
    must report nothing (G15 proves the HTTPS path matches the independent legacy writer).
-6. **Legacy dual write.** Set `TELEMETRY_LEGACY_DUAL_WRITE_ENABLED` to `true` (shared `.env`, restart the worker and the API) only after G7
+6. **Legacy dual write.** Set `TELEMETRY_LEGACY_DUAL_WRITE_ENABLED` to `true` (shared `.env`, then recreate the worker and the API) only after G7
    (the durable DLQ redrive gate) has passed on `main` and the DLQ drill below has been rehearsed in
    this environment.
 7. **Remaining P2 steps.** Continue with the [P2 telemetry rollout
@@ -82,7 +82,7 @@ the API-only secrets.
 - **Worker principal.** Create an access key for the IAM user named by the OpenTofu output
   `telemetry_ingest_iam_user_name` and store it as `TELEMETRY_INGEST_AWS_ACCESS_KEY_ID` /
   `TELEMETRY_INGEST_AWS_SECRET_ACCESS_KEY` in `.env`. Never reuse the API keys. Rotate the access key
-  like any IAM key: create the second key, restart the worker, then delete the old key.
+  like any IAM key: create the second key, recreate the worker, then delete the old key.
 - **Worker InfluxDB token.** Create a dedicated write token scoped to the raw bucket only
   (`influx auth create --org <org> --write-bucket <bucket_id> --description telemetry-ingest`) and
   store it as `TELEMETRY_INGEST_INFLUXDB_TOKEN`. Never use the bootstrap admin token or the API's
@@ -107,12 +107,18 @@ the API-only secrets.
   | `TELEMETRY_INGEST_WORKER_CONCURRENCY`, `TELEMETRY_INGEST_WORKER_MAX_MESSAGES`, `TELEMETRY_INGEST_WORKER_VISIBILITY_SECONDS`, `TELEMETRY_INGEST_PROCESSING_DEADLINE_SECONDS`, `TELEMETRY_INGEST_RETRY_BASE_SECONDS`, `TELEMETRY_INGEST_RETRY_CAP_SECONDS` | optional tuning; compose supplies the defaults (4, 10, 60, 45, 30, 900) when unset |
 
 - **One shared `.env`.** The API loads the same `.env` through its `env_file`, so every switch set
-  there reaches the API on its next restart as well. For the ingest route the API also needs
+  there reaches the API the next time its container is recreated as well. For the ingest route the API also needs
   `API_V2_ENABLED=true`, `TELEMETRY_V2_WRITE_ENABLED=true`, `INGEST_V2_ENABLED` and
   `SQS_TELEMETRY_INGRESS_QUEUE_URL`; operators running the CLIs also set
   `SQS_TELEMETRY_INGRESS_DLQ_URL`. The API reads `TELEMETRY_V2_WRITE_ENABLED` and
-  `TELEMETRY_LEGACY_DUAL_WRITE_ENABLED` too (for its own write service), so restart both services
+  `TELEMETRY_LEGACY_DUAL_WRITE_ENABLED` too (for its own write service), so recreate both services
   after changing either.
+- **Applying a change: recreate, never just restart.** Compose sets a container's environment when it
+  creates the container; `docker compose restart` keeps the old values. After editing `.env`,
+  recreate the affected services with the production env files, for example
+  `docker compose --env-file .env --env-file .env.image -f compose.production.yaml up -d api` and
+  `docker compose --env-file .env --env-file .env.image -f compose.production.yaml --profile ingestion up -d telemetry-ingest-worker`.
+  Confirm the new value took effect (the route set, or the worker's start log) before the next step.
 - **`stop_grace_period`.** The worker's `stop_grace_period` (90 s in both compose files) must exceed
   drain + wait + 5 s (A47): `TELEMETRY_INGEST_DRAIN_SECONDS` 30 + `TELEMETRY_INGEST_WORKER_WAIT_SECONDS`
   20 + the 5 s poll grace, more than 55 s at the defaults. SIGTERM first finishes the in-flight long
@@ -127,7 +133,7 @@ the API-only secrets.
 
 | Alarm | Fires when | First response |
 |---|---|---|
-| `<project>-<env>-telemetry-ingress-age` (queue age) | the oldest message is older than `telemetry_ingress_age_alarm_threshold_seconds` (default 300 s) | is the worker running? Check its logs and restart it with the profile; a stopped worker is the usual cause |
+| `<project>-<env>-telemetry-ingress-age` (queue age) | the oldest message is older than `telemetry_ingress_age_alarm_threshold_seconds` (default 300 s) | is the worker running? Check its logs and bring it back with `up -d` and the profile; a stopped worker is the usual cause |
 | `<project>-<env>-telemetry-ingress-depth` | more than `telemetry_ingress_depth_alarm_threshold` (default 1000) visible messages for 5 minutes | worker throughput or an outage; check `ingress_messages_total{outcome="retry"}` by category |
 | `<project>-<env>-telemetry-ingress-dlq` | the DLQ is not empty | run the [DLQ drill](#dlq-drill) |
 
@@ -165,8 +171,7 @@ uv run --locked python scripts/admin/telemetry_dlq.py sample --limit 10
 ```
 
 2. **Diagnose.** Fix the cause before redriving: an InfluxDB or DynamoDB outage is over, a worker
-   bug is fixed and deployed, or a fenced or deferred DeviceIntegration, account or Device is in the
-   intended state. Bodies that fail to parse (`envelope_invalid`) or are forged will fail again.
+   bug is fixed and deployed, or a deferred DeviceIntegration, account or Device is active again. Bodies that fail to parse (`envelope_invalid`) or are forged will fail again.
    `redrive` has no filter: it moves every message it receives, up to `--max`. A redriven bad body
    cycles back to the DLQ after about 8 × 60 s as a new message, so its 14-day expiry restarts. When
    such bodies are present, redrive deliberately with a small `--max`, and expect them back.
@@ -207,8 +212,12 @@ uv run --locked python scripts/admin/telemetry_quarantine.py health --tenant <te
 ```
 
 2. **Fix the cause.** For `deployment_unresolved`, create the Deployment that covered the event time
-   (through `/v2`); for a fenced row (`fenced_<reason>`), restore the DeviceIntegration, account or
-   Device only when the data is legitimate.
+   (through `/v2`). Fenced rows (`fenced_<reason>`) are not replayable in practice: a decommissioned
+   DeviceIntegration, a revoked account and a decommissioned Device are terminal states with no
+   lifecycle transition back, and a replay keeps the original account and DeviceIntegration ids, so
+   it would be fenced again (a replacement DeviceIntegration does not help). Dismiss fenced rows, or
+   recover them only through a separately approved procedure; mismatch and unresolved-identity rows
+   come from forged or corrupted envelopes and are dismissed after investigation.
 3. **Replay** (dry run, then apply). One new `telemetry-ingress@1` envelope is sent per
    `(ingress_id, device_integration_id)` group, with `replay=true`, `replay_of` the original
    ingress id, the first `received_at`, the stored mapping versions and the stored observations;
@@ -255,7 +264,8 @@ uv run --locked python scripts/admin/telemetry_quarantine.py dismiss --tenant <t
 ## Decommissioning
 
 - **DeviceIntegration.** Decommissioning a DeviceIntegration stops new admissions (`403`) and fences
-  queued messages: they are persisted as replayable `fenced_integration_decommissioned` rows plus a
+  queued messages: they are persisted as `fenced_integration_decommissioned` rows (replayable in
+  form, D9, but a replay is fenced again, so they are dismissed) plus a
   summary row, then deleted. The external identity stays claimed (D22): the `EXTERNAL_ID` row keeps
   `status=decommissioned`, so the same external device id cannot be re-claimed in P3.
 - **IntegrationAccount.** Revoking the account fences its queued messages
@@ -274,8 +284,8 @@ Rollback follows §24: route pilots back, disable the endpoint, retain the queue
 
 1. **Route pilots back** to their previous (legacy) path, so they stop calling the HTTPS endpoint.
 2. **Stop legacy dual write:** set `TELEMETRY_LEGACY_DUAL_WRITE_ENABLED=false` in the shared `.env`
-   and restart the worker (and the API, which reads it too), if it was on.
-3. **Disable the endpoint:** set `INGEST_V2_ENABLED=false` and restart the API. New requests get
+   and recreate the worker (and the API, which reads it too), if it was on.
+3. **Disable the endpoint:** set `INGEST_V2_ENABLED=false` and recreate the API (`up -d api`). New requests get
    `404`; everything already accepted stays queued.
 4. **Let the worker drain** the source queue (queue depth and age back to zero), unless the worker
    itself is the reason for the rollback.
