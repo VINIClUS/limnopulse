@@ -374,9 +374,26 @@ def kit_ids(scenarios: Sequence[Callable[..., Any]]) -> list[str]:
 # Ingest credentials --------------------------------------------------------------------------
 
 
+# Named store reads that a multi-read port performs below its boundary. The authenticator and
+# trusted-mapping subjects accept these as `fail_next` operations, so a fault can hit a later
+# read (the account after the credential; the device or a component after the identity).
+STORE_READS = (
+    "get_ingest_credential",
+    "get_integration_account",
+    "resolve_external_identity",
+    "get_device",
+    "get_component",
+)
+
+
 class FaultInjectable(Protocol):
-    """Every kit subject can make its next call of a port `operation` (the method name) raise
-    `exc` exactly once, from the store underneath. Later waves use it to test 503 paths."""
+    """Every kit subject can make the next call of `operation` raise `exc` exactly once, at or
+    below the port boundary. `operation` is a port method name, or for the authenticator and
+    trusted-mapping subjects one of `STORE_READS`. Later waves use it to test their 503 paths.
+
+    The scenarios inject one fault and assert that the very same object propagates, so an
+    adapter must not retry internally (boto3 already retries) nor re-wrap the error. The queue
+    scenarios assume ElasticMQ-style deterministic short polling (`wait_seconds=0`)."""
 
     def fail_next(self, operation: str, exc: BaseException) -> None: ...
 
@@ -2004,13 +2021,10 @@ async def _seed_quarantine(subject: Any) -> None:
     await subject.repository.put_quarantine_entries(fenced_entries())
 
 
-_RECEIVED_MESSAGES: dict[int, Any] = {}
-
-
 async def _seed_received_message(subject: Any) -> None:
     await subject.producer.send(envelope())
     (message,) = await _receive(subject)
-    _RECEIVED_MESSAGES[id(subject)] = message
+    subject.kit_received_message = message
 
 
 def queue_errors() -> tuple[BaseException, ...]:
@@ -2050,6 +2064,12 @@ CONNECTOR_AUTHENTICATOR_CONTRACT += (
     _fault_scenario(
         "authenticate",
         "authenticate",
+        lambda s: s.authenticator.authenticate(ingest_token(CREDENTIAL, SECRET)),
+        prepare=_seed_authenticable,
+    ),
+    _fault_scenario(
+        "authenticate_account_read",
+        "get_integration_account",
         lambda s: s.authenticator.authenticate(ingest_token(CREDENTIAL, SECRET)),
         prepare=_seed_authenticable,
     ),
@@ -2107,6 +2127,31 @@ TRUSTED_MAPPING_CONTRACT += (
     _fault_scenario(
         "fence", "fence", lambda s: s.mapping.fence(envelope()), prepare=_seed_full_mapping
     ),
+    # The last reads: a component-read failure must be a 503, never COMPONENT_INVALID.
+    _fault_scenario(
+        "admit_device_read",
+        "get_device",
+        lambda s: s.mapping.admit(SOURCE, batch(COMPONENT)),
+        prepare=_seed_full_mapping,
+    ),
+    _fault_scenario(
+        "admit_component_read",
+        "get_component",
+        lambda s: s.mapping.admit(SOURCE, batch(COMPONENT)),
+        prepare=_seed_full_mapping,
+    ),
+    _fault_scenario(
+        "fence_account_read",
+        "get_integration_account",
+        lambda s: s.mapping.fence(envelope()),
+        prepare=_seed_full_mapping,
+    ),
+    _fault_scenario(
+        "fence_device_read",
+        "get_device",
+        lambda s: s.mapping.fence(envelope()),
+        prepare=_seed_full_mapping,
+    ),
 )
 INGRESS_QUEUE_CONTRACT += (
     _fault_scenario(
@@ -2115,18 +2160,20 @@ INGRESS_QUEUE_CONTRACT += (
     _fault_scenario(
         "queue_send_raw", "send_raw", lambda s: s.producer.send_raw("{}"), errors=queue_errors
     ),
-    _fault_scenario("queue_receive", "receive", _receive),
+    _fault_scenario("queue_receive", "receive", _receive, errors=queue_errors),
     _fault_scenario(
         "queue_change_visibility",
         "change_visibility",
-        lambda s: s.consumer.change_visibility(_RECEIVED_MESSAGES[id(s)], 30),
+        lambda s: s.consumer.change_visibility(s.kit_received_message, 30),
         prepare=_seed_received_message,
+        errors=queue_errors,
     ),
     _fault_scenario(
         "queue_delete",
         "delete",
-        lambda s: s.consumer.delete(_RECEIVED_MESSAGES[id(s)]),
+        lambda s: s.consumer.delete(s.kit_received_message),
         prepare=_seed_received_message,
+        errors=queue_errors,
     ),
 )
 QUARANTINE_REPOSITORY_CONTRACT += (
