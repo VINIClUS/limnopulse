@@ -26,7 +26,7 @@ from limnopulse_api.api.v2.schemas.ingest_credentials import (
 from limnopulse_api.core.errors import ConflictError, NotFoundError
 from limnopulse_api.domain.alerts import AuditContext
 from limnopulse_api.domain.entities import TenantAccess
-from limnopulse_api.domain.ids import require_canonical_id
+from limnopulse_api.domain.ids import require_canonical_id, require_safe_id
 from limnopulse_api.domain.roles import WRITE_ROLES
 from limnopulse_api.repositories.ingestion import IngestCredentialRepository
 from limnopulse_api.services.ingest_credentials import IngestCredentialService
@@ -41,6 +41,7 @@ router = APIRouter(
 IngestCredentialPathId = Annotated[
     str, Path(), AfterValidator(lambda value: require_canonical_id(value, "ic"))
 ]
+IntegrationAccountPathId = Annotated[str, Path(), AfterValidator(require_safe_id)]
 TenantWriterDep = Annotated[TenantAccess, Depends(require_tenant_role(*tuple(WRITE_ROLES)))]
 IngestCredentialRepositoryDep = Annotated[
     IngestCredentialRepository, Depends(get_ingest_credential_repository)
@@ -77,11 +78,11 @@ async def _run(call: Awaitable[Any]) -> Any:
 )
 async def issue_ingest_credential(
     tenant_id: str,
-    integration_account_id: str,
+    integration_account_id: IntegrationAccountPathId,
+    access: TenantWriterDep,
     request: Request,
     credentials: IngestCredentialRepositoryDep,
     integrations: IntegrationRepositoryDep,
-    access: TenantWriterDep,
 ) -> JSONResponse:
     service = IngestCredentialService(credentials=credentials, integrations=integrations)
     issued = await _run(
@@ -101,10 +102,10 @@ async def issue_ingest_credential(
 @router.get("", response_model=IngestCredentialListResponse, responses=_RESPONSES)
 async def list_ingest_credentials(
     tenant_id: str,
-    integration_account_id: str,
+    integration_account_id: IntegrationAccountPathId,
+    _access: TenantWriterDep,
     credentials: IngestCredentialRepositoryDep,
     integrations: IntegrationRepositoryDep,
-    _access: TenantWriterDep,
 ) -> IngestCredentialListResponse:
     service = IngestCredentialService(credentials=credentials, integrations=integrations)
     listed = await _run(service.list(tenant_id, integration_account_id))
@@ -120,13 +121,13 @@ async def list_ingest_credentials(
 )
 async def revoke_ingest_credential(
     tenant_id: str,
-    integration_account_id: str,
+    integration_account_id: IntegrationAccountPathId,
     ingest_credential_id: IngestCredentialPathId,
+    access: TenantWriterDep,
     payload: IngestCredentialRevokeRequest,
     request: Request,
     credentials: IngestCredentialRepositoryDep,
     integrations: IntegrationRepositoryDep,
-    access: TenantWriterDep,
 ) -> IngestCredentialResponse:
     service = IngestCredentialService(credentials=credentials, integrations=integrations)
     revoked = await _run(

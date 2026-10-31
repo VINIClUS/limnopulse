@@ -11,6 +11,8 @@ from collections.abc import Callable, Mapping
 from datetime import datetime
 from typing import Any
 
+from botocore.exceptions import ClientError
+
 from limnopulse_api.adapters.dynamodb_v2 import (
     DynamoConditionalConflict,
     DynamoV2RepositoryBase,
@@ -155,7 +157,7 @@ class DynamoIngestCredentialRepository(DynamoV2RepositoryBase):
             {"Put": self._audit_put(audit_item)},
         ]
         try:
-            await self.transact_write(actions)
+            await self._transact(actions)
         except DynamoConditionalConflict as exc:
             if _ACCOUNT_CHECK in exc.failed_indexes and _old_item(exc, _ACCOUNT_CHECK) is None:
                 raise NotFoundError("integration account not found") from exc
@@ -246,20 +248,39 @@ class DynamoIngestCredentialRepository(DynamoV2RepositoryBase):
             {"Put": self._audit_put(audit_item)},
         ]
         try:
-            await self.transact_write(actions)
+            await self._transact(actions)
         except DynamoConditionalConflict as exc:
-            if _AUTHORITATIVE_UPDATE in exc.failed_indexes:
-                old = _old_item(exc, _AUTHORITATIVE_UPDATE)
-                old = None if old is None else self.deserialize_item(old)
-                if (
-                    old is None
-                    or old.get("tenant_id") != tenant_id
-                    or old.get("integration_account_id") != integration_account_id
-                    or old.get("status") != IngestCredentialStatus.ACTIVE.value
-                ):
-                    raise NotFoundError("ingest credential not found") from exc
-            raise ConflictError("ingest credential version conflict") from exc
-        return revoked
+            not_found = _AUTHORITATIVE_UPDATE in exc.failed_indexes and not self._is_active_row(
+                _old_item(exc, _AUTHORITATIVE_UPDATE), tenant_id, integration_account_id
+            )
+        else:
+            return revoked
+        # Raised outside the handler: the cancelled `ALL_OLD` item holds `secret_sha256`, so it
+        # must not stay reachable through the exception chain (error trackers, frame locals).
+        if not_found:
+            raise NotFoundError("ingest credential not found")
+        raise ConflictError("ingest credential version conflict")
+
+    async def _transact(self, actions: list[dict[str, Any]]) -> None:
+        """A cancellation caused only by a concurrent transaction on the same items is a
+        conflict (409), as in the other transactional adapters; store failures propagate."""
+        try:
+            await self.transact_write(actions)
+        except ClientError as exc:
+            if _is_transaction_conflict(exc):
+                raise ConflictError("concurrent ingest credential change") from None
+            raise
+
+    def _is_active_row(
+        self, item: Mapping[str, Any] | None, tenant_id: str, integration_account_id: str
+    ) -> bool:
+        row = None if item is None else self.deserialize_item(item)
+        return (
+            row is not None
+            and row.get("tenant_id") == tenant_id
+            and row.get("integration_account_id") == integration_account_id
+            and row.get("status") == IngestCredentialStatus.ACTIVE.value
+        )
 
     # Request builders ------------------------------------------------------------------------
 
@@ -273,6 +294,17 @@ class DynamoIngestCredentialRepository(DynamoV2RepositoryBase):
         """The slot `Delete` builder lives here, not on the pinned repository base."""
         request: dict[str, Any] = {"TableName": self.table_name, "Key": self.serialize_item(key)}
         return self._with_condition(request, condition, None, values)
+
+
+def _is_transaction_conflict(exc: ClientError) -> bool:
+    response = exc.response
+    if response.get("Error", {}).get("Code") != "TransactionCanceledException":
+        return False
+    reasons = response.get("CancellationReasons")
+    return isinstance(reasons, list) and any(
+        isinstance(reason, Mapping) and reason.get("Code") == "TransactionConflict"
+        for reason in reasons
+    )
 
 
 def _old_item(exc: DynamoConditionalConflict, index: int) -> Mapping[str, Any] | None:

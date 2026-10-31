@@ -610,3 +610,28 @@ def test_listing_is_scoped_to_the_path_account_and_404s_for_a_missing_one() -> N
 
     assert [item["ingest_credential_id"] for item in listed.json()["items"]] == [mine]
     assert missing.status_code == 404
+
+
+# Diff-review regressions (added after approval at 8da31a7) -----------------------------------
+
+
+@pytest.mark.parametrize("method", ["post", "get"])
+def test_a_reserved_key_character_in_the_account_path_is_422_not_500(method: str) -> None:
+    api = Api()
+    path = f"/tenants/{TENANT}/integration-accounts/a%23b/ingest-credentials"
+
+    response = getattr(api.client, method)(path)
+
+    assert response.status_code == 422
+    assert "a#b" not in response.text
+    assert api.dynamo.reads == []
+
+
+def test_role_check_runs_before_the_repository_dependencies() -> None:
+    api = Api("viewer")
+    del api.app.state.ingest_credential_repository
+    del api.app.state.integration_repository
+
+    responses = [api.issue(), api.client.get(CREDENTIALS), api.revoke(FOREIGN_CREDENTIAL)]
+
+    assert [response.status_code for response in responses] == [403, 403, 403]

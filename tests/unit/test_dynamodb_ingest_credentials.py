@@ -576,3 +576,98 @@ async def test_audit_item_records_actor_tenant_resource_and_statuses() -> None:
         assert {k: v for k, v in actual.items() if k not in ignored} == {
             k: v for k, v in expected.items() if k not in ignored
         }
+
+
+# Diff-review regressions (added after approval at 8da31a7) -----------------------------------
+
+
+class TransactionConflictOnce(FaultingClient):
+    """Cancels the next transaction the way DynamoDB does when another transaction touches the
+    same items: only `TransactionConflict` reasons, no `ConditionalCheckFailed`."""
+
+    def transact_write_items(self, **kwargs: Any) -> Any:
+        reasons = [{"Code": "TransactionConflict"} for _ in kwargs["TransactItems"]]
+        raise ClientError(
+            {
+                "Error": {"Code": "TransactionCanceledException", "Message": "cancelled"},
+                "CancellationReasons": reasons,
+            },
+            "TransactWriteItems",
+        )
+
+
+@pytest.mark.asyncio
+async def test_transaction_conflict_cancellations_are_conflicts_not_store_failures() -> None:
+    subject = fake_subject()
+    await subject.seed_account(integration_account())
+    await subject.repository.create_ingest_credential(credential(), AUDIT)
+    racing = DynamoIngestCredentialRepository(
+        TABLE,
+        TransactionConflictOnce(subject.raw),
+        clock=lambda: RECEIVED,
+        audit_table_name=AUDIT_TABLE,
+    )
+
+    with pytest.raises(ConflictError) as issued:
+        await racing.create_ingest_credential(
+            credential(ingest_credential_id=OTHER_CREDENTIAL, slot=2), AUDIT
+        )
+    with pytest.raises(ConflictError) as revoked:
+        await racing.revoke_ingest_credential(
+            TENANT, ACCOUNT, CREDENTIAL, expected_version=1, revoked_at=RECEIVED, audit=AUDIT
+        )
+
+    assert not isinstance(issued.value, NotFoundError)
+    assert not isinstance(revoked.value, NotFoundError)
+    assert await subject.repository.get_ingest_credential(CREDENTIAL) == credential()
+
+
+def _chain(exc: BaseException) -> list[BaseException]:
+    seen: list[BaseException] = []
+    current: BaseException | None = exc
+    while current is not None and current not in seen:
+        seen.append(current)
+        current = current.__cause__ or current.__context__
+    return seen
+
+
+@pytest.mark.asyncio
+async def test_revoke_failures_do_not_carry_the_digest_in_the_exception_chain() -> None:
+    subject = fake_subject()
+    await subject.seed_account(integration_account())
+    issued = await subject.repository.create_ingest_credential(credential(), AUDIT)
+    await subject.repository.revoke_ingest_credential(
+        TENANT, ACCOUNT, CREDENTIAL, expected_version=1, revoked_at=RECEIVED, audit=AUDIT
+    )
+    failures: list[BaseException] = []
+    # Both failures are classified from the cancelled `ALL_OLD` row, which holds the digest:
+    # a stale version on an active row (409), and an already-revoked row (404).
+    for row, version, expected in (
+        (credential(), 9, ConflictError),
+        (
+            credential(
+                status=IngestCredentialStatus.REVOKED,
+                revoked_at=RECEIVED,
+                updated_at=RECEIVED,
+                version=2,
+            ),
+            2,
+            NotFoundError,
+        ),
+    ):
+        await subject.seed_credential(row)
+        with pytest.raises(expected) as exc_info:
+            await subject.repository.revoke_ingest_credential(
+                TENANT,
+                ACCOUNT,
+                CREDENTIAL,
+                expected_version=version,
+                revoked_at=RECEIVED,
+                audit=AUDIT,
+            )
+        failures.append(exc_info.value)
+
+    for failure in failures:
+        for link in _chain(failure):
+            assert issued.secret_sha256 not in repr(getattr(link, "response", "")), link
+            assert issued.secret_sha256 not in str(link)
