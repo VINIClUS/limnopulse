@@ -374,7 +374,7 @@ async def test_bucket_literal_is_escaped(method: str, bucket: str, literal: str)
     for item in query_api.calls:
         flat = compact(item["query"])
         assert f"from(bucket:{literal})|>range(" in flat
-        assert "${x}" not in flat.replace("\\${x}", "")
+        assert "$" not in flat
 
 
 @pytest.mark.asyncio

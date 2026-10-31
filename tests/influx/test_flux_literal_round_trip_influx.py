@@ -26,6 +26,7 @@ ROUND_TRIP_VALUES = json.loads(
         encoding="utf-8"
     )
 )["round_trip"]
+assert len(ROUND_TRIP_VALUES) >= 20, "D19 round-trip values are incomplete"
 
 # Line protocol cannot carry an empty tag, a raw CR/LF/tab or a trailing backslash; spaces,
 # commas and equals signs would need line-protocol escapes, so they are left out too.

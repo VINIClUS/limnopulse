@@ -212,7 +212,8 @@ def position(query: str, pattern: str) -> int:
 
 
 def assert_no_unescaped_interpolation(query: str) -> None:
-    assert re.search(r"(?<!\\)\$\{", query) is None, query
+    # P2 plan D19: every `$` is written as `\x24`, so no query keeps a raw `$`.
+    assert "$" not in query, query
 
 
 # --- protocol -----------------------------------------------------------------------------

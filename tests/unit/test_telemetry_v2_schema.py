@@ -815,6 +815,8 @@ D19_CASES = json.loads(
 )
 FLUX_LITERAL_CASES = [(case["value"], case["literal"]) for case in D19_CASES["literals"]]
 FLUX_ROUND_TRIP_VALUES = D19_CASES["round_trip"]
+assert len(FLUX_LITERAL_CASES) >= 20, "D19 literal cases are incomplete"
+assert len(FLUX_ROUND_TRIP_VALUES) >= 20, "D19 round-trip values are incomplete"
 
 # C0 controls JSON can only write as `\b`, `\f` or `\u00XX`, none of which Flux accepts.
 REJECTED_C0 = [chr(code) for code in range(0x20) if chr(code) not in "\n\r\t"]
