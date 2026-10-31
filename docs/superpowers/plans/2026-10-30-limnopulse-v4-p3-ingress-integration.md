@@ -172,7 +172,7 @@ Epic #15's entry decision is to freeze generic ingress/HTTPS first; a non-AWS ge
 | D13 | Rate limits and entitlements | **Rate limits.**<br>• An in-process token bucket per IntegrationAccount (default 120 requests/minute, burst 20). It runs after authentication and before the body is read.<br>• Two pre-auth buckets run before any DynamoDB read, in this order: a **process-global** bucket (default 600/minute), then a bucket keyed by the parsed `ic_` id (default 60/minute). Random `ic_` ids therefore cannot amplify store reads.<br>• No distributed cache is involved (ADR-019). With N API replicas the bound is N × limit, which is bounded and documented.<br>**Entitlements.**<br>• `IngressEntitlementCheck` is a hook. Its default `AllowDirectIngressEntitlements` allows, because direct HTTPS is on every tier (§18.3).<br>• Enforcement against EntitlementSnapshot is **DEFERRED → #20 (P4)**.<br>**Store outage.** If the authoritative stores are unavailable, the request fails closed with 503. |
 | D14 | Metrics | **Port.** `TelemetryMetrics`, a port with `increment(name, value=1, **labels)` and `observe(name, value, **labels)`.<br>**Names.** Closed `*_total` and `*_seconds` names drawn from §23.2 (see **Metrics**).<br>**Labels.** Only closed-enum values, never a tenant, account, device, component or identity.<br>**Adapter.** A structured-JSON log line on logger `limnopulse.telemetry.metrics`, shaped so that an OTLP adapter can follow without renaming. No new dependency.<br>**Queue age.** Taken from `SentTimestamp`.<br>**Alarms.** CloudWatch age, depth and DLQ alarms (P3-02).<br>**Not in P3.** Stale/offline device views, connector sync lag and calibration metrics belong to P6/P9. |
 | D15 | Switches and routes | **`INGEST_V2_ENABLED`** (default `false`).<br>• Requires `API_V2_ENABLED=true`, `TELEMETRY_V2_WRITE_ENABLED=true` and a non-empty `SQS_TELEMETRY_INGRESS_QUEUE_URL`.<br>• Mounts exactly `POST /ingest/v2/observations` plus the **5 tenant routes** of the credential and lifecycle routers (see **Routes**).<br>**`API_V2_ENABLED` alone** still mounts exactly the 53 M1 tenant routes.<br>**Router placement.** The lifecycle routes go in a new router file, `api/v2/routers/integration_lifecycle.py`. The existing integrations router is not extended. |
-| D16 | Ships dark; legacy-device coverage | **Dark by default.** With every switch off, nothing produces canonical telemetry in production. All production switch flips are owner actions in the runbook.<br>**The D16 read-switch precondition stays open after P3.** That precondition is "a producer writes every legacy device to `observation_numeric`" (P2 D16). Legacy devices publish MQTT, which the HTTPS path cannot carry. The gate moves to a Backlog issue, `[Backlog][P3 follow-up] Producer path for legacy MQTT devices`. The orchestrator creates that issue together with the task issues, and the issue is the single owner. It will be decomposed as the separately approved MQTT slice. The P3-11 runbook links it.<br>**P3's contribution: G15.** With `TELEMETRY_LEGACY_DUAL_WRITE_ENABLED=false`, the keyed divergence check between `observation_numeric` (written by the P3 worker) and `water_quality` (written independently by the legacy writer, for the same readings) reports zero differences. |
+| D16 | Ships dark; legacy-device coverage | **Dark by default.** With every switch off, nothing produces canonical telemetry in production. All production switch flips are owner actions in the runbook.<br>**The D16 read-switch precondition stays open after P3.** That precondition is "a producer writes every legacy device to `observation_numeric`" (P2 D16). Legacy devices publish MQTT, which the HTTPS path cannot carry. The gate moves to a Backlog issue, `[Backlog][P3 follow-up] Producer path for legacy MQTT devices`. That is issue #104, created together with the task issues, and it is the single owner. It will be decomposed as the separately approved MQTT slice. The P3-11 runbook links it.<br>**P3's contribution: G15.** With `TELEMETRY_LEGACY_DUAL_WRITE_ENABLED=false`, the keyed divergence check between `observation_numeric` (written by the P3 worker) and `water_quality` (written independently by the legacy writer, for the same readings) reports zero differences. |
 | D17 | Storage | No Scan, no GSI, no new table. A test checks the new keys against existing listing prefixes. |
 | D18 | Dependencies | No new dependency and no lockfile change. |
 | D19 | ADR recording | **What P3-11 appends.** A `**Phase split (P3).**` paragraph at the end of `## Implementation gate`, with no new heading, in ADR-006, ADR-007 and ADR-016.<br>**Changes to the P2 test.** P3-11 relaxes `tests/contracts/test_p2_acceptance_gate.py`:<br>• the P2 paragraph must be immediately followed by **at most** the P3 paragraph;<br>• every pre-existing hash stays pinned;<br>• a new P3 test checks for the P3 paragraph.<br>**Constraints on the ADR-016 text.** It must avoid the forbidden regexes in `test_architecture_inventory.py:646-659`.<br>**Required content, pinned by the new P3 test:**<br>• **ADR-006** mentions `P3`, `P6`, `#17`, `quarantine`, `connector health` and `INGEST_STATE`.<br>• **ADR-007** mentions `P3`, `redrive`, `D16`, `Backlog` and `G15`.<br>• **ADR-016** mentions `P3`, `Idempotency-Key`, `entitlement`, `#20` and `DLQ redrive`. It states that entitlement enforcement is P4 (#20) and that P3 ships the pre-enqueue hook.<br>• **Every one** links `../p3-ingestion-rollout-runbook.md`. |
@@ -234,18 +234,18 @@ flowchart TD
 
 | Task | Issue | Blocked by | Blocks |
 |---|---|---|---|
-| P3-00 | TBD | plan | P3-03, P3-04, P3-05, P3-06 |
-| P3-01 | TBD | plan | P3-03, P3-04, P3-05, P3-06 |
-| P3-02 | TBD | plan | P3-10 |
-| P3-03 | TBD | P3-00, P3-01 | P3-07 |
-| P3-04 | TBD | P3-00, P3-01 | P3-07, P3-08 |
-| P3-05 | TBD | P3-00, P3-01 | P3-07, P3-08, P3-09 |
-| P3-06 | TBD | P3-00, P3-01 | P3-08, P3-09 |
-| P3-07 | TBD | P3-03, P3-04, P3-05 | P3-10 |
-| P3-08 | TBD | P3-04, P3-05, P3-06 | P3-10 |
-| P3-09 | TBD | P3-05, P3-06 | P3-11 |
-| P3-10 | TBD | P3-02, P3-07, P3-08 | P3-11 |
-| P3-11 | TBD | P3-09, P3-10 (others transitively) | Epic #15 |
+| P3-00 | #92 | plan | P3-03, P3-04, P3-05, P3-06 |
+| P3-01 | #93 | plan | P3-03, P3-04, P3-05, P3-06 |
+| P3-02 | #94 | plan | P3-10 |
+| P3-03 | #95 | P3-00, P3-01 | P3-07 |
+| P3-04 | #96 | P3-00, P3-01 | P3-07, P3-08 |
+| P3-05 | #97 | P3-00, P3-01 | P3-07, P3-08, P3-09 |
+| P3-06 | #98 | P3-00, P3-01 | P3-08, P3-09 |
+| P3-07 | #99 | P3-03, P3-04, P3-05 | P3-10 |
+| P3-08 | #100 | P3-04, P3-05, P3-06 | P3-10 |
+| P3-09 | #101 | P3-05, P3-06 | P3-11 |
+| P3-10 | #102 | P3-02, P3-07, P3-08 | P3-11 |
+| P3-11 | #103 | P3-09, P3-10 (others transitively) | Epic #15 |
 
 ## Locked Cross-Task Contracts
 
@@ -730,7 +730,7 @@ class TelemetryMetrics(Protocol):
 - **Harness** (`tests/support/ingestion_harness.py`):
   - **Fixtures.**
     - `ingestion_queue_pair(max_receive_count=2, visibility_seconds=2)` creates a unique source queue and DLQ with a `RedrivePolicy`, and deletes them afterwards.
-    - `ingestion_table()` creates a unique domain table with the exact `scripts/dev/init_dynamodb.py` key schema and GSIs, imported rather than copied. It deletes the table afterwards.
+    - `ingestion_table()` creates a unique domain table with the exact `scripts/dev/init_dynamodb.py` key schema and GSIs, imported rather than copied, and with **TTL disabled** (DynamoDB Local deletes expired items within seconds once TTL is enabled). It deletes the table afterwards.
   - **Clients and credentials.** `sqs_client()` and `dynamodb_client()` are pointed at `INGESTION_SQS_URL` / `INGESTION_DYNAMODB_URL` (defaults `http://127.0.0.1:9324` / `http://127.0.0.1:8001`). They use dummy credentials injected in code, because `verify.yml` must not contain AWS key names.
   - **`ToggleableTcpProxy`.** A thread-based TCP forwarder with `up()`/`down()`, which G7 places in front of InfluxDB.
     - `down()` closes the listener **and** resets every established forwarded socket, so pooled keep-alive connections cannot bypass it.
@@ -760,6 +760,7 @@ class TelemetryMetrics(Protocol):
     - A conditional Put with `attribute_not_exists` fails on the second write.
     - `attribute_not_exists(x) OR x < :t` behaves as a monotone mark.
     - A `TransactWriteItems` with a failing `ConditionCheck` reports the index.
+    - The P3-00 Dynamo-fake expression vectors run unchanged against DynamoDB Local once P3-00 is merged. If P3-00 merges after this task, they run in P3-03/P3-04/P3-06 instead.
   - **Proxy.** `ToggleableTcpProxy.down()` makes an Influx write raise a retryable `TelemetryWriteError` through `InfluxObservationWriter`, and `up()` restores it.
   - **Skip rule.** `tests/ingestion` skips cleanly without `RUN_INGESTION_INTEGRATION=1`.
 - [ ] **Step 2: Update the CI contract test deliberately.** Keep every existing invariant:
@@ -829,6 +830,7 @@ class TelemetryMetrics(Protocol):
     - no forbidden infrastructure words;
     - no secrets.
   - `queues.tf` counts stay unchanged.
+  - The SHA-256 of `iam_runtime.tf` is pinned unchanged, and the operator policy has no attachment.
 - [ ] **Step 2: Run red, commit, test gate,** then implement after approval.
 - [ ] **Step 3: Run the shared gates and the infrastructure checks.** That means `make verify-tofu` (install tofu 1.12.6 locally if needed) and `make verify-compose`.
 
@@ -906,7 +908,7 @@ class TelemetryMetrics(Protocol):
 
 **Files:**
 - Create: `src/limnopulse_api/services/trusted_mapping.py`, `src/limnopulse_api/services/integration_lifecycle.py`, `src/limnopulse_api/api/v2/routers/integration_lifecycle.py`, `src/limnopulse_api/api/v2/schemas/integration_lifecycle.py`
-- Modify: `src/limnopulse_api/adapters/dynamodb_integrations.py`, `src/limnopulse_api/services/integrations.py`, `src/limnopulse_api/services/telemetry_normalizer.py`
+- Modify: `src/limnopulse_api/adapters/dynamodb_integrations.py`, `src/limnopulse_api/adapters/dynamodb_devices_v2.py` (adapter-only consistent `get_device`), `src/limnopulse_api/services/integrations.py`, `src/limnopulse_api/services/telemetry_normalizer.py`
 - Test: `tests/unit/test_trusted_mapping.py`, `tests/unit/test_integration_lifecycle.py`, `tests/unit/test_dynamodb_integration_resolver.py`, `tests/unit/test_https_identity_namespace.py`, `tests/unit/test_normalizer_capability_gate.py`, `tests/api/test_v2_integration_lifecycle.py`, `tests/ingestion/test_integration_lifecycle_dynamodb.py`
 
 **Interfaces:**
@@ -1358,7 +1360,7 @@ class TelemetryMetrics(Protocol):
 | ADR-006: operator reconciliation | P3-09; G8 |
 | ADR-006: current-health views from receive/ingest time | **DEFERRED → #17** (P6), from the P3 `INGEST_STATE` rows |
 | ADR-007: durable SQS redrive after an Influx outage, recovery without loss | P3-08; P3-09; G7 |
-| ADR-007 / D16: producer for every legacy device, then the read switches | **DEFERRED → Backlog (legacy MQTT producer)**; P3 delivers G15 |
+| ADR-007 / D16: producer for every legacy device, then the read switches | **DEFERRED → #104 (Backlog: legacy MQTT producer)**; P3 delivers G15 |
 | #15: external identity → DeviceIntegration as `TrustedSourceContext`; first-receipt `received_at` on replay | P3-04; P3-07; P3-08; G5, G8 |
 | #15: §23.2 metrics | P3-08; P3-07; G12 |
 | ADR-001: queued ingest fenced after decommission | P3-04; P3-08; G9 |
