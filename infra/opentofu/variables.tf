@@ -204,9 +204,20 @@ variable "telemetry_ingress_depth_alarm_threshold" {
 }
 
 variable "telemetry_ingress_alarm_actions" {
-  description = "ARNs notified by the telemetry ingress age, depth and DLQ alarms. Empty means the alarms only change state."
+  description = "Extra ARNs notified by the telemetry ingress age, depth and DLQ alarms, on top of the module's own alarm topic."
   type        = list(string)
   default     = []
+}
+
+variable "telemetry_ingress_alarm_email" {
+  description = "On-call mailbox subscribed to the telemetry ingress alarm topic. Empty creates no subscription; set it only in the untracked tfvars, and confirm the subscription from the email AWS sends."
+  type        = string
+  default     = ""
+
+  validation {
+    condition     = var.telemetry_ingress_alarm_email == "" || can(regex("^[^@\\s]+@[^@\\s]+\\.[^@\\s]+$", var.telemetry_ingress_alarm_email))
+    error_message = "telemetry_ingress_alarm_email must be empty or a bare email address."
+  }
 }
 
 locals {

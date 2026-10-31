@@ -270,7 +270,7 @@ resource "aws_cloudwatch_metric_alarm" "telemetry_ingress_age" {
   comparison_operator = "GreaterThanThreshold"
   threshold           = var.telemetry_ingress_age_alarm_threshold_seconds
   treat_missing_data  = "notBreaching"
-  alarm_actions       = var.telemetry_ingress_alarm_actions
+  alarm_actions       = concat(var.telemetry_ingress_alarm_actions, [aws_sns_topic.telemetry_ingress_alarms[0].arn])
 
   tags = local.common_tags
 }
@@ -289,7 +289,7 @@ resource "aws_cloudwatch_metric_alarm" "telemetry_ingress_dlq" {
   comparison_operator = "GreaterThanThreshold"
   threshold           = 0
   treat_missing_data  = "notBreaching"
-  alarm_actions       = var.telemetry_ingress_alarm_actions
+  alarm_actions       = concat(var.telemetry_ingress_alarm_actions, [aws_sns_topic.telemetry_ingress_alarms[0].arn])
 
   tags = local.common_tags
 }
@@ -308,7 +308,108 @@ resource "aws_cloudwatch_metric_alarm" "telemetry_ingress_depth" {
   comparison_operator = "GreaterThanThreshold"
   threshold           = var.telemetry_ingress_depth_alarm_threshold
   treat_missing_data  = "notBreaching"
-  alarm_actions       = var.telemetry_ingress_alarm_actions
+  alarm_actions       = concat(var.telemetry_ingress_alarm_actions, [aws_sns_topic.telemetry_ingress_alarms[0].arn])
 
   tags = local.common_tags
+}
+
+
+# Alarm routing. CloudWatch cannot publish to a topic encrypted with the
+# AWS-managed aws/sns key, so the topic gets its own customer-managed key whose
+# policy lets CloudWatch encrypt. The email subscription (the on-call target)
+# is created only when telemetry_ingress_alarm_email is set, and stays
+# PendingConfirmation until the recipient clicks the link AWS sends.
+data "aws_caller_identity" "telemetry_ingress_alarms" {
+  count = var.telemetry_ingress ? 1 : 0
+}
+
+data "aws_iam_policy_document" "telemetry_ingress_alarms_key" {
+  count = var.telemetry_ingress ? 1 : 0
+
+  statement {
+    sid       = "AccountAdministration"
+    effect    = "Allow"
+    actions   = ["kms:*"]
+    resources = ["*"]
+
+    principals {
+      type        = "AWS"
+      identifiers = ["arn:aws:iam::${data.aws_caller_identity.telemetry_ingress_alarms[0].account_id}:root"]
+    }
+  }
+
+  statement {
+    sid       = "CloudWatchAlarmPublish"
+    effect    = "Allow"
+    actions   = ["kms:Decrypt", "kms:GenerateDataKey*"]
+    resources = ["*"]
+
+    principals {
+      type        = "Service"
+      identifiers = ["cloudwatch.amazonaws.com"]
+    }
+
+    condition {
+      test     = "StringEquals"
+      variable = "aws:SourceAccount"
+      values   = [data.aws_caller_identity.telemetry_ingress_alarms[0].account_id]
+    }
+  }
+}
+
+resource "aws_kms_key" "telemetry_ingress_alarms" {
+  count = var.telemetry_ingress ? 1 : 0
+
+  description             = "Encrypts the telemetry ingress alarm topic."
+  enable_key_rotation     = true
+  deletion_window_in_days = 30
+  policy                  = data.aws_iam_policy_document.telemetry_ingress_alarms_key[0].json
+
+  tags = local.common_tags
+}
+
+resource "aws_sns_topic" "telemetry_ingress_alarms" {
+  count = var.telemetry_ingress ? 1 : 0
+
+  name              = "${var.project_name}-${var.environment}-telemetry-ingress-alarms"
+  kms_master_key_id = aws_kms_key.telemetry_ingress_alarms[0].arn
+
+  tags = local.common_tags
+}
+
+data "aws_iam_policy_document" "telemetry_ingress_alarms_topic" {
+  count = var.telemetry_ingress ? 1 : 0
+
+  statement {
+    sid       = "CloudWatchAlarmPublish"
+    effect    = "Allow"
+    actions   = ["sns:Publish"]
+    resources = [aws_sns_topic.telemetry_ingress_alarms[0].arn]
+
+    principals {
+      type        = "Service"
+      identifiers = ["cloudwatch.amazonaws.com"]
+    }
+
+    condition {
+      test     = "StringEquals"
+      variable = "aws:SourceAccount"
+      values   = [data.aws_caller_identity.telemetry_ingress_alarms[0].account_id]
+    }
+  }
+}
+
+resource "aws_sns_topic_policy" "telemetry_ingress_alarms" {
+  count = var.telemetry_ingress ? 1 : 0
+
+  arn    = aws_sns_topic.telemetry_ingress_alarms[0].arn
+  policy = data.aws_iam_policy_document.telemetry_ingress_alarms_topic[0].json
+}
+
+resource "aws_sns_topic_subscription" "telemetry_ingress_alarms_email" {
+  count = var.telemetry_ingress && var.telemetry_ingress_alarm_email != "" ? 1 : 0
+
+  topic_arn = aws_sns_topic.telemetry_ingress_alarms[0].arn
+  protocol  = "email"
+  endpoint  = var.telemetry_ingress_alarm_email
 }

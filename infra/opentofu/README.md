@@ -16,7 +16,9 @@ This directory contains the OpenTofu scaffold for cloud infrastructure. Docker C
 - Telemetry ingress queue and DLQ (`telemetry_ingress`, default `false`): SSE,
   256 KiB messages, redrive after eight receives, SecureTransport-deny queue
   policies, age/depth/DLQ CloudWatch alarms, a dedicated `telemetry_ingest`
-  worker user, the API send grant and an unattached operator policy.
+  worker user, the API send grant and an unattached operator policy. The
+  alarms publish to a KMS-encrypted SNS topic; `telemetry_ingress_alarm_email`
+  subscribes the on-call mailbox, which must confirm the email AWS sends.
 - Placeholder variables for Redis and InfluxDB cloud endpoints.
 
 ## Not Included Yet

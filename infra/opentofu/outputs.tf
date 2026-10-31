@@ -144,3 +144,8 @@ output "telemetry_ingest_iam_user_name" {
   description = "IAM user for the telemetry ingest worker; create its access key out of band."
   value       = try(aws_iam_user.telemetry_ingest[0].name, null)
 }
+
+output "telemetry_ingress_alarm_topic_arn" {
+  description = "SNS topic the telemetry ingress alarms publish to."
+  value       = try(aws_sns_topic.telemetry_ingress_alarms[0].arn, null)
+}

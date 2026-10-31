@@ -422,6 +422,10 @@ def test_opentofu_scaffold_avoids_local_only_and_disallowed_storage_stack() -> N
 # blocks without a new dependency. Attribute values stay raw expression text.
 
 INGESTION_GATE = "var.telemetry_ingress ? 1 : 0"
+# The on-call email subscription is the only block with a stricter gate: no mailbox, no
+# subscription.
+ALARM_EMAIL_GATE = 'var.telemetry_ingress && var.telemetry_ingress_alarm_email != "" ? 1 : 0'
+ALARM_TOPIC = "aws_sns_topic.telemetry_ingress_alarms[0]"
 UNCHANGED_FILE_SHA256 = {
     "iam_runtime.tf": "1b928edce92709b8a3790e207edb2a0d442dc7d710af608a7e0a606b7d879fa1",
     "queues.tf": "d85972d656c951d6a728fecfe4f762f0e96dc1e4687ee39d068edbea74ad9425",
@@ -454,6 +458,7 @@ TELEMETRY_VARIABLES = {
     "telemetry_ingress_age_alarm_threshold_seconds": ("number", "300"),
     "telemetry_ingress_depth_alarm_threshold": ("number", None),
     "telemetry_ingress_alarm_actions": ("list(string)", "[]"),
+    "telemetry_ingress_alarm_email": ("string", '""'),
 }
 
 
@@ -735,13 +740,21 @@ def test_ingestion_queues_tf_count_gate_covers_every_block() -> None:
         ("resource", "aws_iam_policy"),
         ("resource", "aws_iam_user_policy_attachment"),
         ("resource", "aws_cloudwatch_metric_alarm"),
+        ("resource", "aws_kms_key"),
+        ("resource", "aws_sns_topic"),
+        ("resource", "aws_sns_topic_policy"),
+        ("resource", "aws_sns_topic_subscription"),
         ("data", "aws_iam_policy_document"),
+        ("data", "aws_caller_identity"),
     }
 
     assert blocks
     for block in blocks:
         assert (block.kind, block.labels[0]) in allowed, block.labels
-        assert block.attrs.get("count") == INGESTION_GATE, block.labels
+        expected_gate = (
+            ALARM_EMAIL_GATE if block.labels[0] == "aws_sns_topic_subscription" else INGESTION_GATE
+        )
+        assert block.attrs.get("count") == expected_gate, block.labels
 
     text = _strip_comments(_read("ingestion_queues.tf"))
     gated = {(block.labels[0], block.labels[1]) for block in blocks}
@@ -944,7 +957,9 @@ def test_ingestion_queues_tf_alarms_cover_age_dlq_and_depth() -> None:
         assert alarm.attrs.get("treat_missing_data") != '"breaching"'
         assert re.fullmatch(r"[1-9][0-9]*", alarm.attrs["period"]), alarm.attrs["period"]
         assert int(alarm.attrs["evaluation_periods"]) >= 1
-        assert alarm.attrs["alarm_actions"] == "var.telemetry_ingress_alarm_actions"
+        assert alarm.attrs["alarm_actions"] == (
+            f"concat(var.telemetry_ingress_alarm_actions, [{ALARM_TOPIC}.arn])"
+        )
         assert (
             alarm.attrs.get("ok_actions", alarm.attrs["alarm_actions"])
             == (alarm.attrs["alarm_actions"])
@@ -1006,6 +1021,9 @@ def test_ingestion_queues_tf_outputs_and_descriptions() -> None:
     assert outputs["telemetry_ingest_iam_user_name"].attrs["value"] in null_safe(
         "aws_iam_user.telemetry_ingest[0]", "name"
     )
+    assert outputs["telemetry_ingress_alarm_topic_arn"].attrs["value"] in null_safe(
+        ALARM_TOPIC, "arn"
+    )
     new_outputs = {
         name for name in outputs if name.startswith(("telemetry_ingress", "telemetry_ingest"))
     }
@@ -1013,7 +1031,79 @@ def test_ingestion_queues_tf_outputs_and_descriptions() -> None:
         "telemetry_ingress_queue_url",
         "telemetry_ingress_dlq_url",
         "telemetry_ingest_iam_user_name",
+        "telemetry_ingress_alarm_topic_arn",
     }
+
+
+def _statement_principal(statement: _HclBlock) -> tuple[str, list[str]]:
+    (principals,) = statement.nested("principals")
+    return principals.attrs["type"], _list_items(principals.attrs["identifiers"])
+
+
+def _source_account_condition(statement: _HclBlock) -> None:
+    (condition,) = statement.nested("condition")
+    assert condition.attrs["test"] == '"StringEquals"'
+    assert condition.attrs["variable"] == '"aws:SourceAccount"'
+    assert _list_items(condition.attrs["values"]) == [
+        "data.aws_caller_identity.telemetry_ingress_alarms[0].account_id"
+    ]
+
+
+def test_ingestion_queues_tf_alarm_topic_is_encrypted_and_only_cloudwatch_publishes() -> None:
+    blocks = _ingestion_blocks()
+    documents = _policy_documents(blocks)
+
+    # CloudWatch cannot use the AWS-managed aws/sns key, so the topic has its own rotated key.
+    (key,) = _resources(blocks, "aws_kms_key").values()
+    assert key.attrs["enable_key_rotation"] == "true"
+    assert key.attrs["policy"] == (
+        "data.aws_iam_policy_document.telemetry_ingress_alarms_key[0].json"
+    )
+    (topic,) = _resources(blocks, "aws_sns_topic").values()
+    assert topic.attrs["kms_master_key_id"] == "aws_kms_key.telemetry_ingress_alarms[0].arn"
+    assert topic.attrs["name"] == (
+        '"${var.project_name}-${var.environment}-telemetry-ingress-alarms"'
+    )
+
+    key_statements = {
+        _unquote(s.attrs["sid"]): s
+        for s in documents["telemetry_ingress_alarms_key"].nested("statement")
+    }
+    assert set(key_statements) == {"AccountAdministration", "CloudWatchAlarmPublish"}
+    assert _statement_principal(key_statements["AccountAdministration"]) == (
+        '"AWS"',
+        ['"arn:aws:iam::${data.aws_caller_identity.telemetry_ingress_alarms[0].account_id}:root"'],
+    )
+    cloudwatch_key = key_statements["CloudWatchAlarmPublish"]
+    assert _statement_principal(cloudwatch_key) == ('"Service"', ['"cloudwatch.amazonaws.com"'])
+    assert [_unquote(a) for a in _list_items(cloudwatch_key.attrs["actions"])] == [
+        "kms:Decrypt",
+        "kms:GenerateDataKey*",
+    ]
+    _source_account_condition(cloudwatch_key)
+
+    (topic_policy,) = _resources(blocks, "aws_sns_topic_policy").values()
+    assert topic_policy.attrs["arn"] == f"{ALARM_TOPIC}.arn"
+    assert topic_policy.attrs["policy"] == (
+        "data.aws_iam_policy_document.telemetry_ingress_alarms_topic[0].json"
+    )
+    (publish,) = documents["telemetry_ingress_alarms_topic"].nested("statement")
+    assert publish.attrs.get("effect", '"Allow"') == '"Allow"'
+    assert _list_items(publish.attrs["actions"]) == ['"sns:Publish"']
+    assert _list_items(publish.attrs["resources"]) == [f"{ALARM_TOPIC}.arn"]
+    assert _statement_principal(publish) == ('"Service"', ['"cloudwatch.amazonaws.com"'])
+    _source_account_condition(publish)
+
+    (subscription,) = _resources(blocks, "aws_sns_topic_subscription").values()
+    assert subscription.attrs == {
+        "count": ALARM_EMAIL_GATE,
+        "topic_arn": f"{ALARM_TOPIC}.arn",
+        "protocol": '"email"',
+        "endpoint": "var.telemetry_ingress_alarm_email",
+    }
+    # The real mailbox lives only in the untracked tfvars.
+    tfvars = _read("env/cloud.tfvars.example")
+    assert re.search(r'^telemetry_ingress_alarm_email\s+=\s+""$', tfvars, re.MULTILINE)
 
 
 def test_ingestion_queues_tf_variables_declared_and_in_tfvars_example() -> None:
