@@ -39,6 +39,7 @@ T0 = OBSERVED
 E = SequenceEvent
 INGESTED = RECEIVED + timedelta(seconds=30)
 THIRD_COMPONENT = "cmp_" + "9" * 32
+FOURTH_COMPONENT = "cmp_" + "a" * 32
 
 
 def t(minutes: int) -> datetime:
@@ -163,6 +164,9 @@ def test_marks_take_per_component_maxima_from_eligible_accepted_observations() -
             sequence=1,
             flags=[QualityFlag.DELAYED, QualityFlag.REPLAY],
         ),
+        # The mark is the maximum (observed_at, sequence) PAIR, not two separate maxima.
+        canonical_observation(component_id=FOURTH_COMPONENT, observed_at=t(1), sequence=9),
+        canonical_observation(component_id=FOURTH_COMPONENT, observed_at=t(2), sequence=3),
     )
     rejected = (
         quarantined(QuarantineReason.METRIC_UNKNOWN),
@@ -179,7 +183,7 @@ def test_marks_take_per_component_maxima_from_eligible_accepted_observations() -
         ACCOUNT,
     )
     by_component = {mark.component_id: mark for mark in marks.component_marks}
-    assert len(by_component) == len(marks.component_marks) == 3
+    assert len(by_component) == len(marks.component_marks) == 4
     assert by_component == {
         COMPONENT: ComponentMark(
             component_id=COMPONENT,
@@ -201,6 +205,13 @@ def test_marks_take_per_component_maxima_from_eligible_accepted_observations() -
             ingested_at=INGESTED,
             observed_at=t(1),
             sequence=1,
+        ),
+        FOURTH_COMPONENT: ComponentMark(
+            component_id=FOURTH_COMPONENT,
+            received_at=RECEIVED,
+            ingested_at=INGESTED,
+            observed_at=t(2),
+            sequence=3,
         ),
     }
     assert marks.device_mark == DeviceMark(received_at=RECEIVED, ingested_at=INGESTED)

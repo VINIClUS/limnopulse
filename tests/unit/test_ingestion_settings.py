@@ -144,7 +144,7 @@ def test_retry_base_must_not_exceed_the_cap() -> None:
     )
 
     with pytest.raises(ValidationError) as exc_info:
-        _settings(telemetry_ingest_retry_base_seconds=901, telemetry_ingest_retry_cap_seconds=900)
+        _settings(telemetry_ingest_retry_base_seconds=600, telemetry_ingest_retry_cap_seconds=300)
 
     assert "TELEMETRY_INGEST_RETRY_BASE_SECONDS" in str(exc_info.value)
 

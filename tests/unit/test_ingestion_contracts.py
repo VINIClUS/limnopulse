@@ -600,6 +600,35 @@ def test_batch_rejects_bad_external_device_ids(external_device_id: str) -> None:
         )
 
 
+def _components(count: int) -> list[str]:
+    return [f"cmp_{index:032x}" for index in range(count)]
+
+
+def test_batch_accepts_thirty_two_distinct_components() -> None:
+    observations = [_observation(component_id=item) for item in _components(32)]
+    observations += [_observation(), _observation(component_id=_components(1)[0])]
+
+    batch = IngestObservationBatch.model_validate(_batch(observations))
+
+    assert len({item.component_id for item in batch.observations} - {None}) == 32
+    assert ingestion.MAX_INGEST_DISTINCT_COMPONENTS == 32
+
+
+def test_batch_rejects_more_than_thirty_two_distinct_components() -> None:
+    observations = [_observation(component_id=item) for item in _components(33)]
+    body = json.dumps(_batch(observations))
+
+    with pytest.raises(ValidationError) as exc_info:
+        IngestObservationBatch.model_validate_json(body)
+
+    (error,) = exc_info.value.errors()
+    assert error["type"] == "value_error"
+    assert "at most 32 distinct component_id values" in error["msg"]
+    assert redacted_validation_detail(exc_info.value) == [
+        {"loc": ["body"], "msg": "invalid value", "type": "value_error"}
+    ]
+
+
 def test_batch_accepts_the_longest_external_device_id() -> None:
     batch = IngestObservationBatch.model_validate(
         _batch([_observation()], external_device_id="x" * 512)

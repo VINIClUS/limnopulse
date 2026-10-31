@@ -398,6 +398,7 @@ async def credential_slot_taken_is_conflict(subject: CredentialKitSubject) -> No
             credential(ingest_credential_id=OTHER_CREDENTIAL), AUDIT
         )
     assert await subject.repository.get_ingest_credential(OTHER_CREDENTIAL) is None
+    assert [item["action"] for item in subject.audit_items()] == ["ingest_credential.issued"]
 
     second = credential(ingest_credential_id=OTHER_CREDENTIAL, slot=2)
     assert await subject.repository.create_ingest_credential(second, AUDIT) == second
@@ -421,6 +422,23 @@ async def credential_requires_an_eligible_account(subject: CredentialKitSubject)
             credential(integration_account_id=OTHER_ACCOUNT), AUDIT
         )
     assert await subject.repository.get_ingest_credential(CREDENTIAL) is None
+    assert subject.audit_items() == []
+
+
+async def credential_cannot_target_another_tenants_account(
+    subject: CredentialKitSubject,
+) -> None:
+    await subject.seed_account(integration_account())
+
+    with pytest.raises((ConflictError, NotFoundError)):
+        await subject.repository.create_ingest_credential(credential(tenant_id=OTHER_TENANT), AUDIT)
+
+    assert await subject.repository.get_ingest_credential(CREDENTIAL) is None
+    assert await subject.repository.list_ingest_credentials(OTHER_TENANT, ACCOUNT) == []
+    assert await subject.repository.list_ingest_credentials(TENANT, ACCOUNT) == []
+    assert subject.audit_items() == []
+    # The slot stays free for the account's own tenant.
+    assert await subject.repository.create_ingest_credential(credential(), AUDIT) == credential()
 
 
 async def credential_pending_account_may_issue(subject: CredentialKitSubject) -> None:
@@ -522,6 +540,7 @@ CREDENTIAL_REPOSITORY_CONTRACT = (
     credential_create_get_list,
     credential_slot_taken_is_conflict,
     credential_requires_an_eligible_account,
+    credential_cannot_target_another_tenants_account,
     credential_pending_account_may_issue,
     credential_revoke_frees_the_slot,
     credential_revoke_stale_version_is_conflict,
@@ -1278,14 +1297,16 @@ def envelope_of_message_bytes(target: int) -> IngressEnvelope:
             ]
         )
 
-    one = ingress_message_bytes(build([1]))
-    per_observation = ingress_message_bytes(build([1, 1])) - one
+    # Observations start with a 40-character source_event_id and may grow it to 128, so the
+    # target is reachable well within MAX_INGEST_OBSERVATIONS.
+    one = ingress_message_bytes(build([40]))
+    per_observation = ingress_message_bytes(build([40, 40])) - one
     count = (target - one) // per_observation + 1
     assert count <= 1_000
-    lengths = [1] * count
+    lengths = [40] * count
     missing = target - ingress_message_bytes(build(lengths))
     for index in range(count):
-        grow = min(missing, 127)
+        grow = min(missing, 88)
         lengths[index] += grow
         missing -= grow
     assert missing == 0
@@ -1368,7 +1389,10 @@ async def _all_pages(
         collected.extend(page.entries)
         if page.next_after_sk is None:
             return collected
-        assert page.next_after_sk == page.entries[-1].entry_key
+        # A filtered page may be empty yet carry a cursor (Query with Limit plus a filter).
+        if page.entries:
+            assert page.next_after_sk == page.entries[-1].entry_key
+        assert page.next_after_sk != after
         after = page.next_after_sk
     raise AssertionError("pagination did not terminate")
 
@@ -1646,6 +1670,33 @@ async def state_fence_marks_touch_only_the_connector(subject: IngestStateKitSubj
     )
 
 
+async def state_fence_reason_ties_are_order_independent(subject: IngestStateKitSubject) -> None:
+    def fenced(account_id: str, reason: str) -> IngestMarks:
+        return IngestMarks(
+            tenant_id=TENANT,
+            device_id=None,
+            integration_account_id=account_id,
+            component_marks=(),
+            device_mark=None,
+            connector_mark=ConnectorMark(fenced_at=RECEIVED, fence_reason=reason),
+        )
+
+    for account_id, order in (
+        (ACCOUNT, ("account_revoked", "integration_mismatch")),
+        (OTHER_ACCOUNT, ("integration_mismatch", "account_revoked")),
+    ):
+        for reason in order:
+            await subject.repository.apply_ingest_marks(fenced(account_id, reason))
+
+    for account_id in (ACCOUNT, OTHER_ACCOUNT):
+        health = await subject.repository.get_connector_health(TENANT, account_id)
+        assert health is not None
+        assert (health.last_fenced_at, health.last_fence_reason) == (
+            RECEIVED,
+            "integration_mismatch",
+        )
+
+
 async def state_empty_marks_write_nothing(subject: IngestStateKitSubject) -> None:
     empty = IngestMarks(
         tenant_id=TENANT,
@@ -1664,6 +1715,7 @@ async def state_empty_marks_write_nothing(subject: IngestStateKitSubject) -> Non
 
 INGEST_STATE_CONTRACT = (
     state_empty_marks_write_nothing,
+    state_fence_reason_ties_are_order_independent,
     state_apply_then_read,
     state_rows_are_tenant_checked,
     state_marks_are_monotone,
@@ -2230,17 +2282,21 @@ def _vectors_m1() -> list[DynamoVector]:
                 after={(PK, SK): _row(written=1) if succeeds else seeded},
             )
         )
-    guarded = _row(status="active", tenant_id="t1", version=3, last_ended_at="2026-01-02")
+    guarded = _row(
+        status="active", tenant_id="t1", version=3, last_ended_at="2026-01-02", deployment_id="d1"
+    )
     names = {
         "#status": "status",
         "#tenant_id": "tenant_id",
         "#version": "version",
         "#last_ended_at": "last_ended_at",
+        "#deployment_id": "deployment_id",
     }
     cases = [
         ("status_tenant", "attribute_exists(PK) AND #status = :active AND #tenant_id = :tenant_id"),
         ("tenant", "attribute_exists(PK) AND #tenant_id = :tenant_id"),
         ("status_in", "attribute_exists(PK) AND #status IN (:pending, :active)"),
+        ("deployment", "attribute_exists(PK) AND #deployment_id = :deployment_id"),
         (
             "version_tenant",
             "attribute_exists(PK) AND #version = :expected_version AND #tenant_id = :tenant_id",
@@ -2257,6 +2313,7 @@ def _vectors_m1() -> list[DynamoVector]:
         ":tenant_id": "t1",
         ":expected_version": 3,
         ":started_at": "2026-01-03",
+        ":deployment_id": "d1",
     }
     failing = {
         ":active": "active",
@@ -2264,6 +2321,7 @@ def _vectors_m1() -> list[DynamoVector]:
         ":tenant_id": "t2",
         ":expected_version": 2,
         ":started_at": "2026-01-01",
+        ":deployment_id": "d2",
     }
     for label, condition in cases:
         used_names = {key: value for key, value in names.items() if key in condition}
@@ -2291,6 +2349,36 @@ def _vectors_m1() -> list[DynamoVector]:
                     after={(PK, SK): {**row, "touched": 1} if succeeds else row},
                 )
             )
+    migration = (
+        "attribute_not_exists(PK) OR (#entity_type = :entity_type "
+        "AND #tenant_id = :tenant_id AND #migration = :migration)"
+    )
+    migration_names = {
+        "#entity_type": "entity_type",
+        "#tenant_id": "tenant_id",
+        "#migration": "migration",
+    }
+    for name, seeded, succeeds in (
+        ("absent", None, True),
+        ("same", _row(entity_type="migration", tenant_id="t1", migration="m1"), True),
+        ("other", _row(entity_type="migration", tenant_id="t2", migration="m1"), False),
+    ):
+        vectors.append(
+            DynamoVector(
+                f"m1_migration_receipt_{name}",
+                "put_item",
+                _put(
+                    migration,
+                    names=migration_names,
+                    entity_type="migration",
+                    tenant_id="t1",
+                    migration="m1",
+                ),
+                seed=() if seeded is None else (seeded,),
+                succeeds=succeeds,
+                after={(PK, SK): _row(written=1) if succeeds else seeded},
+            )
+        )
     counter = "SET #run_count = if_not_exists(#run_count, :zero) + :one"
     for name, seeded, expected in (("absent", None, 1), ("existing", _row(run_count=4), 5)):
         vectors.append(
