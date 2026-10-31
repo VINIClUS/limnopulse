@@ -94,3 +94,39 @@ jobs:
         with:
           go-version-file: go.mod
       - run: make verify-influx
+  ingestion:
+    runs-on: ubuntu-latest
+    services:
+      elasticmq:
+        image: softwaremill/elasticmq-native:1.6.16@sha256:8383f29ad746c12981ca2128f689a4b4a93815235f1a7851d2f165316503d132
+        ports:
+          - 9324:9324
+      dynamodb:
+        # DynamoDB Local listens on 8000 in the container; the harness default is 8001.
+        image: amazon/dynamodb-local:3.3.2@sha256:6ada631ec7aa5fc83446855eb17233e3dad184fec47477e8140c6c569cfe0c86
+        ports:
+          - 8001:8000
+      influxdb:
+        # The same digest-pinned 2.7.11 and throwaway onboarding as the influx job.
+        image: influxdb:2.7.11@sha256:d92a10e9e75aff18eca38ff3a8f0b4a800706a5dd44d1b0ece264af04458525b
+        env:
+          DOCKER_INFLUXDB_INIT_MODE: setup
+          DOCKER_INFLUXDB_INIT_USERNAME: limnopulse-ci
+          DOCKER_INFLUXDB_INIT_PASSWORD: throwaway-ci-password
+          DOCKER_INFLUXDB_INIT_ORG: limnopulse
+          DOCKER_INFLUXDB_INIT_BUCKET: limnopulse_ci
+          DOCKER_INFLUXDB_INIT_ADMIN_TOKEN: local-dev-token
+        ports:
+          - 8086:8086
+        options: >-
+          --health-cmd "influx ping"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 30
+    steps:
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+      - uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6
+        with:
+          python-version: "3.12"
+      - uses: astral-sh/setup-uv@d0cc045d04ccac9d8b7881df0226f9e82c39688e # v6.8.0
+      - run: make verify-ingestion
