@@ -272,8 +272,9 @@ func TestRunnerComparesPresentZeroAgainstThreshold(t *testing.T) {
 
 func TestRunnerDropsStaleWindowAggregate(t *testing.T) {
 	active := VersionedState{State: State{Mode: ModeActive, ActiveEventID: "alert_1", ActiveStatus: StatusOpen, LastValue: Measured(4.2)}, Revision: 3}
+	// The raw stale aggregate 1 breaches "< 5"; it must not count.
 	_, commit := runSingleRule(t, runnableWork,
-		fakeWindowReader{result: WindowResult{Quality: QualityStaleData, Value: 9.9}}, active)
+		fakeWindowReader{result: WindowResult{Quality: QualityStaleData, Value: 1}}, active)
 
 	if commit.Evaluation.Value.IsPresent() || commit.Evaluation.Breached || commit.Evaluation.Quality != QualityStaleData {
 		t.Fatalf("stale evaluation = %#v, want absent and not breached", commit.Evaluation)
@@ -287,14 +288,54 @@ func TestRunnerDropsStaleWindowAggregate(t *testing.T) {
 }
 
 func TestRunnerDropsWindowValueOnQueryError(t *testing.T) {
-	reader := fakeWindowReader{result: WindowResult{Quality: QualitySufficient, Value: 7}, err: errors.New("influx timeout")}
-	summary, commit := runSingleRule(t, runnableWork, reader, VersionedState{})
+	// The reader also returns a sufficient breaching window; the error wins.
+	reader := fakeWindowReader{result: WindowResult{Quality: QualitySufficient, Value: 1}, err: errors.New("influx timeout")}
+	work := func(slot time.Time) Work {
+		rule := runnableWork(slot)
+		rule.Rule.Duration = 2 * time.Minute
+		return rule
+	}
+	evaluationTime := time.Date(2026, 7, 15, 12, 1, 0, 0, time.UTC)
+	slot := LatestCompleteSlot(evaluationTime, time.Minute, 15*time.Second)
+	pending := VersionedState{State: State{
+		Mode: ModePending, ConfirmedSlots: 1, PendingSince: slot.Add(-time.Minute), LastBreachSlot: slot.Add(-time.Minute),
+	}, Revision: 2}
+	summary, commit := runSingleRule(t, work, reader, pending)
 
 	if commit.Evaluation.Quality != QualityQueryError || commit.Evaluation.Value.IsPresent() || commit.Evaluation.Breached {
 		t.Fatalf("query error evaluation = %#v, want absent query_error", commit.Evaluation)
 	}
-	if commit.Decision.Transition != TransitionNone || summary.RulesWithError != 1 {
+	if commit.Decision.Transition != TransitionNone || commit.Decision.Next.ConfirmedSlots != 1 || summary.RulesWithError != 1 {
 		t.Fatalf("query error decision = %#v, summary = %#v", commit.Decision, summary)
+	}
+}
+
+func TestRunnerKeepsMissedSlotsOnIndeterminateEvaluations(t *testing.T) {
+	for name, reader := range map[string]fakeWindowReader{
+		"query error": {err: errors.New("influx timeout")},
+		"stale":       {result: WindowResult{Quality: QualityStaleData, Value: 1}},
+		"downgraded":  {result: WindowResult{Quality: QualitySufficient, Value: math.NaN()}},
+	} {
+		evaluationTime := time.Date(2026, 7, 15, 12, 4, 0, 0, time.UTC)
+		slot := LatestCompleteSlot(evaluationTime, time.Minute, 15*time.Second)
+		work := runnableWork(slot.Add(-3 * time.Minute))
+		work.Rule.Duration = 3 * time.Minute
+		store := &fakeStore{
+			candidates: []Candidate{{PK: work.PK, SK: work.SK, RuleID: "rule_1", Bucket: EvaluationBucket("tnt_1", "rule_1")}},
+			work:       map[string]Work{"rule_1": work},
+			states: map[string]VersionedState{"rule_1": {State: State{
+				Mode: ModePending, ConfirmedSlots: 1, PendingSince: slot.Add(-4 * time.Minute), LastBreachSlot: slot.Add(-4 * time.Minute),
+			}, Revision: 2}},
+		}
+
+		(Runner{Store: store, Windows: reader}).Run(context.Background(), runnableConfig(evaluationTime))
+
+		if len(store.commits) != 1 || store.commits[0].Evaluation.MissedSlots != 3 {
+			t.Fatalf("%s: commits = %#v", name, store.commits)
+		}
+		if next := store.commits[0].Decision.Next; next.Mode != ModeHealthy || next.ConfirmedSlots != 0 {
+			t.Fatalf("%s: coalesced gap did not reset pending: %#v", name, next)
+		}
 	}
 }
 
@@ -324,8 +365,13 @@ func TestRunnerDowngradesSufficientWindowWithoutUsableValue(t *testing.T) {
 type blockingWindowReader struct{}
 
 func (blockingWindowReader) Evaluate(ctx context.Context, _ EvaluationRule, _ WindowSpec) (WindowResult, error) {
-	<-ctx.Done()
-	return WindowResult{Quality: QualitySufficient, Value: 3}, ctx.Err()
+	select {
+	case <-ctx.Done():
+		return WindowResult{Quality: QualitySufficient, Value: 3}, ctx.Err()
+	case <-time.After(2 * time.Second):
+		// Fails the test instead of hanging when PerRuleTimeout is not applied.
+		return WindowResult{Quality: QualitySufficient, Value: 3}, nil
+	}
 }
 
 func TestRunnerTreatsPerRuleTimeoutAsAbsentQueryError(t *testing.T) {

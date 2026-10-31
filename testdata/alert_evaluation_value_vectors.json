@@ -35,6 +35,27 @@
       }
     },
     {
+      "name": "v2_present_zero_sufficient",
+      "writer": "go_v2",
+      "stored_state_json": "{\"SchemaVersion\":2,\"Mode\":\"active\",\"ConfirmedSlots\":0,\"PendingSince\":\"0001-01-01T00:00:00Z\",\"LastBreachSlot\":\"0001-01-01T00:00:00Z\",\"LastEvaluatedSlot\":\"2026-07-15T12:00:45Z\",\"LastQuality\":\"sufficient\",\"LastValue\":0,\"ActiveEventID\":\"alert_1\",\"ActiveStatus\":\"open\",\"ActiveOpenedAt\":\"2026-07-15T11:58:45Z\",\"OpeningOutboxes\":{\"email\":\"outbox_open_email\"},\"CooldownUntil\":\"2026-07-15T12:28:45Z\",\"LastNotifiedEventID\":\"alert_1\",\"SuppressionSourceEventID\":\"\"}",
+      "expected_last_value": {
+        "present": true,
+        "value": 0
+      },
+      "python_resolved_state_json": "{\"ActiveEventID\":\"\",\"ActiveOpenedAt\":\"0001-01-01T00:00:00Z\",\"ActiveStatus\":\"\",\"ConfirmedSlots\":0,\"CooldownUntil\":\"2026-07-15T12:28:45Z\",\"LastBreachSlot\":\"0001-01-01T00:00:00Z\",\"LastEvaluatedSlot\":\"2026-07-15T12:00:45Z\",\"LastNotifiedEventID\":\"alert_1\",\"LastQuality\":\"sufficient\",\"LastValue\":0,\"Mode\":\"healthy\",\"OpeningOutboxes\":null,\"PendingSince\":\"0001-01-01T00:00:00Z\",\"SchemaVersion\":2,\"SuppressionSourceEventID\":\"\"}",
+      "go_encode": {
+        "last_quality": "sufficient",
+        "last_value": {
+          "present": true,
+          "value": 0
+        }
+      },
+      "expected_after_old_go_rewrite": {
+        "present": true,
+        "value": 0
+      }
+    },
+    {
       "name": "v2_present_positive",
       "writer": "go_v2",
       "stored_state_json": "{\"SchemaVersion\":2,\"Mode\":\"active\",\"ConfirmedSlots\":0,\"PendingSince\":\"0001-01-01T00:00:00Z\",\"LastBreachSlot\":\"0001-01-01T00:00:00Z\",\"LastEvaluatedSlot\":\"2026-07-15T12:00:45Z\",\"LastQuality\":\"sufficient\",\"LastValue\":4.2,\"ActiveEventID\":\"alert_1\",\"ActiveStatus\":\"open\",\"ActiveOpenedAt\":\"2026-07-15T11:58:45Z\",\"OpeningOutboxes\":{\"email\":\"outbox_open_email\"},\"CooldownUntil\":\"2026-07-15T12:28:45Z\",\"LastNotifiedEventID\":\"alert_1\",\"SuppressionSourceEventID\":\"\"}",
@@ -203,6 +224,25 @@
       "python_resolved_state_json": "{\"ActiveEventID\":\"\",\"ActiveOpenedAt\":\"0001-01-01T00:00:00Z\",\"ActiveStatus\":\"\",\"ConfirmedSlots\":0,\"CooldownUntil\":\"2026-07-15T12:28:45Z\",\"LastBreachSlot\":\"0001-01-01T00:00:00Z\",\"LastEvaluatedSlot\":\"2026-07-15T12:00:45Z\",\"LastNotifiedEventID\":\"alert_1\",\"LastQuality\":\"stale_data\",\"LastValue\":0,\"Mode\":\"healthy\",\"OpeningOutboxes\":null,\"PendingSince\":\"0001-01-01T00:00:00Z\",\"SuppressionSourceEventID\":\"\"}"
     },
     {
+      "name": "legacy_negative_zero_sufficient",
+      "writer": "go_legacy",
+      "stored_state_json": "{\"Mode\":\"active\",\"ConfirmedSlots\":0,\"PendingSince\":\"0001-01-01T00:00:00Z\",\"LastBreachSlot\":\"0001-01-01T00:00:00Z\",\"LastEvaluatedSlot\":\"2026-07-15T12:00:45Z\",\"LastQuality\":\"sufficient\",\"LastValue\":-0,\"ActiveEventID\":\"alert_1\",\"ActiveStatus\":\"open\",\"ActiveOpenedAt\":\"2026-07-15T11:58:45Z\",\"OpeningOutboxes\":{\"email\":\"outbox_open_email\"},\"CooldownUntil\":\"2026-07-15T12:28:45Z\",\"LastNotifiedEventID\":\"alert_1\",\"SuppressionSourceEventID\":\"\"}",
+      "expected_last_value": {
+        "present": true,
+        "value": 0
+      },
+      "python_resolved_state_json": "{\"ActiveEventID\":\"\",\"ActiveOpenedAt\":\"0001-01-01T00:00:00Z\",\"ActiveStatus\":\"\",\"ConfirmedSlots\":0,\"CooldownUntil\":\"2026-07-15T12:28:45Z\",\"LastBreachSlot\":\"0001-01-01T00:00:00Z\",\"LastEvaluatedSlot\":\"2026-07-15T12:00:45Z\",\"LastNotifiedEventID\":\"alert_1\",\"LastQuality\":\"sufficient\",\"LastValue\":0,\"Mode\":\"healthy\",\"OpeningOutboxes\":null,\"PendingSince\":\"0001-01-01T00:00:00Z\",\"SuppressionSourceEventID\":\"\"}"
+    },
+    {
+      "name": "legacy_out_of_range_value",
+      "writer": "hand",
+      "stored_state_json": "{\"Mode\":\"active\",\"ActiveEventID\":\"alert_1\",\"ActiveStatus\":\"open\",\"LastQuality\":\"sufficient\",\"LastValue\":1e+30}",
+      "expected_last_value": {
+        "present": false
+      },
+      "python_resolved_state_json": "{\"ActiveEventID\":\"\",\"ActiveOpenedAt\":\"0001-01-01T00:00:00Z\",\"ActiveStatus\":\"\",\"ConfirmedSlots\":0,\"LastBreachSlot\":\"0001-01-01T00:00:00Z\",\"LastQuality\":\"sufficient\",\"LastValue\":1e+30,\"Mode\":\"healthy\",\"OpeningOutboxes\":null,\"PendingSince\":\"0001-01-01T00:00:00Z\",\"SuppressionSourceEventID\":\"\"}"
+    },
+    {
       "name": "legacy_missing_key",
       "writer": "hand",
       "stored_state_json": "{\"Mode\":\"active\",\"ActiveEventID\":\"alert_1\",\"ActiveStatus\":\"open\"}",
@@ -239,6 +279,25 @@
       "python_resolved_state_json": "{\"ActiveEventID\":\"\",\"ActiveOpenedAt\":\"0001-01-01T00:00:00Z\",\"ActiveStatus\":\"\",\"ConfirmedSlots\":0,\"LastBreachSlot\":\"0001-01-01T00:00:00Z\",\"LastValue\":0,\"Mode\":\"healthy\",\"OpeningOutboxes\":null,\"PendingSince\":\"0001-01-01T00:00:00Z\",\"SuppressionSourceEventID\":\"\"}"
     },
     {
+      "name": "legacy_explicit_version_0",
+      "writer": "hand",
+      "stored_state_json": "{\"SchemaVersion\":0,\"Mode\":\"active\",\"ActiveEventID\":\"alert_1\",\"ActiveStatus\":\"open\",\"LastQuality\":\"query_error\",\"LastValue\":4.2}",
+      "expected_last_value": {
+        "present": true,
+        "value": 4.2
+      },
+      "python_resolved_state_json": "{\"ActiveEventID\":\"\",\"ActiveOpenedAt\":\"0001-01-01T00:00:00Z\",\"ActiveStatus\":\"\",\"ConfirmedSlots\":0,\"LastBreachSlot\":\"0001-01-01T00:00:00Z\",\"LastQuality\":\"query_error\",\"LastValue\":4.2,\"Mode\":\"healthy\",\"OpeningOutboxes\":null,\"PendingSince\":\"0001-01-01T00:00:00Z\",\"SchemaVersion\":0,\"SuppressionSourceEventID\":\"\"}"
+    },
+    {
+      "name": "legacy_null_version",
+      "writer": "hand",
+      "stored_state_json": "{\"SchemaVersion\":null,\"Mode\":\"active\",\"ActiveEventID\":\"alert_1\",\"ActiveStatus\":\"open\",\"LastQuality\":\"stale_data\",\"LastValue\":0}",
+      "expected_last_value": {
+        "present": false
+      },
+      "python_resolved_state_json": "{\"ActiveEventID\":\"\",\"ActiveOpenedAt\":\"0001-01-01T00:00:00Z\",\"ActiveStatus\":\"\",\"ConfirmedSlots\":0,\"LastBreachSlot\":\"0001-01-01T00:00:00Z\",\"LastQuality\":\"stale_data\",\"LastValue\":0,\"Mode\":\"healthy\",\"OpeningOutboxes\":null,\"PendingSince\":\"0001-01-01T00:00:00Z\",\"SchemaVersion\":null,\"SuppressionSourceEventID\":\"\"}"
+    },
+    {
       "name": "legacy_explicit_version_1",
       "writer": "hand",
       "stored_state_json": "{\"SchemaVersion\":1,\"Mode\":\"active\",\"ActiveEventID\":\"alert_1\",\"ActiveStatus\":\"open\",\"LastQuality\":\"stale_data\",\"LastValue\":0}",
@@ -251,26 +310,37 @@
   "state_error_vectors": [
     {
       "name": "unknown_future_version",
+      "expected_error": "unsupported_schema",
       "stored_state_json": "{\"SchemaVersion\":3,\"Mode\":\"active\",\"LastQuality\":\"sufficient\",\"LastValue\":4.2}"
     },
     {
       "name": "negative_version",
+      "expected_error": "unsupported_schema",
       "stored_state_json": "{\"SchemaVersion\":-1,\"Mode\":\"active\",\"LastQuality\":\"sufficient\",\"LastValue\":4.2}"
     },
     {
       "name": "v2_string_value",
+      "expected_error": "malformed",
       "stored_state_json": "{\"SchemaVersion\":2,\"Mode\":\"active\",\"LastQuality\":\"sufficient\",\"LastValue\":\"4.2\"}"
     },
     {
       "name": "v2_object_value",
+      "expected_error": "malformed",
       "stored_state_json": "{\"SchemaVersion\":2,\"Mode\":\"active\",\"LastQuality\":\"sufficient\",\"LastValue\":{}}"
     },
     {
       "name": "string_version",
+      "expected_error": "malformed",
       "stored_state_json": "{\"SchemaVersion\":\"2\",\"Mode\":\"active\",\"LastQuality\":\"sufficient\",\"LastValue\":4.2}"
     },
     {
+      "name": "fractional_version",
+      "expected_error": "malformed",
+      "stored_state_json": "{\"SchemaVersion\":2.5,\"Mode\":\"active\",\"LastQuality\":\"sufficient\",\"LastValue\":4.2}"
+    },
+    {
       "name": "legacy_string_value",
+      "expected_error": "malformed",
       "stored_state_json": "{\"Mode\":\"active\",\"LastQuality\":\"sufficient\",\"LastValue\":\"0\"}"
     }
   ],
@@ -313,6 +383,26 @@
       },
       "attribute": {
         "N": "0.0000001"
+      }
+    },
+    {
+      "name": "present_upper_bound",
+      "value": {
+        "present": true,
+        "value": 1e+25
+      },
+      "attribute": {
+        "N": "10000000000000000000000000"
+      }
+    },
+    {
+      "name": "present_lower_bound",
+      "value": {
+        "present": true,
+        "value": -1e-100
+      },
+      "attribute": {
+        "N": "-0.0000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000001"
       }
     },
     {

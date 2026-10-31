@@ -106,7 +106,8 @@ Absent always means **no attribute**: omitted on `Put`, `REMOVE` on `Update`. It
 
 - Version 2: `LastValue` is a number (present) or `null` (absent). A missing key also means absent.
 - The marker lives in the adapter, not in the domain `State`. Embedding flattens `State` only while `State` has no JSON methods or tags of its own. The vector tests pin the exact Go bytes and so guard the flat key set that Python rewrites.
-- Legacy (no marker, or `1`): written by a binary from before this design. Since `0a41659`, an old `Decide` assigns `LastValue` only on sufficient evaluations, but its zero value is `0`, so a legacy `0` may be a placeholder. Legacy decode:
+- Every decoded number passes through `Measured`. A stored value outside the persistable range, in either version, therefore decodes as absent.
+- Legacy: no marker, `null`, `0` or `1`. Go's integer decoding cannot tell a missing marker from `null` or `0`, and no writer emits them. Legacy records are written by a binary from before this design. Since `0a41659`, an old `Decide` assigns `LastValue` only on sufficient evaluations, but its zero value is `0`, so a legacy `0` may be a placeholder. Legacy decode:
   - a non-zero number → present (a real retained value);
   - `0` with `LastQuality == "sufficient"` → present zero;
   - `0` with any other `LastQuality` (including empty or missing), `null`, or a missing key → absent.
@@ -120,7 +121,7 @@ Absent always means **no attribute**: omitted on `Put`, `REMOVE` on `Update`. It
 - Any other `SchemaVersion` (for example 3, or a negative number) fails `LoadState` with `ErrUnsupportedStateSchema` (fail closed). A tolerant reader would be worse: `statePut` would write the document back through `State` and silently drop the fields a newer writer added.
   - **Operational effect:** the runner treats it like any state read failure. The rule is counted as fatal with the distinct error category `state_schema`, its lease expires and is not released, `next_evaluation_at` does not advance, and the run exits 1.
   - Rolling a future v3 writer back to a v2 binary would make every affected rule blind (no opens, no recoveries) until the rollback is reverted. A future version must therefore ship reader support first, in a separate deploy, before any writer emits it.
-- Malformed `LastValue` (a string, an object) fails `LoadState`, as it already did for `float64`.
+- A marker that is not an integer (a string, or a fraction such as `2.5`) is malformed rather than an unsupported version. So is a malformed `LastValue` (a string, an object). Both fail `LoadState` under the `state_read` category, as a malformed `LastValue` already did for `float64`.
 
 ### 6. Migration and backfill
 

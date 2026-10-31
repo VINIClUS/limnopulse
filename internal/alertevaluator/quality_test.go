@@ -349,6 +349,8 @@ func TestNonFiniteAggregateIsInvalidAndAbsent(t *testing.T) {
 	}
 
 	// One bucket overflows to +Inf and the next to -Inf, so the mean is NaN.
+	// This relies on the fixed summation order pinned by
+	// TestMeanSumsBucketsAndDevicesInAscendingOrder.
 	nanSpec := qualitySpec(AggregationMean)
 	var nanSamples []Sample
 	for bucket := 0; bucket < 6; bucket++ {
@@ -364,6 +366,21 @@ func TestNonFiniteAggregateIsInvalidAndAbsent(t *testing.T) {
 	result = EvaluateSamples(nanSpec, nanSamples)
 	if result.Quality != QualityInsufficientData || result.Measurement().IsPresent() {
 		t.Fatalf("NaN mean = %#v, measurement = %v, want absent insufficient_data", result, result.Measurement())
+	}
+}
+
+func TestOutOfRangeAggregateIsInvalidBeforeStaleClassification(t *testing.T) {
+	spec := qualitySpec(AggregationMax)
+	spec.MinimumCoverageRatio = 0.4
+	var samples []Sample
+	for offset := time.Duration(0); offset < 30*time.Second; offset += spec.ExpectedSampleInterval {
+		samples = append(samples, Sample{Time: spec.Start.Add(offset + time.Second), DeviceID: "dev_1", Value: 1e30})
+	}
+
+	result := EvaluateSamples(spec, samples)
+
+	if result.Quality != QualityInsufficientData || result.Measurement().IsPresent() {
+		t.Fatalf("stale out-of-range window = %#v, want insufficient_data", result)
 	}
 }
 

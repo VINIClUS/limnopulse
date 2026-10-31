@@ -56,13 +56,13 @@ func TestGapRestartsPendingConfirmation(t *testing.T) {
 func TestIndeterminateDataNeverOpensOrResolves(t *testing.T) {
 	rule := testRule()
 	pending := Decide(rule, State{}, sufficient(testSlot, true), time.Minute).Next
-	indeterminate := Decide(rule, pending, Evaluation{Slot: testSlot.Add(time.Minute), Quality: QualityStaleData}, time.Minute)
+	indeterminate := Decide(rule, pending, Evaluation{Slot: testSlot.Add(time.Minute), Quality: QualityStaleData, Value: Measured(0)}, time.Minute)
 	if indeterminate.Next.Mode != ModePending || indeterminate.Transition != TransitionNone {
 		t.Fatalf("pending indeterminate = %#v", indeterminate)
 	}
 
 	opened := Decide(rule, pending, sufficient(testSlot.Add(time.Minute), true), time.Minute).Next
-	activeIndeterminate := Decide(rule, opened, Evaluation{Slot: testSlot.Add(2 * time.Minute), Quality: QualityQueryError}, time.Minute)
+	activeIndeterminate := Decide(rule, opened, Evaluation{Slot: testSlot.Add(2 * time.Minute), Quality: QualityQueryError, Value: Measured(0)}, time.Minute)
 	if activeIndeterminate.Next.Mode != ModeActive || activeIndeterminate.Transition != TransitionNone {
 		t.Fatalf("active indeterminate = %#v", activeIndeterminate)
 	}
@@ -296,5 +296,37 @@ func TestDeterminateValueReplacesRetainedLastValue(t *testing.T) {
 
 	if value, ok := decision.Next.LastValue.Get(); !ok || value != -3.5 {
 		t.Fatalf("last value = %v, want present -3.5", decision.Next.LastValue)
+	}
+}
+
+func TestPresentValueWithIndeterminateQualityNeverMovesAnIncident(t *testing.T) {
+	rule := testRule()
+	pending := Decide(rule, State{}, sufficient(testSlot, true), time.Minute).Next
+	confirm := Decide(rule, pending, Evaluation{Slot: testSlot.Add(time.Minute), Quality: QualityStaleData, Breached: true, Value: Measured(1)}, time.Minute)
+	if confirm.Transition != TransitionNone || confirm.Next.Mode != ModePending || confirm.Next.ConfirmedSlots != 1 {
+		t.Fatalf("stale breaching value confirmed the pending incident: %#v", confirm)
+	}
+
+	opened := Decide(rule, pending, sufficient(testSlot.Add(time.Minute), true), time.Minute).Next
+	resolve := Decide(rule, opened, Evaluation{Slot: testSlot.Add(2 * time.Minute), Quality: QualityStaleData, Value: Measured(0)}, time.Minute)
+	if resolve.Transition != TransitionNone || resolve.Next.Mode != ModeActive || resolve.Next.ActiveEventID != opened.ActiveEventID {
+		t.Fatalf("stale clean value resolved the active incident: %#v", resolve)
+	}
+}
+
+func TestIndeterminateSlotBreaksTheConfirmationChain(t *testing.T) {
+	rule := testRule()
+	pending := Decide(rule, State{}, sufficient(testSlot, true), time.Minute).Next
+	for _, gap := range []Evaluation{
+		{Slot: testSlot.Add(time.Minute), Quality: QualityStaleData, Value: Measured(1)},
+		absentButSufficient(testSlot.Add(time.Minute), true),
+		{Slot: testSlot.Add(time.Minute), Quality: QualityQueryError},
+	} {
+		afterGap := Decide(rule, pending, gap, time.Minute).Next
+		next := Decide(rule, afterGap, sufficient(testSlot.Add(2*time.Minute), true), time.Minute)
+		if next.Transition != TransitionNone || next.Next.Mode != ModePending || next.Next.ConfirmedSlots != 1 ||
+			!next.Next.PendingSince.Equal(testSlot.Add(2*time.Minute)) {
+			t.Fatalf("%s slot did not break the chain: %#v", gap.Quality, next)
+		}
 	}
 }

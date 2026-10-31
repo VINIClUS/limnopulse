@@ -4,8 +4,11 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
+	"math"
 	"os"
 	"path/filepath"
+	"reflect"
 	"strings"
 	"testing"
 	"time"
@@ -37,6 +40,7 @@ type valueVectors struct {
 	} `json:"state_vectors"`
 	StateErrorVectors []struct {
 		Name            string `json:"name"`
+		ExpectedError   string `json:"expected_error"`
 		StoredStateJSON string `json:"stored_state_json"`
 	} `json:"state_error_vectors"`
 	DynamoDBValueVectors []struct {
@@ -72,18 +76,43 @@ func (value vectorValue) measurement() alertevaluator.Measurement {
 func assertMeasurement(t *testing.T, label string, got alertevaluator.Measurement, want vectorValue) {
 	t.Helper()
 	value, ok := got.Get()
-	if ok != want.Present || (ok && value != want.Value) {
+	if ok != want.Present || (ok && (value != want.Value || (value == 0 && math.Signbit(value)))) {
 		t.Fatalf("%s: LastValue = %v, want present=%v value=%v", label, got, want.Present, want.Value)
 	}
 }
 
+func goEncodeBaseState(t *testing.T, vectors valueVectors) alertevaluator.State {
+	t.Helper()
+	var state alertevaluator.State
+	if err := json.Unmarshal(vectors.GoEncodeBaseState, &state); err != nil {
+		t.Fatal(err)
+	}
+	if state.ActiveEventID == "" || len(state.OpeningOutboxes) == 0 || state.CooldownUntil.IsZero() {
+		t.Fatalf("go_encode_base_state is incomplete: %#v", state)
+	}
+	return state
+}
+
 func TestStateVectorsDecodeToTheirExpectedLastValue(t *testing.T) {
-	for _, vector := range loadValueVectors(t).StateVectors {
+	vectors := loadValueVectors(t)
+	base := goEncodeBaseState(t, vectors)
+	for _, vector := range vectors.StateVectors {
 		state, err := decodeStateJSON(vector.StoredStateJSON)
 		if err != nil {
 			t.Fatalf("%s: decode stored document: %v", vector.Name, err)
 		}
 		assertMeasurement(t, vector.Name+" stored", state.LastValue, vector.ExpectedLastValue)
+		if state.Mode != alertevaluator.ModeActive || state.ActiveEventID != "alert_1" || state.ActiveStatus != alertevaluator.StatusOpen {
+			t.Fatalf("%s: decode lost lifecycle fields: %#v", vector.Name, state)
+		}
+		if vector.Writer == "go_v2" || vector.Writer == "go_legacy" {
+			want := base
+			want.LastQuality = state.LastQuality
+			want.LastValue = state.LastValue
+			if !reflect.DeepEqual(state, want) {
+				t.Fatalf("%s: decoded state\n%#v\nwant\n%#v", vector.Name, state, want)
+			}
+		}
 	}
 }
 
@@ -107,10 +136,7 @@ func TestStateVectorsPinTheGoWriterBytes(t *testing.T) {
 		if vector.GoEncode == nil {
 			continue
 		}
-		var state alertevaluator.State
-		if err := json.Unmarshal(vectors.GoEncodeBaseState, &state); err != nil {
-			t.Fatal(err)
-		}
+		state := goEncodeBaseState(t, vectors)
 		state.LastQuality = alertevaluator.Quality(vector.GoEncode.LastQuality)
 		state.LastValue = vector.GoEncode.LastValue.measurement()
 
@@ -121,6 +147,13 @@ func TestStateVectorsPinTheGoWriterBytes(t *testing.T) {
 		if document != vector.StoredStateJSON {
 			t.Fatalf("%s: Go wrote\n%s\nwant\n%s", vector.Name, document, vector.StoredStateJSON)
 		}
+		decoded, err := decodeStateJSON(document)
+		if err != nil {
+			t.Fatalf("%s: decode own document: %v", vector.Name, err)
+		}
+		if !reflect.DeepEqual(decoded, state) {
+			t.Fatalf("%s: round trip\n%#v\nwant\n%#v", vector.Name, decoded, state)
+		}
 		encoded++
 	}
 	if encoded == 0 {
@@ -129,8 +162,9 @@ func TestStateVectorsPinTheGoWriterBytes(t *testing.T) {
 }
 
 // mainBranchState is the evaluator state struct as it was before the value
-// became optional. An old evaluator decodes into it and re-encodes it, which
-// drops SchemaVersion and turns null into 0.
+// became optional. An old evaluator's LoadState decodes into it with a plain
+// json.Unmarshal and its statePut re-encodes it with json.Marshal, which drops
+// SchemaVersion and turns null into 0.
 type mainBranchState struct {
 	Mode                     alertevaluator.Mode
 	ConfirmedSlots           int
@@ -162,9 +196,6 @@ func TestOldEvaluatorRewriteOfVersionTwoStateFallsBackToLegacyDecode(t *testing.
 		if err != nil {
 			t.Fatal(err)
 		}
-		if strings.Contains(string(rewritten), "SchemaVersion") {
-			t.Fatalf("%s: old rewrite kept the marker: %s", vector.Name, rewritten)
-		}
 		state, err := decodeStateJSON(string(rewritten))
 		if err != nil {
 			t.Fatalf("%s: decode old rewrite: %v", vector.Name, err)
@@ -181,11 +212,27 @@ func TestOldEvaluatorRewriteOfVersionTwoStateFallsBackToLegacyDecode(t *testing.
 	}
 }
 
-func TestStateErrorVectorsFailClosed(t *testing.T) {
-	for _, vector := range loadValueVectors(t).StateErrorVectors {
-		if state, err := decodeStateJSON(vector.StoredStateJSON); err == nil {
-			t.Fatalf("%s: decoded %#v, want error", vector.Name, state)
+func TestLegacyVectorsAreWhatTheOldEvaluatorWrites(t *testing.T) {
+	checked := 0
+	for _, vector := range loadValueVectors(t).StateVectors {
+		if vector.Writer != "go_legacy" {
+			continue
 		}
+		var old mainBranchState
+		if err := json.Unmarshal([]byte(vector.StoredStateJSON), &old); err != nil {
+			t.Fatal(err)
+		}
+		written, err := json.Marshal(old)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if string(written) != vector.StoredStateJSON {
+			t.Fatalf("%s: old evaluator writes\n%s\nnot\n%s", vector.Name, written, vector.StoredStateJSON)
+		}
+		checked++
+	}
+	if checked == 0 {
+		t.Fatal("no go_legacy vectors")
 	}
 }
 
@@ -238,11 +285,13 @@ func TestCommitWritesStateJSONWithMarkerAndRetainedValue(t *testing.T) {
 		evaluation alertevaluator.Evaluation
 		want       string
 		wantValue  vectorValue
+		ruleValue  string
 	}{
-		{"determinate zero", alertevaluator.Measured(4.2), alertevaluator.Evaluation{Slot: slot, Quality: alertevaluator.QualitySufficient, Value: alertevaluator.Measured(0)}, `"LastValue":0`, vectorValue{Present: true, Value: 0}},
-		{"stale keeps retained zero", alertevaluator.Measured(0), alertevaluator.Evaluation{Slot: slot, Quality: alertevaluator.QualityStaleData}, `"LastValue":0`, vectorValue{Present: true, Value: 0}},
-		{"query error keeps retained negative", alertevaluator.Measured(-3.5), alertevaluator.Evaluation{Slot: slot, Quality: alertevaluator.QualityQueryError}, `"LastValue":-3.5`, vectorValue{Present: true, Value: -3.5}},
-		{"never determinate stays null", alertevaluator.Measurement{}, alertevaluator.Evaluation{Slot: slot, Quality: alertevaluator.QualityInsufficientData}, `"LastValue":null`, vectorValue{}},
+		{"determinate zero", alertevaluator.Measured(4.2), alertevaluator.Evaluation{Slot: slot, Quality: alertevaluator.QualitySufficient, Value: alertevaluator.Measured(0)}, `"LastValue":0,`, vectorValue{Present: true, Value: 0}, "0"},
+		{"determinate negative", alertevaluator.Measurement{}, alertevaluator.Evaluation{Slot: slot, Quality: alertevaluator.QualitySufficient, Value: alertevaluator.Measured(-3.5)}, `"LastValue":-3.5,`, vectorValue{Present: true, Value: -3.5}, "-3.5"},
+		{"stale keeps retained zero", alertevaluator.Measured(0), alertevaluator.Evaluation{Slot: slot, Quality: alertevaluator.QualityStaleData, Value: alertevaluator.Measured(9.9)}, `"LastValue":0,`, vectorValue{Present: true, Value: 0}, ""},
+		{"query error keeps retained negative", alertevaluator.Measured(-3.5), alertevaluator.Evaluation{Slot: slot, Quality: alertevaluator.QualityQueryError}, `"LastValue":-3.5,`, vectorValue{Present: true, Value: -3.5}, ""},
+		{"never determinate stays null", alertevaluator.Measurement{}, alertevaluator.Evaluation{Slot: slot, Quality: alertevaluator.QualityInsufficientData}, `"LastValue":null,`, vectorValue{}, ""},
 	}
 	for _, test := range tests {
 		current := alertevaluator.State{Mode: alertevaluator.ModeHealthy, LastValue: test.previous}
@@ -253,6 +302,19 @@ func TestCommitWritesStateJSONWithMarkerAndRetainedValue(t *testing.T) {
 		})
 		if err != nil {
 			t.Fatalf("%s: %v", test.name, err)
+		}
+		// A healthy rule commits only the rule schedule and the state.
+		if len(items) != 2 || items[0].Update == nil || items[1].Put == nil {
+			t.Fatalf("%s: transaction shape = %#v", test.name, items)
+		}
+		rule := items[0].Update
+		if test.ruleValue != "" {
+			if !strings.Contains(*rule.UpdateExpression, "#last_value = :value") {
+				t.Fatalf("%s: rule update = %s", test.name, *rule.UpdateExpression)
+			}
+			numberAttribute(t, test.name+" rule :value", rule.ExpressionAttributeValues[":value"], test.ruleValue)
+		} else if _, hasValue := rule.ExpressionAttributeValues[":value"]; hasValue || !strings.Contains(*rule.UpdateExpression, "REMOVE #last_value") {
+			t.Fatalf("%s: rule update = %s values = %#v", test.name, *rule.UpdateExpression, rule.ExpressionAttributeValues)
 		}
 		state := unmarshalItem(t, items[1].Put.Item)
 		document, _ := state["state_json"].(string)
@@ -317,6 +379,38 @@ func activeMetadataCommit(t *testing.T, evaluation alertevaluator.Evaluation) []
 	return items
 }
 
+// recoveryCommit resolves an active incident with a clean determinate value.
+func recoveryCommit(t *testing.T, value alertevaluator.Measurement) []types.TransactWriteItem {
+	t.Helper()
+	work, err := workFromItem(ruleItemWithLease())
+	if err != nil {
+		t.Fatal(err)
+	}
+	slot := time.Date(2026, 7, 15, 12, 5, 45, 0, time.UTC)
+	current := alertevaluator.State{
+		Mode: alertevaluator.ModeActive, ActiveEventID: "alert_existing", ActiveStatus: alertevaluator.StatusOpen,
+		OpeningOutboxes: map[alertevaluator.Channel]string{
+			alertevaluator.ChannelEmail: "outbox_open_email", alertevaluator.ChannelTelegram: "outbox_open_telegram",
+		},
+	}
+	clean := alertevaluator.Evaluation{Slot: slot, Quality: alertevaluator.QualitySufficient, Value: value}
+	decision := alertevaluator.Decide(work.Rule.Rule, current, clean, time.Minute)
+	if decision.Transition != alertevaluator.TransitionRecovered {
+		t.Fatalf("setup decision = %#v", decision)
+	}
+	items, err := (Store{Table: "domain"}).commitItems(alertevaluator.CommitRequest{
+		Work: work, PreviousState: alertevaluator.VersionedState{State: current, Revision: 1},
+		Evaluation: clean, Decision: decision, Slot: slot, NextDue: slot.Add(time.Minute),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(items) != 6 || items[2].Update == nil {
+		t.Fatalf("recovery transaction shape = %#v", items)
+	}
+	return items
+}
+
 func numberAttribute(t *testing.T, label string, value types.AttributeValue, want string) {
 	t.Helper()
 	number, ok := value.(*types.AttributeValueMemberN)
@@ -334,6 +428,9 @@ func TestDynamoDBValueVectorsForEveryValueAttribute(t *testing.T) {
 				t.Fatalf("%s: present vector needs one N attribute: %#v", vector.Name, vector.Attribute)
 			}
 			_, items := openingCommit(t, vector.Value.measurement())
+			if len(items) != 6 {
+				t.Fatalf("%s: opening transaction has %d items, want rule + state + event + transition + 2 outboxes", vector.Name, len(items))
+			}
 			numberAttribute(t, vector.Name+" rule :value", items[0].Update.ExpressionAttributeValues[":value"], want)
 			numberAttribute(t, vector.Name+" event last_evaluation_value", items[2].Put.Item["last_evaluation_value"], want)
 			for _, outbox := range items[4:] {
@@ -349,6 +446,12 @@ func TestDynamoDBValueVectorsForEveryValueAttribute(t *testing.T) {
 				}
 				numberAttribute(t, vector.Name+" "+name+" metadata :value", update.ExpressionAttributeValues[":value"], want)
 			}
+
+			recovery := recoveryCommit(t, vector.Value.measurement())
+			numberAttribute(t, vector.Name+" resolution :value", recovery[2].Update.ExpressionAttributeValues[":value"], want)
+			for _, outbox := range recovery[4:] {
+				numberAttribute(t, vector.Name+" recovery outbox evaluation_value", outbox.Put.Item["evaluation_value"], want)
+			}
 			continue
 		}
 
@@ -360,6 +463,7 @@ func TestDynamoDBValueVectorsForEveryValueAttribute(t *testing.T) {
 			{Slot: slot, Quality: alertevaluator.QualityStaleData, Value: alertevaluator.Measured(9.9)},
 			{Slot: slot, Quality: alertevaluator.QualityQueryError, Value: alertevaluator.Measured(0)},
 			{Slot: slot, Quality: alertevaluator.QualitySufficient, Breached: true},
+			{Slot: slot, Quality: alertevaluator.QualitySufficient, Breached: false},
 		} {
 			metadata := activeMetadataCommit(t, evaluation)
 			for name, update := range map[string]*types.Update{"rule": metadata[0].Update, "event": metadata[2].Update} {
@@ -382,6 +486,10 @@ func TestCommitRefusesToOpenOrResolveWithoutADeterminateValue(t *testing.T) {
 	request.Evaluation.Value = alertevaluator.Measurement{}
 	if _, err := (Store{Table: "domain"}).commitItems(request); err == nil {
 		t.Fatal("opening commit without a value succeeded")
+	}
+	request.Evaluation = alertevaluator.Evaluation{Slot: request.Slot, Quality: alertevaluator.QualityStaleData, Breached: true, Value: alertevaluator.Measured(4.2)}
+	if _, err := (Store{Table: "domain"}).commitItems(request); err == nil {
+		t.Fatal("opening commit with an indeterminate evaluation succeeded")
 	}
 
 	work, err := workFromItem(ruleItemWithLease())
@@ -424,7 +532,10 @@ func TestUnsupportedStateSchemaIsDistinguishableFromMalformedState(t *testing.T)
 		t.Fatal(err)
 	}
 	for _, vector := range loadValueVectors(t).StateErrorVectors {
-		wantSchema := vector.Name == "unknown_future_version" || vector.Name == "negative_version"
+		if vector.ExpectedError != "unsupported_schema" && vector.ExpectedError != "malformed" {
+			t.Fatalf("%s: unknown expected_error %q", vector.Name, vector.ExpectedError)
+		}
+		wantSchema := vector.ExpectedError == "unsupported_schema"
 		_, decodeErr := decodeStateJSON(vector.StoredStateJSON)
 		store := Store{Table: "domain", Client: &fakeClient{getOutput: stateItemOutput(t, vector.StoredStateJSON, 7)}}
 		_, loadErr := store.LoadState(context.Background(), work)
@@ -446,10 +557,10 @@ func TestCommitRecordsSufficientWithoutValueAsInsufficient(t *testing.T) {
 		Mode: alertevaluator.ModeActive, ActiveEventID: "alert_1", ActiveStatus: alertevaluator.StatusOpen,
 		LastValue: alertevaluator.Measured(4.2),
 	}
-	tokens := map[string]string{}
 	for name, evaluation := range map[string]alertevaluator.Evaluation{
-		"sufficient without value": {Slot: slot, Quality: alertevaluator.QualitySufficient, Breached: true},
-		"insufficient":             {Slot: slot, Quality: alertevaluator.QualityInsufficientData},
+		"sufficient without value, breached": {Slot: slot, Quality: alertevaluator.QualitySufficient, Breached: true},
+		"sufficient without value, clean":    {Slot: slot, Quality: alertevaluator.QualitySufficient, Breached: false},
+		"insufficient":                       {Slot: slot, Quality: alertevaluator.QualityInsufficientData},
 	} {
 		client := &fakeClient{}
 		request := alertevaluator.CommitRequest{
@@ -473,12 +584,40 @@ func TestCommitRecordsSufficientWithoutValueAsInsufficient(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
-		if state.LastQuality != alertevaluator.QualityInsufficientData {
-			t.Fatalf("%s: state LastQuality = %s", name, state.LastQuality)
+		if state.LastQuality != alertevaluator.QualityInsufficientData || state.Mode != alertevaluator.ModeActive {
+			t.Fatalf("%s: state = %#v, want active with LastQuality insufficient_data", name, state)
 		}
-		tokens[name] = *client.transactInput.ClientRequestToken
+		if len(items) != 3 {
+			t.Fatalf("%s: transaction has %d items, want rule + state + event metadata", name, len(items))
+		}
 	}
-	if tokens["sufficient without value"] != tokens["insufficient"] {
-		t.Fatalf("commit tokens differ for equivalent evaluations: %#v", tokens)
+}
+
+func TestCommitIdentityDoesNotDependOnTheValue(t *testing.T) {
+	type identity struct {
+		token, eventID string
+		outboxes       []string
+	}
+	identities := map[string]identity{}
+	for _, value := range []float64{0, 4.2, -3.5} {
+		request, _ := openingCommit(t, alertevaluator.Measured(value))
+		client := &fakeClient{}
+		if err := (Store{Table: "domain", Client: client}).Commit(context.Background(), request); err != nil {
+			t.Fatal(err)
+		}
+		got := identity{token: *client.transactInput.ClientRequestToken, eventID: request.Decision.EventID}
+		for _, outbox := range request.Decision.Outboxes {
+			got.outboxes = append(got.outboxes, outbox.OutboxID)
+		}
+		identities[fmt.Sprint(value)] = got
+	}
+	if !reflect.DeepEqual(identities["0"], identities["4.2"]) || !reflect.DeepEqual(identities["0"], identities["-3.5"]) {
+		t.Fatalf("identities depend on the value: %#v", identities)
+	}
+	// Computed on main (ec2624b) for the same request with Value 0, 4.2 and
+	// -3.5; replay across versions must keep producing them.
+	if identities["0"].token != "eval-753a5535ca5429df3756e6f9e56ab16" ||
+		identities["0"].eventID != "alert_794efa72a1f4edff05c77088e195ee07eee53cbfee9bb663f7ca1bf9d1998fbf" {
+		t.Fatalf("opening identity = %#v, want the main-branch token and event ID", identities["0"])
 	}
 }

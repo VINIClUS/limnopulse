@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"math"
 	"testing"
+	"time"
 )
 
 func TestMeasurementZeroValueIsAbsent(t *testing.T) {
@@ -86,32 +87,24 @@ func TestMeasurementJSONDecodesNumberNullAndMissing(t *testing.T) {
 		{`{"V":-3.5}`, true, -3.5},
 		{`{"V":4.2}`, true, 4.2},
 		{`{"V":1e-07}`, true, 1e-7},
+		{`{"V":-0}`, true, 0},
 		{`{"V":null}`, false, 0},
 		{`{"V":1e+200}`, false, 0},
-		{`{}`, false, 0},
 	}
 	for _, test := range tests {
+		// Seed a present value so a null that leaves the field untouched fails.
 		decoded := struct{ V Measurement }{V: Measured(99)}
-		if test.document == `{}` {
-			decoded.V = Measurement{}
-		}
 		if err := json.Unmarshal([]byte(test.document), &decoded); err != nil {
 			t.Fatalf("decode %s: %v", test.document, err)
 		}
 		value, ok := decoded.V.Get()
-		if ok != test.wantPresent || value != test.wantValue {
-			t.Fatalf("decode %s = (%v, %v), want (%v, %v)", test.document, value, ok, test.wantValue, test.wantPresent)
+		if ok != test.wantPresent || (ok && (value != test.wantValue || (value == 0 && math.Signbit(value)))) {
+			t.Fatalf("decode %s = (%v, %v), want present=%v value=%v", test.document, value, ok, test.wantPresent, test.wantValue)
 		}
 	}
-}
-
-func TestMeasurementJSONNullClearsAPreviouslyPresentValue(t *testing.T) {
-	decoded := struct{ V Measurement }{V: Measured(4.2)}
-	if err := json.Unmarshal([]byte(`{"V":null}`), &decoded); err != nil {
-		t.Fatal(err)
-	}
-	if decoded.V.IsPresent() {
-		t.Fatalf("null left %v present, want absent", decoded.V)
+	var missing struct{ V Measurement }
+	if err := json.Unmarshal([]byte(`{}`), &missing); err != nil || missing.V.IsPresent() {
+		t.Fatalf("missing key decoded as %v (err %v), want absent", missing.V, err)
 	}
 }
 
@@ -147,26 +140,27 @@ func TestEvaluationIsDeterminateOnlyWhenSufficientWithValue(t *testing.T) {
 }
 
 func TestEvaluationNormalizedEnforcesTheDeterminacyInvariant(t *testing.T) {
+	slot := time.Date(2026, 7, 15, 12, 0, 45, 0, time.UTC)
 	tests := []struct {
 		name string
 		in   Evaluation
 		want Evaluation
 	}{
 		{"determinate is unchanged",
-			Evaluation{Quality: QualitySufficient, Value: Measured(0), Breached: true, MissedSlots: 2},
-			Evaluation{Quality: QualitySufficient, Value: Measured(0), Breached: true, MissedSlots: 2}},
+			Evaluation{Slot: slot, Quality: QualitySufficient, Value: Measured(0), Breached: true, MissedSlots: 2},
+			Evaluation{Slot: slot, Quality: QualitySufficient, Value: Measured(0), Breached: true, MissedSlots: 2}},
 		{"sufficient without value becomes insufficient",
-			Evaluation{Quality: QualitySufficient, Breached: true, MissedSlots: 1},
-			Evaluation{Quality: QualityInsufficientData, MissedSlots: 1}},
+			Evaluation{Slot: slot, Quality: QualitySufficient, Breached: true, MissedSlots: 1},
+			Evaluation{Slot: slot, Quality: QualityInsufficientData, MissedSlots: 1}},
 		{"stale drops its value and breach",
-			Evaluation{Quality: QualityStaleData, Value: Measured(9.9), Breached: true},
-			Evaluation{Quality: QualityStaleData}},
+			Evaluation{Slot: slot, Quality: QualityStaleData, Value: Measured(9.9), Breached: true, MissedSlots: 3},
+			Evaluation{Slot: slot, Quality: QualityStaleData, MissedSlots: 3}},
 		{"query error drops a placeholder zero",
-			Evaluation{Quality: QualityQueryError, Value: Measured(0), Breached: true},
-			Evaluation{Quality: QualityQueryError}},
+			Evaluation{Slot: slot, Quality: QualityQueryError, Value: Measured(0), Breached: true},
+			Evaluation{Slot: slot, Quality: QualityQueryError}},
 		{"empty quality drops its value",
-			Evaluation{Value: Measured(1)},
-			Evaluation{}},
+			Evaluation{Slot: slot, Value: Measured(1)},
+			Evaluation{Slot: slot}},
 	}
 	for _, test := range tests {
 		got := test.in.Normalized()

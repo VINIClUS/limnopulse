@@ -62,19 +62,27 @@ def test_fixture_covers_the_issue_6_value_classes() -> None:
     fixture = _fixture()
     assert fixture["schema_version"] == 1
     names = {vector["name"] for vector in fixture["state_vectors"]}
-    expected = {vector["expected_last_value"]["present"] for vector in fixture["state_vectors"]}
-    assert expected == {True, False}
-    assert any(name.startswith("legacy_") for name in names)
-    assert any(name.startswith("v2_") for name in names)
-    values = {
-        vector["expected_last_value"].get("value")
-        for vector in fixture["state_vectors"]
-        if vector["expected_last_value"]["present"]
+    assert {
+        "v2_present_zero_sufficient",
+        "v2_present_zero_after_indeterminate",
+        "v2_present_negative_retained",
+        "v2_absent_null",
+        "v2_absent_missing_key",
+        "legacy_sufficient_zero",
+        "legacy_placeholder_zero",
+        "legacy_retained_nonzero",
+        "legacy_negative_zero_placeholder",
+        "legacy_null",
+        "legacy_missing_key",
+    } <= names
+    errors = {vector["name"]: vector["expected_error"] for vector in fixture["state_error_vectors"]}
+    assert errors["unknown_future_version"] == "unsupported_schema"
+    assert set(errors.values()) == {"unsupported_schema", "malformed"}
+    attributes = {
+        vector["name"]: vector["attribute"] for vector in fixture["dynamodb_value_vectors"]
     }
-    assert 0 in values
-    assert any(value < 0 for value in values)
-    assert any(value > 0 for value in values)
-    assert fixture["state_error_vectors"]
+    assert attributes["present_zero"] == {"N": "0"}
+    assert attributes["absent"] is None
 
 
 @pytest.mark.parametrize("vector", _state_vectors(), ids=lambda vector: vector["name"])
@@ -102,16 +110,6 @@ def test_pending_reset_preserves_the_value_keys(vector: dict[str, Any]) -> None:
     after = json.loads(updated["state_json"])
     assert after["Mode"] == "healthy"
     _assert_value_keys_preserved(pending, after)
-
-
-def test_python_rewrite_keeps_null_and_the_marker_tokens() -> None:
-    vector = next(v for v in _state_vectors() if v["name"] == "v2_absent_null")
-    resolved = resolved_evaluator_state(_state_item(vector["stored_state_json"]), "alert_1", NOW)
-
-    assert resolved is not None
-    document = resolved[0]["state_json"]
-    assert '"LastValue":null' in document
-    assert '"SchemaVersion":2' in document
 
 
 class _RawItemClient:
