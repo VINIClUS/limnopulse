@@ -43,6 +43,7 @@ from limnopulse_api.services.ingestion import IngestRejected, IngressService
 
 INGEST_OBSERVATIONS_PATH = "/ingest/v2/observations"
 _CONTENT_LENGTH = re.compile(r"[0-9]+")
+_MAX_LENGTH_DIGITS = len(str(MAX_INGEST_BODY_BYTES))
 _CONNECTOR_VERSION = re.compile(CONNECTOR_VERSION_PATTERN)
 _IDEMPOTENCY_LOC = ["header", "idempotency-key"]
 _CONNECTOR_LOC = ["header", "x-connector-version"]
@@ -55,7 +56,8 @@ def _utc_now() -> datetime:
 
 
 def get_ingress_service(request: Request) -> IngressService:
-    """Composes the service from the frozen `app.state` ports; a missing one is a 503."""
+    """Composes the service from the frozen `app.state` ports. A missing port is a
+    misconfiguration, answered 503 (fail closed) before any route step runs."""
     return IngressService(
         authenticator=get_connector_authenticator(request),
         preauth_global_limiter=get_ingress_preauth_global_rate_limiter(request),
@@ -78,13 +80,23 @@ def _check_media_type(service: IngressService, headers: Headers) -> None:
     if supported:
         media_type, *parameters = (part.strip() for part in content_type.split(";"))
         supported = media_type.lower() == "application/json" and all(
-            parameter.lower().replace('"', "") == "charset=utf-8" for parameter in parameters
+            parameter.lower().replace('"', "") == "charset=utf-8"
+            for parameter in parameters
+            if parameter  # RFC 9110 allows empty parameters ("application/json;")
         )
     encodings = headers.getlist("content-encoding")
     if not supported or any(value.strip().lower() != "identity" for value in encodings):
         raise service.reject(
             415, IngestErrorDetail.UNSUPPORTED_MEDIA_TYPE.value, outcome="unsupported_media"
         )
+
+
+def _declared_length_fits(declared: str) -> bool:
+    """Digits only, within the limit; never `int()` on unbounded text (4300-digit cap)."""
+    if _CONTENT_LENGTH.fullmatch(declared) is None:
+        return False
+    significant = declared.lstrip("0") or "0"
+    return len(significant) <= _MAX_LENGTH_DIGITS and int(significant) <= MAX_INGEST_BODY_BYTES
 
 
 def _too_large(service: IngressService) -> IngestRejected:
@@ -94,9 +106,7 @@ def _too_large(service: IngressService) -> IngestRejected:
 async def _read_body(service: IngressService, request: Request) -> bytes:
     """Step 6: a declared length is checked before reading; the stream stops at the limit."""
     declared = request.headers.get("content-length")
-    if declared is not None and (
-        _CONTENT_LENGTH.fullmatch(declared) is None or int(declared) > MAX_INGEST_BODY_BYTES
-    ):
+    if declared is not None and not _declared_length_fits(declared):
         raise _too_large(service)
     body = bytearray()
     async for chunk in request.stream():

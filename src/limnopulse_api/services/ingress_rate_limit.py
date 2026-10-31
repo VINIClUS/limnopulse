@@ -47,8 +47,11 @@ class TokenBucketRateLimiter:
         else:
             self._buckets.move_to_end(key)
             stored, last = bucket
+            # A reading older than the bucket (callers racing across an await) refills nothing
+            # and never moves the bucket back, so elapsed time is credited only once.
             elapsed = max(0.0, now - last)
             tokens = min(float(self.capacity), stored + elapsed * self.refill_per_second)
+            now = max(now, last)
         if tokens >= 1:
             self._buckets[key] = (tokens - 1, now)
             return None

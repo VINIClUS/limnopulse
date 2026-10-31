@@ -198,7 +198,8 @@ class IngressService:
             raise self._unavailable("authentication", error) from None
         if source is None:
             raise self._unauthorized()
-        self._limit(self.account_limiter, source.integration_account_id, now)
+        # Read the clock again: the authenticator awaited the store in between.
+        self._limit(self.account_limiter, source.integration_account_id, self.monotonic())
         return source
 
     # Steps 8-16 -----------------------------------------------------------------------------
