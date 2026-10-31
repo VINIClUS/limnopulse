@@ -11,6 +11,8 @@ exactly as before P2. No deployed service calls the telemetry pipeline in P2: th
 dev CLI `scripts/dev/ingest_reading_v2.py`, and Telegraf keeps writing only `water_quality`. Turning
 on any switch in a shared environment is therefore a **rehearsal** until P3 delivers a producer.
 
+P3 delivers that producer for HTTPS connectors (the telemetry ingest worker) and the durable DLQ redrive the legacy dual-write step below waits for; its enablement order, DLQ redrive and quarantine drills are in the [P3 ingestion rollout runbook](p3-ingestion-rollout-runbook.md).
+
 ## Flags
 
 | Setting / env | Default | Owner | Effect |
@@ -99,7 +101,8 @@ Each step is a separate change with its own soak time. Never skip a step; roll b
    D16 window.
    Telegraf still writes `water_quality`, so the checks compare the two producers.
 3. Set `TELEMETRY_LEGACY_DUAL_WRITE_ENABLED=true` only after the P3 durable redrive test passes
-   (#15): a legacy write that fails after acceptance must be redelivered, never dropped.
+   (#15): a legacy write that fails after acceptance must be redelivered, never dropped. P3 proves
+   it with G7 ([P3 ingestion rollout runbook](p3-ingestion-rollout-runbook.md), DLQ drill).
 4. Set `API_V2_ENABLED=true` and `API_V2_TELEMETRY_ENABLED=true` to expose the three `/v2` telemetry
    reads.
 5. Once the D16 precondition holds, set `ALERT_EVALUATOR_TELEMETRY_SOURCE=v2` in one environment first, and compare alert outcomes with

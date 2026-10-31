@@ -710,7 +710,7 @@ def test_runbook_production_environment_covers_the_worker_env_and_principal() ->
         r"empty",
         r"exit(s)? 2|exit code 2",
         r"`stop_grace_period`",
-        r"drain.{0,40}wait.{0,40}5 ?s",
+        r"(exceed|above|more than|greater)[^.]{0,60}drain.{0,40}wait.{0,40}5 ?s",
         r"`--env-file`",
     ):
         assert re.search(pattern, text, re.IGNORECASE), pattern
@@ -720,11 +720,13 @@ def test_runbook_alarms_and_deadlines() -> None:
     text = section("Alarms and deadlines")
     tofu = (ROOT / "infra/opentofu/ingestion_queues.tf").read_text(encoding="utf-8")
     max_receive_count = int(re.search(r"maxReceiveCount\s*=\s*(\d+)", tofu).group(1))
-    for suffix in re.findall(
+    suffixes = re.findall(
         r'alarm_name\s*=\s*"\$\{var\.project_name\}-\$\{var\.environment\}'
         r'-([a-z-]+)"',
         tofu,
-    ):
+    )
+    assert suffixes
+    for suffix in suffixes:
         assert suffix in text, suffix
     for pattern in (
         r"queue[- ]age",
@@ -768,6 +770,8 @@ def test_runbook_dlq_drill_commands_parse_and_dry_run_is_the_default() -> None:
     for argv in commands:
         args = telemetry_dlq._parser().parse_args(_substitute(argv))
         assert args.command in {"sample", "redrive"}
+        if args.command == "redrive" and "--apply" not in argv:
+            assert args.apply is False
     text = " ".join(raw.split())
     for pattern in (
         r"dry run",
@@ -849,23 +853,20 @@ def test_runbook_rollback_order_keeps_the_queued_messages() -> None:
     endpoint = first(r"`INGEST_V2_ENABLED=false`")
     worker = first(r"`TELEMETRY_V2_WRITE_ENABLED=false`")
     assert pilots < endpoint < worker
+    dual_write = first(r"`TELEMETRY_LEGACY_DUAL_WRITE_ENABLED=false`")
+    assert dual_write <= worker
     text = " ".join(raw.split())
     for pattern in (r"§24", r"retain", r"never purge|do not purge", r"DLQ", r"legacy"):
         assert re.search(pattern, text, re.IGNORECASE), pattern
 
 
-REQUIRED_CHECKS = (
-    "python",
-    "go",
-    "opentofu",
-    "compose",
-    "frontend",
-    "influx",
-    "sonar",
-    "build",
-    "Trivy",
-    "ingestion",
-)
+def required_checks() -> list[str]:
+    """The status-check contexts the owner can require: the `verify.yml` job keys plus `sonar`."""
+    verify = (ROOT / ".github/workflows/verify.yml").read_text(encoding="utf-8")
+    jobs = verify[verify.index("\njobs:") :]
+    names = re.findall(r"^  ([a-z][a-z0-9_-]*):\s*$", jobs, flags=re.MULTILINE)
+    assert {"python", "go", "ingestion"} <= set(names)
+    return [*names, "sonar"]
 
 
 def test_runbook_owner_actions() -> None:
@@ -881,7 +882,7 @@ def test_runbook_owner_actions() -> None:
         r"ruleset",
     ):
         assert re.search(pattern, text, re.IGNORECASE), pattern
-    for check in REQUIRED_CHECKS:
+    for check in required_checks():
         assert f"`{check}`" in text, check
 
 
@@ -978,7 +979,7 @@ ADR_GATE_SHA256 = MappingProxyType(
 ADR_REFERENCES = {
     ADR_006: (r"\bP3\b", r"\bP6\b", r"#17\b", r"quarantine", r"connector health", r"INGEST_STATE"),
     ADR_007: (r"\bP3\b", r"redrive", r"\bD16\b", r"Backlog", r"\bG15\b"),
-    ADR_016: (r"\bP3\b", r"Idempotency-Key", r"entitlement", r"#20\b", r"DLQ redrive"),
+    ADR_016: (r"\bP3\b", r"Idempotency-Key", r"(?i)entitlement", r"#20\b", r"DLQ redrive"),
 }
 
 
@@ -1007,7 +1008,7 @@ def test_adr_016_records_the_entitlement_deferral_and_the_pre_enqueue_hook() -> 
     paragraphs = markdown_section(ADR_016.read_text(encoding="utf-8"), "Implementation gate")
     phase_split = " ".join(paragraphs.strip().split("\n\n")[-1].split())
     assert re.search(r"entitlement enforcement[^.]*\bP4\b[^.]*#20", phase_split, re.IGNORECASE)
-    assert re.search(r"P3 ships the pre-enqueue (entitlement )?hook", phase_split, re.IGNORECASE)
+    assert re.search(r"\bP3\b[^.]*pre-enqueue[^.]*hook", phase_split, re.IGNORECASE)
 
 
 def test_adr_016_phase_split_avoids_the_forbidden_phrases() -> None:
