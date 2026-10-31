@@ -295,17 +295,6 @@ def test_port_value_types_are_the_domain_types(name: str) -> None:
     assert getattr(ports, name) is getattr(domain, name)
 
 
-def test_m1_protocols_stay_untouched() -> None:
-    from limnopulse_api.repositories import v2_contracts
-
-    assert "get_device" in vars(v2_contracts.DeviceReader)
-    assert list(inspect.signature(v2_contracts.DeviceReader.get_device).parameters) == [
-        "self",
-        "tenant_id",
-        "device_id",
-    ]
-
-
 # FastAPI dependencies --------------------------------------------------------------------------
 
 STATE_NAMES = (

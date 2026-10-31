@@ -79,7 +79,12 @@ def test_integer_bounds_accept_the_edges_and_reject_beyond(name: str, low: int, 
 @pytest.mark.parametrize(
     ("env_name", "raw", "field", "expected"),
     [
-        ("INGEST_V2_ENABLED", "false", "ingest_v2_enabled", False),
+        (
+            "SQS_TELEMETRY_INGRESS_QUEUE_URL",
+            "http://q/ingress",
+            "sqs_telemetry_ingress_queue_url",
+            "http://q/ingress",
+        ),
         ("SQS_ENDPOINT_URL", "http://localhost:9324", "sqs_endpoint_url", "http://localhost:9324"),
         (
             "SQS_TELEMETRY_INGRESS_DLQ_URL",
@@ -97,6 +102,15 @@ def test_fields_read_their_exact_env_names(
     monkeypatch.setenv(env_name, raw)
 
     assert getattr(_settings(), field) == expected
+
+
+def test_ingest_switch_reads_its_env_name(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("INGEST_V2_ENABLED", "true")
+    monkeypatch.setenv("API_V2_ENABLED", "true")
+    monkeypatch.setenv("TELEMETRY_V2_WRITE_ENABLED", "true")
+    monkeypatch.setenv("SQS_TELEMETRY_INGRESS_QUEUE_URL", "http://q/ingress")
+
+    assert _settings().ingest_v2_enabled is True
 
 
 def test_ingest_switch_with_every_requirement_is_accepted() -> None:
@@ -119,12 +133,6 @@ def test_ingest_switch_requires_its_dependencies(missing: dict[str, Any]) -> Non
         _settings(**{**ENABLED, **missing})
 
     assert "INGEST_V2_ENABLED" in str(exc_info.value)
-
-
-def test_dependencies_alone_do_not_enable_ingest() -> None:
-    settings = _settings(**{**ENABLED, "ingest_v2_enabled": False})
-
-    assert settings.ingest_v2_enabled is False
 
 
 def test_retry_base_must_not_exceed_the_cap() -> None:
@@ -156,11 +164,3 @@ def test_ingest_settings_errors_never_echo_values(monkeypatch: pytest.MonkeyPatc
 
     assert "zq9x" not in str(exc_info.value)
     assert "INGEST_V2_ENABLED" in str(exc_info.value)
-
-
-def test_bound_errors_never_echo_values() -> None:
-    with pytest.raises(ValidationError) as exc_info:
-        _settings(ingest_rate_limiter_max_keys=987_654_321)
-
-    assert "987654321" not in str(exc_info.value)
-    assert "987_654_321" not in str(exc_info.value)

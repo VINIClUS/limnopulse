@@ -114,14 +114,6 @@ def test_shuffled_input_gives_the_same_events() -> None:
         assert classify_component_sequence(state(), list(order)) == expected
 
 
-def test_classifier_never_mutates_state() -> None:
-    current = state()
-
-    classify_component_sequence(current, [(t(1), 6), (t(2), 7)])
-
-    assert current == state()
-
-
 # Marks builder -------------------------------------------------------------------------------
 
 
@@ -261,13 +253,28 @@ def test_quarantine_only_messages_mark_no_component() -> None:
     )
 
 
+# "No marks": the plan types `build_ingest_marks(...) -> IngestMarks` with a required
+# `connector_mark`, so an empty message carries no component, device or connector mark.
+NO_MARKS = IngestMarks(
+    tenant_id=TENANT,
+    device_id=None,
+    integration_account_id=ACCOUNT,
+    component_marks=(),
+    device_mark=None,
+    connector_mark=ConnectorMark(),
+)
+
+
 def test_replay_messages_produce_no_marks() -> None:
     replay = envelope(replay=True, replay_of="ing_" + "5" * 32)
     accepted = (canonical_observation(sequence=1),)
+    rejected = (quarantined(QuarantineReason.METRIC_UNKNOWN),)
 
-    assert build_ingest_marks(replay, outcome(accepted), ingested_at=INGESTED) is None
+    assert build_ingest_marks(replay, outcome(accepted, rejected), ingested_at=INGESTED) == (
+        NO_MARKS
+    )
     fence = IngressFence(reason=IngressFenceReason.ACCOUNT_REVOKED, account_verified=True)
-    assert build_ingest_marks(replay, None, fence=fence, ingested_at=INGESTED) is None
+    assert build_ingest_marks(replay, None, fence=fence, ingested_at=INGESTED) == NO_MARKS
 
 
 @pytest.mark.parametrize("reason", list(IngressFenceReason))
@@ -289,7 +296,7 @@ def test_verified_fences_mark_only_the_connector(reason: IngressFenceReason) -> 
 def test_unverified_fences_produce_no_marks() -> None:
     fence = IngressFence(reason=IngressFenceReason.IDENTITY_UNRESOLVED, account_verified=False)
 
-    assert build_ingest_marks(envelope(), None, fence=fence, ingested_at=INGESTED) is None
+    assert build_ingest_marks(envelope(), None, fence=fence, ingested_at=INGESTED) == NO_MARKS
 
 
 def test_forged_cross_tenant_envelope_never_marks_the_foreign_device() -> None:

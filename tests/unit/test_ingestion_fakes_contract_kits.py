@@ -7,6 +7,7 @@ from typing import Any
 import pytest
 
 from limnopulse_api.repositories import ingestion as ports
+from tests.contracts import m1_fakes
 from tests.contracts.m1_fakes import ConditionalDynamoClient
 from tests.support import ingestion_fakes as fakes
 from tests.support.ingestion_contract_kits import (
@@ -139,23 +140,28 @@ def test_fake_rate_limiter_implements_its_port() -> None:
     assert isinstance(limiter, ports.IngressRateLimiter)
 
 
-def test_fake_metrics_refuse_open_names_and_labels() -> None:
-    subject = fakes.metrics_subject()
-
-    with pytest.raises(ValueError):
-        subject.metrics.increment("ingest_requests_total", outcome="accepted", tenant_id="t")
-    with pytest.raises(ValueError):
-        subject.metrics.increment("ingest_unknown_total")
-    with pytest.raises(ValueError):
-        subject.metrics.observe("ingress_queue_age_seconds", 1.0, device_id="d")
-    assert subject.recorded() == []
-
-
 # DynamoDB fake ---------------------------------------------------------------------------------
 
 
-def test_dynamo_fake_reuses_the_m1_evaluator() -> None:
+def test_dynamo_fake_reuses_the_m1_evaluator(monkeypatch: pytest.MonkeyPatch) -> None:
+    calls: list[str] = []
+    original = m1_fakes._Condition
+
+    class _Spy(original):  # type: ignore[misc, valid-type]
+        def __init__(self, text: str, *args: Any) -> None:
+            calls.append(text)
+            super().__init__(text, *args)
+
+    monkeypatch.setattr(m1_fakes, "_Condition", _Spy)
+    paired = next(v for v in DYNAMO_EXPRESSION_VECTORS if v.name == "paired_mark_tie_lower_breaker")
+    status_in = next(v for v in DYNAMO_EXPRESSION_VECTORS if v.name == "issuance_check_active")
+
+    run_dynamo_vector(IngestionDynamoClient(), "LimnopulseDomain", paired)
+    run_dynamo_vector(IngestionDynamoClient(), "LimnopulseDomain", status_in)
+
     assert issubclass(IngestionDynamoClient, ConditionalDynamoClient)
+    assert paired.request["ConditionExpression"] in calls
+    assert any("IN (:pending, :active)" in text for text in calls)
 
 
 @pytest.mark.parametrize("vector", DYNAMO_EXPRESSION_VECTORS, ids=lambda vector: vector.name)

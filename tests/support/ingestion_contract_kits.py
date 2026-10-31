@@ -21,7 +21,10 @@ import pytest
 from boto3.dynamodb.types import TypeDeserializer, TypeSerializer
 from botocore.exceptions import ClientError
 
-from limnopulse_api.adapters.dynamodb_v2 import account_scoped_identity_hash
+from limnopulse_api.adapters.dynamodb_v2 import (
+    account_scoped_identity_hash,
+    external_identity_hash,
+)
 from limnopulse_api.core.errors import ConflictError, IngressMessageTooLarge, NotFoundError
 from limnopulse_api.domain.alerts import AuditContext
 from limnopulse_api.domain.devices_v2 import (
@@ -34,12 +37,14 @@ from limnopulse_api.domain.devices_v2 import (
 )
 from limnopulse_api.domain.ids import default_component_id_for_legacy_device
 from limnopulse_api.domain.ingestion import (
+    MAX_INGRESS_MESSAGE_BYTES,
     QUARANTINE_TTL,
     AuthenticatedSource,
     ComponentIngestState,
     ComponentMark,
     ConnectorHealth,
     ConnectorMark,
+    DeviceIngestState,
     DeviceMark,
     IngestCredential,
     IngestCredentialStatus,
@@ -63,6 +68,7 @@ from limnopulse_api.domain.ingestion import (
     ingest_credential_fingerprint,
     ingest_secret_sha256,
     ingest_token,
+    ingress_message_bytes,
     new_ingress_receipt,
 )
 from limnopulse_api.domain.integrations import (
@@ -114,6 +120,7 @@ OBSERVED = datetime(2026, 10, 30, 11, 59, tzinfo=UTC)
 AUDIT = AuditContext(actor_id="user-1", ip="203.0.113.7", user_agent="kit")
 KEY_SHA = "c" * 64
 REQUEST_SHA = "d" * 64
+EMOJI = "\U0001f600"
 
 
 def source_observation(**overrides: Any) -> SourceObservation:
@@ -402,9 +409,10 @@ async def credential_requires_an_eligible_account(subject: CredentialKitSubject)
     # No IntegrationAccount row at all.
     with pytest.raises((ConflictError, NotFoundError)):
         await subject.repository.create_ingest_credential(credential(), AUDIT)
-    await subject.seed_account(integration_account(status=IntegrationAccountStatus.REVOKED))
-    with pytest.raises((ConflictError, NotFoundError)):
-        await subject.repository.create_ingest_credential(credential(), AUDIT)
+    for status in (IntegrationAccountStatus.REVOKED, IntegrationAccountStatus.ERROR):
+        await subject.seed_account(integration_account(status=status))
+        with pytest.raises((ConflictError, NotFoundError)):
+            await subject.repository.create_ingest_credential(credential(), AUDIT)
     await subject.seed_account(
         integration_account(integration_account_id=OTHER_ACCOUNT, provider_key="vendor_cloud")
     )
@@ -625,18 +633,32 @@ async def resolve_known_identity(subject: ResolverKitSubject) -> None:
 
 async def resolve_is_account_scoped(subject: ResolverKitSubject) -> None:
     foreign_hash = account_scoped_identity_hash(PROVIDER, OTHER_ACCOUNT, EXTERNAL_DEVICE)
-    await subject.seed_device_integration(
-        device_integration(
-            tenant_id=OTHER_TENANT,
-            integration_account_id=OTHER_ACCOUNT,
-            external_identity_hash=foreign_hash,
-        )
+    foreign = device_integration(
+        tenant_id=OTHER_TENANT,
+        integration_account_id=OTHER_ACCOUNT,
+        external_identity_hash=foreign_hash,
     )
+    await subject.seed_device_integration(foreign)
 
+    assert await subject.resolver.resolve_external_identity(PROVIDER, foreign_hash) == foreign
     assert await subject.resolver.resolve_external_identity(PROVIDER, IDENTITY_HASH) is None
+    global_hash = external_identity_hash(PROVIDER, EXTERNAL_DEVICE)
+    assert await subject.resolver.resolve_external_identity(PROVIDER, global_hash) is None
 
 
-EXTERNAL_IDENTITY_RESOLVER_CONTRACT = (resolve_known_identity, resolve_is_account_scoped)
+async def resolve_returns_decommissioned_integrations(subject: ResolverKitSubject) -> None:
+    # The identity stays claimed (D22); the fence needs the row to say why it refuses.
+    retired = device_integration(status=DeviceIntegrationStatus.DECOMMISSIONED)
+    await subject.seed_device_integration(retired)
+
+    assert await subject.resolver.resolve_external_identity(PROVIDER, IDENTITY_HASH) == retired
+
+
+EXTERNAL_IDENTITY_RESOLVER_CONTRACT = (
+    resolve_known_identity,
+    resolve_is_account_scoped,
+    resolve_returns_decommissioned_integrations,
+)
 
 
 # Integration lifecycle -----------------------------------------------------------------------
@@ -683,16 +705,22 @@ async def lifecycle_account_errors(subject: LifecycleKitSubject) -> None:
             updated_at=RECEIVED,
             audit=AUDIT,
         )
-    with pytest.raises(ConflictError):  # stale version
+    await subject.seed_account(
+        integration_account(
+            integration_account_id=OTHER_ACCOUNT, status=IntegrationAccountStatus.ACTIVE
+        )
+    )
+    with pytest.raises(ConflictError) as stale:  # stale version on a legal transition
         await subject.repository.transition_integration_account(
             TENANT,
-            ACCOUNT,
-            IntegrationAccountStatus.REVOKED,
+            OTHER_ACCOUNT,
+            IntegrationAccountStatus.ERROR,
             expected_version=9,
             updated_at=RECEIVED,
             audit=AUDIT,
         )
-    for tenant_id, account_id in ((OTHER_TENANT, ACCOUNT), (TENANT, OTHER_ACCOUNT)):
+    assert not isinstance(stale.value, NotFoundError)
+    for tenant_id, account_id in ((OTHER_TENANT, ACCOUNT), (TENANT, "ia_" + "0" * 32)):
         with pytest.raises(NotFoundError):
             await subject.repository.transition_integration_account(
                 tenant_id,
@@ -818,9 +846,11 @@ async def _seed_mapping(
     integration: Mapping[str, Any] | None = None,
     device_state: Mapping[str, Any] | None = None,
     with_device: bool = True,
+    with_account: bool = True,
     components: Sequence[DeviceComponent] = (),
 ) -> None:
-    await subject.seed_account(integration_account(**(account or {})))
+    if with_account:
+        await subject.seed_account(integration_account(**(account or {})))
     await subject.seed_device_integration(device_integration(**(integration or {})))
     if with_device:
         await subject.seed_device(device(**(device_state or {})))
@@ -885,6 +915,49 @@ ADMIT_DENIAL_CASES: tuple[tuple[str, dict[str, Any], IngressDenial], ...] = (
         "device missing",
         {"with_device": False},
         IngressDenial(reason=IngressAdmissionDenied.DEVICE_INACTIVE, observation_index=None),
+    ),
+    (
+        "integration error",
+        {"integration": {"status": DeviceIntegrationStatus.ERROR}},
+        IngressDenial(reason=IngressAdmissionDenied.INTEGRATION_INACTIVE, observation_index=None),
+    ),
+    (
+        "account pending",
+        {"account": {"status": IntegrationAccountStatus.PENDING}},
+        IngressDenial(reason=IngressAdmissionDenied.ACCOUNT_INACTIVE, observation_index=None),
+    ),
+    (
+        "account error",
+        {"account": {"status": IntegrationAccountStatus.ERROR}},
+        IngressDenial(reason=IngressAdmissionDenied.ACCOUNT_INACTIVE, observation_index=None),
+    ),
+    (
+        "account not https",
+        {"account": {"provider_key": "vendor_cloud"}},
+        IngressDenial(reason=IngressAdmissionDenied.ACCOUNT_INACTIVE, observation_index=None),
+    ),
+    (
+        "device provisioning",
+        {"device_state": {"status": DeviceStatus.PROVISIONING}},
+        IngressDenial(reason=IngressAdmissionDenied.DEVICE_INACTIVE, observation_index=None),
+    ),
+    (
+        "device decommissioned",
+        {"device_state": {"status": DeviceStatus.DECOMMISSIONED}},
+        IngressDenial(reason=IngressAdmissionDenied.DEVICE_INACTIVE, observation_index=None),
+    ),
+    (
+        "device of another tenant",
+        {"device_state": {"tenant_id": OTHER_TENANT}},
+        IngressDenial(reason=IngressAdmissionDenied.DEVICE_INACTIVE, observation_index=None),
+    ),
+    (
+        "first failure wins",
+        {
+            "integration": {"status": DeviceIntegrationStatus.DECOMMISSIONED},
+            "device_state": {"status": DeviceStatus.SUSPENDED},
+        },
+        IngressDenial(reason=IngressAdmissionDenied.INTEGRATION_INACTIVE, observation_index=None),
     ),
 )
 
@@ -995,6 +1068,54 @@ FENCE_CASES: tuple[tuple[str, dict[str, Any], dict[str, Any], object], ...] = (
         {},
         {"tenant_id": OTHER_TENANT},
         IngressFence(reason=IngressFenceReason.INTEGRATION_MISMATCH, account_verified=False),
+    ),
+    (
+        "forged account id",
+        {},
+        {"integration_account_id": OTHER_ACCOUNT},
+        IngressFence(reason=IngressFenceReason.INTEGRATION_MISMATCH, account_verified=False),
+    ),
+    (
+        "forged provider key",
+        {},
+        {"provider_key": "https_other"},
+        IngressFence(reason=IngressFenceReason.IDENTITY_UNRESOLVED, account_verified=True),
+    ),
+    (
+        "account missing",
+        {"with_account": False},
+        {},
+        IngressFence(reason=IngressFenceReason.IDENTITY_UNRESOLVED, account_verified=False),
+    ),
+    (
+        "account not https",
+        {"account": {"provider_key": "vendor_cloud"}},
+        {},
+        IngressFence(reason=IngressFenceReason.ACCOUNT_REVOKED, account_verified=True),
+    ),
+    (
+        "account error",
+        {"account": {"status": IntegrationAccountStatus.ERROR}},
+        {},
+        IngressDefer(reason=IngressDeferReason.ACCOUNT_NOT_ACTIVE),
+    ),
+    (
+        "integration provisioning",
+        {"integration": {"status": DeviceIntegrationStatus.PROVISIONING}},
+        {},
+        IngressDefer(reason=IngressDeferReason.INTEGRATION_NOT_ACTIVE),
+    ),
+    (
+        "device missing",
+        {"with_device": False},
+        {},
+        IngressFence(reason=IngressFenceReason.DEVICE_DECOMMISSIONED, account_verified=True),
+    ),
+    (
+        "device suspended",
+        {"device_state": {"status": DeviceStatus.SUSPENDED}},
+        {},
+        IngressDefer(reason=IngressDeferReason.DEVICE_NOT_ACTIVE),
     ),
 )
 
@@ -1110,7 +1231,7 @@ def oversized_envelope() -> IngressEnvelope:
             source_unit="u" * 16,
             source_event_id="e" * 128,
             sequence=index,
-            source_metadata={"firmware_version": "\U0001f600" * 64},
+            source_metadata={"firmware_version": EMOJI * 64},
         )
         for index in range(1_000)
     ]
@@ -1144,11 +1265,67 @@ async def queue_visibility_and_delete(subject: QueueKitSubject) -> None:
     assert await _receive(subject) == []
 
 
+def envelope_of_message_bytes(target: int) -> IngressEnvelope:
+    """An envelope whose UTF-8 body bytes + the 31 attribute bytes equal `target` exactly."""
+
+    def build(event_lengths: Sequence[int]) -> IngressEnvelope:
+        return envelope(
+            observations=[
+                source_observation(
+                    metric_key="m" * 64, source_unit="u" * 16, source_event_id="e" * length
+                )
+                for length in event_lengths
+            ]
+        )
+
+    one = ingress_message_bytes(build([1]))
+    per_observation = ingress_message_bytes(build([1, 1])) - one
+    count = (target - one) // per_observation + 1
+    assert count <= 1_000
+    lengths = [1] * count
+    missing = target - ingress_message_bytes(build(lengths))
+    for index in range(count):
+        grow = min(missing, 127)
+        lengths[index] += grow
+        missing -= grow
+    assert missing == 0
+    exact = build(lengths)
+    assert ingress_message_bytes(exact) == target
+    return exact
+
+
+def multibyte_envelope() -> IngressEnvelope:
+    """Fewer than 262144 characters but more than 262144 UTF-8 bytes."""
+    message = envelope(
+        observations=[
+            source_observation(sequence=index, source_metadata={"firmware_version": EMOJI * 64})
+            for index in range(800)
+        ]
+    )
+    text = message.to_json()
+    assert len(text) + 31 <= MAX_INGRESS_MESSAGE_BYTES < len(text.encode("utf-8")) + 31
+    return message
+
+
 async def queue_rejects_oversized_envelopes(subject: QueueKitSubject) -> None:
-    with pytest.raises(IngressMessageTooLarge):
-        await subject.producer.send(oversized_envelope())
+    for message in (
+        oversized_envelope(),
+        multibyte_envelope(),
+        envelope_of_message_bytes(MAX_INGRESS_MESSAGE_BYTES + 1),
+    ):
+        with pytest.raises(IngressMessageTooLarge):
+            await subject.producer.send(message)
 
     assert await _receive(subject) == []
+
+
+async def queue_accepts_an_envelope_at_the_exact_limit(subject: QueueKitSubject) -> None:
+    message = envelope_of_message_bytes(MAX_INGRESS_MESSAGE_BYTES)
+
+    await subject.producer.send(message)
+    (received,) = await _receive(subject)
+
+    assert received.body == message.to_json()
 
 
 async def queue_send_raw_keeps_the_body(subject: QueueKitSubject) -> None:
@@ -1164,6 +1341,7 @@ INGRESS_QUEUE_CONTRACT = (
     queue_send_and_receive,
     queue_visibility_and_delete,
     queue_rejects_oversized_envelopes,
+    queue_accepts_an_envelope_at_the_exact_limit,
     queue_send_raw_keeps_the_body,
 )
 
@@ -1285,7 +1463,7 @@ async def quarantine_transition_errors(subject: QuarantineKitSubject) -> None:
     with pytest.raises(NotFoundError):
         await subject.repository.transition_quarantine_entry(
             TENANT,
-            key[:-1] + "0",
+            key[:-1] + ("0" if key[-1] != "0" else "1"),
             QuarantineEntryStatus.DISMISSED,
             expected_version=1,
             at=RECEIVED,
@@ -1340,6 +1518,9 @@ QUARANTINE_REPOSITORY_CONTRACT = (
 class IngestStateKitSubject(Protocol):
     repository: Any  # IngestStateRepository
 
+    # The port has no device-state read (P6 owns the views); the subject exposes the raw row.
+    async def device_state(self, device_id: str) -> DeviceIngestState | None: ...
+
 
 async def state_apply_then_read(subject: IngestStateKitSubject) -> None:
     applied = marks(quarantined_at=RECEIVED, quarantine_reason="metric_unknown")
@@ -1368,6 +1549,12 @@ async def state_apply_then_read(subject: IngestStateKitSubject) -> None:
         last_fenced_at=None,
         last_fence_reason=None,
     )
+    assert await subject.device_state(DEVICE) == DeviceIngestState(
+        tenant_id=TENANT,
+        device_id=DEVICE,
+        last_received_at=RECEIVED,
+        last_ingested_at=RECEIVED + timedelta(seconds=1),
+    )
 
 
 async def state_rows_are_tenant_checked(subject: IngestStateKitSubject) -> None:
@@ -1391,6 +1578,10 @@ async def state_marks_are_monotone(subject: IngestStateKitSubject) -> None:
     await subject.repository.apply_ingest_marks(newer)
 
     state = (await subject.repository.get_component_states(TENANT, [COMPONENT]))[COMPONENT]
+    device_state = await subject.device_state(DEVICE)
+    assert device_state is not None
+    assert device_state.last_received_at == RECEIVED + timedelta(minutes=1)
+    assert device_state.last_ingested_at == RECEIVED + timedelta(minutes=1, seconds=1)
     assert state.last_received_at == RECEIVED + timedelta(minutes=1)
     assert state.last_ingested_at == RECEIVED + timedelta(minutes=1, seconds=1)
     assert (state.last_observed_at, state.last_observed_sequence) == (
@@ -1441,6 +1632,7 @@ async def state_fence_marks_touch_only_the_connector(subject: IngestStateKitSubj
     await subject.repository.apply_ingest_marks(fenced)
 
     assert await subject.repository.get_component_states(TENANT, [COMPONENT]) == {}
+    assert await subject.device_state(DEVICE) is None
     health = await subject.repository.get_connector_health(TENANT, ACCOUNT)
     assert health == ConnectorHealth(
         tenant_id=TENANT,
@@ -1454,7 +1646,24 @@ async def state_fence_marks_touch_only_the_connector(subject: IngestStateKitSubj
     )
 
 
+async def state_empty_marks_write_nothing(subject: IngestStateKitSubject) -> None:
+    empty = IngestMarks(
+        tenant_id=TENANT,
+        device_id=None,
+        integration_account_id=ACCOUNT,
+        component_marks=(),
+        device_mark=None,
+        connector_mark=ConnectorMark(),
+    )
+
+    await subject.repository.apply_ingest_marks(empty)
+
+    assert await subject.repository.get_connector_health(TENANT, ACCOUNT) is None
+    assert await subject.device_state(DEVICE) is None
+
+
 INGEST_STATE_CONTRACT = (
+    state_empty_marks_write_nothing,
     state_apply_then_read,
     state_rows_are_tenant_checked,
     state_marks_are_monotone,
@@ -1526,7 +1735,25 @@ async def metrics_records_one_object_per_call(subject: MetricsKitSubject) -> Non
     ]
 
 
-TELEMETRY_METRICS_CONTRACT = (metrics_records_one_object_per_call,)
+async def metrics_refuse_open_names_and_labels(subject: MetricsKitSubject) -> None:
+    for call in (
+        lambda: subject.metrics.increment(
+            "ingest_requests_total", outcome="accepted", tenant_id=TENANT
+        ),
+        lambda: subject.metrics.increment("ingest_requests_total", outcome="bogus"),
+        lambda: subject.metrics.increment("ingest_unknown_total"),
+        lambda: subject.metrics.observe("ingress_queue_age_seconds", 1.0, device_id=DEVICE),
+    ):
+        with pytest.raises(ValueError):
+            call()
+
+    assert subject.recorded() == []
+
+
+TELEMETRY_METRICS_CONTRACT = (
+    metrics_records_one_object_per_call,
+    metrics_refuse_open_names_and_labels,
+)
 
 
 # DynamoDB expression vectors ------------------------------------------------------------------
@@ -1551,6 +1778,7 @@ class DynamoVector:
     cancellation_codes: tuple[str, ...] = ()
     cancellation_items: Mapping[int, Mapping[str, Any]] = field(default_factory=dict)
     query_sks: tuple[str, ...] = ()
+    query_has_more: bool | None = None  # LastEvaluatedKey expected (True) or absent (False)
 
 
 def _row(**attributes: Any) -> dict[str, Any]:
@@ -1936,6 +2164,7 @@ def _vectors_queries() -> list[DynamoVector]:
             },
             seed=rows,
             query_sks=("INGEST_CREDENTIAL#ia1#ic1", "INGEST_CREDENTIAL#ia1#ic2"),
+            query_has_more=False,
         ),
         DynamoVector(
             "query_between",
@@ -1961,6 +2190,7 @@ def _vectors_queries() -> list[DynamoVector]:
             },
             seed=rows,
             query_sks=(rows[1]["SK"], rows[2]["SK"]),
+            query_has_more=True,
         ),
         DynamoVector(
             "query_descending",
@@ -1981,7 +2211,131 @@ def _vectors_queries() -> list[DynamoVector]:
     ]
 
 
+def _vectors_m1() -> list[DynamoVector]:
+    """Expressions the existing M1 adapters emit (`adapters/dynamodb_*.py`)."""
+    vectors: list[DynamoVector] = []
+    receipt_condition = "attribute_not_exists(PK) OR #expires_at <= :now"
+    for name, seeded, succeeds in (
+        ("absent", None, True),
+        ("expired", _row(expires_at=100), True),
+        ("live", _row(expires_at=101), False),
+    ):
+        vectors.append(
+            DynamoVector(
+                f"m1_receipt_{name}",
+                "put_item",
+                _put(receipt_condition, names={"#expires_at": "expires_at"}, now=100),
+                seed=() if seeded is None else (seeded,),
+                succeeds=succeeds,
+                after={(PK, SK): _row(written=1) if succeeds else seeded},
+            )
+        )
+    guarded = _row(status="active", tenant_id="t1", version=3, last_ended_at="2026-01-02")
+    names = {
+        "#status": "status",
+        "#tenant_id": "tenant_id",
+        "#version": "version",
+        "#last_ended_at": "last_ended_at",
+    }
+    cases = [
+        ("status_tenant", "attribute_exists(PK) AND #status = :active AND #tenant_id = :tenant_id"),
+        ("tenant", "attribute_exists(PK) AND #tenant_id = :tenant_id"),
+        ("status_in", "attribute_exists(PK) AND #status IN (:pending, :active)"),
+        (
+            "version_tenant",
+            "attribute_exists(PK) AND #version = :expected_version AND #tenant_id = :tenant_id",
+        ),
+        (
+            "ended_before",
+            "attribute_exists(PK) AND (attribute_not_exists(#last_ended_at) "
+            "OR #last_ended_at <= :started_at)",
+        ),
+    ]
+    matching = {
+        ":active": "active",
+        ":pending": "pending",
+        ":tenant_id": "t1",
+        ":expected_version": 3,
+        ":started_at": "2026-01-03",
+    }
+    failing = {
+        ":active": "active",
+        ":pending": "pending",
+        ":tenant_id": "t2",
+        ":expected_version": 2,
+        ":started_at": "2026-01-01",
+    }
+    for label, condition in cases:
+        used_names = {key: value for key, value in names.items() if key in condition}
+        for outcome, values, row in (
+            ("match", matching, guarded),
+            ("mismatch", failing, {**guarded, "status": "revoked"}),
+            ("absent", matching, None),
+        ):
+            used = {key: value for key, value in values.items() if key in condition}
+            used[":one"] = 1
+            succeeds = outcome == "match"
+            if label == "ended_before" and outcome == "mismatch":
+                row = {**guarded, "last_ended_at": "2026-01-02"}
+            if label == "tenant" and outcome == "mismatch":
+                row = guarded
+            if label == "status_in" and outcome == "mismatch":
+                row = {**guarded, "status": "revoked"}
+            vectors.append(
+                DynamoVector(
+                    f"m1_{label}_{outcome}",
+                    "update_item",
+                    _update("SET touched = :one", condition, names=used_names, values=used),
+                    seed=() if row is None else (row,),
+                    succeeds=succeeds,
+                    after={(PK, SK): {**row, "touched": 1} if succeeds else row},
+                )
+            )
+    counter = "SET #run_count = if_not_exists(#run_count, :zero) + :one"
+    for name, seeded, expected in (("absent", None, 1), ("existing", _row(run_count=4), 5)):
+        vectors.append(
+            DynamoVector(
+                f"m1_counter_{name}",
+                "update_item",
+                _update(
+                    counter, None, names={"#run_count": "run_count"}, values={":zero": 0, ":one": 1}
+                ),
+                seed=() if seeded is None else (seeded,),
+                after={(PK, SK): _row(run_count=expected)},
+            )
+        )
+    vectors.append(
+        DynamoVector(
+            "remove_only",
+            "update_item",
+            _update("REMOVE lease_owner, lease_expires_at", "attribute_exists(PK)"),
+            seed=(_row(status="open", lease_owner="w1", lease_expires_at=5),),
+            after={(PK, SK): _row(status="open")},
+        )
+    )
+    rows = tuple({"PK": "Q#2", "SK": sk} for sk in ("A", "B", "C", "D"))
+    for name, condition, values, expected in (
+        ("upper", "PK = :pk AND SK <= :sk_upper", {":sk_upper": "B"}, ("A", "B")),
+        ("lower", "PK = :pk AND SK >= :sk_lower", {":sk_lower": "C"}, ("C", "D")),
+    ):
+        vectors.append(
+            DynamoVector(
+                f"query_m1_{name}",
+                "query",
+                {
+                    "KeyConditionExpression": condition,
+                    "ExpressionAttributeValues": {":pk": "Q#2", **values},
+                },
+                seed=rows,
+                query_sks=expected,
+                query_has_more=False,
+            )
+        )
+    return vectors
+
+
 DYNAMO_EXPRESSION_VECTORS: tuple[DynamoVector, ...] = (
+    *_vectors_m1(),
     *_vectors_put_new(),
     *_vectors_receipt_claim(),
     *_vectors_issuance_check(),
@@ -2018,12 +2372,31 @@ def _wire(request: Mapping[str, Any], table_name: str) -> dict[str, Any]:
     return wired
 
 
+def _touched_keys(vector: DynamoVector) -> set[tuple[str, str]]:
+    keys = {(item["PK"], item["SK"]) for item in vector.seed}
+    keys.update(vector.after)
+    bodies = [
+        body for action in vector.request.get("TransactItems", []) for body in action.values()
+    ] or [vector.request]
+    for body in bodies:
+        raw = body.get("Item") or body.get("Key")
+        if raw is not None:
+            keys.add((raw["PK"], raw["SK"]))
+    return keys
+
+
 def run_dynamo_vector(client: Any, table_name: str, vector: DynamoVector) -> None:
+    """Runs one vector; it first deletes every row the vector touches, so vectors can share one
+    table (DynamoDB Local) in any order."""
+    for pk, sk in _touched_keys(vector):
+        client.delete_item(TableName=table_name, Key=_encode({"PK": pk, "SK": sk}))
     for item in vector.seed:
         client.put_item(TableName=table_name, Item=_encode(item))
     if vector.operation == "query":
         response = client.query(**_wire(vector.request, table_name))
         assert tuple(_decode(item)["SK"] for item in response["Items"]) == vector.query_sks
+        if vector.query_has_more is not None:
+            assert ("LastEvaluatedKey" in response) is vector.query_has_more
         return
     if vector.operation == "transact_write_items":
         request = {

@@ -720,6 +720,11 @@ def test_envelope_always_writes_the_three_mapping_versions_literally() -> None:
         assert literal in text
 
 
+@pytest.mark.parametrize("version", ["!", "~" * 64, "gw/1.0+build.7"])
+def test_envelope_accepts_printable_ascii_connector_versions(version: str) -> None:
+    assert envelope(connector_version=version).connector_version == version
+
+
 def test_envelope_round_trip_is_lossless_with_every_optional_field() -> None:
     message = envelope(
         replay_of="ing_" + "5" * 32,
@@ -762,6 +767,9 @@ def test_envelope_round_trip_is_lossless_with_every_optional_field() -> None:
         {"external_identity_hash": "E" * 64},
         {"device_integration_id": "di-plain"},
         {"connector_version": "has space"},
+        {"connector_version": ""},
+        {"connector_version": "v\x7f"},
+        {"connector_version": "v\u00e9"},
         {"connector_version": "v" * 65},
         {"observations": []},
         {"unexpected": 1},
@@ -905,7 +913,7 @@ def test_epoch_microseconds_is_exact_integer_arithmetic() -> None:
 
 def test_new_receipt_holds_the_ttl_invariant() -> None:
     created = datetime(2026, 10, 30, 12, 0, 0, 123456, tzinfo=UTC)
-    created_us = 1_793_448_000_123_456
+    created_us = 1_793_361_600_123_456
 
     receipt = new_ingress_receipt(
         integration_account_id=ACCOUNT,
@@ -938,8 +946,8 @@ def test_new_receipt_holds_the_ttl_invariant() -> None:
 @pytest.mark.parametrize(
     "overrides",
     [
-        {"expires_at": 1_793_534_400},
-        {"created_at_us": 1_793_448_000_123_457},
+        {"expires_at": 1_793_448_000},
+        {"created_at_us": 1_793_361_600_123_457},
         {"key_sha256": "C" * 64},
         {"ingress_id": "ing_" + "A" * 32},
         {"created_at": datetime(2026, 10, 30, 12, 0, 0, 123456)},
@@ -958,8 +966,8 @@ def test_receipt_rejects_inconsistent_fields(overrides: dict[str, Any]) -> None:
         "mapping_versions": NormalizationVersions(),
         "state": "pending",
         "created_at": created,
-        "created_at_us": 1_793_448_000_123_456,
-        "expires_at": 1_793_534_401,
+        "created_at_us": 1_793_361_600_123_456,
+        "expires_at": 1_793_448_001,
     }
     IngressReceipt.model_validate(payload)
 
@@ -1140,13 +1148,26 @@ def test_quarantine_rows_for_a_terminal_fence() -> None:
     assert len({row.quarantine_id for row in rows}) == 4
 
 
+def _envelope_cut_inside_an_emoji() -> IngressEnvelope:
+    observations = [
+        source_observation(sequence=index, source_metadata={"firmware_version": EMOJI * 64})
+        for index in range(12)
+    ]
+    for shift in range(256):
+        message = envelope(
+            tenant_id="t" * (1 + min(shift, 127)),
+            device_id="d" * (1 + max(0, shift - 127)),
+            observations=observations,
+        )
+        try:
+            message.to_json().encode("utf-8")[:2_048].decode("utf-8")
+        except UnicodeDecodeError:
+            return message
+    raise AssertionError("no layout puts byte 2048 inside a multi-byte character")
+
+
 def test_fenced_message_excerpt_is_cut_on_a_utf8_boundary() -> None:
-    message = envelope(
-        observations=[
-            source_observation(sequence=index, source_metadata={"firmware_version": EMOJI * 64})
-            for index in range(12)
-        ]
-    )
+    message = _envelope_cut_inside_an_emoji()
     full = message.to_json().encode("utf-8")
     fence = IngressFence(reason=IngressFenceReason.ACCOUNT_REVOKED, account_verified=True)
 
@@ -1155,7 +1176,8 @@ def test_fenced_message_excerpt_is_cut_on_a_utf8_boundary() -> None:
     (summary,) = [row for row in rows if row.kind == QuarantineEntryKind.FENCED_MESSAGE]
     excerpt = summary.envelope_excerpt_json.encode("utf-8")
     assert len(full) > 2_048
-    assert len(excerpt) <= 2_048 and len(excerpt) > 2_048 - 4
+    assert 2_048 - 4 < len(excerpt) < 2_048  # byte 2048 splits an emoji, so the cut backs off
+    assert excerpt.decode("utf-8") == summary.envelope_excerpt_json
     assert full.startswith(excerpt)
     assert summary.truncated is True and summary.replayable is False
 
@@ -1348,6 +1370,16 @@ ADMIT_ROWS: list[tuple[str, dict[str, Any], IngressAdmissionDenied | None]] = [
         IngressAdmissionDenied.DEVICE_INACTIVE,
     ),
     (
+        "device of another tenant",
+        {"device": {"tenant_id": OTHER_TENANT}},
+        IngressAdmissionDenied.DEVICE_INACTIVE,
+    ),
+    (
+        "device row for another device",
+        {"device": {"device_id": OTHER_DEVICE}},
+        IngressAdmissionDenied.DEVICE_INACTIVE,
+    ),
+    (
         "first failure wins",
         {
             "integration": {"status": DeviceIntegrationStatus.DECOMMISSIONED},
@@ -1510,6 +1542,18 @@ FENCE_ROWS: list[tuple[str, dict[str, Any], dict[str, Any], object]] = [
         IngressDefer(reason=IngressDeferReason.DEVICE_NOT_ACTIVE),
     ),
     (
+        "device of another tenant",
+        {"device": {"tenant_id": OTHER_TENANT}},
+        {},
+        _fence(IngressFenceReason.DEVICE_DECOMMISSIONED),
+    ),
+    (
+        "integration row inconsistent with the identity",
+        {"integration": {"external_identity_hash": "e" * 64}},
+        {},
+        _fence(IngressFenceReason.IDENTITY_UNRESOLVED),
+    ),
+    (
         "integration before account",
         {
             "integration": {"status": DeviceIntegrationStatus.ERROR},
@@ -1603,13 +1647,20 @@ def test_trusted_context_comes_from_the_resolved_integration_and_the_envelope() 
         mapping_versions=NormalizationVersions(quality_policy_version="quality-policy@0"),
     )
 
-    context = build_trusted_context(message, device_integration())
+    resolved = device_integration(
+        tenant_id=OTHER_TENANT,
+        device_id=OTHER_DEVICE,
+        device_integration_id=OTHER_INTEGRATION,
+        provider_key="https_other",
+    )
+
+    context = build_trusted_context(message, resolved)
 
     assert context == TrustedSourceContext(
-        tenant_id=TENANT,
-        device_id=DEVICE,
-        integration_id=INTEGRATION,
-        integration_type=PROVIDER,
+        tenant_id=OTHER_TENANT,
+        device_id=OTHER_DEVICE,
+        integration_id=OTHER_INTEGRATION,
+        integration_type="https_other",
         source_type=SourceType.HTTPS,
         connector_version="gw/2",
         received_at=RECEIVED,

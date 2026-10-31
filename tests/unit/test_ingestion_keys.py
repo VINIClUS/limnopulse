@@ -305,7 +305,7 @@ def test_quarantine_entry_item_round_trip() -> None:
     fenced = build_quarantine_entries(
         envelope(connector_version="gw/1", replay=True, replay_of="ing_" + "5" * 32),
         fence=IngressFence(reason=IngressFenceReason.ACCOUNT_REVOKED, account_verified=True),
-        now=RECEIVED,
+        now=RECEIVED + timedelta(microseconds=1),
     )
     quarantined = QuarantinedObservation(
         reason=QuarantineReason.METRIC_UNKNOWN,
@@ -323,9 +323,9 @@ def test_quarantine_entry_item_round_trip() -> None:
     from limnopulse_api.services.telemetry_pipeline import PipelineOutcome
 
     observation_rows = build_quarantine_entries(
-        envelope(),
+        envelope(received_at=RECEIVED + timedelta(microseconds=3)),
         outcome=PipelineOutcome(written=None, quarantined=(quarantined,), counts={}),  # type: ignore[arg-type]
-        now=RECEIVED,
+        now=RECEIVED + timedelta(microseconds=1),
     )
 
     for entry in (*fenced, *observation_rows):
@@ -423,3 +423,30 @@ def test_receipt_and_quarantine_are_the_new_ttl_rows() -> None:
     assert "expires_at" in ingress_receipt_to_item(receipt())
     assert "expires_at" in quarantine_entry_to_item(entry)
     assert "expires_at" not in ingest_credential_to_item(credential())
+    state = ComponentIngestState(
+        tenant_id=TENANT,
+        component_id=COMPONENT,
+        device_id=DEVICE,
+        last_received_at=RECEIVED,
+        last_ingested_at=RECEIVED,
+        last_observed_at=None,
+        last_observed_sequence=None,
+    )
+    assert "expires_at" not in component_ingest_state_to_item(state)
+    assert "expires_at" not in device_ingest_state_to_item(
+        DeviceIngestState(
+            tenant_id=TENANT, device_id=DEVICE, last_received_at=RECEIVED, last_ingested_at=None
+        )
+    )
+    assert "expires_at" not in connector_health_to_item(
+        ConnectorHealth(
+            tenant_id=TENANT,
+            integration_account_id=ACCOUNT,
+            last_received_at=RECEIVED,
+            last_accepted_at=None,
+            last_quarantined_at=None,
+            last_quarantine_reason=None,
+            last_fenced_at=None,
+            last_fence_reason=None,
+        )
+    )
