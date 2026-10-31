@@ -12,13 +12,13 @@ from pydantic import AfterValidator, BaseModel, ConfigDict, Field
 from limnopulse_api.api.v2.schemas.common import V2VersionedResponse
 from limnopulse_api.domain.ids import require_canonical_id
 from limnopulse_api.domain.integrations import DeviceIntegration, IntegrationAccount
-from limnopulse_api.domain.v2_common import PROVIDER_KEY_PATTERN
+from limnopulse_api.domain.v2_common import (
+    EXTERNAL_IDENTITY_MAX_LENGTH,
+    EXTERNAL_IDENTITY_PATTERN,
+    PROVIDER_KEY_PATTERN,
+)
 
 PROVIDER_KEY_MAX_LENGTH = 128
-EXTERNAL_IDENTITY_MAX_LENGTH = 512
-# Identities are hashed byte-exact, so surrounding whitespace and control characters are refused
-# rather than normalized: "X" and "X " must not become two distinct claims.
-EXTERNAL_IDENTITY_PATTERN = r"^[^\s\x00-\x1f\x7f](?:[^\x00-\x1f\x7f]*[^\s\x00-\x1f\x7f])?$"
 
 
 def _require_integration_account_id(value: str) -> str:

@@ -1,14 +1,13 @@
 """Unmounted `/v2` Integration routes; M1-07 mounts them under `/v2`."""
 
-from collections.abc import Callable, Coroutine
+from collections.abc import Coroutine
 from typing import Annotated, Any
 
-from fastapi import APIRouter, Depends, HTTPException, Path, Request, Response, status
-from fastapi.exceptions import RequestValidationError
-from fastapi.routing import APIRoute
+from fastapi import APIRouter, Depends, HTTPException, Path, Response, status
 from pydantic import AfterValidator
 
 from limnopulse_api.api.dependencies import require_tenant_role
+from limnopulse_api.api.redacted_validation import _RedactedValidationRoute
 from limnopulse_api.api.v1.schemas.common import ErrorResponse
 from limnopulse_api.api.v2.dependencies import DeviceReaderDep, IntegrationRepositoryDep
 from limnopulse_api.api.v2.schemas.common import V2_ERROR_RESPONSES, IdempotencyKeyHeader
@@ -29,25 +28,6 @@ from limnopulse_api.services.integrations import (
     IntegrationInputError,
     IntegrationService,
 )
-
-
-class _RedactedValidationRoute(APIRoute):
-    """Drop rejected input values from 422 bodies so secrets and identities are never echoed."""
-
-    def get_route_handler(self) -> Callable[[Request], Coroutine[Any, Any, Response]]:
-        handler = super().get_route_handler()
-
-        async def redacted_handler(request: Request) -> Response:
-            try:
-                return await handler(request)
-            except RequestValidationError as exc:
-                errors = [
-                    {key: value for key, value in error.items() if key not in {"input", "ctx"}}
-                    for error in exc.errors()
-                ]
-                raise RequestValidationError(errors) from None
-
-        return redacted_handler
 
 
 router = APIRouter(

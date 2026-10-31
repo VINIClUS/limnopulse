@@ -14,6 +14,7 @@ from typing import Any
 
 from limnopulse_api.domain.legacy_telemetry_mapping import map_legacy_reading
 from limnopulse_api.domain.telemetry_v2 import (
+    CanonicalObservation,
     NormalizationResult,
     QuarantinedObservation,
     SourceObservation,
@@ -31,6 +32,8 @@ class PipelineOutcome:
     written: TelemetryWriteOutcome
     quarantined: tuple[QuarantinedObservation, ...]
     counts: Mapping[str, int]  # read-only; closed keys of `NormalizationResult.counts()`
+    # The observations actually written; P3 derives ingest marks and sequence events from them.
+    accepted: tuple[CanonicalObservation, ...] = ()
 
 
 class TelemetryPipeline:
@@ -67,4 +70,5 @@ class TelemetryPipeline:
             written=written,
             quarantined=result.quarantined,
             counts=MappingProxyType(dict(result.counts())),
+            accepted=result.accepted,
         )
