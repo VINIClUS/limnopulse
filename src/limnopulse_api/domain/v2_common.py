@@ -16,6 +16,10 @@ SHA256_HEX_PATTERN = r"^[0-9a-f]{64}$"
 CAPABILITY_KEY_PATTERN = r"^[a-z][a-z0-9]*(?:[._][a-z0-9]+)*$"
 PROVIDER_KEY_PATTERN = r"^[a-z][a-z0-9_]*(?:\.[a-z0-9_]+)*$"
 IDEMPOTENCY_SCOPE_PATTERN = r"^[A-Za-z0-9][A-Za-z0-9._:/-]{0,255}$"
+EXTERNAL_IDENTITY_MAX_LENGTH = 512
+# Identities are hashed byte-exact, so surrounding whitespace and control characters are refused
+# rather than normalized: "X" and "X " must not become two distinct claims.
+EXTERNAL_IDENTITY_PATTERN = r"^[^\s\x00-\x1f\x7f](?:[^\x00-\x1f\x7f]*[^\s\x00-\x1f\x7f])?$"
 
 SafeId = Annotated[str, AfterValidator(require_safe_id)]
 DeviceId = Annotated[str, AfterValidator(require_device_id)]

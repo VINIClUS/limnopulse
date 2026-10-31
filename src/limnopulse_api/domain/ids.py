@@ -1,4 +1,6 @@
 import re
+from collections.abc import Iterable
+from hashlib import sha256
 from uuid import NAMESPACE_URL, uuid4, uuid5
 
 # Historical identifiers stay readable; "#" is excluded because IDs are interpolated into keys.
@@ -57,6 +59,27 @@ def new_deployment_id() -> str:
 
 def new_capability_id() -> str:
     return f"cap_{uuid4().hex}"
+
+
+def new_ingest_credential_id() -> str:
+    return f"ic_{uuid4().hex}"
+
+
+def new_ingress_id() -> str:
+    return f"ing_{uuid4().hex}"
+
+
+def quarantine_entry_id(ingress_id: str, ordinal: int, excerpt_json: str) -> str:
+    """Content-derived, so a redelivered message rebuilds the same id (D9)."""
+    digest = sha256(excerpt_json.encode("utf-8")).hexdigest()
+    name = f"limnopulse:quarantine:{ingress_id}:{ordinal}:{digest}"
+    return f"qtn_{uuid5(NAMESPACE_URL, name).hex}"
+
+
+def replay_ingress_id(entry_keys: Iterable[str]) -> str:
+    """Deterministic per replay group, so a rerun after a crash reuses it (D10)."""
+    name = "limnopulse:replay:" + ",".join(sorted(entry_keys))
+    return f"ing_{uuid5(NAMESPACE_URL, name).hex}"
 
 
 def is_canonical_id(value: str, prefix: str) -> bool:

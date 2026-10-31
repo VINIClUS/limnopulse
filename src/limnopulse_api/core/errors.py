@@ -36,3 +36,15 @@ class TelemetryWriteError(LimnopulseError):
     def __init__(self, message: str, *, retryable: bool) -> None:
         super().__init__(message)
         self.retryable = retryable
+
+
+class IngressQueueError(LimnopulseError):
+    """The ingress queue did not accept or serve a message."""
+
+    def __init__(self, message: str, *, retryable: bool) -> None:
+        super().__init__(message)
+        self.retryable = retryable
+
+
+class IngressMessageTooLarge(LimnopulseError):
+    """An ingress envelope exceeds `MAX_INGRESS_MESSAGE_BYTES`; it was not sent."""

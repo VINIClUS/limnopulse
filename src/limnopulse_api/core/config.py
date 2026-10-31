@@ -53,6 +53,25 @@ class Settings(BaseSettings):
     telemetry_legacy_dual_write_enabled: bool = False
     api_v2_telemetry_enabled: bool = False
     v1_telemetry_read_source: TelemetryReadSource = "legacy"
+    # P3 ingestion (dark by default; P3-10 wires the composition).
+    ingest_v2_enabled: bool = False
+    sqs_endpoint_url: str | None = None
+    sqs_telemetry_ingress_queue_url: str = ""
+    sqs_telemetry_ingress_dlq_url: str = ""
+    ingest_rate_limit_per_minute: int = Field(default=120, ge=1, le=6_000)
+    ingest_rate_limit_burst: int = Field(default=20, ge=1, le=1_000)
+    ingest_rate_limiter_max_keys: int = Field(default=10_000, ge=100, le=1_000_000)
+    # Pre-auth bucket capacity = max(1, per_minute // 10); refill = per_minute / 60 per second.
+    ingest_preauth_rate_limit_per_minute: int = Field(default=60, ge=1, le=6_000)
+    ingest_preauth_global_per_minute: int = Field(default=600, ge=1, le=60_000)
+    telemetry_ingest_processing_deadline_seconds: int = Field(default=45, ge=5, le=900)
+    telemetry_ingest_worker_concurrency: int = Field(default=4, ge=1, le=10)
+    telemetry_ingest_worker_max_messages: int = Field(default=10, ge=1, le=10)
+    telemetry_ingest_worker_wait_seconds: int = Field(default=20, ge=0, le=20)
+    telemetry_ingest_worker_visibility_seconds: int = Field(default=60, ge=10, le=43_200)
+    telemetry_ingest_retry_base_seconds: int = Field(default=30, ge=1, le=900)
+    telemetry_ingest_retry_cap_seconds: int = Field(default=900, ge=1, le=43_200)
+    telemetry_ingest_drain_seconds: int = Field(default=30, ge=1, le=300)
 
     @model_validator(mode="after")
     def validate_auth_mode_for_environment(self) -> "Settings":
@@ -69,6 +88,18 @@ class Settings(BaseSettings):
                 raise ValueError("TELEGRAM_BOT_USERNAME must be configured")
         if self.api_v2_telemetry_enabled and not self.api_v2_enabled:
             raise ValueError("API_V2_TELEMETRY_ENABLED requires API_V2_ENABLED=true")
+        if self.ingest_v2_enabled:
+            if not self.api_v2_enabled:
+                raise ValueError("INGEST_V2_ENABLED requires API_V2_ENABLED=true")
+            if not self.telemetry_v2_write_enabled:
+                raise ValueError("INGEST_V2_ENABLED requires TELEMETRY_V2_WRITE_ENABLED=true")
+            if not self.sqs_telemetry_ingress_queue_url:
+                raise ValueError("INGEST_V2_ENABLED requires SQS_TELEMETRY_INGRESS_QUEUE_URL")
+        if self.telemetry_ingest_retry_base_seconds > self.telemetry_ingest_retry_cap_seconds:
+            raise ValueError(
+                "TELEMETRY_INGEST_RETRY_BASE_SECONDS must not exceed "
+                "TELEMETRY_INGEST_RETRY_CAP_SECONDS"
+            )
         return self
 
 

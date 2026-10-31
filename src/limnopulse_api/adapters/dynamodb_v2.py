@@ -2,7 +2,9 @@
 
 Only generic primitives live here: key builders, hashing helpers, idempotency receipt codecs
 and a repository base with serialized reads, paginated queries, conditional write builders and
-the conditional-failure -> `ConflictError` mapping. Entity codecs belong to each adapter.
+the conditional-failure -> `ConflictError` mapping. M1 entity codecs belong to each adapter; the
+P3 ingestion codecs (`ingest_credential_*`, `ingress_receipt_*`, `quarantine_entry_*` and the
+ingest-state `*_to_item`/`*_from_item`) are frozen here by P3-00, and the P3 adapters reuse them.
 """
 
 import json
@@ -19,6 +21,16 @@ from boto3.dynamodb.types import TypeDeserializer, TypeSerializer
 from botocore.exceptions import ClientError
 
 from limnopulse_api.core.errors import ConflictError
+from limnopulse_api.domain.ingestion import (
+    QUARANTINE_TTL,
+    ComponentIngestState,
+    ConnectorHealth,
+    DeviceIngestState,
+    IngestCredential,
+    IngressReceipt,
+    QuarantineEntry,
+)
+from limnopulse_api.domain.telemetry_v2 import NormalizationVersions, QuarantinedObservation
 from limnopulse_api.domain.v2_common import (
     IDEMPOTENCY_KEY_MAX_LENGTH,
     IDEMPOTENCY_KEY_MIN_LENGTH,
@@ -54,6 +66,18 @@ def external_identity_hash(provider_key: str, external_identity: str) -> str:
     if not external_identity:
         raise ValueError("external identity must not be empty")
     return sha256(f"{provider_key}\0{external_identity}".encode()).hexdigest()
+
+
+def account_scoped_identity_hash(
+    provider_key: str, integration_account_id: str, external_device_id: str
+) -> str:
+    """D4: HTTPS identities are scoped to their IntegrationAccount. `\x1f` cannot occur in an
+    external identity (`EXTERNAL_IDENTITY_PATTERN`), so the joined value is unambiguous."""
+    if not integration_account_id or "\x1f" in integration_account_id:
+        raise ValueError("invalid integration account id")
+    if not external_device_id:
+        raise ValueError("external identity must not be empty")
+    return external_identity_hash(provider_key, f"{integration_account_id}\x1f{external_device_id}")
 
 
 def idempotency_key_hash(idempotency_key: str) -> str:
@@ -177,6 +201,59 @@ class DynamoV2KeyBuilder:
     def legacy_device(self, tenant_id: str, device_id: str) -> dict[str, str]:
         return {"PK": self.tenant_partition(tenant_id), "SK": f"DEVICE#{_part(device_id)}"}
 
+    # P3 ingestion rows -------------------------------------------------------------------------
+
+    def ingest_credential(self, ingest_credential_id: str) -> dict[str, str]:
+        return {"PK": f"INGEST_CREDENTIAL#{_part(ingest_credential_id)}", "SK": "META"}
+
+    def ingest_credential_listing(
+        self, tenant_id: str, integration_account_id: str, ingest_credential_id: str
+    ) -> dict[str, str]:
+        return {
+            "PK": self.tenant_partition(tenant_id),
+            "SK": f"{self.ingest_credential_listing_prefix(integration_account_id)}"
+            f"{_part(ingest_credential_id)}",
+        }
+
+    def ingest_credential_listing_prefix(self, integration_account_id: str) -> str:
+        return f"INGEST_CREDENTIAL#{_part(integration_account_id)}#"
+
+    def ingest_credential_slot(
+        self, tenant_id: str, integration_account_id: str, slot: int
+    ) -> dict[str, str]:
+        if type(slot) is not int or slot not in (1, 2):
+            raise ValueError("credential slot must be 1 or 2")
+        return {
+            "PK": self.tenant_partition(tenant_id),
+            "SK": f"INGEST_CREDENTIAL_SLOT#{_part(integration_account_id)}#{slot}",
+        }
+
+    def ingress_receipt(self, integration_account_id: str, key_sha256: str) -> dict[str, str]:
+        return {"PK": f"INGRESS_RECEIPT#{_part(integration_account_id)}", "SK": _part(key_sha256)}
+
+    def quarantine_partition(self, tenant_id: str) -> str:
+        return f"QUARANTINE#{_part(tenant_id)}"
+
+    def quarantine_entry(
+        self, tenant_id: str, received_at: datetime, quarantine_id: str
+    ) -> dict[str, str]:
+        return {
+            "PK": self.quarantine_partition(tenant_id),
+            "SK": f"{canonical_timestamp_key(received_at)}#{_part(quarantine_id)}",
+        }
+
+    def component_ingest_state(self, component_id: str) -> dict[str, str]:
+        return {"PK": f"COMPONENT#{_part(component_id)}", "SK": "INGEST_STATE#CURRENT"}
+
+    def device_ingest_state(self, device_id: str) -> dict[str, str]:
+        return {"PK": f"DEVICE#{_part(device_id)}", "SK": "INGEST_STATE#CURRENT"}
+
+    def connector_health(self, integration_account_id: str) -> dict[str, str]:
+        return {
+            "PK": f"INTEGRATION_ACCOUNT#{_part(integration_account_id)}",
+            "SK": "CONNECTOR_HEALTH#CURRENT",
+        }
+
 
 _KEYS = DynamoV2KeyBuilder()
 
@@ -226,8 +303,9 @@ def idempotency_receipt_to_item(receipt: IdempotencyReceipt) -> dict[str, Any]:
         "request_hash": receipt.request_hash,
         "response_snapshot_json": receipt.response_snapshot_json,
         "created_at": canonical_timestamp_key(receipt.created_at),
-        # Numeric TTL attribute; only receipts may carry it. Rounded up so TTL deletion and the
-        # overwrite condition never act before the exact 24-hour deadline.
+        # Numeric TTL attribute; only receipts (this one and the P3 ingress receipt) and P3
+        # quarantine rows may carry it. Rounded up so TTL deletion and the overwrite condition
+        # never act before the exact 24-hour deadline.
         "expires_at": math.ceil(receipt.expires_at.timestamp()),
     }
 
@@ -242,6 +320,252 @@ def idempotency_receipt_from_item(item: Mapping[str, Any]) -> IdempotencyReceipt
         response_snapshot_json=item["response_snapshot_json"],
         created_at=created_at,
         expires_at=created_at + IDEMPOTENCY_RECEIPT_TTL,
+    )
+
+
+# P3 ingestion codecs (frozen by P3-00) ----------------------------------------------------------
+
+
+def _timestamp(value: datetime | None) -> str | None:
+    return None if value is None else canonical_timestamp_key(value)
+
+
+def _optional_timestamp(item: Mapping[str, Any], name: str) -> datetime | None:
+    value = item.get(name)
+    return None if value is None else parse_canonical_timestamp(value)
+
+
+def _without_none(item: dict[str, Any]) -> dict[str, Any]:
+    """Absent attributes, never NULL: monotone conditions test `attribute_not_exists`."""
+    return {key: value for key, value in item.items() if value is not None}
+
+
+def _versions(item: Mapping[str, Any]) -> NormalizationVersions:
+    return NormalizationVersions.model_validate(item["mapping_versions"])
+
+
+def ingest_credential_to_item(credential: IngestCredential) -> dict[str, Any]:
+    return _without_none(
+        {
+            **_KEYS.ingest_credential(credential.ingest_credential_id),
+            "entity_type": "ingest_credential",
+            "tenant_id": credential.tenant_id,
+            "ingest_credential_id": credential.ingest_credential_id,
+            "integration_account_id": credential.integration_account_id,
+            "slot": credential.slot,
+            "secret_sha256": credential.secret_sha256,
+            "fingerprint": credential.fingerprint,
+            "status": credential.status.value,
+            "revoked_at": _timestamp(credential.revoked_at),
+            "created_at": canonical_timestamp_key(credential.created_at),
+            "updated_at": canonical_timestamp_key(credential.updated_at),
+            "version": credential.version,
+            "schema_version": credential.schema_version,
+        }
+    )
+
+
+def ingest_credential_from_item(item: Mapping[str, Any]) -> IngestCredential:
+    return IngestCredential(
+        tenant_id=item["tenant_id"],
+        ingest_credential_id=item["ingest_credential_id"],
+        integration_account_id=item["integration_account_id"],
+        slot=item["slot"],
+        secret_sha256=item["secret_sha256"],
+        fingerprint=item["fingerprint"],
+        status=item["status"],
+        revoked_at=_optional_timestamp(item, "revoked_at"),
+        created_at=parse_canonical_timestamp(item["created_at"]),
+        updated_at=parse_canonical_timestamp(item["updated_at"]),
+        version=item["version"],
+    )
+
+
+def ingress_receipt_to_item(receipt: IngressReceipt) -> dict[str, Any]:
+    return {
+        **_KEYS.ingress_receipt(receipt.integration_account_id, receipt.key_sha256),
+        "entity_type": "ingress_receipt",
+        "integration_account_id": receipt.integration_account_id,
+        "tenant_id": receipt.tenant_id,
+        "key_sha256": receipt.key_sha256,
+        "request_sha256": receipt.request_sha256,
+        "ingress_id": receipt.ingress_id,
+        "received_at": canonical_timestamp_key(receipt.received_at),
+        "mapping_versions": receipt.mapping_versions.model_dump(mode="json"),
+        "state": receipt.state.value,
+        "created_at": canonical_timestamp_key(receipt.created_at),
+        "created_at_us": receipt.created_at_us,
+        "expires_at": receipt.expires_at,  # TTL only; liveness is decided on created_at_us
+    }
+
+
+def ingress_receipt_from_item(item: Mapping[str, Any]) -> IngressReceipt:
+    return IngressReceipt(
+        integration_account_id=item["integration_account_id"],
+        tenant_id=item["tenant_id"],
+        key_sha256=item["key_sha256"],
+        request_sha256=item["request_sha256"],
+        ingress_id=item["ingress_id"],
+        received_at=parse_canonical_timestamp(item["received_at"]),
+        mapping_versions=_versions(item),
+        state=item["state"],
+        created_at=parse_canonical_timestamp(item["created_at"]),
+        created_at_us=item["created_at_us"],
+        expires_at=item["expires_at"],
+    )
+
+
+def quarantine_entry_to_item(entry: QuarantineEntry) -> dict[str, Any]:
+    return _without_none(
+        {
+            **_KEYS.quarantine_entry(entry.tenant_id, entry.received_at, entry.quarantine_id),
+            "entity_type": "telemetry_quarantine",
+            "tenant_id": entry.tenant_id,
+            "quarantine_id": entry.quarantine_id,
+            "kind": entry.kind.value,
+            "reason": entry.reason,
+            "ingress_id": entry.ingress_id,
+            "replay_of": entry.replay_of,
+            "integration_account_id": entry.integration_account_id,
+            "provider_key": entry.provider_key,
+            "external_identity_hash": entry.external_identity_hash,
+            "source_type": entry.source_type.value,
+            "connector_version": entry.connector_version,
+            "device_integration_id": entry.device_integration_id,
+            "device_id": entry.device_id,
+            "received_at": canonical_timestamp_key(entry.received_at),
+            "mapping_versions": entry.mapping_versions.model_dump(mode="json"),
+            "observation_json": (
+                None if entry.observation is None else entry.observation.model_dump_json()
+            ),
+            "source_observation_json": entry.source_observation_json,
+            "envelope_excerpt_json": entry.envelope_excerpt_json,
+            "truncated": entry.truncated,
+            "replayable": entry.replayable,
+            "status": entry.status.value,
+            "replayed_ingress_id": entry.replayed_ingress_id,
+            "created_at": canonical_timestamp_key(entry.created_at),
+            "updated_at": canonical_timestamp_key(entry.updated_at),
+            "version": entry.version,
+            "schema_version": entry.schema_version,
+            "expires_at": math.ceil(entry.expires_at.timestamp()),
+        }
+    )
+
+
+def quarantine_entry_from_item(item: Mapping[str, Any]) -> QuarantineEntry:
+    created_at = parse_canonical_timestamp(item["created_at"])
+    observation = item.get("observation_json")
+    return QuarantineEntry(
+        tenant_id=item["tenant_id"],
+        quarantine_id=item["quarantine_id"],
+        kind=item["kind"],
+        reason=item["reason"],
+        ingress_id=item["ingress_id"],
+        replay_of=item.get("replay_of"),
+        integration_account_id=item["integration_account_id"],
+        provider_key=item["provider_key"],
+        external_identity_hash=item["external_identity_hash"],
+        source_type=item["source_type"],
+        connector_version=item.get("connector_version"),
+        device_integration_id=item["device_integration_id"],
+        device_id=item["device_id"],
+        received_at=parse_canonical_timestamp(item["received_at"]),
+        mapping_versions=_versions(item),
+        observation=(
+            None if observation is None else QuarantinedObservation.model_validate_json(observation)
+        ),
+        source_observation_json=item.get("source_observation_json"),
+        envelope_excerpt_json=item.get("envelope_excerpt_json"),
+        truncated=item["truncated"],
+        replayable=item["replayable"],
+        status=item["status"],
+        replayed_ingress_id=item.get("replayed_ingress_id"),
+        created_at=created_at,
+        updated_at=parse_canonical_timestamp(item["updated_at"]),
+        version=item["version"],
+        # The exact deadline; the epoch TTL attribute is rounded up.
+        expires_at=created_at + QUARANTINE_TTL,
+    )
+
+
+def component_ingest_state_to_item(state: ComponentIngestState) -> dict[str, Any]:
+    return _without_none(
+        {
+            **_KEYS.component_ingest_state(state.component_id),
+            "entity_type": "component_ingest_state",
+            "tenant_id": state.tenant_id,
+            "component_id": state.component_id,
+            "device_id": state.device_id,
+            "last_received_at": _timestamp(state.last_received_at),
+            "last_ingested_at": _timestamp(state.last_ingested_at),
+            "last_observed_at": _timestamp(state.last_observed_at),
+            "last_observed_sequence": state.last_observed_sequence,
+        }
+    )
+
+
+def component_ingest_state_from_item(item: Mapping[str, Any]) -> ComponentIngestState:
+    return ComponentIngestState(
+        tenant_id=item["tenant_id"],
+        component_id=item["component_id"],
+        device_id=item["device_id"],
+        last_received_at=_optional_timestamp(item, "last_received_at"),
+        last_ingested_at=_optional_timestamp(item, "last_ingested_at"),
+        last_observed_at=_optional_timestamp(item, "last_observed_at"),
+        last_observed_sequence=item.get("last_observed_sequence"),
+    )
+
+
+def device_ingest_state_to_item(state: DeviceIngestState) -> dict[str, Any]:
+    return _without_none(
+        {
+            **_KEYS.device_ingest_state(state.device_id),
+            "entity_type": "device_ingest_state",
+            "tenant_id": state.tenant_id,
+            "device_id": state.device_id,
+            "last_received_at": _timestamp(state.last_received_at),
+            "last_ingested_at": _timestamp(state.last_ingested_at),
+        }
+    )
+
+
+def device_ingest_state_from_item(item: Mapping[str, Any]) -> DeviceIngestState:
+    return DeviceIngestState(
+        tenant_id=item["tenant_id"],
+        device_id=item["device_id"],
+        last_received_at=_optional_timestamp(item, "last_received_at"),
+        last_ingested_at=_optional_timestamp(item, "last_ingested_at"),
+    )
+
+
+def connector_health_to_item(health: ConnectorHealth) -> dict[str, Any]:
+    return _without_none(
+        {
+            **_KEYS.connector_health(health.integration_account_id),
+            "entity_type": "connector_health",
+            "tenant_id": health.tenant_id,
+            "integration_account_id": health.integration_account_id,
+            "last_received_at": _timestamp(health.last_received_at),
+            "last_accepted_at": _timestamp(health.last_accepted_at),
+            "last_quarantined_at": _timestamp(health.last_quarantined_at),
+            "last_quarantine_reason": health.last_quarantine_reason,
+            "last_fenced_at": _timestamp(health.last_fenced_at),
+            "last_fence_reason": health.last_fence_reason,
+        }
+    )
+
+
+def connector_health_from_item(item: Mapping[str, Any]) -> ConnectorHealth:
+    return ConnectorHealth(
+        tenant_id=item["tenant_id"],
+        integration_account_id=item["integration_account_id"],
+        last_received_at=_optional_timestamp(item, "last_received_at"),
+        last_accepted_at=_optional_timestamp(item, "last_accepted_at"),
+        last_quarantined_at=_optional_timestamp(item, "last_quarantined_at"),
+        last_quarantine_reason=item.get("last_quarantine_reason"),
+        last_fenced_at=_optional_timestamp(item, "last_fenced_at"),
+        last_fence_reason=item.get("last_fence_reason"),
     )
 
 
