@@ -3,6 +3,8 @@ package alertevaluator
 import (
 	"context"
 	"errors"
+	"fmt"
+	"math"
 	"sync"
 	"testing"
 	"time"
@@ -16,6 +18,7 @@ type fakeStore struct {
 	commits    []CommitRequest
 	queryErr   error
 	commitErr  error
+	loadErr    error
 }
 
 func (store *fakeStore) QueryDue(_ context.Context, request DueRequest) (DuePage, error) {
@@ -40,6 +43,9 @@ func (store *fakeStore) Claim(_ context.Context, candidate Candidate, _ LeaseReq
 }
 
 func (store *fakeStore) LoadState(_ context.Context, work Work) (VersionedState, error) {
+	if store.loadErr != nil {
+		return VersionedState{}, store.loadErr
+	}
 	return store.states[work.Rule.RuleID], nil
 }
 
@@ -217,5 +223,157 @@ func TestRunnerEscalatesSystemicWindowFailures(t *testing.T) {
 
 	if summary.ExitCode != ExitFatal || summary.ScopeCompleted || summary.RulesWithError != 3 {
 		t.Fatalf("summary = %#v", summary)
+	}
+}
+
+func runSingleRule(t *testing.T, work func(time.Time) Work, reader WindowReader, state VersionedState) (RunSummary, CommitRequest) {
+	t.Helper()
+	evaluationTime := time.Date(2026, 7, 15, 12, 1, 0, 0, time.UTC)
+	slot := LatestCompleteSlot(evaluationTime, time.Minute, 15*time.Second)
+	rule := work(slot)
+	store := &fakeStore{
+		candidates: []Candidate{{PK: rule.PK, SK: rule.SK, RuleID: rule.Rule.RuleID, Bucket: EvaluationBucket(rule.Rule.TenantID, rule.Rule.RuleID)}},
+		work:       map[string]Work{rule.Rule.RuleID: rule},
+		states:     map[string]VersionedState{rule.Rule.RuleID: state},
+	}
+	summary := (Runner{Store: store, Windows: reader}).Run(context.Background(), runnableConfig(evaluationTime))
+	if len(store.commits) != 1 {
+		t.Fatalf("commits = %#v, summary = %#v", store.commits, summary)
+	}
+	return summary, store.commits[0]
+}
+
+func TestRunnerTreatsSufficientZeroAsPresentAndBreached(t *testing.T) {
+	summary, commit := runSingleRule(t, runnableWork,
+		fakeWindowReader{result: WindowResult{Quality: QualitySufficient, Value: 0}}, VersionedState{})
+
+	value, ok := commit.Evaluation.Value.Get()
+	if !ok || value != 0 || !commit.Evaluation.Breached || commit.Evaluation.Quality != QualitySufficient {
+		t.Fatalf("evaluation = %#v, want present breached 0 for operator < 5", commit.Evaluation)
+	}
+	if commit.Decision.Transition != TransitionOpened || summary.IncidentsFired != 1 {
+		t.Fatalf("present zero did not open: decision = %#v, summary = %#v", commit.Decision, summary)
+	}
+}
+
+func TestRunnerComparesPresentZeroAgainstThreshold(t *testing.T) {
+	work := func(slot time.Time) Work {
+		rule := runnableWork(slot)
+		rule.Rule.Threshold = -1
+		return rule
+	}
+	_, commit := runSingleRule(t, work,
+		fakeWindowReader{result: WindowResult{Quality: QualitySufficient, Value: 0}}, VersionedState{})
+
+	if value, ok := commit.Evaluation.Value.Get(); !ok || value != 0 || commit.Evaluation.Breached {
+		t.Fatalf("evaluation = %#v, want present clean 0 for operator < -1", commit.Evaluation)
+	}
+}
+
+func TestRunnerDropsStaleWindowAggregate(t *testing.T) {
+	active := VersionedState{State: State{Mode: ModeActive, ActiveEventID: "alert_1", ActiveStatus: StatusOpen, LastValue: Measured(4.2)}, Revision: 3}
+	_, commit := runSingleRule(t, runnableWork,
+		fakeWindowReader{result: WindowResult{Quality: QualityStaleData, Value: 9.9}}, active)
+
+	if commit.Evaluation.Value.IsPresent() || commit.Evaluation.Breached || commit.Evaluation.Quality != QualityStaleData {
+		t.Fatalf("stale evaluation = %#v, want absent and not breached", commit.Evaluation)
+	}
+	if commit.Decision.Transition != TransitionNone || commit.Decision.Next.Mode != ModeActive {
+		t.Fatalf("stale evaluation moved the incident: %#v", commit.Decision)
+	}
+	if value, ok := commit.Decision.Next.LastValue.Get(); !ok || value != 4.2 {
+		t.Fatalf("stale evaluation replaced last value: %v", commit.Decision.Next.LastValue)
+	}
+}
+
+func TestRunnerDropsWindowValueOnQueryError(t *testing.T) {
+	reader := fakeWindowReader{result: WindowResult{Quality: QualitySufficient, Value: 7}, err: errors.New("influx timeout")}
+	summary, commit := runSingleRule(t, runnableWork, reader, VersionedState{})
+
+	if commit.Evaluation.Quality != QualityQueryError || commit.Evaluation.Value.IsPresent() || commit.Evaluation.Breached {
+		t.Fatalf("query error evaluation = %#v, want absent query_error", commit.Evaluation)
+	}
+	if commit.Decision.Transition != TransitionNone || summary.RulesWithError != 1 {
+		t.Fatalf("query error decision = %#v, summary = %#v", commit.Decision, summary)
+	}
+}
+
+func TestRunnerDowngradesSufficientWindowWithoutUsableValue(t *testing.T) {
+	// NaN compares as clean for "<", so before the value became optional a NaN
+	// aggregate resolved the active incident.
+	active := VersionedState{State: State{
+		Mode: ModeActive, ActiveEventID: "alert_1", ActiveStatus: StatusOpen,
+		OpeningOutboxes: map[Channel]string{ChannelEmail: "outbox_open_email"}, LastValue: Measured(4.2),
+	}, Revision: 3}
+	for _, invalid := range []float64{math.NaN(), math.Inf(1), math.Inf(-1), 1e200, -1e26, 5e-324} {
+		_, commit := runSingleRule(t, runnableWork,
+			fakeWindowReader{result: WindowResult{Quality: QualitySufficient, Value: invalid}}, active)
+
+		if commit.Evaluation.Quality != QualityInsufficientData || commit.Evaluation.Value.IsPresent() || commit.Evaluation.Breached {
+			t.Fatalf("value %v: evaluation = %#v, want absent insufficient_data", invalid, commit.Evaluation)
+		}
+		if commit.Decision.Transition != TransitionNone || commit.Decision.Next.Mode != ModeActive {
+			t.Fatalf("value %v: decision = %#v, want the active incident untouched", invalid, commit.Decision)
+		}
+		if commit.Decision.Next.LastQuality != QualityInsufficientData {
+			t.Fatalf("value %v: recorded quality = %s", invalid, commit.Decision.Next.LastQuality)
+		}
+	}
+}
+
+type blockingWindowReader struct{}
+
+func (blockingWindowReader) Evaluate(ctx context.Context, _ EvaluationRule, _ WindowSpec) (WindowResult, error) {
+	<-ctx.Done()
+	return WindowResult{Quality: QualitySufficient, Value: 3}, ctx.Err()
+}
+
+func TestRunnerTreatsPerRuleTimeoutAsAbsentQueryError(t *testing.T) {
+	evaluationTime := time.Date(2026, 7, 15, 12, 1, 0, 0, time.UTC)
+	slot := LatestCompleteSlot(evaluationTime, time.Minute, 15*time.Second)
+	work := runnableWork(slot)
+	store := &fakeStore{
+		candidates: []Candidate{{PK: work.PK, SK: work.SK, RuleID: "rule_1", Bucket: EvaluationBucket("tnt_1", "rule_1")}},
+		work:       map[string]Work{"rule_1": work}, states: map[string]VersionedState{},
+	}
+	config := runnableConfig(evaluationTime)
+	config.PerRuleTimeout = 10 * time.Millisecond
+
+	summary := (Runner{Store: store, Windows: blockingWindowReader{}}).Run(context.Background(), config)
+
+	if len(store.commits) != 1 || summary.ErrorCategories["window_query"] != 1 {
+		t.Fatalf("commits = %#v, summary = %#v", store.commits, summary)
+	}
+	evaluation := store.commits[0].Evaluation
+	if evaluation.Quality != QualityQueryError || evaluation.Value.IsPresent() || evaluation.Breached {
+		t.Fatalf("timed out evaluation = %#v, want absent query_error", evaluation)
+	}
+	if store.commits[0].Decision.Transition != TransitionNone {
+		t.Fatalf("timed out decision = %#v", store.commits[0].Decision)
+	}
+}
+
+func TestRunnerReportsUnsupportedStateSchemaSeparately(t *testing.T) {
+	for _, test := range []struct {
+		err          error
+		wantCategory string
+	}{
+		{fmt.Errorf("decode alert evaluation state JSON: %w", ErrUnsupportedStateSchema), "state_schema"},
+		{errors.New("dynamo unavailable"), "state_read"},
+	} {
+		evaluationTime := time.Date(2026, 7, 15, 12, 1, 0, 0, time.UTC)
+		slot := LatestCompleteSlot(evaluationTime, time.Minute, 15*time.Second)
+		work := runnableWork(slot)
+		store := &fakeStore{
+			candidates: []Candidate{{PK: work.PK, SK: work.SK, RuleID: "rule_1", Bucket: EvaluationBucket("tnt_1", "rule_1")}},
+			work:       map[string]Work{"rule_1": work}, loadErr: test.err,
+		}
+
+		summary := (Runner{Store: store, Windows: fakeWindowReader{}}).Run(context.Background(), runnableConfig(evaluationTime))
+
+		if summary.ErrorCategories[test.wantCategory] != 1 || len(summary.ErrorCategories) != 1 ||
+			summary.ExitCode != ExitFatal || len(store.commits) != 0 {
+			t.Fatalf("%v: summary = %#v, commits = %d", test.err, summary, len(store.commits))
+		}
 	}
 }
