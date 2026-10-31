@@ -7,7 +7,8 @@ Device does not own is 404.
 
 from typing import Annotated
 
-from fastapi import APIRouter, Depends, HTTPException, Request
+from fastapi import APIRouter, Depends, HTTPException, Path, Request
+from pydantic import AfterValidator
 
 from limnopulse_api.api.dependencies import require_tenant_role
 from limnopulse_api.api.ingestion_dependencies import get_integration_lifecycle_repository
@@ -27,6 +28,7 @@ from limnopulse_api.api.v2.schemas.integrations import (
 from limnopulse_api.core.errors import ConflictError, NotFoundError
 from limnopulse_api.domain.alerts import AuditContext
 from limnopulse_api.domain.entities import TenantAccess
+from limnopulse_api.domain.ids import require_canonical_id
 from limnopulse_api.domain.integrations import DeviceIntegrationStatus, IntegrationAccountStatus
 from limnopulse_api.domain.roles import WRITE_ROLES
 from limnopulse_api.repositories.ingestion import IntegrationLifecycleRepository
@@ -38,6 +40,13 @@ router = APIRouter(
     route_class=_RedactedValidationRoute,
 )
 
+# Canonical ids only: a malformed id (e.g. one containing `#`) is a redacted 422, never a key error.
+IntegrationAccountPathId = Annotated[
+    str, Path(), AfterValidator(lambda value: require_canonical_id(value, "ia"))
+]
+DeviceIntegrationPathId = Annotated[
+    str, Path(), AfterValidator(lambda value: require_canonical_id(value, "di"))
+]
 TenantWriterDep = Annotated[TenantAccess, Depends(require_tenant_role(*tuple(WRITE_ROLES)))]
 LifecycleRepositoryDep = Annotated[
     IntegrationLifecycleRepository, Depends(get_integration_lifecycle_repository)
@@ -66,7 +75,7 @@ def _http_error(exc: NotFoundError | ConflictError) -> HTTPException:
 )
 async def transition_integration_account(
     tenant_id: str,
-    integration_account_id: str,
+    integration_account_id: IntegrationAccountPathId,
     payload: V2IntegrationAccountStatusUpdate,
     request: Request,
     repository: LifecycleRepositoryDep,
@@ -95,7 +104,7 @@ async def transition_integration_account(
 async def transition_device_integration(
     tenant_id: str,
     device_id: DevicePathId,
-    device_integration_id: str,
+    device_integration_id: DeviceIntegrationPathId,
     payload: V2DeviceIntegrationStatusUpdate,
     request: Request,
     repository: LifecycleRepositoryDep,

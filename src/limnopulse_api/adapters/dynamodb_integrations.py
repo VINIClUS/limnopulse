@@ -459,5 +459,5 @@ class DynamoIntegrationRepository(DynamoV2RepositoryBase):
         return {
             "TableName": audit_table,
             "Item": self.serialize_item(item),
-            "ConditionExpression": "attribute_not_exists(PK)",
+            "ConditionExpression": "attribute_not_exists(PK) AND attribute_not_exists(SK)",
         }
