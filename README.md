@@ -237,7 +237,7 @@ Local rehearsal (the no-Docker runners `scripts/dev/run_local_elasticmq.sh`, `ru
 docker compose up -d elasticmq dynamodb-local influxdb
 python scripts/dev/init_dynamodb.py && python scripts/dev/seed_local.py
 python -m scripts.migrations.m1_backfill_default_site_assets --tenant tnt_local_001 --apply
-API_V2_ENABLED=true python scripts/dev/seed_ingest_local.py   # prints an ingest token once
+python scripts/dev/seed_ingest_local.py   # prints an ingest token once
 API_V2_ENABLED=true TELEMETRY_V2_WRITE_ENABLED=true INGEST_V2_ENABLED=true \
   SQS_TELEMETRY_INGRESS_QUEUE_URL=http://localhost:9324/000000000000/limnopulse-telemetry-ingress \
   uvicorn limnopulse_api.main:app --reload
@@ -245,6 +245,8 @@ docker compose --profile ingestion up telemetry-ingest-worker
 ```
 
 `scripts/dev/seed_ingest_local.py` creates an active `https_direct` IntegrationAccount and an active DeviceIntegration for `local-device-001`, issues an ingest credential and prints its token to stdout once; nothing is stored in the repository. Keep `INGEST_V2_ENABLED=false` in a local `.env` when running the test suite.
+
+The worker uses `restart: on-failure:5` in production, which may leave it stopped after a Docker daemon restart or host reboot, and the default deploy (`up -d` without `--profile ingestion`) does not recreate it with a new `IMAGE_TAG`. Once ingestion is enabled, start it again after a reboot and redeploy it with the profile so the API (producer) and worker (consumer) run the same image. The queue-age alarm covers a stopped worker.
 
 **Rollback:** unset `INGEST_V2_ENABLED` (restart the API) and stop the `ingestion` profile. Queued messages stay in the queue and the DLQ until the worker runs again. The rollout sequence, owner flips and drills are in the [P3 ingestion rollout runbook](docs/p3-ingestion-rollout-runbook.md) (added by P3-11).
 

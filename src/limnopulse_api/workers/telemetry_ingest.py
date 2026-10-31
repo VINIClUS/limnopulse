@@ -5,7 +5,8 @@ override; no new image). It has its own composition, never `create_app`, so the 
 cache client is never built, and it runs as the dedicated `telemetry_ingest` principal.
 
 - **Start guard.** `main()` exits 2 unless `TELEMETRY_V2_WRITE_ENABLED=true` and
-  `SQS_TELEMETRY_INGRESS_QUEUE_URL` is set: a worker that cannot write must never delete.
+  `SQS_TELEMETRY_INGRESS_QUEUE_URL` is set: a worker that cannot write must never delete. Outside
+  local/test it also exits 2 when its own AWS keys or InfluxDB write token are empty.
 - **Shutdown.** SIGTERM and SIGINT set the loop's `stop`; the P3-08 loop drains in-flight
   messages for `TELEMETRY_INGEST_DRAIN_SECONDS`.
 - **Timeouts.** botocore connect and read timeouts stay finite, because the drain waits for an
@@ -16,6 +17,7 @@ Log lines carry closed categories only, never a setting value or an exception me
 
 import asyncio
 import logging
+import os
 import signal
 import sys
 from collections.abc import Callable
@@ -53,6 +55,9 @@ _CONNECT_TIMEOUT_SECONDS = 10
 _DYNAMODB_READ_TIMEOUT_SECONDS = 30
 # Added to the long-poll wait, so an idle receive returns well before the read times out.
 _SQS_READ_TIMEOUT_MARGIN_SECONDS = 20
+# Standard mode retries throttling and transient errors with a bounded number of attempts, so
+# one hung call cannot hold the drain past the compose stop grace (A47).
+_RETRIES = {"mode": "standard", "max_attempts": 3}
 _LOCAL_ENVIRONMENTS = {"local", "test"}
 
 
@@ -89,7 +94,9 @@ def build_worker(
         "dynamodb",
         **dynamodb_client_kwargs(settings),
         config=Config(
-            connect_timeout=_CONNECT_TIMEOUT_SECONDS, read_timeout=_DYNAMODB_READ_TIMEOUT_SECONDS
+            connect_timeout=_CONNECT_TIMEOUT_SECONDS,
+            read_timeout=_DYNAMODB_READ_TIMEOUT_SECONDS,
+            retries=_RETRIES,
         ),
     )
     sqs = client_factory(
@@ -99,6 +106,7 @@ def build_worker(
             connect_timeout=_CONNECT_TIMEOUT_SECONDS,
             read_timeout=settings.telemetry_ingest_worker_wait_seconds
             + _SQS_READ_TIMEOUT_MARGIN_SECONDS,
+            retries=_RETRIES,
         ),
     )
     influxdb = influx_client_factory(
@@ -163,7 +171,11 @@ def build_worker(
 
 
 async def _run(settings: Settings) -> int:
-    worker = build_worker(settings)
+    try:
+        worker = build_worker(settings)
+    except Exception as error:  # noqa: BLE001 - by category only, never the message
+        logger.error("telemetry ingest worker could not be composed (%s)", type(error).__name__)
+        return 1
     stop = asyncio.Event()
     loop = asyncio.get_running_loop()
     signals = (signal.SIGTERM, signal.SIGINT)
@@ -182,6 +194,16 @@ async def _run(settings: Settings) -> int:
     return 0
 
 
+def _has_own_credentials(settings: Settings) -> bool:
+    return all(
+        (
+            os.environ.get("AWS_ACCESS_KEY_ID", "").strip(),
+            os.environ.get("AWS_SECRET_ACCESS_KEY", "").strip(),
+            settings.influxdb_token.strip(),
+        )
+    )
+
+
 def main() -> int:
     logging.basicConfig(level=logging.INFO, format="%(message)s")
     try:
@@ -198,6 +220,14 @@ def main() -> int:
     if not settings.sqs_telemetry_ingress_queue_url:
         logger.error(
             "telemetry ingest worker refused to start: SQS_TELEMETRY_INGRESS_QUEUE_URL is empty"
+        )
+        return EXIT_REFUSED
+    if settings.app_env not in _LOCAL_ENVIRONMENTS and not _has_own_credentials(settings):
+        # Compose interpolates a missing variable to "": fail fast rather than poll forever
+        # with NoCredentialsError while the API keeps answering 202.
+        logger.error(
+            "telemetry ingest worker refused to start: its AWS credentials or InfluxDB write "
+            "token are empty"
         )
         return EXIT_REFUSED
     return asyncio.run(_run(settings))

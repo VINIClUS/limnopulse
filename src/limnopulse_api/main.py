@@ -2,6 +2,7 @@ from contextlib import asynccontextmanager
 
 import boto3
 import redis.asyncio as redis
+from botocore.config import Config
 from botocore.exceptions import BotoCoreError, ClientError
 from fastapi import FastAPI
 from fastapi.exceptions import RequestValidationError
@@ -54,6 +55,11 @@ from limnopulse_api.workers.telemetry_ingest import sqs_client_kwargs
 __all__ = ["app", "create_app", "sqs_client_kwargs"]
 
 
+_INGRESS_SQS_CONFIG = Config(
+    connect_timeout=5, read_timeout=10, retries={"mode": "standard", "max_attempts": 3}
+)
+
+
 def _dynamodb_client_kwargs(settings: Settings) -> dict[str, str]:
     kwargs: dict[str, str] = {"region_name": settings.aws_region}
     if settings.dynamodb_endpoint_url is not None:
@@ -82,7 +88,8 @@ def _wire_ingestion(app: FastAPI, settings: Settings, dynamodb_client: object) -
     integrations = DynamoIntegrationRepository(table, dynamodb_client)
     devices = DynamoDeviceComponentRepository(table, dynamodb_client)
     limiters = ingress_rate_limiters(settings)
-    sqs_client = boto3.client("sqs", **sqs_client_kwargs(settings))
+    # Fail fast during an SQS brownout: admission answers 503 instead of holding the request.
+    sqs_client = boto3.client("sqs", **sqs_client_kwargs(settings), config=_INGRESS_SQS_CONFIG)
     app.state.ingest_credential_repository = credentials
     app.state.connector_authenticator = IngestCredentialAuthenticator(
         credentials=credentials, integrations=integrations
