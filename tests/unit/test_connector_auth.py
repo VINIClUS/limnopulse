@@ -5,6 +5,8 @@ not an active HTTPS account, all authenticate to `None` (401). Store failures pr
 """
 
 import hmac
+import logging
+import secrets
 from typing import Any
 
 import pytest
@@ -17,6 +19,7 @@ from limnopulse_api.domain.ingestion import (
 )
 from limnopulse_api.domain.integrations import IntegrationAccount, IntegrationAccountStatus
 from limnopulse_api.repositories.ingestion import ConnectorAuthenticator
+from limnopulse_api.services import connector_auth
 from limnopulse_api.services.connector_auth import IngestCredentialAuthenticator
 from tests.support.ingestion_contract_kits import (
     ACCOUNT,
@@ -84,10 +87,15 @@ def compare_calls(monkeypatch: pytest.MonkeyPatch) -> list[tuple[Any, Any]]:
     original = hmac.compare_digest
 
     def spy(a: Any, b: Any) -> bool:
-        calls.append((a, b))
+        calls.append(tuple(x.decode() if isinstance(x, bytes) else x for x in (a, b)))
         return original(a, b)
 
+    # Patched where an implementation may bind it: the `hmac` module, `secrets`, or a
+    # `from hmac import compare_digest` in the authenticator module.
     monkeypatch.setattr(hmac, "compare_digest", spy)
+    monkeypatch.setattr(secrets, "compare_digest", spy)
+    if hasattr(connector_auth, "compare_digest"):
+        monkeypatch.setattr(connector_auth, "compare_digest", spy)
     return calls
 
 
@@ -168,6 +176,8 @@ async def test_unknown_credential_performs_one_dummy_comparison(compare_calls: l
 
     assert subject.credentials.reads == [OTHER_CREDENTIAL]
     assert len(compare_calls) == 1
+    # The presented secret is still hashed, so unknown ids cost the same as known ones.
+    assert ingest_secret_sha256(SECRET) in compare_calls[0]
     assert subject.integrations.reads == []
 
 
@@ -179,7 +189,7 @@ async def test_digests_are_compared_in_constant_time(compare_calls: list) -> Non
 
     digest = ingest_secret_sha256(SECRET)
     assert len(compare_calls) == 1
-    assert sorted(map(str, compare_calls[0])) == [digest, digest]
+    assert list(compare_calls[0]) == [digest, digest]
 
 
 @pytest.mark.asyncio
@@ -189,7 +199,7 @@ async def test_digest_mismatch_is_rejected(compare_calls: list) -> None:
     assert await subject.authenticator.authenticate(ingest_token(CREDENTIAL, "B" * 43)) is None
 
     assert len(compare_calls) == 1
-    assert credential().secret_sha256 in map(str, compare_calls[0])
+    assert credential().secret_sha256 in compare_calls[0]
     assert subject.integrations.reads == []
 
 
@@ -272,3 +282,21 @@ async def test_account_store_failure_propagates() -> None:
         await subject.authenticator.authenticate(TOKEN)
 
     assert exc_info.value is error
+
+
+@pytest.mark.asyncio
+async def test_authentication_never_logs_the_token_secret_or_digest(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    subject = await _seeded()
+    caplog.set_level(logging.DEBUG)
+
+    for token in (
+        TOKEN,
+        ingest_token(CREDENTIAL, "B" * 43),
+        ingest_token(OTHER_CREDENTIAL, SECRET),
+    ):
+        await subject.authenticator.authenticate(token)
+
+    for secret_material in (SECRET, TOKEN, ingest_secret_sha256(SECRET), "B" * 43):
+        assert secret_material not in caplog.text

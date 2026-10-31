@@ -6,13 +6,14 @@ items can be inspected directly.
 """
 
 import json
+import logging
 import re
 from datetime import UTC, datetime
 from typing import Any
 
 import pytest
 from boto3.dynamodb.types import TypeDeserializer, TypeSerializer
-from botocore.exceptions import BotoCoreError, ClientError
+from botocore.exceptions import BotoCoreError, ClientError, EndpointConnectionError
 from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse
 from fastapi.testclient import TestClient
@@ -194,6 +195,7 @@ def test_member_and_viewer_are_forbidden_on_every_route(role: str) -> None:
 
     assert [response.status_code for response in responses] == [403, 403, 403]
     assert api.dynamo.transactions == []
+    assert api.dynamo.reads == []  # the role check runs before any store access
 
 
 @pytest.mark.parametrize("role", ["owner", "admin"])
@@ -216,6 +218,7 @@ def test_non_member_tenant_is_forbidden() -> None:
 
     assert response.status_code == 403
     assert api.dynamo.transactions == []
+    assert api.dynamo.reads == []
 
 
 # Issuance ------------------------------------------------------------------------------------
@@ -378,6 +381,7 @@ def test_issue_ignores_a_request_body_and_never_echoes_it() -> None:
 
     response = api.client.post(CREDENTIALS, json={"token": SENTINEL, "secret": SENTINEL})
 
+    assert response.status_code == 201
     assert SENTINEL not in response.text
     assert SENTINEL not in api.written()
 
@@ -513,20 +517,91 @@ def test_bad_path_ids_are_rejected_without_echo(path: str) -> None:
 
     response = api.client.post(path, json={"expected_version": 1})
 
-    assert response.status_code in (404, 422)
+    # Path ids are validated as canonical ids before any store access.
+    assert response.status_code == 422
     assert SENTINEL not in response.text
     assert api.dynamo.transactions == []
+    assert api.dynamo.reads == []
 
 
-def test_store_failures_are_503_not_404_or_409() -> None:
+@pytest.mark.parametrize(
+    "error",
+    [
+        ClientError({"Error": {"Code": "InternalServerError", "Message": "x"}}, "Dynamo"),
+        EndpointConnectionError(endpoint_url="http://dynamodb.invalid"),
+    ],
+    ids=["client_error", "endpoint_down"],
+)
+@pytest.mark.parametrize("route", ["issue", "list", "revoke"])
+def test_store_failures_are_503_not_404_or_409(route: str, error: Exception) -> None:
     api = Api()
-    api.dynamo.fail_next(
-        "transact_write_items",
-        ClientError(
-            {"Error": {"Code": "InternalServerError", "Message": "x"}}, "TransactWriteItems"
-        ),
-    )
+    credential_id = api.issue().json()["ingest_credential_id"]
+    operation = {"issue": "transact_write_items", "list": "query", "revoke": "transact_write_items"}
+    api.dynamo.fail_next(operation[route], error)
 
-    response = api.issue()
+    response = {
+        "issue": lambda: api.issue(),
+        "list": lambda: api.client.get(CREDENTIALS),
+        "revoke": lambda: api.revoke(credential_id),
+    }[route]()
 
     assert response.status_code == 503
+
+
+def test_issuance_takes_no_idempotency_key_and_writes_no_receipt() -> None:
+    api = Api()
+    headers = {"Idempotency-Key": "issue-credential-01"}
+
+    first = api.client.post(CREDENTIALS, headers=headers)
+    second = api.client.post(CREDENTIALS, headers=headers)
+
+    assert (first.status_code, second.status_code) == (201, 201)
+    assert first.json()["ingest_credential_id"] != second.json()["ingest_credential_id"]
+    assert "issue-credential-01" not in api.written()
+    assert not [i for i in api.items() if "receipt" in str(i.get("entity_type"))]
+
+
+@pytest.mark.parametrize(
+    "status", [IntegrationAccountStatus.REVOKED, IntegrationAccountStatus.ERROR]
+)
+def test_revoke_still_works_once_the_account_is_ineligible(status) -> None:
+    api = Api()
+    credential_id = api.issue().json()["ingest_credential_id"]
+    api.seed_account(Api.account(status=status))
+
+    response = api.revoke(credential_id)
+
+    assert response.status_code == 200
+    assert response.json()["status"] == "revoked"
+
+
+def test_credential_routes_never_log_secret_material(caplog: pytest.LogCaptureFixture) -> None:
+    caplog.set_level(logging.DEBUG)
+    api = Api()
+
+    issued = api.issue().json()
+    api.client.get(CREDENTIALS)
+    api.revoke(issued["ingest_credential_id"])
+    api.revoke(issued["ingest_credential_id"], {"expected_version": 2})
+
+    digest = next(
+        i["secret_sha256"] for i in api.items() if i.get("entity_type") == "ingest_credential"
+    )
+    _, secret = parse_ingest_token(issued["token"])
+    for material in (issued["token"], secret, digest):
+        assert material not in caplog.text
+
+
+def test_listing_is_scoped_to_the_path_account_and_404s_for_a_missing_one() -> None:
+    api = Api("owner", Api.account(), Api.account(integration_account_id=OTHER_ACCOUNT))
+    other = f"/tenants/{TENANT}/integration-accounts/{OTHER_ACCOUNT}/ingest-credentials"
+    mine = api.issue().json()["ingest_credential_id"]
+    api.issue(other)
+
+    listed = api.client.get(CREDENTIALS)
+    missing = api.client.get(
+        f"/tenants/{TENANT}/integration-accounts/{'ia_' + '9' * 32}/ingest-credentials"
+    )
+
+    assert [item["ingest_credential_id"] for item in listed.json()["items"]] == [mine]
+    assert missing.status_code == 404

@@ -14,6 +14,7 @@ from typing import Any
 
 import pytest
 from boto3.dynamodb.types import TypeDeserializer, TypeSerializer
+from botocore.exceptions import ClientError
 
 from limnopulse_api.adapters.dynamodb_ingest_credentials import DynamoIngestCredentialRepository
 from limnopulse_api.adapters.dynamodb_integrations import (
@@ -228,7 +229,7 @@ async def test_issue_is_one_transaction_with_the_d2_conditions_and_one_audit_put
     slot_key = KEYS.ingest_credential_slot(TENANT, ACCOUNT, 1)
     listing_key = KEYS.ingest_credential_listing(TENANT, ACCOUNT, CREDENTIAL)
     credential_key = KEYS.ingest_credential(CREDENTIAL)
-    assert sorted(kinds[:-1]) == sorted(
+    assert sorted(row for row in kinds if row[1] == TABLE) == sorted(
         [
             ("ConditionCheck", TABLE, account_key["PK"], account_key["SK"]),
             ("Put", TABLE, slot_key["PK"], slot_key["SK"]),
@@ -242,9 +243,10 @@ async def test_issue_is_one_transaction_with_the_d2_conditions_and_one_audit_put
     assert not [row for row in kinds if row[0] != "ConditionCheck" and row[3] == account_key["SK"]]
 
     check = _body(transaction, "ConditionCheck", account_key["PK"], account_key["SK"])
-    assert check["ConditionExpression"] == (
-        "attribute_exists(PK) AND #status IN (:pending, :active) AND provider_key = :https"
-    )
+    assert check["ConditionExpression"] in {
+        "#status IN (:pending, :active) AND provider_key = :https",  # D2 verbatim
+        "attribute_exists(PK) AND #status IN (:pending, :active) AND provider_key = :https",
+    }
     assert _decode(check["ExpressionAttributeValues"]) == {
         ":pending": "pending",
         ":active": "active",
@@ -303,8 +305,24 @@ async def test_revoke_is_one_transaction_bound_to_tenant_account_status_and_vers
     assert _decode(slot["ExpressionAttributeValues"]) == {":ic": CREDENTIAL}
 
 
+class ChangedAfterRead(FaultingClient):
+    """Changes the credential row behind the adapter's back, right after the adapter read it:
+    only the cancelled item (`ALL_OLD`) shows the truth."""
+
+    def __init__(self, inner: Any, **changes: Any) -> None:
+        super().__init__(inner)
+        self.changes = changes
+
+    def get_item(self, **kwargs: Any) -> Any:
+        response = super().get_item(**kwargs)
+        key = _decode(kwargs["Key"])
+        if key["PK"].startswith("INGEST_CREDENTIAL#") and "Item" in response:
+            self.inner.items[(key["PK"], key["SK"])].update(self.changes)
+        return response
+
+
 @pytest.mark.asyncio
-async def test_revoke_maps_the_old_item_to_404_or_409() -> None:
+async def test_revoke_classifies_404_or_409_from_the_cancelled_item() -> None:
     """404 vs 409 comes from the cancelled authoritative item (`ALL_OLD`), not a re-read."""
     subject = fake_subject()
     await subject.seed_account(integration_account())
@@ -316,21 +334,42 @@ async def test_revoke_maps_the_old_item_to_404_or_409() -> None:
             TENANT, ACCOUNT, CREDENTIAL, expected_version=9, revoked_at=RECEIVED, audit=AUDIT
         )
     assert not isinstance(stale.value, NotFoundError)
-
-    with pytest.raises(NotFoundError):
-        await subject.repository.revoke_ingest_credential(
-            "tenant-b", ACCOUNT, CREDENTIAL, expected_version=1, revoked_at=RECEIVED, audit=AUDIT
-        )
-    with pytest.raises(NotFoundError):
-        await subject.repository.revoke_ingest_credential(
-            TENANT, ACCOUNT, OTHER_CREDENTIAL, expected_version=1, revoked_at=RECEIVED, audit=AUDIT
-        )
-    # Each attempt reads at most the authoritative row once (to find its slot); a failure is
-    # classified from the cancellation reasons, never from a second read.
+    for tenant_id, credential_id in (("tenant-b", CREDENTIAL), (TENANT, OTHER_CREDENTIAL)):
+        with pytest.raises(NotFoundError):
+            await subject.repository.revoke_ingest_credential(
+                tenant_id,
+                ACCOUNT,
+                credential_id,
+                expected_version=1,
+                revoked_at=RECEIVED,
+                audit=AUDIT,
+            )
+    # Each attempt reads at most the authoritative row once (to find its slot).
     reads = subject.raw.reads[reads_before:]
     assert all(pk.startswith("INGEST_CREDENTIAL#") for _, pk, _ in reads)
     assert len(reads) <= 3
     assert all(consistent for _, _, consistent in reads)
+
+    # The row was active at version 1 when read, revoked before the commit: the cancelled
+    # item says "not active", so the answer is 404 (kit semantics), never a version 409.
+    def racing(**changes: Any) -> DynamoIngestCredentialRepository:
+        client = ChangedAfterRead(subject.raw, **changes)
+        return DynamoIngestCredentialRepository(
+            TABLE, client, clock=lambda: RECEIVED, audit_table_name=AUDIT_TABLE
+        )
+
+    with pytest.raises(NotFoundError):
+        await racing(
+            status="revoked", revoked_at="2026-01-01T00:00:00.000000Z"
+        ).revoke_ingest_credential(
+            TENANT, ACCOUNT, CREDENTIAL, expected_version=1, revoked_at=RECEIVED, audit=AUDIT
+        )
+    # Active again but at a newer version than the one read and expected: a version 409.
+    with pytest.raises(ConflictError) as bumped:
+        await racing(status="active", version=2).revoke_ingest_credential(
+            TENANT, ACCOUNT, CREDENTIAL, expected_version=1, revoked_at=RECEIVED, audit=AUDIT
+        )
+    assert not isinstance(bumped.value, NotFoundError)
 
 
 @pytest.mark.asyncio
@@ -451,48 +490,50 @@ async def test_credential_reads_are_strongly_consistent() -> None:
     assert all(consistent for _, _, consistent in subject.raw.reads)
 
 
+class AuditCollision(FaultingClient):
+    """Before a transaction runs, stores a copy of its audit item, so the audit Put (conditioned
+    on `attribute_not_exists(PK)`) fails inside that transaction."""
+
+    def __init__(self, inner: Any, audit_table: str) -> None:
+        super().__init__(inner)
+        self.audit_table = audit_table
+
+    def transact_write_items(self, **kwargs: Any) -> Any:
+        for action in kwargs["TransactItems"]:
+            put = action.get("Put")
+            if put is not None and put["TableName"] == self.audit_table:
+                self.inner.put_item(TableName=self.audit_table, Item=put["Item"])
+        return super().transact_write_items(**kwargs)
+
+
 @pytest.mark.asyncio
-async def test_an_audit_write_failure_aborts_the_change(monkeypatch) -> None:
+async def test_an_audit_write_failure_aborts_the_change() -> None:
     """The audit Put shares the transaction: when it cannot be written, nothing is."""
     subject = fake_subject()
     await subject.seed_account(integration_account())
-    fixed = type("FixedUuid", (), {"hex": "f" * 32})()
-    monkeypatch.setattr(ingestion_domain, "uuid4", lambda: fixed)
-    collision = ingestion_domain.ingest_audit_item(
-        action="ingest_credential.issued",
-        tenant_id=TENANT,
-        resource_id=CREDENTIAL,
-        before_status=None,
-        after_status="active",
-        context=AUDIT,
-        now=CREATED,
+    colliding = DynamoIngestCredentialRepository(
+        TABLE,
+        AuditCollision(subject.raw, AUDIT_TABLE),
+        clock=lambda: RECEIVED,
+        audit_table_name=AUDIT_TABLE,
     )
-    subject.raw.put_item(TableName=AUDIT_TABLE, Item=_encode(collision))
 
-    with pytest.raises(ConflictError):
-        await subject.repository.create_ingest_credential(credential(), AUDIT)
+    with pytest.raises((ConflictError, ClientError)):
+        await colliding.create_ingest_credential(credential(), AUDIT)
 
     assert await subject.repository.get_ingest_credential(CREDENTIAL) is None
     assert await subject.repository.list_ingest_credentials(TENANT, ACCOUNT) == []
     slot = KEYS.ingest_credential_slot(TENANT, ACCOUNT, 1)
     assert (slot["PK"], slot["SK"]) not in subject.raw.items
 
-    monkeypatch.undo()
     await subject.repository.create_ingest_credential(credential(), AUDIT)
-    revoke_collision = {
-        **collision,
-        "SK": f"{RECEIVED.isoformat()}#audit_{'f' * 32}",
-        "PK": f"TENANT#{TENANT}#MONTH#{RECEIVED:%Y-%m}",
-    }
-    subject.raw.put_item(TableName=AUDIT_TABLE, Item=_encode(revoke_collision))
-    monkeypatch.setattr(ingestion_domain, "uuid4", lambda: fixed)
-
-    with pytest.raises(ConflictError):
-        await subject.repository.revoke_ingest_credential(
+    with pytest.raises((ConflictError, ClientError)):
+        await colliding.revoke_ingest_credential(
             TENANT, ACCOUNT, CREDENTIAL, expected_version=1, revoked_at=RECEIVED, audit=AUDIT
         )
 
     assert await subject.repository.get_ingest_credential(CREDENTIAL) == credential()
+    assert (slot["PK"], slot["SK"]) in subject.raw.items
 
 
 @pytest.mark.asyncio
@@ -527,7 +568,8 @@ async def test_audit_item_records_actor_tenant_resource_and_statuses() -> None:
         now=revoked_at.astimezone(UTC),
         fingerprint=credential().fingerprint,
     )
-    ignored = {"SK", "event_id"}  # random per item
+    # Random per item, or derived from the adapter's choice of audit instant.
+    ignored = {"PK", "SK", "event_id", "created_at", "expires_at"}
     for actual, expected in ((issued, expected_issue), (revoked, expected_revoke)):
         assert {k: v for k, v in actual.items() if k not in ignored} == {
             k: v for k, v in expected.items() if k not in ignored

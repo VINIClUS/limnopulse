@@ -200,10 +200,20 @@ async def test_pending_account_may_issue() -> None:
 async def test_missing_or_foreign_account_is_not_found() -> None:
     harness = Harness(integration_account(tenant_id=OTHER_TENANT))
 
+    creates: list[IngestCredential] = []
+
+    class Recording(FakeIngestCredentialRepository):
+        async def create_ingest_credential(self, credential, audit):
+            creates.append(credential)
+            return await super().create_ingest_credential(credential, audit)
+
+    harness.service = harness.make_service(Recording(harness.store))
+
     with pytest.raises(NotFoundError):
         await harness.issue()
     with pytest.raises(NotFoundError):
         await harness.issue(account_id=OTHER_ACCOUNT)
+    assert creates == []  # the service checks the account itself before writing
     assert harness.store.credentials == {}
 
 
@@ -232,19 +242,26 @@ async def test_concurrent_issues_for_one_free_slot_have_exactly_one_winner() -> 
     harness = Harness(integration_account())
     await harness.issue()  # slot 1 taken; slot 2 is the one free slot
     barrier = asyncio.Barrier(2)
+    lists = 0
 
     class RacingRepository(FakeIngestCredentialRepository):
         async def list_ingest_credentials(self, tenant_id: str, integration_account_id: str):
+            nonlocal lists
             listed = await super().list_ingest_credentials(tenant_id, integration_account_id)
-            await barrier.wait()  # both callers read before either writes
+            lists += 1
+            if lists <= 2:
+                await barrier.wait()  # both first reads happen before either write
             return listed
 
     racing = harness.make_service(RacingRepository(harness.store))
 
-    results = await asyncio.gather(
-        racing.issue(TENANT, ACCOUNT, audit=AUDIT),
-        racing.issue(TENANT, ACCOUNT, audit=AUDIT),
-        return_exceptions=True,
+    results = await asyncio.wait_for(
+        asyncio.gather(
+            racing.issue(TENANT, ACCOUNT, audit=AUDIT),
+            racing.issue(TENANT, ACCOUNT, audit=AUDIT),
+            return_exceptions=True,
+        ),
+        timeout=5,
     )
 
     winners = [result for result in results if isinstance(result, IssuedIngestCredential)]
@@ -342,6 +359,21 @@ async def test_cross_tenant_or_cross_account_revoke_is_not_found_and_changes_not
 
     assert harness.store.credentials[victim_id].tenant_id == OTHER_TENANT
     assert [item["tenant_id"] for item in harness.store.audit] == [OTHER_TENANT, OTHER_TENANT]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "status", [IntegrationAccountStatus.REVOKED, IntegrationAccountStatus.ERROR]
+)
+async def test_revoke_still_works_once_the_account_is_ineligible(status) -> None:
+    """Operators must be able to clean up credentials of a revoked or failing account."""
+    harness = Harness(integration_account())
+    issued = await harness.issue()
+    harness.store.accounts[(TENANT, ACCOUNT)] = integration_account(status=status)
+
+    revoked = await harness.revoke(issued.credential.ingest_credential_id)
+
+    assert revoked.status == IngestCredentialStatus.REVOKED
 
 
 @pytest.mark.asyncio
