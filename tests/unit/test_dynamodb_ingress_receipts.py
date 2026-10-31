@@ -7,6 +7,7 @@ is strongly consistent, the claim uses the single liveness predicate on `created
 `mark_enqueued` is a conditional update that never touches another request's receipt.
 """
 
+import re
 from collections.abc import Callable
 from datetime import timedelta
 from typing import Any
@@ -38,7 +39,6 @@ from tests.support.ingestion_dynamo_fake import IngestionDynamoClient
 
 TABLE = "LimnopulseDomain"
 KEYS = DynamoV2KeyBuilder()
-CLAIM_CONDITION = "attribute_not_exists(PK) OR #created_at_us <= :cutoff_us"
 
 # Port operation -> the boto3 operation the adapter performs for it (the fault point).
 _BOTO_OPERATION = {
@@ -46,6 +46,24 @@ _BOTO_OPERATION = {
     "claim_ingress_receipt": "put_item",
     "mark_ingress_receipt_enqueued": "update_item",
 }
+
+
+def resolved_condition(request: dict[str, Any]) -> str:
+    """The condition with every `#name` and `:value` placeholder replaced by what it stands for,
+    so the test checks the meaning, not the adapter's placeholder spelling."""
+    condition = request["ConditionExpression"]
+    names = request.get("ExpressionAttributeNames", {})
+    values = request.get("ExpressionAttributeValues", {})
+    for placeholder in sorted(names, key=len, reverse=True):
+        condition = re.sub(rf"{re.escape(placeholder)}(?![\w])", names[placeholder], condition)
+    for placeholder in sorted(values, key=len, reverse=True):
+        (literal,) = values[placeholder].values()
+        condition = re.sub(rf"{re.escape(placeholder)}(?![\w])", str(literal), condition)
+    return " ".join(condition.split())
+
+
+def conjuncts(condition: str) -> set[str]:
+    return {part.strip().strip("()").strip() for part in condition.split(" AND ")}
 
 
 class RecordingClient:
@@ -125,11 +143,8 @@ async def test_claim_uses_the_single_liveness_predicate(subject: DynamoReceiptSu
     await subject.repository.claim_ingress_receipt(receipt(created_at=now), now=now)
 
     (put,) = subject.calls("put_item")
-    assert put["ConditionExpression"] == CLAIM_CONDITION
-    assert put["ExpressionAttributeNames"] == {"#created_at_us": "created_at_us"}
-    assert put["ExpressionAttributeValues"] == {
-        ":cutoff_us": {"N": str(ingress_receipt_cutoff_us(now))}
-    }
+    cutoff = ingress_receipt_cutoff_us(now)
+    assert resolved_condition(put) == f"attribute_not_exists(PK) OR created_at_us <= {cutoff}"
 
 
 @pytest.mark.asyncio
@@ -165,16 +180,17 @@ async def test_mark_enqueued_is_a_conditional_update(subject: DynamoReceiptSubje
     await subject.repository.mark_ingress_receipt_enqueued(ACCOUNT, KEY_SHA, INGRESS, at=RECEIVED)
 
     (update,) = subject.calls("update_item")
-    assert "ConditionExpression" in update
-    values = update.get("ExpressionAttributeValues", {})
-    assert {"S": INGRESS} in values.values()
-    assert {"S": IngressReceiptState.PENDING.value} in values.values()
+    # An extra `attribute_exists(PK)` guard is allowed; the two frozen conditions are required.
+    assert conjuncts(resolved_condition(update)) - {"attribute_exists(PK)"} == {
+        f"ingress_id = {INGRESS}",
+        f"state = {IngressReceiptState.PENDING.value}",
+    }
     assert len(subject.calls("put_item")) == 1  # the mark is never a blind put
     stored = subject.raw()
     assert stored["state"] == IngressReceiptState.ENQUEUED.value
-    assert {key: value for key, value in stored.items() if key != "state"} == {
-        key: value for key, value in ingress_receipt_to_item(first).items() if key != "state"
-    }
+    for key, value in ingress_receipt_to_item(first).items():
+        if key != "state":
+            assert stored[key] == value, key
 
 
 @pytest.mark.asyncio

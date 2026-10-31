@@ -10,6 +10,7 @@ that records the call order, so each short-circuit is asserted as "nothing calle
 """
 
 import asyncio
+import inspect
 import json
 import logging
 from collections.abc import Callable
@@ -21,10 +22,12 @@ import pytest
 from botocore.exceptions import ClientError, EndpointConnectionError
 
 from limnopulse_api.adapters.dynamodb_v2 import canonical_request_hash, idempotency_key_hash
+from limnopulse_api.core.config import Settings
 from limnopulse_api.core.errors import IngressMessageTooLarge, IngressQueueError
 from limnopulse_api.domain.devices_v2 import DeviceStatus
 from limnopulse_api.domain.ingestion import (
     INGRESS_ENVELOPE_SCHEMA,
+    INGRESS_SCHEMA_ATTRIBUTE_BYTES,
     MAX_INGRESS_MESSAGE_BYTES,
     AuthenticatedSource,
     IngestObservationBatch,
@@ -40,9 +43,11 @@ from limnopulse_api.domain.ingestion import (
 )
 from limnopulse_api.domain.integrations import DeviceIntegrationStatus, IntegrationAccountStatus
 from limnopulse_api.domain.telemetry_v2 import NormalizationVersions
+from limnopulse_api.domain.v2_common import format_utc_timestamp
 from limnopulse_api.repositories.ingestion import IngressEntitlementCheck
 from limnopulse_api.services.ingress_entitlements import AllowDirectIngressEntitlements
 from limnopulse_api.services.ingestion import IngestAccepted, IngestRejected, IngressService
+from limnopulse_api.services.ingress_rate_limit import ingress_rate_limiters
 from tests.support.ingestion_contract_kits import (
     ACCOUNT,
     COMPONENT,
@@ -65,6 +70,7 @@ from tests.support.ingestion_contract_kits import (
     device,
     device_integration,
     entitlement_default_allows,
+    envelope_of_message_bytes,
     integration_account,
     oversized_envelope,
 )
@@ -121,9 +127,10 @@ def store_errors() -> tuple[BaseException, ...]:
 
 
 class Spy:
-    """Forwards every call to `target` and records `(name.method, args, kwargs)` in `log`."""
+    """Forwards every call to `target` and records `(name.method, arguments)` in `log`, with the
+    arguments bound by parameter name, so positional and keyword calls record the same."""
 
-    def __init__(self, name: str, target: Any, log: list[tuple[str, tuple, dict]]) -> None:
+    def __init__(self, name: str, target: Any, log: list[tuple[str, dict[str, Any]]]) -> None:
         self._name = name
         self._target = target
         self._log = log
@@ -133,16 +140,21 @@ class Spy:
         if not callable(value):
             return value
         label = f"{self._name}.{attribute}"
+        signature = inspect.signature(value)
+
+        def record(args: tuple, kwargs: dict) -> None:
+            self._log.append((label, dict(signature.bind(*args, **kwargs).arguments)))
+
         if asyncio.iscoroutinefunction(value):
 
             async def call_async(*args: Any, **kwargs: Any) -> Any:
-                self._log.append((label, args, kwargs))
+                record(args, kwargs)
                 return await value(*args, **kwargs)
 
             return call_async
 
         def call(*args: Any, **kwargs: Any) -> Any:
-            self._log.append((label, args, kwargs))
+            record(args, kwargs)
             return value(*args, **kwargs)
 
         return call
@@ -184,8 +196,9 @@ class Ingress:
         self.store = self.subject.store
         self.queue = self.subject.queue
         self.metrics = RecordingTelemetryMetrics()
-        self.log: list[tuple[str, tuple, dict]] = []
+        self.log: list[tuple[str, dict[str, Any]]] = []
         self.now = RECEIVED
+        self.tick = timedelta(0)  # how far the wall clock advances after each read
         self.mono = 1_000.0
         self.issued: list[str] = []
         receipt_port = receipts(self.subject) if receipts else self.subject.receipts
@@ -202,10 +215,15 @@ class Ingress:
             entitlements=Spy("entitlements", self.subject.entitlements, self.log),
             producer=Spy("producer", self.queue, self.log),
             metrics=self.metrics,
-            clock=lambda: self.now,
+            clock=self._clock,
             monotonic=lambda: self.mono,
             new_ingress_id=self._next_ingress_id,
         )
+
+    def _clock(self) -> datetime:
+        now = self.now
+        self.now = now + self.tick
+        return now
 
     def _next_ingress_id(self) -> str:
         ingress_id = f"ing_{len(self.issued) + 1:032x}"
@@ -221,10 +239,10 @@ class Ingress:
             await self.subject.seed_component(item)
 
     def calls(self) -> list[str]:
-        return [name for name, _, _ in self.log]
+        return [name for name, _ in self.log]
 
-    def calls_of(self, name: str) -> list[tuple[tuple, dict]]:
-        return [(args, kwargs) for label, args, kwargs in self.log if label == name]
+    def calls_of(self, name: str) -> list[dict[str, Any]]:
+        return [arguments for label, arguments in self.log if label == name]
 
     def bodies(self) -> list[dict[str, Any]]:
         return [json.loads(stored["body"]) for stored in self.queue.messages.values()]
@@ -428,10 +446,10 @@ async def test_steps_1_to_4_run_in_order_with_the_injected_monotonic_clock(
         "authenticator.authenticate",
         "account.try_acquire",
     ]
-    assert ingress.calls_of("preauth_global.try_acquire") == [(("*",), {"now": 4_242.5})]
-    assert ingress.calls_of("preauth.try_acquire") == [((CREDENTIAL,), {"now": 4_242.5})]
-    assert ingress.calls_of("authenticator.authenticate") == [((TOKEN,), {})]
-    assert ingress.calls_of("account.try_acquire") == [((ACCOUNT,), {"now": 4_242.5})]
+    assert ingress.calls_of("preauth_global.try_acquire") == [{"key": "*", "now": 4_242.5}]
+    assert ingress.calls_of("preauth.try_acquire") == [{"key": CREDENTIAL, "now": 4_242.5}]
+    assert ingress.calls_of("authenticator.authenticate") == [{"token": TOKEN}]
+    assert ingress.calls_of("account.try_acquire") == [{"key": ACCOUNT, "now": 4_242.5}]
     assert ingress.outcomes() == []
 
 
@@ -467,7 +485,14 @@ async def test_step2_per_ic_bucket_is_429_before_the_store() -> None:
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
     "case",
-    ["unknown_credential", "wrong_secret", "revoked", "account_revoked", "account_missing"],
+    [
+        "unknown_credential",
+        "wrong_secret",
+        "revoked",
+        "account_revoked",
+        "account_missing",
+        "account_not_https",
+    ],
 )
 async def test_step3_unauthenticated_is_401_before_the_account_bucket(
     ingress: Ingress, case: str
@@ -476,7 +501,8 @@ async def test_step3_unauthenticated_is_401_before_the_account_bucket(
         integration_account(
             status=IntegrationAccountStatus.REVOKED
             if case == "account_revoked"
-            else IntegrationAccountStatus.ACTIVE
+            else IntegrationAccountStatus.ACTIVE,
+            provider_key="vendor_cloud" if case == "account_not_https" else PROVIDER,
         )
     )
     if case == "account_missing":
@@ -537,19 +563,17 @@ async def test_step4_account_bucket_is_429_after_authentication() -> None:
 
 @pytest.mark.asyncio
 async def test_random_credential_ids_cannot_amplify_store_reads() -> None:
-    global_per_minute, per_ic_per_minute = 600, 60
-    ingress = Ingress(
-        preauth_global=InMemoryRateLimiter(
-            capacity=preauth_bucket_capacity(global_per_minute),
-            refill_per_second=global_per_minute / 60,
-            max_keys=10,
-        ),
-        preauth=InMemoryRateLimiter(
-            capacity=preauth_bucket_capacity(per_ic_per_minute),
-            refill_per_second=per_ic_per_minute / 60,
-            max_keys=10_000,
-        ),
+    global_per_minute = 600
+    limiters = ingress_rate_limiters(
+        Settings(
+            _env_file=None,
+            app_env="test",
+            auth_mode="dev",
+            ingest_preauth_global_per_minute=global_per_minute,
+            ingest_preauth_rate_limit_per_minute=60,
+        )
     )
+    ingress = Ingress(preauth_global=limiters.preauth_global, preauth=limiters.preauth)
     reads = 0
     original = ingress.store.get_ingest_credential
 
@@ -567,9 +591,10 @@ async def test_random_credential_ids_cannot_amplify_store_reads() -> None:
             await ingress.service.authenticate(f"Bearer {token}")
         statuses.append(exc_info.value.status_code)
 
-    # Bucket capacity plus one minute of refill bounds the store reads of a whole minute.
+    # The global bucket bounds the store reads of a minute: its burst capacity plus one minute of
+    # refill (the plan's "at most the global limit", with the frozen burst of per_minute // 10).
     bound = preauth_bucket_capacity(global_per_minute) + global_per_minute
-    assert 0 < reads <= bound
+    assert global_per_minute <= reads <= bound
     assert statuses.count(401) == reads
     assert statuses.count(429) == 10_000 - reads
 
@@ -599,9 +624,16 @@ async def test_fresh_request_is_accepted_after_the_send(ingress: Ingress) -> Non
         mapping_versions=NormalizationVersions(),
     )
     assert ingress.calls_of("receipts.mark_ingress_receipt_enqueued") == [
-        ((ACCOUNT, idempotency_key_hash(IDEMPOTENCY_KEY), ingress.issued[0]), {"at": RECEIVED})
+        {
+            "integration_account_id": ACCOUNT,
+            "key_sha256": idempotency_key_hash(IDEMPOTENCY_KEY),
+            "ingress_id": ingress.issued[0],
+            "at": RECEIVED,
+        }
     ]
-    assert ingress.calls_of("entitlements.allows") == [((TENANT, ACCOUNT, 2), {})]
+    assert ingress.calls_of("entitlements.allows") == [
+        {"tenant_id": TENANT, "integration_account_id": ACCOUNT, "observation_count": 2}
+    ]
     assert ingress.outcomes() == ["accepted"]
     assert {
         "metric": "ingest_observations_admitted_total",
@@ -731,6 +763,23 @@ async def test_live_receipt_for_a_different_request_is_409(
 
 
 @pytest.mark.asyncio
+async def test_receipts_are_scoped_to_the_authenticated_account(ingress: Ingress) -> None:
+    await ingress.seed()
+    foreign = stored_receipt(
+        make_batch(), state=IngressReceiptState.ENQUEUED, request_sha256="0" * 64
+    )
+    foreign = foreign.model_copy(update={"integration_account_id": OTHER_ACCOUNT})
+    put_receipt(ingress, foreign)
+
+    accepted = await ingress.admit(make_batch())
+
+    assert accepted.replayed is False
+    assert accepted.ingress_id != foreign.ingress_id
+    assert ingress.receipt() is not None
+    assert ingress.store.receipts[(OTHER_ACCOUNT, foreign.key_sha256)] == foreign
+
+
+@pytest.mark.asyncio
 async def test_pending_same_request_resumes_with_the_stored_values_and_no_claim(
     ingress: Ingress,
 ) -> None:
@@ -757,9 +806,9 @@ async def test_pending_same_request_resumes_with_the_stored_values_and_no_claim(
             mapping_versions=PINNED,
         ).to_json()
     ]
-    assert ingress.calls_of("receipts.mark_ingress_receipt_enqueued")[0][0][2] == pending.ingress_id
+    (mark,) = ingress.calls_of("receipts.mark_ingress_receipt_enqueued")
+    assert mark["ingress_id"] == pending.ingress_id
     assert ingress.receipt() == pending.model_copy(update={"state": IngressReceiptState.ENQUEUED})
-    assert ingress.issued == []
     assert ingress.outcomes() == ["replayed"]
 
 
@@ -779,7 +828,9 @@ async def test_pending_retry_with_a_fresh_denial_is_403_and_sends_nothing(
 
     assert_rejected(exc_info, FORBIDDEN)
     assert ingress.raw_bodies() == []
+    assert "receipts.claim_ingress_receipt" not in ingress.calls()
     assert ingress.receipt() == pending
+    assert ingress.outcomes() == ["forbidden"]
 
 
 @pytest.mark.asyncio
@@ -814,27 +865,44 @@ async def test_failed_send_leaves_the_receipt_pending_and_the_retry_keeps_receiv
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("retryable", [True, False])
-async def test_any_queue_error_is_503_never_202(ingress: Ingress, retryable: bool) -> None:
+@pytest.mark.parametrize(
+    "error",
+    [
+        IngressQueueError("down", retryable=True),
+        IngressQueueError("down", retryable=False),
+        IngressMessageTooLarge("too large"),
+        store_errors()[0],
+        store_errors()[1],
+        RuntimeError("boom"),
+    ],
+    ids=["retryable", "permanent", "too_large", "client_error", "endpoint", "unexpected"],
+)
+async def test_any_send_failure_is_503_never_202(ingress: Ingress, error: BaseException) -> None:
     await ingress.seed()
-    ingress.subject.fail_next("send", IngressQueueError("down", retryable=retryable))
+    ingress.subject.fail_next("send", error)
 
     with pytest.raises(IngestRejected) as exc_info:
         await ingress.admit()
 
     assert_rejected(exc_info, UNAVAILABLE)
     assert "receipts.mark_ingress_receipt_enqueued" not in ingress.calls()
+    assert ingress.raw_bodies() == []
+    assert ingress.receipt().state == IngressReceiptState.PENDING
+    assert ingress.outcomes() == ["unavailable"]
 
 
 @pytest.mark.asyncio
 async def test_mark_failure_after_a_send_is_still_202_and_the_retry_resends_the_same_ids(
-    ingress: Ingress,
+    ingress: Ingress, caplog: pytest.LogCaptureFixture
 ) -> None:
+    caplog.set_level(logging.DEBUG)
     await ingress.seed()
     batch = make_batch()
     ingress.subject.fail_next("mark_ingress_receipt_enqueued", store_errors()[0])
 
     first = await ingress.admit(batch)
+
+    assert any(record.levelno >= logging.WARNING for record in caplog.records)
 
     assert first == IngestAccepted(
         ingress_id=ingress.issued[0], accepted_observations=2, replayed=False
@@ -851,7 +919,6 @@ async def test_mark_failure_after_a_send_is_still_202_and_the_retry_resends_the_
     expected = expected_envelope(batch, ingress_id=first.ingress_id, received_at=RECEIVED)
     assert ingress.raw_bodies() == [expected.to_json(), expected.to_json()]
     assert ingress.receipt().state == IngressReceiptState.ENQUEUED
-    assert ingress.issued == [first.ingress_id]
 
 
 @pytest.mark.asyncio
@@ -870,17 +937,22 @@ async def test_logical_expiry_uses_one_predicate_at_steps_8_and_13(ingress: Ingr
         await ingress.admit(batch)
     assert_rejected(exc_info, CONFLICT)
 
-    # At exactly created_at + 24 h it is expired at step 8 AND claimable at step 13.
+    # At exactly created_at + 24 h it is expired at step 8 AND claimable at step 13, judged at
+    # one request instant even though the wall clock keeps moving.
     ingress.log.clear()
     ingress.now = RECEIVED
+    ingress.tick = timedelta(microseconds=1)
     accepted = await ingress.admit(batch)
 
     assert accepted == IngestAccepted(
-        ingress_id=ingress.issued[0], accepted_observations=2, replayed=False
+        ingress_id=ingress.issued[-1], accepted_observations=2, replayed=False
     )
-    assert ingress.calls().count("receipts.claim_ingress_receipt") == 1
-    assert ingress.receipt().ingress_id == ingress.issued[0]
-    assert ingress.receipt().created_at == RECEIVED
+    (claim,) = ingress.calls_of("receipts.claim_ingress_receipt")
+    assert claim["now"] == RECEIVED
+    assert claim["receipt"].created_at == RECEIVED
+    assert claim["receipt"].received_at == RECEIVED
+    assert ingress.receipt().ingress_id == accepted.ingress_id
+    assert ingress.bodies()[0]["received_at"] == "2026-10-30T12:00:00.000000Z"
 
 
 @pytest.mark.asyncio
@@ -889,17 +961,29 @@ async def test_expired_same_request_is_admitted_again_with_a_new_received_at(
 ) -> None:
     await ingress.seed()
     batch = make_batch()
-    put_receipt(
-        ingress,
-        stored_receipt(
-            batch, state=IngressReceiptState.PENDING, created_at=RECEIVED - timedelta(hours=24)
-        ),
+    pending = stored_receipt(
+        batch, state=IngressReceiptState.PENDING, created_at=RECEIVED - timedelta(hours=24)
     )
 
+    # One microsecond before expiry the pending receipt is resumed with its own values.
+    put_receipt(ingress, pending)
+    ingress.now = RECEIVED - timedelta(microseconds=1)
+    resumed = await ingress.admit(batch)
+    assert resumed == IngestAccepted(
+        ingress_id=pending.ingress_id, accepted_observations=2, replayed=True
+    )
+    assert "receipts.claim_ingress_receipt" not in ingress.calls()
+
+    # At exactly 24 h the same request is a fresh admission with a new id and received_at.
+    put_receipt(ingress, pending)
+    ingress.queue.messages.clear()
+    ingress.log.clear()
+    ingress.now = RECEIVED
     accepted = await ingress.admit(batch)
 
     assert accepted.replayed is False
-    assert accepted.ingress_id == ingress.issued[0]
+    assert accepted.ingress_id != pending.ingress_id
+    assert ingress.calls().count("receipts.claim_ingress_receipt") == 1
     assert ingress.bodies()[0]["received_at"] == "2026-10-30T12:00:00.000000Z"
     assert ingress.bodies()[0]["mapping_versions"] == NormalizationVersions().model_dump(
         mode="json"
@@ -907,22 +991,31 @@ async def test_expired_same_request_is_admitted_again_with_a_new_received_at(
 
 
 class RacingReceipts:
-    """Step 8 sees no receipt; every claim then returns `winners` in order (a lost race)."""
+    """Step 8 sees no receipt; every claim then loses to `winners` in order: the winner is
+    stored and returned, and any later read sees it too (a lost race)."""
 
     def __init__(self, inner: FakeIngressReceiptRepository, winners: list[IngressReceipt]):
         self.inner = inner
         self.winners = list(winners)
+        self.reads = 0
 
     async def get_ingress_receipt(self, integration_account_id: str, key_sha256: str) -> Any:
-        return None
+        self.reads += 1
+        if self.reads == 1:
+            return None
+        return self.inner.store.receipts.get((integration_account_id, key_sha256))
 
     async def claim_ingress_receipt(self, receipt: IngressReceipt, *, now: datetime) -> Any:
         winner = self.winners.pop(0) if self.winners else receipt
         self.inner.store.receipts[(winner.integration_account_id, winner.key_sha256)] = winner
         return winner
 
-    async def mark_ingress_receipt_enqueued(self, *args: Any, **kwargs: Any) -> None:
-        await self.inner.mark_ingress_receipt_enqueued(*args, **kwargs)
+    async def mark_ingress_receipt_enqueued(
+        self, integration_account_id: str, key_sha256: str, ingress_id: str, *, at: datetime
+    ) -> None:
+        await self.inner.mark_ingress_receipt_enqueued(
+            integration_account_id, key_sha256, ingress_id, at=at
+        )
 
 
 def racing(*winners: IngressReceipt) -> Ingress:
@@ -932,7 +1025,8 @@ def racing(*winners: IngressReceipt) -> Ingress:
 @pytest.mark.asyncio
 async def test_claim_race_lost_to_a_pending_same_request_uses_the_winners_values() -> None:
     batch = make_batch()
-    winner = stored_receipt(batch, state=IngressReceiptState.PENDING, created_at=RECEIVED)
+    winner_received = RECEIVED - timedelta(minutes=7)
+    winner = stored_receipt(batch, state=IngressReceiptState.PENDING, created_at=winner_received)
     ingress = racing(winner)
     await ingress.seed()
 
@@ -943,9 +1037,16 @@ async def test_claim_race_lost_to_a_pending_same_request_uses_the_winners_values
     )
     assert ingress.calls().count("receipts.claim_ingress_receipt") == 1
     assert ingress.raw_bodies() == [
-        expected_envelope(batch, ingress_id=winner.ingress_id, mapping_versions=PINNED).to_json()
+        expected_envelope(
+            batch,
+            ingress_id=winner.ingress_id,
+            received_at=winner_received,
+            mapping_versions=PINNED,
+        ).to_json()
     ]
-    assert ingress.calls_of("receipts.mark_ingress_receipt_enqueued")[0][0][2] == winner.ingress_id
+    (mark,) = ingress.calls_of("receipts.mark_ingress_receipt_enqueued")
+    assert mark["ingress_id"] == winner.ingress_id
+    assert ingress.outcomes() == ["replayed"]
 
 
 @pytest.mark.asyncio
@@ -962,6 +1063,7 @@ async def test_claim_race_lost_to_an_enqueued_same_request_replays() -> None:
     )
     assert ingress.raw_bodies() == []
     assert "receipts.mark_ingress_receipt_enqueued" not in ingress.calls()
+    assert ingress.outcomes() == ["replayed"]
 
 
 @pytest.mark.asyncio
@@ -978,6 +1080,7 @@ async def test_claim_race_lost_to_a_different_request_is_409() -> None:
 
     assert_rejected(exc_info, CONFLICT)
     assert ingress.raw_bodies() == []
+    assert ingress.outcomes() == ["conflict"]
 
 
 @pytest.mark.asyncio
@@ -995,14 +1098,17 @@ async def test_claim_race_lost_twice_is_503_without_a_loop() -> None:
     assert_rejected(exc_info, UNAVAILABLE)
     assert ingress.calls().count("receipts.claim_ingress_receipt") == 2
     assert ingress.raw_bodies() == []
+    assert ingress.outcomes() == ["unavailable"]
 
 
 class BarrierReceipts:
-    """Holds every step-8 read until `parties` requests have read, so they race to claim."""
+    """Holds every step-8 read until `parties` requests have read, and every claim until all
+    have claimed, so the loser sees a still-pending winner."""
 
     def __init__(self, inner: FakeIngressReceiptRepository, parties: int) -> None:
         self.inner = inner
         self.barrier = asyncio.Barrier(parties)
+        self.after_claim = asyncio.Barrier(parties)
 
     async def get_ingress_receipt(self, integration_account_id: str, key_sha256: str) -> Any:
         found = await self.inner.get_ingress_receipt(integration_account_id, key_sha256)
@@ -1010,15 +1116,22 @@ class BarrierReceipts:
         return found
 
     async def claim_ingress_receipt(self, receipt: IngressReceipt, *, now: datetime) -> Any:
-        return await self.inner.claim_ingress_receipt(receipt, now=now)
+        winner = await self.inner.claim_ingress_receipt(receipt, now=now)
+        await self.after_claim.wait()  # both claim before either sends
+        return winner
 
-    async def mark_ingress_receipt_enqueued(self, *args: Any, **kwargs: Any) -> None:
-        await self.inner.mark_ingress_receipt_enqueued(*args, **kwargs)
+    async def mark_ingress_receipt_enqueued(
+        self, integration_account_id: str, key_sha256: str, ingress_id: str, *, at: datetime
+    ) -> None:
+        await self.inner.mark_ingress_receipt_enqueued(
+            integration_account_id, key_sha256, ingress_id, at=at
+        )
 
 
 @pytest.mark.asyncio
 async def test_two_concurrent_same_key_requests_share_one_ingress_id() -> None:
     ingress = Ingress(receipts=lambda s: BarrierReceipts(s.receipts, 2))
+    ingress.tick = timedelta(milliseconds=3)  # each request reads a different instant
     await ingress.seed()
     batch = make_batch()
 
@@ -1028,14 +1141,18 @@ async def test_two_concurrent_same_key_requests_share_one_ingress_id() -> None:
 
     assert first.ingress_id == second.ingress_id
     assert sorted([first.replayed, second.replayed]) == [False, True]
-    assert ingress.calls().count("receipts.get_ingress_receipt") == 2
+    assert ingress.calls().count("receipts.get_ingress_receipt") >= 2
     assert len(ingress.store.receipts) == 1
+    assert ingress.calls().count("receipts.claim_ingress_receipt") == 2
+    winner = ingress.receipt()
     bodies = ingress.bodies()
-    assert 1 <= len(bodies) <= 2
+    assert len(bodies) == 2  # the loser resumes the pending winner: a safe duplicate
     assert {(body["ingress_id"], body["received_at"]) for body in bodies} == {
-        (first.ingress_id, "2026-10-30T12:00:00.000000Z")
+        (winner.ingress_id, format_utc_timestamp(winner.received_at))
     }
-    assert ingress.receipt().state == IngressReceiptState.ENQUEUED
+    assert first.ingress_id == winner.ingress_id
+    assert winner.state == IngressReceiptState.ENQUEUED
+    assert sorted(ingress.outcomes()) == ["accepted", "replayed"]
 
 
 # Steps 9-12: admission, components, entitlement and the size guard --------------------------
@@ -1158,20 +1275,51 @@ async def test_step11_entitlement_denial_is_403_before_the_claim(ingress: Ingres
 
 
 class PaddingMapping:
-    """Admits like the fake, then pads the resolved observations past the queue size guard."""
+    """Admits like the fake, then replaces the resolved observations with `padded`."""
 
-    def __init__(self, inner: FakeTrustedMapping) -> None:
+    def __init__(self, inner: FakeTrustedMapping, padded: IngressEnvelope) -> None:
         self.inner = inner
+        self.padded = padded
 
     async def admit(self, source: AuthenticatedSource, batch: IngestObservationBatch) -> Any:
         admission = await self.inner.admit(source, batch)
         assert isinstance(admission, IngressAdmission)
-        return admission.model_copy(update={"observations": oversized_envelope().observations})
+        return admission.model_copy(update={"observations": self.padded.observations})
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("message_bytes", "accepted"),
+    [
+        (MAX_INGRESS_MESSAGE_BYTES, True),
+        (MAX_INGRESS_MESSAGE_BYTES + 1, False),
+        # The body alone fits; only the schema attribute bytes push it over the guard.
+        (MAX_INGRESS_MESSAGE_BYTES + INGRESS_SCHEMA_ATTRIBUTE_BYTES - 1, False),
+    ],
+    ids=["exact", "one_over", "attribute_bytes_count"],
+)
+async def test_step12_size_guard_counts_utf8_body_and_attribute_bytes(
+    message_bytes: int, accepted: bool
+) -> None:
+    padded = envelope_of_message_bytes(message_bytes)
+    ingress = Ingress(mapping=lambda s: PaddingMapping(s.mapping, padded))
+    await ingress.seed()
+
+    if accepted:
+        await ingress.admit(connector_version=None)
+        (raw,) = ingress.raw_bodies()
+        assert len(raw.encode("utf-8")) + INGRESS_SCHEMA_ATTRIBUTE_BYTES == message_bytes
+        return
+    with pytest.raises(IngestRejected) as exc_info:
+        await ingress.admit(connector_version=None)
+    assert_rejected(exc_info, TOO_LARGE)
+    assert ingress.store.receipts == {}
+    assert ingress.raw_bodies() == []
 
 
 @pytest.mark.asyncio
 async def test_step12_size_guard_is_413_before_the_claim_and_leaves_no_receipt() -> None:
-    ingress = Ingress(mapping=lambda s: PaddingMapping(s.mapping))
+    ingress = Ingress(mapping=lambda s: PaddingMapping(s.mapping, oversized_envelope()))
     await ingress.seed()
     assert ingress_message_bytes(oversized_envelope()) > MAX_INGRESS_MESSAGE_BYTES
 
@@ -1187,18 +1335,6 @@ async def test_step12_size_guard_is_413_before_the_claim_and_leaves_no_receipt()
     assert ingress.store.receipts == {}
     assert ingress.raw_bodies() == []
     assert ingress.outcomes() == ["too_large"]
-
-
-@pytest.mark.asyncio
-async def test_a_producer_size_refusal_is_413_never_202(ingress: Ingress) -> None:
-    await ingress.seed()
-    ingress.subject.fail_next("send", IngressMessageTooLarge("too large"))
-
-    with pytest.raises(IngestRejected) as exc_info:
-        await ingress.admit()
-
-    assert_rejected(exc_info, TOO_LARGE)
-    assert ingress.raw_bodies() == []
 
 
 # Store failures and G1 -------------------------------------------------------------------
@@ -1296,6 +1432,8 @@ async def test_logs_metrics_bodies_and_receipts_never_carry_secrets_or_raw_ids(
         "key": IDEMPOTENCY_KEY,
         "other_key": OTHER_KEY,
         "external_device_id": EXTERNAL_DEVICE,
+        "digest": credential().secret_sha256,
+        "fingerprint": credential().fingerprint,
     }
     for surface, text in surfaces.items():
         for name, secret in secrets.items():
@@ -1313,16 +1451,3 @@ async def test_allow_direct_ingress_entitlements_allows_everything() -> None:
     assert isinstance(Subject.check, IngressEntitlementCheck)
     await entitlement_default_allows(Subject())
     assert await Subject.check.allows(TENANT, ACCOUNT, 0) is True
-
-
-def test_service_rejection_carries_the_fixed_fields() -> None:
-    rejection = IngestRejected(
-        429, "rate limited", outcome="rate_limited", headers={"Retry-After": "1"}
-    )
-
-    assert (rejection.status_code, rejection.detail, rejection.outcome) == (
-        429,
-        "rate limited",
-        "rate_limited",
-    )
-    assert rejection.headers == {"Retry-After": "1"}

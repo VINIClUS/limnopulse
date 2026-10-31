@@ -238,9 +238,16 @@ def test_router_declares_no_body_or_header_parameters() -> None:
     ]
 
     assert endpoint.methods == {"POST"}
-    assert endpoint.dependant.body_params == []
-    assert endpoint.dependant.header_params == []
-    assert endpoint.dependant.query_params == []
+    assert endpoint.body_field is None
+    pending, seen = [endpoint.dependant], 0
+    while pending:  # the endpoint and every sub-dependency
+        dependant = pending.pop()
+        seen += 1
+        assert dependant.body_params == []
+        assert dependant.header_params == []
+        assert dependant.query_params == []
+        pending.extend(dependant.dependencies)
+    assert seen >= 1
 
 
 def test_router_stays_unmounted() -> None:
@@ -464,14 +471,56 @@ async def test_step5_accepted_media_types(route: Route, overrides: dict[str, str
 @pytest.mark.asyncio
 async def test_step5_runs_after_authentication(route: Route) -> None:
     await route.seed()
+    unknown = ingest_token("ic_" + "f" * 32, SECRET)  # passes the grammar, fails step 3
 
     response = await post(
         route.app,
         encode(payload()),
-        header_map=headers(authorization="Bearer nope", content_type="text/plain"),
+        header_map=headers(authorization=f"Bearer {unknown}", content_type="text/plain"),
     )
 
     assert response.status == 401
+
+
+@pytest.mark.asyncio
+async def test_step5_runs_after_the_account_bucket(route: Route) -> None:
+    await route.seed()
+    route.app.state.ingress_rate_limiter = FixedLimiter(1.0)
+
+    response = await post(
+        route.app, encode(payload()), header_map=headers(content_type="text/plain")
+    )
+
+    assert response.status == 429
+
+
+@pytest.mark.asyncio
+async def test_step5_runs_before_the_size_check(route: Route) -> None:
+    await route.seed()
+
+    response = await post(
+        route.app,
+        encode(payload()),
+        header_map=headers(content_type="text/plain"),
+        content_length=str(MAX_INGEST_BODY_BYTES + 1),
+    )
+
+    assert response.status == 415
+    assert response.bytes_read == 0
+
+
+@pytest.mark.asyncio
+async def test_step6_runs_before_header_validation(route: Route) -> None:
+    await route.seed()
+
+    response = await post(
+        route.app,
+        encode(payload()),
+        header_map=headers(idempotency_key=None),
+        content_length=str(MAX_INGEST_BODY_BYTES + 1),
+    )
+
+    assert response.status == 413
 
 
 # Step 6: bounded body ---------------------------------------------------------------------
@@ -702,6 +751,47 @@ async def test_step7_header_bounds_are_inclusive(
     assert body.get("connector_version") == version
 
 
+@pytest.mark.asyncio
+async def test_step7_more_than_1000_observations_is_a_422(route: Route) -> None:
+    await route.seed()
+    valid = reading(0, component_id=None)
+    body = {"external_device_id": EXTERNAL_DEVICE, "observations": [valid] * 1_001}
+    raw = json.dumps(body, separators=(",", ":")).encode()
+    assert len(raw) <= MAX_INGEST_BODY_BYTES
+
+    response = await post(route.app, raw)
+
+    assert response.json() == {
+        "detail": [{"loc": ["body", "observations"], "msg": "invalid value", "type": "too_long"}]
+    }
+
+
+@pytest.mark.asyncio
+async def test_step7_runs_before_the_receipt_lookup(route: Route) -> None:
+    await route.seed()
+    await post(route.app, encode(payload()))
+
+    response = await post(route.app, encode(payload(reading(0, value="bad"))))
+
+    _assert_redacted_422(response)
+
+
+@pytest.mark.asyncio
+async def test_the_request_hash_is_canonical(route: Route) -> None:
+    await route.seed()
+    first = await post(route.app, encode(payload()))
+    document = payload()
+    reordered = {
+        "observations": [dict(reversed(list(item.items()))) for item in document["observations"]],
+        "external_device_id": document["external_device_id"],
+    }
+
+    again = await post(route.app, json.dumps(reordered, indent=2).encode())
+
+    assert again.status == 202
+    assert again.json() == {**first.json(), "replayed": True}
+
+
 # Steps 9-14 over the route ----------------------------------------------------------------
 
 
@@ -778,6 +868,34 @@ async def test_store_failures_after_the_body_are_503(route: Route, operation: st
     assert route.bodies() == []
 
 
+@pytest.mark.asyncio
+async def test_a_mark_failure_after_the_send_is_still_202(route: Route) -> None:
+    await route.seed()
+    route.subject.fail_next(
+        "mark_ingress_receipt_enqueued",
+        ClientError({"Error": {"Code": "InternalServerError", "Message": "x"}}, "UpdateItem"),
+    )
+
+    response = await post(route.app, encode(payload()))
+
+    assert response.status == 202
+    assert response.json()["replayed"] is False
+    assert len(route.bodies()) == 1
+
+
+@pytest.mark.asyncio
+async def test_a_raw_store_error_from_the_send_is_503(route: Route) -> None:
+    await route.seed()
+    route.subject.fail_next(
+        "send", ClientError({"Error": {"Code": "InternalError", "Message": "x"}}, "SendMessage")
+    )
+
+    response = await post(route.app, encode(payload()))
+
+    assert (response.status, response.json()) == (503, {"detail": "service unavailable"})
+    assert route.bodies() == []
+
+
 # Redaction -------------------------------------------------------------------------------
 
 
@@ -797,5 +915,15 @@ async def test_route_logs_and_metrics_never_carry_secrets(
     await post(route.app, encode(payload()), header_map=headers(authorization=f"Bearer {TOKEN}x"))
 
     text = caplog.text + json.dumps(route.metrics.records)
-    for secret in (TOKEN, SECRET, KEY, "other-key-SENTINEL", "third-key-SENTINEL", EXTERNAL_DEVICE):
+    secrets = (
+        TOKEN,
+        SECRET,
+        KEY,
+        "other-key-SENTINEL",
+        "third-key-SENTINEL",
+        EXTERNAL_DEVICE,
+        credential().secret_sha256,
+        credential().fingerprint,
+    )
+    for secret in secrets:
         assert secret not in text
