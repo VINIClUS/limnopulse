@@ -137,14 +137,16 @@ func (store Store) LoadState(ctx context.Context, work alertevaluator.Work) (ale
 	if err := attributevalue.UnmarshalMap(output.Item, &item); err != nil {
 		return alertevaluator.VersionedState{}, fmt.Errorf("decode alert evaluation state: %w", err)
 	}
-	var state alertevaluator.State
-	if err := json.Unmarshal([]byte(item.StateJSON), &state); err != nil {
+	state, err := decodeStateJSON(item.StateJSON)
+	if err != nil {
 		return alertevaluator.VersionedState{}, fmt.Errorf("decode alert evaluation state JSON: %w", err)
 	}
 	return alertevaluator.VersionedState{State: state, Revision: item.Revision}, nil
 }
 
 func (store Store) Commit(ctx context.Context, request alertevaluator.CommitRequest) error {
+	// The items and the idempotency token describe the same normalized evaluation.
+	request.Evaluation = request.Evaluation.Normalized()
 	items, err := store.commitItems(request)
 	if err != nil {
 		return err
@@ -163,6 +165,7 @@ func (store Store) Commit(ctx context.Context, request alertevaluator.CommitRequ
 }
 
 func (store Store) commitItems(request alertevaluator.CommitRequest) ([]types.TransactWriteItem, error) {
+	request.Evaluation = request.Evaluation.Normalized()
 	ruleUpdate, err := store.ruleScheduleUpdate(request)
 	if err != nil {
 		return nil, err
@@ -226,8 +229,8 @@ func (store Store) ruleScheduleUpdate(request alertevaluator.CommitRequest) (*ty
 		":epoch": request.Work.LeaseEpoch, ":true": true, ":active": "active",
 	}
 	updateExpression := "SET #next_due = :next_due, #gsi_sk = :gsi_sk, #last_slot = :slot, #last_quality = :quality"
-	if request.Evaluation.Quality == alertevaluator.QualitySufficient {
-		valueMap[":value"] = request.Evaluation.Value
+	if value, ok := determinateValue(request.Evaluation); ok {
+		valueMap[":value"] = value
 		updateExpression += ", #last_value = :value REMOVE #lease_owner, #lease_expires"
 	} else {
 		updateExpression += " REMOVE #last_value, #lease_owner, #lease_expires"
@@ -250,7 +253,7 @@ func (store Store) ruleScheduleUpdate(request alertevaluator.CommitRequest) (*ty
 }
 
 func (store Store) statePut(request alertevaluator.CommitRequest) (*types.Put, error) {
-	stateJSON, err := json.Marshal(request.Decision.Next)
+	stateJSON, err := encodeStateJSON(request.Decision.Next)
 	if err != nil {
 		return nil, fmt.Errorf("encode alert state: %w", err)
 	}
@@ -258,7 +261,7 @@ func (store Store) statePut(request alertevaluator.CommitRequest) (*types.Put, e
 		"PK": request.Work.PK, "SK": stateSortKey(request.Work.Rule.RuleID),
 		"entity_type": "alert_evaluation_state", "tenant_id": request.Work.Rule.TenantID,
 		"rule_id": request.Work.Rule.RuleID, "state_revision": request.PreviousState.Revision + 1,
-		"state_json": string(stateJSON), "updated_at": alertevaluator.FixedUTCTimestamp(request.Slot),
+		"state_json": stateJSON, "updated_at": alertevaluator.FixedUTCTimestamp(request.Slot),
 	})
 	if err != nil {
 		return nil, err
@@ -276,6 +279,10 @@ func (store Store) statePut(request alertevaluator.CommitRequest) (*types.Put, e
 }
 
 func (store Store) eventPut(request alertevaluator.CommitRequest) (*types.Put, error) {
+	value, ok := determinateValue(request.Evaluation)
+	if !ok {
+		return nil, fmt.Errorf("open alert event without a determinate evaluation value")
+	}
 	status := request.Decision.Next.ActiveStatus
 	item, err := attributevalue.MarshalMap(map[string]any{
 		"PK": request.Work.PK, "SK": eventSortKey(request.Decision.EventID), "entity_type": "alert_event",
@@ -291,7 +298,7 @@ func (store Store) eventPut(request alertevaluator.CommitRequest) (*types.Put, e
 		"confirmed_open_window_end": alertevaluator.FixedUTCTimestamp(request.Slot),
 		"window_start":              alertevaluator.FixedUTCTimestamp(request.Slot.Add(-request.Work.Rule.Window)),
 		"window_end":                alertevaluator.FixedUTCTimestamp(request.Slot), "last_evaluated_at": alertevaluator.FixedUTCTimestamp(request.Slot),
-		"last_evaluation_quality": string(request.Evaluation.Quality), "last_evaluation_value": request.Evaluation.Value,
+		"last_evaluation_quality": string(request.Evaluation.Quality), "last_evaluation_value": value,
 		"suppression_source_event_id": request.Decision.Next.SuppressionSourceEventID,
 		"GSI2PK":                      request.Work.PK + "#ALERT_EVENTS",
 		"GSI2SK":                      alertevaluator.FixedUTCTimestamp(request.Slot) + "#EVENT#" + request.Decision.EventID,
@@ -339,8 +346,8 @@ func (store Store) outboxPut(request alertevaluator.CommitRequest, outbox alerte
 		"evaluation_window_end":   alertevaluator.FixedUTCTimestamp(request.Slot),
 		"evaluated_at":            alertevaluator.FixedUTCTimestamp(request.Slot),
 	}
-	if request.Evaluation.Quality == alertevaluator.QualitySufficient {
-		values["evaluation_value"] = request.Evaluation.Value
+	if value, ok := determinateValue(request.Evaluation); ok {
+		values["evaluation_value"] = value
 	}
 	if outbox.Channel == alertevaluator.ChannelEmail ||
 		(outbox.Channel == alertevaluator.ChannelTelegram && store.TelegramDeliveryEnabled) {
@@ -381,7 +388,7 @@ func (store Store) outboxPut(request alertevaluator.CommitRequest, outbox alerte
 }
 
 func (store Store) eventMetadataUpdate(request alertevaluator.CommitRequest) (*types.Update, error) {
-	if request.Evaluation.Quality == alertevaluator.QualitySufficient {
+	if request.Evaluation.IsDeterminate() {
 		return store.activeEventUpdate(request, activeEventMetadataWithValue)
 	}
 	return store.activeEventUpdate(request, activeEventMetadataWithoutValue)
@@ -410,17 +417,21 @@ func (store Store) activeEventUpdate(request alertevaluator.CommitRequest, kind 
 		"#status": "status", "#last_at": "last_evaluated_at",
 		"#last_quality": "last_evaluation_quality", "#last_value": "last_evaluation_value",
 	}
+	value, determinate := determinateValue(request.Evaluation)
+	if !determinate && kind != activeEventMetadataWithoutValue {
+		return nil, fmt.Errorf("update alert event value without a determinate evaluation")
+	}
 	var expression string
 	switch kind {
 	case activeEventMetadataWithValue:
 		expression = "SET #last_at = :slot, #last_quality = :quality, #last_value = :value"
-		valueMap[":value"] = request.Evaluation.Value
+		valueMap[":value"] = value
 	case activeEventMetadataWithoutValue:
 		expression = "SET #last_at = :slot, #last_quality = :quality REMOVE #last_value"
 	case activeEventResolution:
 		eventID = request.Decision.ResolvedEventID
 		expression = "SET #status = :resolved, #resolved_at = :slot, #updated_at = :slot, #version = #version + :one, #last_at = :slot, #last_quality = :quality, #last_value = :value REMOVE #gsi3pk, #gsi3sk"
-		valueMap[":value"] = request.Evaluation.Value
+		valueMap[":value"] = value
 		valueMap[":resolved"] = "resolved"
 		valueMap[":one"] = int64(1)
 		names["#resolved_at"] = "resolved_at"
@@ -441,6 +452,15 @@ func (store Store) activeEventUpdate(request alertevaluator.CommitRequest, kind 
 		ConditionExpression:      aws.String("#status IN (:open, :acknowledged, :suppressed)"),
 		ExpressionAttributeNames: names, ExpressionAttributeValues: values,
 	}, nil
+}
+
+// determinateValue returns the value to persist for an evaluation. Absent
+// values are never written: callers omit or REMOVE the attribute instead.
+func determinateValue(evaluation alertevaluator.Evaluation) (float64, bool) {
+	if !evaluation.IsDeterminate() {
+		return 0, false
+	}
+	return evaluation.Value.Get()
 }
 
 func addActiveAlertIndex(item map[string]types.AttributeValue, tenantID, eventID string, openedAt time.Time) (map[string]types.AttributeValue, error) {

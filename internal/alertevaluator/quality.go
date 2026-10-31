@@ -34,6 +34,9 @@ type WindowSpec struct {
 	Aggregation            Aggregation
 }
 
+// WindowResult describes one evaluation window. Value is the raw aggregate,
+// meaningful only when Quality is sufficient (stale windows fill it too); read
+// the evaluation value through Measurement.
 type WindowResult struct {
 	Quality                 Quality
 	Value                   float64
@@ -100,7 +103,7 @@ func EvaluateSamples(spec WindowSpec, samples []Sample) WindowResult {
 		return result
 	}
 	value, ok := aggregateSamples(spec, canonical, values)
-	if !ok {
+	if !ok || !Measured(value).IsPresent() {
 		return result
 	}
 	result.Value = value
@@ -110,6 +113,15 @@ func EvaluateSamples(spec WindowSpec, samples []Sample) WindowResult {
 	}
 	result.Quality = QualitySufficient
 	return result
+}
+
+// Measurement returns the window value only when the window is sufficient and
+// the value is a valid measurement.
+func (result WindowResult) Measurement() Measurement {
+	if result.Quality != QualitySufficient {
+		return Measurement{}
+	}
+	return Measured(result.Value)
 }
 
 func aggregateSamples(spec WindowSpec, canonical map[sampleKey]Sample, values []Sample) (float64, bool) {

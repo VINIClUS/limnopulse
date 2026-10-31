@@ -80,8 +80,29 @@ type Evaluation struct {
 	Slot        time.Time
 	Quality     Quality
 	Breached    bool
-	Value       float64
+	Value       Measurement
 	MissedSlots int
+}
+
+// IsDeterminate reports whether the evaluation may move an incident: its
+// quality is sufficient and it carries a value.
+func (evaluation Evaluation) IsDeterminate() bool {
+	return evaluation.Quality == QualitySufficient && evaluation.Value.IsPresent()
+}
+
+// Normalized makes quality and value agree: a sufficient evaluation without a
+// value becomes insufficient, and an indeterminate evaluation carries neither a
+// value nor a breach.
+func (evaluation Evaluation) Normalized() Evaluation {
+	if evaluation.IsDeterminate() {
+		return evaluation
+	}
+	if evaluation.Quality == QualitySufficient {
+		evaluation.Quality = QualityInsufficientData
+	}
+	evaluation.Value = Measurement{}
+	evaluation.Breached = false
+	return evaluation
 }
 
 type State struct {
@@ -91,7 +112,7 @@ type State struct {
 	LastBreachSlot           time.Time
 	LastEvaluatedSlot        time.Time
 	LastQuality              Quality
-	LastValue                float64
+	LastValue                Measurement
 	ActiveEventID            string
 	ActiveStatus             EventStatus
 	ActiveOpenedAt           time.Time
@@ -118,6 +139,7 @@ type Decision struct {
 }
 
 func Decide(rule Rule, current State, evaluation Evaluation, cadence time.Duration) Decision {
+	evaluation = evaluation.Normalized()
 	next := cloneState(current)
 	if next.Mode == "" {
 		next.Mode = ModeHealthy
@@ -128,7 +150,7 @@ func Decide(rule Rule, current State, evaluation Evaluation, cadence time.Durati
 	if evaluation.MissedSlots > 0 && next.Mode == ModePending {
 		resetPending(&next)
 	}
-	if evaluation.Quality != QualitySufficient {
+	if !evaluation.IsDeterminate() {
 		return Decision{Next: next, Transition: TransitionNone}
 	}
 	next.LastValue = evaluation.Value
