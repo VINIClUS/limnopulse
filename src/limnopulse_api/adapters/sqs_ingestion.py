@@ -6,10 +6,13 @@ Every boto3 call runs in `asyncio.to_thread`. The D6 size guard counts UTF-8 bod
 a retryable `IngressQueueError`; any failure of delete or a visibility change becomes a permanent
 one (the worker loop logs and counts it). An `IngressQueueError` raised below the client boundary
 passes through as-is, and nothing is retried here because boto3 already retries. Error messages
-never carry the message body.
+never carry the message body. A cancelled delete or visibility change still waits for its
+in-flight call, so a late heartbeat can never land after the worker's final action.
 """
 
 import asyncio
+import contextlib
+from collections.abc import Callable
 from datetime import UTC, datetime, timedelta
 from typing import Any
 
@@ -58,11 +61,16 @@ class SqsIngressQueue:
             )
         except (BotoCoreError, ClientError) as error:
             raise IngressQueueError(_describe("receive", error), retryable=True) from error
-        return [_message(item) for item in response.get("Messages") or []]
+        try:
+            return [_message(item) for item in response.get("Messages") or []]
+        except (KeyError, TypeError, ValueError) as error:
+            raise IngressQueueError(
+                "SQS receive returned a malformed message", retryable=True
+            ) from error
 
     async def delete(self, message: IngressQueueMessage) -> None:
         try:
-            await asyncio.to_thread(
+            await _run_to_completion(
                 self._client.delete_message,
                 QueueUrl=self._queue_url,
                 ReceiptHandle=message.receipt_handle,
@@ -75,7 +83,7 @@ class SqsIngressQueue:
     async def change_visibility(self, message: IngressQueueMessage, seconds: int) -> None:
         timeout = min(max(seconds, 0), MAX_VISIBILITY_SECONDS)
         try:
-            await asyncio.to_thread(
+            await _run_to_completion(
                 self._client.change_message_visibility,
                 QueueUrl=self._queue_url,
                 ReceiptHandle=message.receipt_handle,
@@ -108,6 +116,21 @@ class SqsIngressQueue:
         if not message_id:
             raise IngressQueueError("send returned no message id", retryable=True)
         return str(message_id)
+
+
+async def _run_to_completion(call: Callable[..., Any], /, **kwargs: Any) -> Any:
+    """`asyncio.to_thread`, except that a cancelled caller first waits for the in-flight call.
+
+    The thread cannot be stopped, so without this a cancelled heartbeat could still change the
+    visibility after the caller's final `delete` or `change_visibility` (P3-08 heartbeat rule).
+    """
+    task = asyncio.ensure_future(asyncio.to_thread(call, **kwargs))
+    try:
+        return await asyncio.shield(task)
+    except asyncio.CancelledError:
+        with contextlib.suppress(Exception):
+            await task
+        raise
 
 
 def _message(item: dict[str, Any]) -> IngressQueueMessage:
