@@ -37,6 +37,7 @@ from tests.support.ingestion_contract_kits import (
     device_integration,
     envelope,
     integration_account,
+    source_observation,
 )
 from tests.support.ingestion_dynamo_fake import IngestionDynamoClient
 from tests.support.ingestion_fakes import (
@@ -289,3 +290,18 @@ def test_dynamo_fake_rejects_unused_placeholders_and_logs_consistency() -> None:
     client.get_item(TableName="t", Key=_encode({"PK": "C", "SK": "B"}))
 
     assert client.reads == [("get_item", "A", True), ("get_item", "C", False)]
+
+
+def test_fence_rows_bound_oversized_observations() -> None:
+    # A valid observation can serialize beyond 2048 bytes (StrictInt has no size bound).
+    huge = source_observation(value=10**3000)
+    small = source_observation()
+    fence = IngressFence(reason=IngressFenceReason.ACCOUNT_REVOKED, account_verified=True)
+
+    rows = build_quarantine_entries(envelope(observations=[huge, small]), fence=fence, now=RECEIVED)
+
+    oversized, regular = rows[0], rows[1]
+    assert len(oversized.source_observation_json.encode("utf-8")) <= 2_048
+    assert (oversized.truncated, oversized.replayable) == (True, False)
+    json.loads(oversized.source_observation_json)  # still valid JSON
+    assert (regular.truncated, regular.replayable) == (False, True)

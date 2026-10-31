@@ -29,6 +29,7 @@ from limnopulse_api.domain.integrations import (
     IntegrationAccount,
     IntegrationAccountStatus,
 )
+from limnopulse_api.domain.legacy_telemetry_mapping import bounded_excerpt
 from limnopulse_api.domain.telemetry_v2 import (
     ComponentId,
     IntegrationId,
@@ -756,6 +757,17 @@ def _bounded_prefix(text: str) -> tuple[str, bool]:
     return raw[:MAX_ENVELOPE_EXCERPT_BYTES].decode("utf-8", errors="ignore"), True
 
 
+def _observation_excerpt(observation: SourceObservation) -> tuple[str, bool]:
+    """The compact observation JSON, or (beyond 2048 bytes, e.g. a huge integer value) the
+    bounded P2 excerpt flagged as truncated, which makes the row non-replayable."""
+    payload = _observation_payload(observation)
+    text = _json(payload)
+    if len(text.encode("utf-8")) <= MAX_ENVELOPE_EXCERPT_BYTES:
+        return text, False
+    excerpt, _ = bounded_excerpt(payload)
+    return excerpt, True
+
+
 def build_quarantine_entries(
     envelope: IngressEnvelope,
     *,
@@ -833,12 +845,12 @@ def build_quarantine_entries(
         return tuple(rows)
     reason = f"fenced_{fence.reason.value}"
     for source in envelope.observations:
-        source_json = _json(_observation_payload(source))
+        source_json, truncated = _observation_excerpt(source)
         add(
             QuarantineEntryKind.FENCED_OBSERVATION,
             reason,
             source_json,
-            truncated=False,
+            truncated=truncated,
             source_json=source_json,
         )
     excerpt, truncated = _bounded_prefix(envelope.to_json())
