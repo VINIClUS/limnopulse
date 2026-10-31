@@ -12,8 +12,8 @@ runbook](p2-telemetry-rollout-runbook.md).
 ## Preconditions
 
 - **Release gate.** G1–G15 are green on `main` (see [Acceptance matrix](#acceptance-matrix)):
-  `make verify-python`, `make verify-go` and `make verify-ingestion` against ElasticMQ, DynamoDB
-  Local and InfluxDB 2.7.11. The G7 DLQ drill and the G8 quarantine drill were rehearsed locally on
+  `make verify-python`, `make verify-go`, `make verify-influx` and `make verify-ingestion` against
+  ElasticMQ, DynamoDB Local and InfluxDB 2.7.11. The G7 DLQ drill and the G8 quarantine drill were rehearsed locally on
   real services and are recorded on #103.
 - **Dark by default.** P3 ships dark: with every switch off, the API behaves exactly as before P3, and nothing
   produces canonical telemetry in production (D16). The `/v1` OpenAPI is identical in every switch
@@ -107,11 +107,12 @@ the API-only secrets.
 
 - **The API** additionally needs `INGEST_V2_ENABLED`, `SQS_TELEMETRY_INGRESS_QUEUE_URL` (and
   `SQS_TELEMETRY_INGRESS_DLQ_URL` for operators running the CLIs) in its own `.env`.
-- **`stop_grace_period`.** The worker's `stop_grace_period` (90 s in both compose files) must stay
-  greater than the shutdown budget: drain + wait + 5 s (`TELEMETRY_INGEST_DRAIN_SECONDS` 30 +
-  `TELEMETRY_INGEST_WORKER_WAIT_SECONDS` 20 + 5 s poll grace, more than 55 s at the defaults) plus the
-  in-flight call budget. SIGTERM first finishes the in-flight long poll, then drains; a shorter grace
-  lets Docker's SIGKILL cut the drain short. Change the drain or wait settings and the grace together.
+- **`stop_grace_period`.** The worker's `stop_grace_period` (90 s in both compose files) must exceed
+  drain + wait + 5 s (A47): `TELEMETRY_INGEST_DRAIN_SECONDS` 30 + `TELEMETRY_INGEST_WORKER_WAIT_SECONDS`
+  20 + the 5 s poll grace, more than 55 s at the defaults. SIGTERM first finishes the in-flight long
+  poll, then drains; a shorter grace lets Docker's SIGKILL cut the drain short. Keep some headroom for
+  a boto3 call still in flight (`SHUTDOWN_CALL_BUDGET_SECONDS` in `workers/telemetry_ingest.py`), and
+  change the drain or wait settings and the grace together.
 - **Restart policy.** `restart: on-failure:5` may leave the worker stopped after a reboot, and the
   default deploy (without `--profile ingestion`) does not recreate it. Redeploy it with the profile
   so producer and consumer run the same image; the queue-age alarm covers a stopped worker.
@@ -246,8 +247,10 @@ uv run --locked python scripts/admin/telemetry_quarantine.py dismiss --tenant <t
   summary row, then deleted. The external identity stays claimed (D22): the `EXTERNAL_ID` row keeps
   `status=decommissioned`, so the same external device id cannot be re-claimed in P3.
 - **IntegrationAccount.** Revoking the account fences its queued messages
-  (`fenced_account_revoked`) and new requests get `401`. A suspended Device is a temporary fence: its
-  messages are retried and processed once it is active again, or reach the DLQ.
+  (`fenced_account_revoked`) and new requests get `401`.
+- **Suspended Device.** A Device that is `suspended` or `provisioning` (or a DeviceIntegration or
+  account in `error` or `pending`) is a temporary fence: its messages are retried with backoff and
+  processed once it is active again, or reach the DLQ after `maxReceiveCount`.
 - **DeviceIntegrations created before P3-04 (D22).** Under an `https_direct` account they carry the
   M1 global identity hash, never resolve, and admission fails closed with `403`. Re-create them: create
   a new DeviceIntegration for the device under the account (it gets the account-scoped hash) and
