@@ -218,6 +218,36 @@ It uses the DynamoDB-backed M1 repositories and the configured InfluxDB, and pri
 
 The rollout sequence, release gate, keyed divergence checks and known limitations are in the [P2 telemetry rollout runbook](docs/p2-telemetry-rollout-runbook.md).
 
+## V4 P3 Generic HTTPS Ingestion (ships dark)
+
+P3 adds a generic HTTPS ingress, `POST /ingest/v2/observations`, which authenticates a connector with a per-IntegrationAccount ingest credential, resolves the device through the trusted DeviceIntegration mapping and answers `202` only after a durable write to the telemetry SQS queue. A separate telemetry ingest worker drains that queue into `observation_numeric`. P3 ships dark: every switch defaults off (see `.env.example`), and with all of them off the API behaves exactly as before P3.
+
+| Switch | Default | Effect |
+|---|---|---|
+| `INGEST_V2_ENABLED` | `false` | Mount `POST /ingest/v2/observations`, the three ingest-credential routes and the two integration-lifecycle status routes (owner/admin). Requires `API_V2_ENABLED=true`, `TELEMETRY_V2_WRITE_ENABLED=true` and a non-empty `SQS_TELEMETRY_INGRESS_QUEUE_URL`; the API refuses to start otherwise. |
+| `SQS_TELEMETRY_INGRESS_QUEUE_URL` | empty | The telemetry ingress queue (`limnopulse-telemetry-ingress`); `SQS_ENDPOINT_URL` selects ElasticMQ locally. |
+
+With `API_V2_ENABLED=true` alone the tenant routes stay the 53 M1 routes; `INGEST_V2_ENABLED=true` adds exactly 5 tenant routes plus the non-tenant ingest route. The ingest route has no Cognito or dev user authentication: the ingest credential is its only authority.
+
+**Worker.** The `telemetry-ingest-worker` compose service (profile `ingestion`) runs the API image with the entrypoint `python -m limnopulse_api.workers.telemetry_ingest`. It has its own composition (no optional cache client) and exits 2 unless `TELEMETRY_V2_WRITE_ENABLED=true` and `SQS_TELEMETRY_INGRESS_QUEUE_URL` is set, so it can never delete a message it did not write. SIGTERM drains in-flight messages. In production it runs as the dedicated `telemetry_ingest` IAM user: `TELEMETRY_INGEST_AWS_ACCESS_KEY_ID` / `TELEMETRY_INGEST_AWS_SECRET_ACCESS_KEY` and `TELEMETRY_INGEST_INFLUXDB_TOKEN` are interpolated into its own environment, never the API keys.
+
+Local rehearsal (the no-Docker runners `scripts/dev/run_local_elasticmq.sh`, `run_local_dynamodb.sh` and `run_local_influxd.sh` work too):
+
+```bash
+docker compose up -d elasticmq dynamodb-local influxdb
+python scripts/dev/init_dynamodb.py && python scripts/dev/seed_local.py
+python -m scripts.migrations.m1_backfill_default_site_assets --tenant tnt_local_001 --apply
+API_V2_ENABLED=true python scripts/dev/seed_ingest_local.py   # prints an ingest token once
+API_V2_ENABLED=true TELEMETRY_V2_WRITE_ENABLED=true INGEST_V2_ENABLED=true \
+  SQS_TELEMETRY_INGRESS_QUEUE_URL=http://localhost:9324/000000000000/limnopulse-telemetry-ingress \
+  uvicorn limnopulse_api.main:app --reload
+docker compose --profile ingestion up telemetry-ingest-worker
+```
+
+`scripts/dev/seed_ingest_local.py` creates an active `https_direct` IntegrationAccount and an active DeviceIntegration for `local-device-001`, issues an ingest credential and prints its token to stdout once; nothing is stored in the repository. Keep `INGEST_V2_ENABLED=false` in a local `.env` when running the test suite.
+
+**Rollback:** unset `INGEST_V2_ENABLED` (restart the API) and stop the `ingestion` profile. Queued messages stay in the queue and the DLQ until the worker runs again. The rollout sequence, owner flips and drills are in the [P3 ingestion rollout runbook](docs/p3-ingestion-rollout-runbook.md) (added by P3-11).
+
 ## Local Telemetry Ingestion
 
 Phase 2B adds a local MQTT-to-InfluxDB scaffold:

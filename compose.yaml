@@ -187,6 +187,43 @@ services:
     stop_grace_period: 45s
     restart: unless-stopped
 
+  # V4 P3 telemetry ingest worker (D7, D21): `docker compose --profile ingestion up`.
+  # The API image with an entrypoint override; it refuses to start (exit 2) unless
+  # TELEMETRY_V2_WRITE_ENABLED=true and the ingress queue URL is set.
+  telemetry-ingest-worker:
+    profiles: ["ingestion"]
+    build:
+      context: .
+      dockerfile: Dockerfile.api
+    entrypoint: ["python", "-m", "limnopulse_api.workers.telemetry_ingest"]
+    depends_on:
+      elasticmq:
+        condition: service_healthy
+      dynamodb-local:
+        condition: service_started
+      influxdb:
+        condition: service_started
+    environment:
+      APP_ENV: local
+      AUTH_MODE: dev
+      AWS_ACCESS_KEY_ID: local
+      AWS_SECRET_ACCESS_KEY: local
+      AWS_EC2_METADATA_DISABLED: "true"
+      AWS_REGION: us-east-1
+      DYNAMODB_DOMAIN_TABLE: LimnopulseDomain
+      DYNAMODB_ENDPOINT_URL: http://dynamodb-local:8000
+      SQS_ENDPOINT_URL: http://elasticmq:9324
+      SQS_TELEMETRY_INGRESS_QUEUE_URL: http://elasticmq:9324/000000000000/limnopulse-telemetry-ingress
+      INFLUXDB_URL: http://influxdb:8086
+      INFLUXDB_TOKEN: local-dev-token
+      INFLUXDB_ORG: limnopulse
+      INFLUXDB_BUCKET_RAW: limnopulse_raw
+      TELEMETRY_V2_WRITE_ENABLED: "true"
+      TELEMETRY_LEGACY_DUAL_WRITE_ENABLED: "false"
+    init: true
+    stop_grace_period: 75s
+    restart: "no"
+
 volumes:
   dynamodb_data:
   influxdb_data:

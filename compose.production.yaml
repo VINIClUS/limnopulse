@@ -145,6 +145,54 @@ services:
       start_period: 20s
     logging: *default-logging
 
+  # V4 P3 telemetry ingest worker (D7, D21). Not started by the default deploy:
+  #   docker compose ... -f compose.production.yaml --profile ingestion up -d telemetry-ingest-worker
+  # It runs as the dedicated `telemetry_ingest` IAM user (infra/opentofu/ingestion_queues.tf), so
+  # it deliberately has no env_file: the shared .env carries the API principal's AWS keys. Its
+  # settings are interpolated from the --env-file sources instead. It exits 2 (and stops after
+  # the bounded restarts) unless TELEMETRY_V2_WRITE_ENABLED=true and the queue URL is set.
+  telemetry-ingest-worker:
+    image: ghcr.io/viniclus/limnopulse/api:${IMAGE_TAG}
+    profiles: ["ingestion"]
+    entrypoint: ["python", "-m", "limnopulse_api.workers.telemetry_ingest"]
+    restart: on-failure:5
+    environment:
+      APP_ENV: ${APP_ENV}
+      AUTH_MODE: ${AUTH_MODE}
+      TELEGRAM_WEBHOOK_ENABLED: "false"
+      AWS_REGION: ${AWS_REGION}
+      AWS_ACCESS_KEY_ID: ${TELEMETRY_INGEST_AWS_ACCESS_KEY_ID}
+      AWS_SECRET_ACCESS_KEY: ${TELEMETRY_INGEST_AWS_SECRET_ACCESS_KEY}
+      DYNAMODB_DOMAIN_TABLE: ${DYNAMODB_DOMAIN_TABLE}
+      DYNAMODB_AUDIT_TABLE: ${DYNAMODB_AUDIT_TABLE}
+      SQS_TELEMETRY_INGRESS_QUEUE_URL: ${SQS_TELEMETRY_INGRESS_QUEUE_URL}
+      INFLUXDB_URL: http://influxdb:8086
+      INFLUXDB_TOKEN: ${TELEMETRY_INGEST_INFLUXDB_TOKEN}
+      INFLUXDB_ORG: ${INFLUXDB_ORG}
+      INFLUXDB_BUCKET_RAW: ${INFLUXDB_BUCKET_RAW}
+      TELEMETRY_V2_WRITE_ENABLED: ${TELEMETRY_V2_WRITE_ENABLED:-false}
+      TELEMETRY_LEGACY_DUAL_WRITE_ENABLED: ${TELEMETRY_LEGACY_DUAL_WRITE_ENABLED:-false}
+    depends_on:
+      influxdb:
+        condition: service_healthy
+    networks:
+      default: {}
+    read_only: true
+    tmpfs:
+      - /tmp
+    security_opt:
+      - no-new-privileges:true
+    cap_drop: [ALL]
+    init: true
+    stop_grace_period: 75s
+    deploy:
+      resources:
+        limits:
+          cpus: "0.5"
+          memory: 512M
+          pids: 128
+    logging: *default-logging
+
 networks:
   default:
     name: limnopulse_internal
