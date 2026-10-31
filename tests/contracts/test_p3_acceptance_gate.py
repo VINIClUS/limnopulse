@@ -28,7 +28,7 @@ import pytest
 from fastapi import FastAPI
 from fastapi.routing import APIRoute
 
-from limnopulse_api.adapters.dynamodb_v2 import DynamoV2KeyBuilder
+from limnopulse_api.adapters.dynamodb_v2 import DynamoV2KeyBuilder, idempotency_key_hash
 from limnopulse_api.adapters.sqs_ingestion import SqsIngressQueue
 from limnopulse_api.adapters.telemetry_metrics_log import (
     METRICS_LOGGER,
@@ -45,13 +45,7 @@ from limnopulse_api.domain.ingestion import (
     MAX_INGEST_BODY_BYTES,
     MAX_INGEST_OBSERVATIONS,
     MAX_INGRESS_MESSAGE_BYTES,
-    IngressAdmissionDenied,
-    IngressDeferReason,
-    IngressFailureCategory,
-    IngressFenceReason,
-    SequenceEvent,
 )
-from limnopulse_api.domain.telemetry_v2 import QualityFlag, QuarantineReason
 from limnopulse_api.main import create_app
 from limnopulse_api.services.ingress_rate_limit import ingress_rate_limiters
 from limnopulse_api.workers import telemetry_ingest
@@ -176,6 +170,12 @@ async def test_gate11_limits_reject_before_any_queue_admission() -> None:
     assert int(limited.headers["retry-after"]) >= 1
     assert limited.bytes_read == 0
     assert len(route.bodies()) == 1, "only the first request reached the queue"
+    assert (
+        await route.subject.receipts.get_ingress_receipt(
+            ACCOUNT, idempotency_key_hash("g11-limited-0001")
+        )
+        is None
+    ), "no receipt is claimed for a rate-limited request"
     assert route.outcomes().count("rate_limited") == 1
 
 
@@ -203,7 +203,7 @@ async def test_gate11_envelope_size_guard_never_sends_an_oversized_message() -> 
 
 # --- G12: closed metric names and labels ---------------------------------------------------------
 
-# The plan's Metrics table, verbatim.
+# The plan's Metrics table, with every closed enum written out (never derived from production).
 PLAN_METRICS: dict[str, dict[str, frozenset[str]]] = {
     "ingest_requests_total": {
         "outcome": frozenset(
@@ -221,18 +221,83 @@ PLAN_METRICS: dict[str, dict[str, frozenset[str]]] = {
             }
         )
     },
-    "ingest_admission_denied_total": {"reason": frozenset(IngressAdmissionDenied)},
+    "ingest_admission_denied_total": {
+        "reason": frozenset(
+            {
+                "identity_unresolved",
+                "integration_mismatch",
+                "integration_inactive",
+                "account_inactive",
+                "device_inactive",
+                "component_required",
+                "component_invalid",
+                "entitlement_denied",
+            }
+        )
+    },
     "ingest_observations_admitted_total": {},
     "ingress_messages_total": {
         "outcome": frozenset({"processed", "fenced", "retry", "permanent"}),
-        "category": frozenset(IngressFailureCategory),
+        # The worker failure table's categories.
+        "category": frozenset(
+            {
+                "envelope_invalid",
+                "fenced",
+                "fenced_unverified",
+                "deferred",
+                "unexpected",
+                "store_unavailable",
+                "write_retryable",
+                "write_permanent",
+                "contract_violation",
+                "processed",
+            }
+        ),
     },
     "ingress_observations_total": {"result": frozenset({"accepted", "quarantined"})},
-    "ingress_quarantined_total": {"reason": frozenset(QuarantineReason)},
-    "ingress_fenced_total": {"reason": frozenset(IngressFenceReason)},
-    "ingress_deferred_total": {"reason": frozenset(IngressDeferReason)},
-    "ingress_quality_flags_total": {"flag": frozenset(QualityFlag)},
-    "ingress_sequence_events_total": {"event": frozenset(SequenceEvent)},
+    "ingress_quarantined_total": {
+        "reason": frozenset(
+            {
+                "metric_unknown",
+                "unit_unsupported",
+                "value_invalid",
+                "observed_at_invalid",
+                "component_not_owned",
+                "component_not_measuring",
+                "deployment_unresolved",
+            }
+        )
+    },
+    "ingress_fenced_total": {
+        "reason": frozenset(
+            {
+                "identity_unresolved",
+                "integration_mismatch",
+                "integration_decommissioned",
+                "account_revoked",
+                "device_decommissioned",
+            }
+        )
+    },
+    "ingress_deferred_total": {
+        "reason": frozenset({"integration_not_active", "account_not_active", "device_not_active"})
+    },
+    "ingress_quality_flags_total": {
+        "flag": frozenset(
+            {
+                "delayed",
+                "clock_skew_future",
+                "clock_skew_past_extreme",
+                "replay",
+                "duplicate",
+                "sequence_gap",
+                "sequence_regression",
+            }
+        )
+    },
+    "ingress_sequence_events_total": {
+        "event": frozenset({"first", "contiguous", "gap", "regression", "duplicate", "late"})
+    },
     "ingress_write_failures_total": {"retryable": frozenset({"true", "false"})},
     "ingress_normalization_duration_seconds": {},
     "ingress_queue_age_seconds": {},
@@ -341,7 +406,6 @@ def test_gate13_switch_matrix_keeps_v1_and_mounts_exactly_the_switched_routes(
 
     # The M1 count of 53 tenant routes (28 /v1 + 25 /v2) is unchanged; ingest adds exactly 5.
     assert tenant_routes(base | m1) == 53
-    assert tenant_routes(base | m1 | D15_OPERATIONS) == 53 + 5
     assert len(telemetry) == 3
     assert not D15_OPERATIONS & (base | m1 | telemetry)
 
@@ -366,6 +430,9 @@ def test_gate13_switch_matrix_keeps_v1_and_mounts_exactly_the_switched_routes(
         if switches["ingest_v2_enabled"]:
             expected |= D15_OPERATIONS
         assert _operations(app) == expected, switches
+        if switches["ingest_v2_enabled"]:
+            telemetry_routes = 3 if switches["api_v2_telemetry_enabled"] else 0
+            assert tenant_routes(_operations(app)) == 53 + telemetry_routes + 5
     assert valid == 8
 
 
@@ -374,9 +441,12 @@ def test_gate13_switch_matrix_keeps_v1_and_mounts_exactly_the_switched_routes(
     [
         (
             {"TELEMETRY_V2_WRITE_ENABLED": "false", "SQS_TELEMETRY_INGRESS_QUEUE_URL": QUEUE_URL},
-            "v2 writes off",
+            "TELEMETRY_V2_WRITE_ENABLED is off",
         ),
-        ({"TELEMETRY_V2_WRITE_ENABLED": "true", "SQS_TELEMETRY_INGRESS_QUEUE_URL": ""}, "no queue"),
+        (
+            {"TELEMETRY_V2_WRITE_ENABLED": "true", "SQS_TELEMETRY_INGRESS_QUEUE_URL": ""},
+            "SQS_TELEMETRY_INGRESS_QUEUE_URL is empty",
+        ),
     ],
 )
 def test_gate13_worker_exits_2_unless_it_can_write(
@@ -398,6 +468,8 @@ def test_gate13_worker_exits_2_unless_it_can_write(
         check=False,
     )
     assert completed.returncode == telemetry_ingest.EXIT_REFUSED == 2, (case, completed.stderr)
+    # Refused by the start guard itself, not by an unrelated settings error.
+    assert f"refused to start: {case}" in completed.stderr, completed.stderr
 
 
 # --- G14: storage rules and the optional cache ---------------------------------------------------
@@ -568,6 +640,29 @@ def test_runbook_preconditions() -> None:
         assert re.search(pattern, text), pattern
 
 
+def test_runbook_records_the_section_21_2_queue_properties() -> None:
+    """Final Acceptance Matrix row §21.2: the runbook states the queue properties P3-02 provisions,
+    each read from OpenTofu so the document follows the infrastructure."""
+    text = section("Preconditions")
+    tofu = (ROOT / "infra/opentofu/ingestion_queues.tf").read_text(encoding="utf-8")
+    retention = [int(v) for v in re.findall(r"message_retention_seconds\s*=\s*(\d+)", tofu)]
+    assert sorted(retention) == [4 * 86_400, 14 * 86_400]
+    visibility = re.search(r"visibility_timeout_seconds\s*=\s*(\d+)", tofu).group(1)
+    long_poll = re.search(r"receive_wait_time_seconds\s*=\s*(\d+)", tofu).group(1)
+    for pattern in (
+        r"SSE",
+        r"4 days",
+        r"14 days",
+        rf"\b{visibility} ?s",
+        rf"\b{long_poll} ?s",
+        r"`telemetry-ingress@1`",
+        r"opaque",
+        r"least privilege",
+        r"limnopulse-telemetry-ingress-dlq",
+    ):
+        assert re.search(pattern, text, re.IGNORECASE), pattern
+
+
 ENABLEMENT_STEPS = (
     ("infrastructure flag", (r"`telemetry_ingress`", r"tofu|OpenTofu")),
     ("worker", (r"`TELEMETRY_V2_WRITE_ENABLED`", r"telemetry_ingest", r"principal|IAM user")),
@@ -624,6 +719,7 @@ def test_runbook_production_environment_covers_the_worker_env_and_principal() ->
 def test_runbook_alarms_and_deadlines() -> None:
     text = section("Alarms and deadlines")
     tofu = (ROOT / "infra/opentofu/ingestion_queues.tf").read_text(encoding="utf-8")
+    max_receive_count = int(re.search(r"maxReceiveCount\s*=\s*(\d+)", tofu).group(1))
     for suffix in re.findall(
         r'alarm_name\s*=\s*"\$\{var\.project_name\}-\$\{var\.environment\}'
         r'-([a-z-]+)"',
@@ -633,8 +729,7 @@ def test_runbook_alarms_and_deadlines() -> None:
     for pattern in (
         r"queue[- ]age",
         r"DLQ",
-        r"`maxReceiveCount`",
-        r"\b8\b",
+        rf"`maxReceiveCount`.{{0,20}}\b{max_receive_count}\b",
         r"20.{0,3}45 minutes",
         r"14 days",
         r"quarantine",

@@ -49,15 +49,17 @@ from limnopulse_api.adapters.dynamodb_ingress_receipts import DynamoIngressRecei
 from limnopulse_api.adapters.dynamodb_quarantine import DynamoQuarantineRepository
 from limnopulse_api.adapters.dynamodb_v2 import (
     account_scoped_identity_hash,
+    component_ingest_state_to_item,
     device_ingest_state_from_item,
     idempotency_key_hash,
 )
 from limnopulse_api.adapters.sqs_ingestion import SqsIngressQueue
 from limnopulse_api.adapters.telemetry_metrics_log import METRICS_LOGGER
 from limnopulse_api.core.config import Settings
-from limnopulse_api.domain.deployments import Deployment
+from limnopulse_api.domain.deployments import Deployment, DeploymentStatus
 from limnopulse_api.domain.devices_v2 import DeviceStatus
 from limnopulse_api.domain.entities import Membership
+from limnopulse_api.domain.ids import asset_id_for_legacy_pond
 from limnopulse_api.domain.ingestion import (
     INGEST_METRICS,
     IngressEnvelope,
@@ -78,6 +80,7 @@ from limnopulse_api.workers import telemetry_ingest
 from limnopulse_api.workers.telemetry_ingest import build_worker
 from scripts.admin import telemetry_dlq, telemetry_quarantine
 from scripts.dev import seed_ingest_local
+from tests.contracts.test_p2_acceptance_gate import divergence_checks, fill_divergence_check
 from tests.influx.test_p2_acceptance_influx import (
     COMPONENT as LEGACY_COMPONENT,
 )
@@ -91,6 +94,7 @@ from tests.influx.test_p2_acceptance_influx import (
     TENANT as LEGACY_TENANT,
 )
 from tests.influx.test_p2_acceptance_influx import (
+    query_records,
     run_divergence_check,
 )
 from tests.support.influx_harness import influx_clients, influx_settings, write_lines
@@ -126,6 +130,8 @@ from tests.support.ingestion_harness import (
     sqs_client,
 )
 from tests.unit.test_dynamodb_integration_resolver import DynamoIngestionSubject
+from tests.unit.test_ingestion_sequence_vectors import T0 as VECTOR_T0
+from tests.unit.test_ingestion_sequence_vectors import TRUTH_TABLE
 
 pytestmark = pytest.mark.asyncio
 
@@ -167,7 +173,7 @@ def _hard_deadline() -> Iterator[None]:
         raise TimeoutError("test exceeded its hard deadline")
 
     previous = signal.signal(signal.SIGALRM, expire)
-    signal.setitimer(signal.ITIMER_REAL, 4 * GUARD_SECONDS)
+    signal.setitimer(signal.ITIMER_REAL, 6 * GUARD_SECONDS)
     try:
         yield
     finally:
@@ -765,6 +771,8 @@ async def test_gate1_accepted_only_after_the_queue_write(
         marked = await post_batch(http, observations, key="g1-mark-down")
         assert marked.status_code == 202, marked.text
         assert queue_counts(queues.source_url)[0] == 1
+        unmarked = await receipt_of(ingestion_tables, "g1-mark-down")
+        assert unmarked is not None and unmarked.state == IngressReceiptState.PENDING
         app.state.ingress_receipt_repository = receipts
 
         # After recovery the retry enqueues the first `received_at`.
@@ -967,7 +975,14 @@ async def test_gate3_no_cross_tenant_claim_and_forged_envelopes_are_fenced(
     assert (await state_rows(ingestion_tables, tenant=OTHER_TENANT))["connector"] is None
     assert peek_dlq(queues.dlq_url, expected=1) == [unverified.to_json()]
     assert queue_counts(queues.source_url) == (0, 0)
-    assert metric_lines.total("ingress_fenced_total", reason="integration_mismatch") >= 2
+    # The mismatched DI was fenced and deleted once; the unverified one was only ever retried.
+    assert metric_lines.total("ingress_messages_total", outcome="fenced") == 1
+    assert (
+        metric_lines.total(
+            "ingress_messages_total", outcome="permanent", category="fenced_unverified"
+        )
+        >= 2
+    )
     assert points(influx_bucket) == {}
 
 
@@ -1095,6 +1110,16 @@ async def test_gate5_idempotent_retries_keep_the_first_received_at(
         assert enqueued == pending.model_copy(update={"state": IngressReceiptState.ENQUEUED})
 
     lost_receipt = await receipt_of(ingestion_tables, "g5-lost-response")
+    # The pending re-enqueue repeats the first message byte for byte (ingress_id, received_at).
+    bodies = drain_bodies(queues.source_url, expected=3)
+    by_id: dict[str, list[str]] = {}
+    for body in bodies:
+        by_id.setdefault(IngressEnvelope.model_validate_json(body).ingress_id, []).append(body)
+    assert sorted(len(copies) for copies in by_id.values()) == [1, 2]
+    (first_copy, second_copy) = by_id[pending.ingress_id]
+    assert first_copy == second_copy
+    assert IngressEnvelope.model_validate_json(first_copy).received_at == pending.received_at
+    resend(queues.source_url, bodies)
     async with running_worker(settings, metric_lines) as worker:
         await worker.wait_handled(3, outcome="processed")
     assert queue_counts(queues.source_url) == (0, 0)
@@ -1288,6 +1313,7 @@ async def test_gate8_unresolved_deployment_is_quarantined_then_replayed_into_eve
     ingestion_queue_pair: QueueFactory,
     influx_bucket: str,
     metric_lines: MetricLines,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     queues = ingestion_queue_pair(max_receive_count=8, visibility_seconds=30)
     settings = gate_settings(ingestion_tables, queues, influx_bucket)
@@ -1298,9 +1324,15 @@ async def test_gate8_unresolved_deployment_is_quarantined_then_replayed_into_eve
         assert response.status_code == 202, response.text
     first = await receipt_of(ingestion_tables, "g8-unresolved")
 
+    # Persisted before delete: the first quarantine write fails, so the message must survive.
+    monkeypatch.setattr(telemetry_ingest, "DynamoQuarantineRepository", _FailFirstPut)
+    _FailFirstPut.failures = 1
     async with running_worker(settings, metric_lines) as worker:
+        await worker.wait_handled(1, outcome="retry", category="store_unavailable")
+        assert await quarantine_rows(ingestion_tables) == []
+        assert sum(queue_counts(queues.source_url)) == 1, "deleted before the row was persisted"
         await worker.wait_handled(1, outcome="processed")
-    assert queue_counts(queues.source_url) == (0, 0)  # deleted only after the row was persisted
+    assert queue_counts(queues.source_url) == (0, 0)
     (row,) = await quarantine_rows(ingestion_tables)
     assert (row.kind, row.reason, row.status) == (
         QuarantineEntryKind.OBSERVATION,
@@ -1312,8 +1344,22 @@ async def test_gate8_unresolved_deployment_is_quarantined_then_replayed_into_eve
     assert health is not None and health["last_quarantine_reason"] == "deployment_unresolved"
     assert points(influx_bucket) == {}
 
-    # The operator adds the covering Deployment and replays the row.
-    world.add_deployment()
+    # The operator adds the Deployment that covered the event time (since ended), while a later
+    # Deployment of the same Component covers the replay time.
+    earlier = DEPLOYMENT.model_copy(
+        update={"ended_at": at + timedelta(seconds=30), "status": DeploymentStatus.ENDED}
+    )
+    later = DEPLOYMENT.model_copy(
+        update={
+            "deployment_id": "dep_" + "d" * 32,
+            "asset_id": "ast_" + "e" * 32,
+            "started_at": at + timedelta(seconds=30),
+        }
+    )
+    for form in ("mirror", "history"):
+        world.subject.put(deployment_to_item(earlier, form=form))
+    for form in ("mirror", "history", "current"):
+        world.subject.put(deployment_to_item(later, form=form))
     out = io.StringIO()
     code = await asyncio.to_thread(
         telemetry_quarantine.main,
@@ -1326,6 +1372,16 @@ async def test_gate8_unresolved_deployment_is_quarantined_then_replayed_into_eve
         err=io.StringIO(),
     )
     assert code == 0, out.getvalue()
+    # The replay envelope carries the stored first-receipt context and versions.
+    (replay_body,) = drain_bodies(queues.source_url, expected=1)
+    replay = IngressEnvelope.model_validate_json(replay_body)
+    assert (replay.replay, replay.replay_of, replay.received_at) == (
+        True,
+        first.ingress_id,
+        first.received_at,
+    )
+    assert replay.mapping_versions == row.mapping_versions == first.mapping_versions
+    resend(queues.source_url, [replay_body])
     async with running_worker(settings, metric_lines) as worker:
         await worker.wait_handled(2, outcome="processed")
 
@@ -1333,6 +1389,7 @@ async def test_gate8_unresolved_deployment_is_quarantined_then_replayed_into_eve
         ingestion_tables.domain, dynamodb_client()
     ).get_quarantine_entry(TENANT, row.entry_key)
     assert replayed is not None and replayed.status == QuarantineEntryStatus.REPLAYED
+    assert replayed.replayed_ingress_id == replay.ingress_id
     ((measurement, tags, _time), fields_), *rest = points(influx_bucket).items()
     assert rest == [] and measurement == OBSERVATION_MEASUREMENT
     tag_map = dict(tags)
@@ -1351,6 +1408,20 @@ async def test_gate8_unresolved_deployment_is_quarantined_then_replayed_into_eve
     )
     assert fields_["unit_mapping_version"] == versions.unit_mapping_version
     assert fields_["value"] == 22.5 and fields_["sequence"] == 7
+
+
+class _FailFirstPut(DynamoQuarantineRepository):
+    """The worker's quarantine adapter, failing its first `failures` writes."""
+
+    failures = 0
+
+    async def put_quarantine_entries(self, entries: Any) -> None:
+        if _FailFirstPut.failures > 0:
+            _FailFirstPut.failures -= 1
+            raise ClientError(
+                {"Error": {"Code": "InternalServerError", "Message": "injected"}}, "PutItem"
+            )
+        await super().put_quarantine_entries(entries)
 
 
 # --- G9 ------------------------------------------------------------------------------------------
@@ -1522,6 +1593,60 @@ async def test_gate10_sequence_truth_table_end_to_end_and_marks_never_pass_the_f
     assert await state_rows(ingestion_tables) == settled
 
 
+@pytest.mark.parametrize(
+    ("name", "current", "pairs", "expected"), TRUTH_TABLE, ids=[row[0] for row in TRUTH_TABLE]
+)
+async def test_gate10_truth_table_vectors_hold_end_to_end(
+    ingestion_tables: IngestionTables,
+    ingestion_queue_pair: QueueFactory,
+    influx_bucket: str,
+    metric_lines: MetricLines,
+    name: str,
+    current: Any,
+    pairs: list[tuple[datetime, int]],
+    expected: tuple[Any, ...],
+) -> None:
+    """Every P3-06 truth-table vector, rebased to recent time: the seeded state row, one HTTPS
+    request carrying the pairs, and the worker's sequence-event metrics for that message."""
+    queues = ingestion_queue_pair(max_receive_count=8, visibility_seconds=30)
+    settings = gate_settings(ingestion_tables, queues, influx_bucket)
+    world = await kit_world(ingestion_tables)
+    base = recent()
+
+    def rebase(value: datetime) -> datetime:
+        return base + (value - VECTOR_T0)
+
+    if current is not None:
+        seeded = current.model_copy(
+            update={
+                "last_observed_at": None
+                if current.last_observed_at is None
+                else rebase(current.last_observed_at)
+            }
+        )
+        world.subject.put(component_ingest_state_to_item(seeded))
+    observations = [
+        reading(rebase(observed_at), 20.0, sequence=sequence, metric_key=metric, source_unit=unit)
+        for index, (observed_at, sequence) in enumerate(pairs)
+        for metric, unit in [LEGACY_FIELDS[index % len(LEGACY_FIELDS)][1:]]
+    ]
+    async with composed_api(settings) as (_app, http):
+        response = await post_batch(http, observations, key="g10-vector-" + name.replace(" ", "-"))
+        assert response.status_code == 202, response.text
+    async with running_worker(settings, metric_lines) as worker:
+        await worker.wait_handled(1, outcome="processed")
+    got = {
+        event: metric_lines.total("ingress_sequence_events_total", event=event)
+        for event in {
+            labels["event"] for labels in metric_lines.labels("ingress_sequence_events_total")
+        }
+    }
+    want: dict[str, int] = {}
+    for event in expected:
+        want[event.value] = want.get(event.value, 0) + 1
+    assert got == want, name
+
+
 # --- G12 -----------------------------------------------------------------------------------------
 
 
@@ -1584,7 +1709,7 @@ async def test_gate12_no_secret_or_raw_identifier_in_logs_bodies_receipts_or_row
         )
 
     digest = ingest_secret_sha256(SECRET)
-    forbidden = (TOKEN, SECRET, digest, key, EXTERNAL_DEVICE, "Bearer ", WRONG_SECRET)
+    forbidden = (TOKEN, SECRET, digest, key, EXTERNAL_DEVICE, "Bearer ", WRONG_SECRET, sentinel)
     receipts = [
         item for pk in (f"INGRESS_RECEIPT#{ACCOUNT}",) for item in _raw_items(ingestion_tables, pk)
     ]
@@ -1651,8 +1776,32 @@ async def test_gate15_https_path_matches_the_independent_legacy_writer(
     write_lines(influx_bucket, [telegraf_line(item) for item in readings])
     assert _count(influx_bucket, start, stop, LEGACY_MEASUREMENT, "temp_c") == len(readings)
 
-    # The P2 runbook's keyed checks over [now - 2 h, now], which covers [min, max] observed_at.
+    # The P2 runbook's keyed checks over exactly [min observed_at, max observed_at] ...
+    first_at, last_at = readings[0][0], readings[-1][0] + timedelta(microseconds=1)
+
+    def divergences(name: str) -> list[dict[str, Any]]:
+        query = fill_divergence_check(
+            divergence_checks()[name],
+            bucket=influx_bucket,
+            tenant_id=LEGACY_TENANT,
+            pond_id=LEGACY_POND,
+            asset_id=asset_id_for_legacy_pond(LEGACY_TENANT, LEGACY_POND),
+            component_ids=(LEGACY_COMPONENT,),
+            start=first_at,
+            stop=last_at,
+        )
+        return query_records(influx_bucket, query)
+
+    for name in ("points", "latest", "summary"):
+        assert divergences(name) == [], name
+    # ... and through the P2 gate's own runner (its [now - 2 h, now] covers that window).
     now = datetime.now(UTC) + timedelta(seconds=1)
     assert now - timedelta(hours=2) < start and stop <= now + timedelta(seconds=1)
     for name in ("points", "latest", "summary"):
         assert run_divergence_check(SimpleNamespace(bucket=influx_bucket), name, now) == [], name
+
+    # The check is not vacuous: one changed legacy value is reported.
+    changed = (readings[2][0], readings[2][1], {**readings[2][2], "temp_c": 99.5})
+    write_lines(influx_bucket, [telegraf_line(changed)])
+    reported = divergences("points")
+    assert [(row["device_id"], row["field"]) for row in reported] == [(LEGACY_DEVICE, "temp_c")]
