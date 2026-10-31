@@ -163,6 +163,52 @@ variable "telegram_webhook" {
   default     = false
 }
 
+variable "telemetry_ingress" {
+  description = "Provision the P3 telemetry ingress queue, its DLQ, the dedicated telemetry_ingest worker user, the API/operator grants and the queue alarms (ingestion_queues.tf). False until the HTTPS ingress rollout runbook is followed."
+  type        = bool
+  default     = false
+}
+
+variable "telemetry_ingress_queue_name" {
+  description = "SQS queue name for telemetry-ingress@1 envelopes (SQS_TELEMETRY_INGRESS_QUEUE_URL)."
+  type        = string
+  default     = "limnopulse-telemetry-ingress"
+}
+
+variable "telemetry_ingress_dlq_name" {
+  description = "Dead-letter queue name for telemetry ingress messages (SQS_TELEMETRY_INGRESS_DLQ_URL)."
+  type        = string
+  default     = "limnopulse-telemetry-ingress-dlq"
+}
+
+variable "telemetry_ingress_age_alarm_threshold_seconds" {
+  description = "ApproximateAgeOfOldestMessage alarm threshold for the telemetry ingress queue."
+  type        = number
+  default     = 300
+
+  validation {
+    condition     = var.telemetry_ingress_age_alarm_threshold_seconds > 0
+    error_message = "telemetry_ingress_age_alarm_threshold_seconds must be greater than zero."
+  }
+}
+
+variable "telemetry_ingress_depth_alarm_threshold" {
+  description = "ApproximateNumberOfMessagesVisible alarm threshold for the telemetry ingress queue."
+  type        = number
+  default     = 1000
+
+  validation {
+    condition     = var.telemetry_ingress_depth_alarm_threshold > 0
+    error_message = "telemetry_ingress_depth_alarm_threshold must be greater than zero."
+  }
+}
+
+variable "telemetry_ingress_alarm_actions" {
+  description = "ARNs notified by the telemetry ingress age, depth and DLQ alarms. Empty means the alarms only change state."
+  type        = list(string)
+  default     = []
+}
+
 locals {
   # Owner=vinisantana matches the design spec's tagging contract (§ resource
   # tagging): every taggable resource carries Project/Environment/ManagedBy/
