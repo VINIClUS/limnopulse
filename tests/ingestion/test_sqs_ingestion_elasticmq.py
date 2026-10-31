@@ -9,15 +9,18 @@ redrive policy and the DLQ redrive core. Faults are injected at the boto3 client
 
 from __future__ import annotations
 
+import asyncio
 from collections.abc import Callable
 from typing import Any
 
 import pytest
+from botocore.exceptions import EndpointConnectionError
 
 from limnopulse_api.adapters.sqs_ingestion import SqsIngressQueue
-from limnopulse_api.core.errors import IngressMessageTooLarge
+from limnopulse_api.core.errors import IngressMessageTooLarge, IngressQueueError
 from limnopulse_api.domain.ingestion import INGRESS_ENVELOPE_SCHEMA, IngressQueueMessage
-from limnopulse_api.services.ingress_redrive import RedriveReport, redrive_dlq
+from limnopulse_api.services.ingress_redrive import RedriveReport
+from limnopulse_api.services.ingress_redrive import redrive_dlq as _redrive_dlq
 from tests.support.ingestion_contract_kits import (
     INGRESS_QUEUE_CONTRACT,
     envelope,
@@ -28,6 +31,13 @@ from tests.support.ingestion_contract_kits import (
 from tests.support.ingestion_harness import IngestionQueuePair, sqs_client
 
 QueueFactory = Callable[..., IngestionQueuePair]
+REDRIVE_TIMEOUT_SECONDS = 60
+
+
+async def redrive_dlq(**kwargs: Any) -> RedriveReport:
+    """A wrong scan loop fails within the bound instead of hanging the gate."""
+    return await asyncio.wait_for(_redrive_dlq(**kwargs), REDRIVE_TIMEOUT_SECONDS)
+
 
 # Kit operation (port method) -> the boto3 client method the adapter calls for it.
 _CLIENT_METHODS = {
@@ -259,3 +269,45 @@ async def test_redrive_dlq_dry_run_releases_every_message(
     assert _counts(pair.dlq_url) == (3, 0)  # released: all visible again at once
     assert _counts(pair.source_url) == (0, 0)
     assert sorted(message.body for message in await _drain(dlq)) == sorted(bodies)
+
+
+@pytest.mark.asyncio
+async def test_a_stale_receipt_handle_is_a_permanent_queue_error(
+    ingestion_queue_pair: QueueFactory,
+) -> None:
+    pair = ingestion_queue_pair(max_receive_count=5)
+    queue = _queue(pair.source_url)
+    await queue.send(envelope())
+    (first,) = await queue.receive(max_messages=1, wait_seconds=0, visibility_seconds=30)
+    await queue.change_visibility(first, 0)
+    (second,) = await queue.receive(max_messages=1, wait_seconds=0, visibility_seconds=30)
+    stale = first.model_copy(update={"receipt_handle": first.receipt_handle + "-stale"})
+
+    with pytest.raises(IngressQueueError) as exc_info:
+        await queue.delete(stale)
+
+    assert exc_info.value.retryable is False
+    await queue.delete(second)
+    assert _counts(pair.source_url) == (0, 0)
+
+
+@pytest.mark.asyncio
+async def test_redrive_dlq_never_deletes_after_a_failed_send(
+    ingestion_queue_pair: QueueFactory,
+) -> None:
+    pair = ingestion_queue_pair()
+    dlq = _queue(pair.dlq_url)
+    faulty = FaultyClient(sqs_client())
+    source = SqsIngressQueue(client=faulty, queue_url=pair.source_url)
+    bodies = [f'{{"n":{index}}}' for index in range(3)]
+    for body in bodies:
+        await dlq.send_raw(body)
+    faulty.fail_next("send_message", EndpointConnectionError(endpoint_url="http://sqs.invalid"))
+
+    report = await redrive_dlq(dlq=dlq, source=source, max_messages=10, apply=True)
+
+    assert report == RedriveReport(seen=3, redriven=2, failed=1)
+    moved = [message.body for message in await _drain(_queue(pair.source_url))]
+    assert len(moved) == 2
+    # The failed message is still on the DLQ (in flight until its visibility lapses).
+    assert sum(_counts(pair.dlq_url)) == 1

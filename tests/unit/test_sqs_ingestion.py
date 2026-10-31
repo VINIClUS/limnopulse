@@ -94,10 +94,22 @@ def _client_error(code: str, operation: str) -> ClientError:
 def botocore_errors(operation: str) -> list[BaseException]:
     return [
         _client_error("ServiceUnavailable", operation),
-        _client_error("AWS.SimpleQueueService.NonExistentQueue", operation),
+        _client_error("QueueDoesNotExist", operation),
         EndpointConnectionError(endpoint_url="http://sqs.invalid"),
         ReadTimeoutError(endpoint_url="http://sqs.invalid"),
     ]
+
+
+def error_id(error: BaseException) -> str:
+    if isinstance(error, ClientError):
+        return error.response["Error"]["Code"]
+    return type(error).__name__
+
+
+async def on_worker_thread(client: StubSqsClient) -> bool:
+    """True when every recorded client call ran off the event-loop thread (asyncio.to_thread)."""
+    loop_thread = threading.current_thread()
+    return bool(client.calls) and all(thread is not loop_thread for _, _, thread in client.calls)
 
 
 @pytest.fixture
@@ -133,14 +145,14 @@ async def test_send_sends_the_compact_envelope_with_the_schema_attribute(
     message_id = await queue.send(message)
 
     assert message_id == "sqs-id-7"
-    ((method, kwargs, thread),) = client.calls
+    ((method, kwargs, _),) = client.calls
     assert method == "send_message"
     assert kwargs == {
         "QueueUrl": QUEUE_URL,
         "MessageBody": message.to_json(),
         "MessageAttributes": SCHEMA_ATTRIBUTES,
     }
-    assert thread is not threading.main_thread()  # asyncio.to_thread, never the event loop
+    assert await on_worker_thread(client)  # asyncio.to_thread, never the event loop
 
 
 @pytest.mark.asyncio
@@ -207,7 +219,7 @@ async def test_send_without_a_message_id_is_retryable(
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("error", botocore_errors("SendMessage"), ids=type)
+@pytest.mark.parametrize("error", botocore_errors("SendMessage"), ids=error_id)
 async def test_send_maps_botocore_errors_to_retryable(
     client: StubSqsClient, queue: SqsIngressQueue, error: BaseException
 ) -> None:
@@ -232,14 +244,14 @@ async def test_send_raw_sends_the_body_unchanged_with_the_schema_attribute(
 
     assert await queue.send_raw(body) == "raw-1"
 
-    ((method, kwargs, thread),) = client.calls
+    ((method, kwargs, _),) = client.calls
     assert method == "send_message"
     assert kwargs == {
         "QueueUrl": QUEUE_URL,
         "MessageBody": body,
         "MessageAttributes": SCHEMA_ATTRIBUTES,
     }
-    assert thread is not threading.main_thread()
+    assert await on_worker_thread(client)
 
 
 @pytest.mark.asyncio
@@ -261,10 +273,13 @@ async def test_send_raw_applies_the_same_size_guard_in_utf8_bytes(
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "response", [{"MD5OfMessageBody": "x"}, {"MessageId": ""}, {"MessageId": None}]
+)
 async def test_send_raw_without_a_message_id_is_retryable(
-    client: StubSqsClient, queue: SqsIngressQueue
+    client: StubSqsClient, queue: SqsIngressQueue, response: dict[str, Any]
 ) -> None:
-    client.answer("send_message", {"MD5OfMessageBody": "x"})
+    client.answer("send_message", response)
 
     with pytest.raises(IngressQueueError) as exc_info:
         await queue.send_raw("{}")
@@ -273,7 +288,7 @@ async def test_send_raw_without_a_message_id_is_retryable(
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("error", botocore_errors("SendMessage"), ids=type)
+@pytest.mark.parametrize("error", botocore_errors("SendMessage"), ids=error_id)
 async def test_send_raw_maps_botocore_errors_to_retryable(
     client: StubSqsClient, queue: SqsIngressQueue, error: BaseException
 ) -> None:
@@ -294,7 +309,7 @@ async def test_receive_sends_the_exact_request(
 ) -> None:
     await queue.receive(max_messages=7, wait_seconds=20, visibility_seconds=60)
 
-    ((method, kwargs, thread),) = client.calls
+    ((method, kwargs, _),) = client.calls
     assert method == "receive_message"
     assert kwargs == {
         "QueueUrl": QUEUE_URL,
@@ -304,7 +319,7 @@ async def test_receive_sends_the_exact_request(
         "MessageSystemAttributeNames": ["ApproximateReceiveCount", "SentTimestamp"],
     }
     assert "AttributeNames" not in kwargs  # deprecated
-    assert thread is not threading.main_thread()
+    assert await on_worker_thread(client)
 
 
 @pytest.mark.asyncio
@@ -325,6 +340,13 @@ async def test_receive_maps_each_message(client: StubSqsClient, queue: SqsIngres
                     "ReceiptHandle": "handle-2",
                     "Body": "not json at all",
                     "Attributes": {"ApproximateReceiveCount": "9", "SentTimestamp": "0"},
+                },
+                {
+                    # 1.5 s after the epoch: milliseconds, never read as seconds.
+                    "MessageId": "m-3",
+                    "ReceiptHandle": "handle-3",
+                    "Body": "",
+                    "Attributes": {"ApproximateReceiveCount": "2", "SentTimestamp": "1500"},
                 },
             ]
         },
@@ -347,10 +369,16 @@ async def test_receive_maps_each_message(client: StubSqsClient, queue: SqsIngres
             receive_count=9,
             sent_at=datetime(1970, 1, 1, tzinfo=UTC),
         ),
+        IngressQueueMessage(
+            message_id="m-3",
+            receipt_handle="handle-3",
+            body="",
+            receive_count=2,
+            sent_at=datetime(1970, 1, 1, 0, 0, 1, 500_000, tzinfo=UTC),
+        ),
     ]
     assert received[0].sent_at.utcoffset() is not None
     assert received[0].sent_at.utcoffset().total_seconds() == 0  # type: ignore[union-attr]
-    assert type(received[1].receive_count) is int
 
 
 @pytest.mark.asyncio
@@ -364,7 +392,7 @@ async def test_receive_of_an_empty_queue_is_an_empty_list(
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("error", botocore_errors("ReceiveMessage"), ids=type)
+@pytest.mark.parametrize("error", botocore_errors("ReceiveMessage"), ids=error_id)
 async def test_receive_maps_botocore_errors_to_retryable(
     client: StubSqsClient, queue: SqsIngressQueue, error: BaseException
 ) -> None:
@@ -385,12 +413,12 @@ async def test_delete_sends_the_receipt_handle(
 ) -> None:
     await queue.delete(MESSAGE)
 
-    ((method, kwargs, thread),) = client.calls
+    ((method, kwargs, _),) = client.calls
     assert (method, kwargs) == (
         "delete_message",
         {"QueueUrl": QUEUE_URL, "ReceiptHandle": "handle-1"},
     )
-    assert thread is not threading.main_thread()
+    assert await on_worker_thread(client)
 
 
 @pytest.mark.asyncio
@@ -403,12 +431,12 @@ async def test_change_visibility_clamps_to_the_sqs_range(
 ) -> None:
     await queue.change_visibility(MESSAGE, seconds)
 
-    ((method, kwargs, thread),) = client.calls
+    ((method, kwargs, _),) = client.calls
     assert (method, kwargs) == (
         "change_message_visibility",
         {"QueueUrl": QUEUE_URL, "ReceiptHandle": "handle-1", "VisibilityTimeout": expected},
     )
-    assert thread is not threading.main_thread()
+    assert await on_worker_thread(client)
 
 
 @pytest.mark.asyncio
@@ -435,7 +463,7 @@ def _final_action_errors(operation: str) -> list[BaseException]:
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("error", _final_action_errors("DeleteMessage"), ids=type)
+@pytest.mark.parametrize("error", _final_action_errors("DeleteMessage"), ids=error_id)
 async def test_delete_failures_are_permanent_queue_errors(
     client: StubSqsClient, queue: SqsIngressQueue, error: BaseException
 ) -> None:
@@ -449,7 +477,7 @@ async def test_delete_failures_are_permanent_queue_errors(
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("error", _final_action_errors("ChangeMessageVisibility"), ids=type)
+@pytest.mark.parametrize("error", _final_action_errors("ChangeMessageVisibility"), ids=error_id)
 async def test_change_visibility_failures_are_permanent_queue_errors(
     client: StubSqsClient, queue: SqsIngressQueue, error: BaseException
 ) -> None:
@@ -477,33 +505,42 @@ async def test_heartbeat_failures_are_permanent_queue_errors(
 
 # --- injected faults pass through (A44) -------------------------------------------------------
 
-
-def _invocations(queue: SqsIngressQueue) -> list[tuple[str, Any]]:
-    return [
-        ("send_message", lambda: queue.send(envelope())),
-        ("send_message", lambda: queue.send_raw("{}")),
-        (
-            "receive_message",
-            lambda: queue.receive(max_messages=1, wait_seconds=0, visibility_seconds=30),
-        ),
-        ("delete_message", lambda: queue.delete(MESSAGE)),
-        ("change_message_visibility", lambda: queue.change_visibility(MESSAGE, 30)),
-        ("change_message_visibility", lambda: queue.heartbeat(MESSAGE, 30)),
-    ]
+OPERATIONS = {
+    "send": ("send_message", lambda queue: queue.send(envelope())),
+    "send_raw": ("send_message", lambda queue: queue.send_raw("{}")),
+    "receive": (
+        "receive_message",
+        lambda queue: queue.receive(max_messages=1, wait_seconds=0, visibility_seconds=30),
+    ),
+    "delete": ("delete_message", lambda queue: queue.delete(MESSAGE)),
+    "change_visibility": (
+        "change_message_visibility",
+        lambda queue: queue.change_visibility(MESSAGE, 30),
+    ),
+    "heartbeat": ("change_message_visibility", lambda queue: queue.heartbeat(MESSAGE, 30)),
+}
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("retryable", [True, False])
-async def test_an_ingress_queue_error_from_the_client_passes_through_unchanged(
-    client: StubSqsClient, queue: SqsIngressQueue, retryable: bool
+@pytest.mark.parametrize("operation", list(OPERATIONS))
+@pytest.mark.parametrize(
+    "build",
+    [
+        lambda: IngressQueueError("injected at the client boundary", retryable=True),
+        lambda: IngressQueueError("injected at the client boundary", retryable=False),
+        lambda: RuntimeError("a bug, not a queue failure"),
+    ],
+    ids=["queue_error_retryable", "queue_error_permanent", "non_botocore"],
+)
+async def test_non_botocore_errors_pass_through_unchanged(
+    client: StubSqsClient, queue: SqsIngressQueue, operation: str, build: Any
 ) -> None:
-    for method, invoke in _invocations(queue):
-        injected = IngressQueueError("injected at the client boundary", retryable=retryable)
-        client.answer(method, injected)
-        calls_before = len(client.calls)
+    method, invoke = OPERATIONS[operation]
+    injected = build()
+    client.answer(method, injected)
 
-        with pytest.raises(IngressQueueError) as exc_info:
-            await invoke()
+    with pytest.raises(type(injected)) as exc_info:
+        await invoke(queue)
 
-        assert exc_info.value is injected
-        assert len(client.calls) == calls_before + 1  # never retried internally
+    assert exc_info.value is injected  # never re-wrapped
+    assert client.methods() == [method]  # never retried internally

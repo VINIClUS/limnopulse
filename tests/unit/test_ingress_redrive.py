@@ -5,14 +5,24 @@ order of operations (send before delete; no delete after a failed send), that dr
 default and only releases messages, and that exactly `max_messages` are handled.
 """
 
+import asyncio
 from typing import Any
 
 import pytest
 
 from limnopulse_api.core.errors import IngressMessageTooLarge, IngressQueueError
 from limnopulse_api.domain.ingestion import IngressQueueMessage
-from limnopulse_api.services.ingress_redrive import RedriveReport, redrive_dlq
+from limnopulse_api.services.ingress_redrive import RedriveReport
+from limnopulse_api.services.ingress_redrive import redrive_dlq as _redrive_dlq
 from tests.support.ingestion_fakes import FakeIngressQueue, Faults
+
+REDRIVE_TIMEOUT_SECONDS = 10
+
+
+async def redrive_dlq(**kwargs: Any) -> RedriveReport:
+    """A wrong scan loop fails within the bound instead of hanging the suite."""
+    return await asyncio.wait_for(_redrive_dlq(**kwargs), REDRIVE_TIMEOUT_SECONDS)
+
 
 BODIES = [
     '{"schema":"telemetry-ingress@1","ingress_id":"ing_' + "0" * 32 + '"}',
@@ -98,19 +108,20 @@ async def _visible(queue: RecordingQueue) -> list[str]:
 def test_redrive_dlq_is_keyword_only() -> None:
     queue = FakeIngressQueue(Faults())
     with pytest.raises(TypeError):
-        redrive_dlq(queue, queue, 1)  # type: ignore[misc]
+        _redrive_dlq(queue, queue, 1)  # type: ignore[misc]
 
 
 # --- dry-run ----------------------------------------------------------------------------------
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("mode", [{}, {"apply": False}], ids=["default", "apply_false"])
 async def test_dry_run_is_the_default_and_only_counts_and_releases(
-    dlq: RecordingQueue, source: RecordingQueue
+    dlq: RecordingQueue, source: RecordingQueue, mode: dict[str, Any]
 ) -> None:
     await _seed(dlq, BODIES)
 
-    report = await redrive_dlq(dlq=dlq, source=source, max_messages=10)
+    report = await redrive_dlq(dlq=dlq, source=source, max_messages=10, **mode)
 
     assert report == RedriveReport(seen=3, redriven=0, failed=0)
     assert source.ops("send_raw") == [] and source.ops("send") == []
@@ -121,19 +132,6 @@ async def test_dry_run_is_the_default_and_only_counts_and_releases(
     # ... so every one is still on the DLQ and visible again right away.
     assert sorted(await _visible(dlq)) == sorted(BODIES)
     assert source.bodies() == []
-
-
-@pytest.mark.asyncio
-async def test_dry_run_apply_false_matches_the_default(
-    dlq: RecordingQueue, source: RecordingQueue
-) -> None:
-    await _seed(dlq, BODIES)
-
-    report = await redrive_dlq(dlq=dlq, source=source, max_messages=10, apply=False)
-
-    assert report == RedriveReport(seen=3, redriven=0, failed=0)
-    assert source.bodies() == []
-    assert sorted(dlq.bodies()) == sorted(BODIES)
 
 
 @pytest.mark.asyncio
@@ -163,6 +161,7 @@ async def test_apply_sends_the_raw_body_unchanged_then_deletes(
     assert sorted(source.bodies()) == sorted(BODIES)  # byte-identical, never re-serialized
     assert source.ops("send") == []  # the raw path, never the envelope path
     assert dlq.bodies() == []
+    assert dlq.ops("change_visibility") == []  # apply never releases a redriven message
     for body in BODIES:
         sent = dlq.events.index(("source", "send_raw", body))
         deleted = dlq.events.index(("dlq", "delete", body))
@@ -182,6 +181,8 @@ async def test_apply_moves_exactly_max_messages_and_leaves_the_rest(
     assert len(source.bodies()) == 3
     assert len(dlq.bodies()) == 2
     assert sorted(source.bodies() + dlq.bodies()) == sorted(bodies)
+    # The two left over were never received, so they are visible right away.
+    assert sorted(await _visible(dlq)) == sorted(dlq.bodies())
 
 
 @pytest.mark.asyncio
@@ -248,3 +249,19 @@ async def test_a_failing_source_leaves_the_dlq_intact_and_sees_each_message_once
     assert dlq.ops("delete") == []
     assert sorted(dlq.bodies()) == sorted(BODIES)
     assert len(source.ops("send_raw")) == 3  # one attempt per message, no re-receive loop
+
+
+@pytest.mark.asyncio
+async def test_an_unexpected_send_error_propagates_without_deleting(
+    dlq: RecordingQueue, source: RecordingQueue
+) -> None:
+    await _seed(dlq, BODIES[:1])
+    bug = RuntimeError("a bug, not a queue failure")
+    source.fail_bodies[BODIES[0]] = bug
+
+    with pytest.raises(RuntimeError) as exc_info:
+        await redrive_dlq(dlq=dlq, source=source, max_messages=10, apply=True)
+
+    assert exc_info.value is bug
+    assert dlq.ops("delete") == []
+    assert dlq.bodies() == [BODIES[0]]
