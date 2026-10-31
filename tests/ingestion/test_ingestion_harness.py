@@ -13,11 +13,13 @@ from __future__ import annotations
 import copy
 import json
 import os
+import re
 import socket
 import threading
 import time
 import uuid
 from collections.abc import Callable, Iterator
+from pathlib import Path
 from urllib.parse import urlsplit
 
 import pytest
@@ -42,6 +44,9 @@ from scripts.dev import init_dynamodb
 from tests.support.influx_harness import influx_clients, influx_settings
 from tests.support.telemetry_v2_vectors import scenario
 
+pytest_plugins = ["pytester"]
+
+ROOT = Path(__file__).resolve().parents[2]
 QueueFactory = Callable[..., IngestionQueuePair]
 
 MESSAGE_ATTRIBUTES = ["All"]
@@ -184,34 +189,73 @@ def test_wait_until_ready_fails_fast_against_an_unreachable_endpoint(
     monkeypatch.setenv("INGESTION_SQS_URL", f"http://127.0.0.1:{_closed_port()}")
     monkeypatch.setenv("INGESTION_DYNAMODB_URL", f"http://127.0.0.1:{_closed_port()}")
 
-    started = time.monotonic()
-    with pytest.raises(TimeoutError, match="INGESTION_SQS_URL|INGESTION_DYNAMODB_URL"):
-        wait_until_ready(sqs_client(), dynamodb_client(), timeout_seconds=1)
-    assert time.monotonic() - started < 10
+    sqs, dynamodb = sqs_client(), dynamodb_client()
+    outcome: list[BaseException | None] = []
+
+    def attempt() -> None:
+        try:
+            wait_until_ready(sqs, dynamodb, timeout_seconds=1)
+        except BaseException as error:  # noqa: BLE001 - recorded and asserted below
+            outcome.append(error)
+        else:
+            outcome.append(None)
+
+    # A daemon thread bounds the test: a wait that ignores its timeout fails here, not hangs.
+    worker = threading.Thread(target=attempt, daemon=True)
+    worker.start()
+    worker.join(10)
+    assert not worker.is_alive(), "wait_until_ready ignored its timeout"
+    assert len(outcome) == 1 and isinstance(outcome[0], TimeoutError), outcome
+    assert re.search("INGESTION_SQS_URL|INGESTION_DYNAMODB_URL", str(outcome[0]))
 
 
 def test_wait_until_ready_returns_once_both_emulators_answer() -> None:
     wait_until_ready(sqs_client(), dynamodb_client(), timeout_seconds=30)
 
 
-# --- fixture teardown (two tests, run in file order) --------------------------------------------
+# --- fixture teardown -------------------------------------------------------------------------
 
-_CREATED_BY_FIXTURES: dict[str, list[str]] = {"queues": [], "tables": []}
+_FIXTURE_CONFTEST = """
+from tests.support.ingestion_harness import ingestion_queue_pair, ingestion_tables  # noqa: F401
+"""
+
+_FIXTURE_TEST = """
+import json
+import os
 
 
-def test_fixtures_create_resources_for_the_teardown_check(
-    ingestion_queue_pair: QueueFactory, ingestion_tables: IngestionTables
-) -> None:
+def test_create(ingestion_queue_pair, ingestion_tables):
     pair = ingestion_queue_pair()
-    _CREATED_BY_FIXTURES["queues"] = [pair.source_url, pair.dlq_url]
-    _CREATED_BY_FIXTURES["tables"] = [ingestion_tables.domain, ingestion_tables.audit]
+    other = ingestion_queue_pair(max_receive_count=3, visibility_seconds=5)
+    with open(os.environ["FIXTURE_RECORD"], "w", encoding="utf-8") as handle:
+        json.dump(
+            {
+                "queues": [pair.source_url, pair.dlq_url, other.source_url, other.dlq_url],
+                "tables": [ingestion_tables.domain, ingestion_tables.audit],
+            },
+            handle,
+        )
+"""
 
 
-def test_fixtures_delete_their_resources_at_teardown(sqs, dynamodb) -> None:
-    queues, tables = _CREATED_BY_FIXTURES["queues"], _CREATED_BY_FIXTURES["tables"]
-    assert len(queues) == 2 and len(tables) == 2, "run the whole module, in file order"
-    assert not any(_queue_exists(sqs, url) for url in queues)
-    assert not any(_table_exists(dynamodb, name) for name in tables)
+def test_fixtures_delete_their_resources_at_teardown(
+    pytester: pytest.Pytester, monkeypatch: pytest.MonkeyPatch, sqs, dynamodb
+) -> None:
+    record = pytester.path / "record.json"
+    monkeypatch.setenv("FIXTURE_RECORD", str(record))
+    monkeypatch.setenv(
+        "PYTHONPATH", os.pathsep.join(filter(None, [str(ROOT), os.environ.get("PYTHONPATH")]))
+    )
+    pytester.makeconftest(_FIXTURE_CONFTEST)
+    pytester.makepyfile(test_fixture_teardown=_FIXTURE_TEST)
+
+    result = pytester.runpytest_subprocess("-q", "-p", "no:cacheprovider")
+
+    result.assert_outcomes(passed=1)
+    created = json.loads(record.read_text(encoding="utf-8"))
+    assert len(set(created["queues"])) == 4 and len(set(created["tables"])) == 2
+    assert not any(_queue_exists(sqs, url) for url in created["queues"])
+    assert not any(_table_exists(dynamodb, name) for name in created["tables"])
 
 
 # --- SQS (ElasticMQ) ---------------------------------------------------------------------------
@@ -419,6 +463,14 @@ def test_table_pair_context_deletes_both_tables_on_exit(dynamodb) -> None:
 
     assert not _table_exists(dynamodb, tables.domain)
     assert not _table_exists(dynamodb, tables.audit)
+
+
+def test_concurrent_table_pairs_get_unique_names(dynamodb) -> None:
+    with table_pair(dynamodb) as first, table_pair(dynamodb) as second:
+        names = [first.domain, first.audit, second.domain, second.audit]
+        assert len(set(names)) == 4
+        assert not {"LimnopulseDomain", "LimnopulseAudit"} & set(names)
+        assert all(_table_exists(dynamodb, name) for name in names)
 
 
 @pytest.mark.parametrize(

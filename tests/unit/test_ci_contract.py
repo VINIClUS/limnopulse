@@ -355,8 +355,10 @@ def test_local_ingestion_runners_pin_their_artifacts_and_bind_loopback() -> None
     assert ELASTICMQ_JAR_SHA256 in elasticmq_text
     assert "${ELASTICMQ_PORT:-9324}" in elasticmq_text
     # Both the advertised queue URLs and the REST listener stay on loopback.
-    assert re.search(r'node-address\s*\{[^}]*\bhost\s*=\s*"127\.0\.0\.1"', elasticmq_text)
-    assert re.search(r'rest-sqs\s*\{[^}]*\bbind-hostname\s*=\s*"127\.0\.0\.1"', elasticmq_text)
+    # A block body may contain ${...} substitutions (for example the port) before the key.
+    block = r"(?:[^{}]|\$\{[^}]*\})*?"
+    assert re.search(rf'node-address\s*\{{{block}\bhost\s*=\s*"127\.0\.0\.1"', elasticmq_text)
+    assert re.search(rf'rest-sqs\s*\{{{block}\bbind-hostname\s*=\s*"127\.0\.0\.1"', elasticmq_text)
     assert re.search(r"sqs-limits\s*=\s*strict", elasticmq_text)
     assert "ListQueues" in elasticmq_text
     # No pre-declared queues: each test creates and deletes its own.
@@ -430,9 +432,11 @@ def test_ingestion_tests_fail_instead_of_skipping_under_the_integration_flag() -
         extra_args=("-k", "test_proxy_down_makes_influx_writes_retryable"),
     )
 
-    assert returncode == 1, output
-    assert "1 failed" in output, output
-    assert "skipped" not in output.strip().splitlines()[-1]
+    assert returncode != 0, output
+    summary = output.strip().splitlines()[-1]
+    # A setup-time skip turned into a failure is reported as an error; either is acceptable.
+    assert re.search(r"\b1 (failed|error)\b", summary), output
+    assert "skipped" not in summary
     assert "must not skip under RUN_INGESTION_INTEGRATION=1" in output
     assert "RUN_INFLUX_INTEGRATION" in output
 
