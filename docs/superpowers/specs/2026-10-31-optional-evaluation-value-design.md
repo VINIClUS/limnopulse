@@ -1,8 +1,8 @@
 # Optional Evaluation Value Design (issue #6)
 
-**Date:** 2026-10-31  
-**Status:** Accepted design  
-**Issue:** #6 — Model `Evaluation.Value` as an optional value  
+**Date:** 2026-10-31\
+**Status:** Accepted design\
+**Issue:** #6 — Model `Evaluation.Value` as an optional value\
 **Depends on:** Phase 3B evaluator and durable state; PR #5 / commit `0a41659`
 
 **Decision:** evaluation values are presence-aware; an indeterminate evaluation never becomes an implicit zero.
