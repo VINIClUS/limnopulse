@@ -129,3 +129,18 @@ output "workers_iam_user_name" {
   description = "IAM user name to generate the workers runtime's access key for."
   value       = aws_iam_user.workers.name
 }
+
+output "telemetry_ingress_queue_url" {
+  description = "SQS_TELEMETRY_INGRESS_QUEUE_URL"
+  value       = try(aws_sqs_queue.telemetry_ingress[0].id, null)
+}
+
+output "telemetry_ingress_dlq_url" {
+  description = "SQS_TELEMETRY_INGRESS_DLQ_URL"
+  value       = try(aws_sqs_queue.telemetry_ingress_dlq[0].id, null)
+}
+
+output "telemetry_ingest_iam_user_name" {
+  description = "IAM user for the telemetry ingest worker; create its access key out of band."
+  value       = try(aws_iam_user.telemetry_ingest[0].name, null)
+}
