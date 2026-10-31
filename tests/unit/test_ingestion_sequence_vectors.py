@@ -147,9 +147,10 @@ def outcome(accepted: tuple = (), rejected: tuple = ()) -> PipelineOutcome:
 
 def test_marks_take_per_component_maxima_from_eligible_accepted_observations() -> None:
     accepted = (
+        # The maximum pair is never the last eligible observation of its component.
+        canonical_observation(observed_at=t(2), sequence=8, metric_key="orp"),
         canonical_observation(observed_at=t(1), sequence=5),
         canonical_observation(observed_at=t(2), sequence=3, metric_key="ph"),
-        canonical_observation(observed_at=t(2), sequence=8, metric_key="orp"),
         canonical_observation(observed_at=t(9), sequence=99, flags=[QualityFlag.CLOCK_SKEW_FUTURE]),
         canonical_observation(component_id=OTHER_COMPONENT, observed_at=t(5), sequence=None),
         canonical_observation(
@@ -164,6 +165,7 @@ def test_marks_take_per_component_maxima_from_eligible_accepted_observations() -
             sequence=1,
             flags=[QualityFlag.DELAYED, QualityFlag.REPLAY],
         ),
+        canonical_observation(component_id=THIRD_COMPONENT, observed_at=t(0), sequence=7),
         # The mark is the maximum (observed_at, sequence) PAIR, not two separate maxima.
         canonical_observation(component_id=FOURTH_COMPONENT, observed_at=t(1), sequence=9),
         canonical_observation(component_id=FOURTH_COMPONENT, observed_at=t(2), sequence=3),

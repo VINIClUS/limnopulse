@@ -131,6 +131,8 @@ from tests.support.ingestion_contract_kits import (
     TENANT,
     canonical_observation,
     credential,
+    envelope_of_message_bytes,
+    multibyte_envelope,
     device,
     device_integration,
     envelope,
@@ -910,6 +912,17 @@ def test_largest_valid_body_never_exceeds_the_message_guard(
     assert size <= ingestion.MAX_INGRESS_MESSAGE_BYTES
 
 
+def test_kit_size_helpers_build_exact_envelopes() -> None:
+    limit = ingestion.MAX_INGRESS_MESSAGE_BYTES
+
+    for target in (limit, limit + 1):
+        message = envelope_of_message_bytes(target)
+        assert len(message.to_json().encode("utf-8")) + 31 == target
+        assert len(message.observations) <= ingestion.MAX_INGEST_OBSERVATIONS
+    multibyte = multibyte_envelope().to_json()
+    assert len(multibyte) + 31 <= limit < len(multibyte.encode("utf-8")) + 31
+
+
 def test_unicode_expansion_vector_stays_within_the_bound() -> None:
     body = _largest_body(_many_emoji, 1_000, 64)
     batch = IngestObservationBatch.model_validate_json(body)
@@ -1248,6 +1261,11 @@ def test_quarantine_entry_enforces_the_replayable_rule_and_bounds() -> None:
         rebuild(observation_row, source_observation_json='{"value":1}')
     with pytest.raises(ValidationError):
         rebuild(cut, replayable=True)
+    # Truncated but still parseable as a SourceObservation: the truncation alone forbids replay.
+    parseable = observation_row.source_observation_json
+    with pytest.raises(ValidationError):
+        rebuild(observation_row, truncated=True)
+    rebuild(observation_row, truncated=True, replayable=False, source_observation_json=parseable)
     with pytest.raises(ValidationError):
         rebuild(summary, envelope_excerpt_json='"' + "x" * 2_047 + '"')
     with pytest.raises(ValidationError):
@@ -1520,6 +1538,18 @@ FENCE_ROWS: list[tuple[str, dict[str, Any], dict[str, Any], object]] = [
         {"account": None},
         {},
         _fence(IngressFenceReason.IDENTITY_UNRESOLVED, False),
+    ),
+    (
+        "integration decommissioned, no account",
+        {"integration": {"status": DeviceIntegrationStatus.DECOMMISSIONED}, "account": None},
+        {},
+        _fence(IngressFenceReason.INTEGRATION_DECOMMISSIONED, False),
+    ),
+    (
+        "integration error, no account",
+        {"integration": {"status": DeviceIntegrationStatus.ERROR}, "account": None},
+        {},
+        IngressDefer(reason=IngressDeferReason.INTEGRATION_NOT_ACTIVE),
     ),
     (
         "account of another tenant",

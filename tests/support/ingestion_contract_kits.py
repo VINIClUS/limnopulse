@@ -19,13 +19,18 @@ from typing import Any, Protocol
 
 import pytest
 from boto3.dynamodb.types import TypeDeserializer, TypeSerializer
-from botocore.exceptions import ClientError
+from botocore.exceptions import ClientError, EndpointConnectionError
 
 from limnopulse_api.adapters.dynamodb_v2 import (
     account_scoped_identity_hash,
     external_identity_hash,
 )
-from limnopulse_api.core.errors import ConflictError, IngressMessageTooLarge, NotFoundError
+from limnopulse_api.core.errors import (
+    ConflictError,
+    IngressMessageTooLarge,
+    IngressQueueError,
+    NotFoundError,
+)
 from limnopulse_api.domain.alerts import AuditContext
 from limnopulse_api.domain.devices_v2 import (
     ComponentKind,
@@ -369,7 +374,46 @@ def kit_ids(scenarios: Sequence[Callable[..., Any]]) -> list[str]:
 # Ingest credentials --------------------------------------------------------------------------
 
 
-class CredentialKitSubject(Protocol):
+class FaultInjectable(Protocol):
+    """Every kit subject can make its next call of a port `operation` (the method name) raise
+    `exc` exactly once, from the store underneath. Later waves use it to test 503 paths."""
+
+    def fail_next(self, operation: str, exc: BaseException) -> None: ...
+
+
+def store_errors() -> tuple[BaseException, ...]:
+    return (
+        ClientError(
+            {"Error": {"Code": "ProvisionedThroughputExceededException", "Message": "busy"}},
+            "GetItem",
+        ),
+        EndpointConnectionError(endpoint_url="http://dynamodb.invalid"),
+    )
+
+
+def _fault_scenario(
+    name: str,
+    operation: str,
+    invoke: Callable[[Any], Awaitable[Any]],
+    *,
+    prepare: Callable[[Any], Awaitable[None]] | None = None,
+    errors: Callable[[], tuple[BaseException, ...]] = store_errors,
+) -> Callable[[Any], Awaitable[None]]:
+    async def scenario(subject: Any) -> None:
+        if prepare is not None:
+            await prepare(subject)
+        for error in errors():
+            subject.fail_next(operation, error)
+            with pytest.raises(type(error)) as exc_info:
+                await invoke(subject)
+            assert exc_info.value is error  # never swallowed, mapped to None, a denial or a fence
+        await invoke(subject)  # one-shot: the next call reaches the store again
+
+    scenario.__name__ = f"{name}_propagates_store_failures"
+    return scenario
+
+
+class CredentialKitSubject(FaultInjectable, Protocol):
     repository: Any  # IngestCredentialRepository
 
     async def seed_account(self, account: IntegrationAccount) -> None: ...
@@ -472,6 +516,7 @@ async def credential_revoke_stale_version_is_conflict(subject: CredentialKitSubj
     await subject.seed_account(integration_account())
     await subject.repository.create_ingest_credential(credential(), AUDIT)
 
+    before = subject.audit_items()
     with pytest.raises(ConflictError) as exc_info:
         await subject.repository.revoke_ingest_credential(
             TENANT, ACCOUNT, CREDENTIAL, expected_version=7, revoked_at=RECEIVED, audit=AUDIT
@@ -479,6 +524,7 @@ async def credential_revoke_stale_version_is_conflict(subject: CredentialKitSubj
 
     assert not isinstance(exc_info.value, NotFoundError)
     assert await subject.repository.get_ingest_credential(CREDENTIAL) == credential()
+    assert subject.audit_items() == before
 
 
 async def credential_revoke_never_reveals_foreign_rows(subject: CredentialKitSubject) -> None:
@@ -490,6 +536,7 @@ async def credential_revoke_never_reveals_foreign_rows(subject: CredentialKitSub
         (TENANT, ACCOUNT, OTHER_CREDENTIAL),
     ]
 
+    before = subject.audit_items()
     for tenant_id, account_id, credential_id in attempts:
         with pytest.raises(NotFoundError):
             await subject.repository.revoke_ingest_credential(
@@ -501,14 +548,17 @@ async def credential_revoke_never_reveals_foreign_rows(subject: CredentialKitSub
                 audit=AUDIT,
             )
     assert await subject.repository.get_ingest_credential(CREDENTIAL) == credential()
+    assert subject.audit_items() == before
 
     await subject.repository.revoke_ingest_credential(
         TENANT, ACCOUNT, CREDENTIAL, expected_version=1, revoked_at=RECEIVED, audit=AUDIT
     )
+    after_revoke = subject.audit_items()
     with pytest.raises(NotFoundError):  # already revoked: the `#status = :active` condition
         await subject.repository.revoke_ingest_credential(
             TENANT, ACCOUNT, CREDENTIAL, expected_version=2, revoked_at=RECEIVED, audit=AUDIT
         )
+    assert subject.audit_items() == after_revoke
 
 
 async def credential_writes_one_audit_item_per_change(subject: CredentialKitSubject) -> None:
@@ -552,7 +602,7 @@ CREDENTIAL_REPOSITORY_CONTRACT = (
 # Connector authentication -------------------------------------------------------------------
 
 
-class AuthenticatorKitSubject(Protocol):
+class AuthenticatorKitSubject(FaultInjectable, Protocol):
     authenticator: Any  # ConnectorAuthenticator
 
     async def seed_account(self, account: IntegrationAccount) -> None: ...
@@ -635,7 +685,7 @@ CONNECTOR_AUTHENTICATOR_CONTRACT = (
 # External identity resolution ----------------------------------------------------------------
 
 
-class ResolverKitSubject(Protocol):
+class ResolverKitSubject(FaultInjectable, Protocol):
     resolver: Any  # ExternalIdentityResolver
 
     async def seed_device_integration(self, integration: DeviceIntegration) -> None: ...
@@ -683,7 +733,7 @@ EXTERNAL_IDENTITY_RESOLVER_CONTRACT = (
 # Integration lifecycle -----------------------------------------------------------------------
 
 
-class LifecycleKitSubject(Protocol):
+class LifecycleKitSubject(FaultInjectable, Protocol):
     repository: Any  # IntegrationLifecycleRepository
 
     async def seed_account(self, account: IntegrationAccount) -> None: ...
@@ -800,7 +850,7 @@ INTEGRATION_LIFECYCLE_CONTRACT = (
 # Consistent device reads ---------------------------------------------------------------------
 
 
-class DeviceReaderKitSubject(Protocol):
+class DeviceReaderKitSubject(FaultInjectable, Protocol):
     reader: Any  # ConsistentDeviceReader
 
     async def seed_device(self, device: DeviceV2) -> None: ...
@@ -821,7 +871,7 @@ CONSISTENT_DEVICE_READER_CONTRACT = (consistent_device_read,)
 # Trusted mapping -----------------------------------------------------------------------------
 
 
-class TrustedMappingKitSubject(Protocol):
+class TrustedMappingKitSubject(FaultInjectable, Protocol):
     mapping: Any  # TrustedMapping
 
     async def seed_account(self, account: IntegrationAccount) -> None: ...
@@ -971,6 +1021,16 @@ ADMIT_DENIAL_CASES: tuple[tuple[str, dict[str, Any], IngressDenial], ...] = (
         IngressDenial(reason=IngressAdmissionDenied.DEVICE_INACTIVE, observation_index=None),
     ),
     (
+        "integration of another tenant",
+        {"integration": {"tenant_id": OTHER_TENANT}},
+        IngressDenial(reason=IngressAdmissionDenied.INTEGRATION_MISMATCH, observation_index=None),
+    ),
+    (
+        "integration of another account",
+        {"integration": {"integration_account_id": OTHER_ACCOUNT}},
+        IngressDenial(reason=IngressAdmissionDenied.INTEGRATION_MISMATCH, observation_index=None),
+    ),
+    (
         "first failure wins",
         {
             "integration": {"status": DeviceIntegrationStatus.DECOMMISSIONED},
@@ -1101,6 +1161,12 @@ FENCE_CASES: tuple[tuple[str, dict[str, Any], dict[str, Any], object], ...] = (
         IngressFence(reason=IngressFenceReason.IDENTITY_UNRESOLVED, account_verified=True),
     ),
     (
+        "integration decommissioned without an account row",
+        {"with_account": False, "integration": {"status": DeviceIntegrationStatus.DECOMMISSIONED}},
+        {},
+        IngressFence(reason=IngressFenceReason.INTEGRATION_DECOMMISSIONED, account_verified=False),
+    ),
+    (
         "account missing",
         {"with_account": False},
         {},
@@ -1162,7 +1228,7 @@ TRUSTED_MAPPING_CONTRACT = (
 # Ingress receipts ----------------------------------------------------------------------------
 
 
-class ReceiptKitSubject(Protocol):
+class ReceiptKitSubject(FaultInjectable, Protocol):
     repository: Any  # IngressReceiptRepository
 
 
@@ -1202,6 +1268,22 @@ async def receipt_claim_after_logical_expiry(subject: ReceiptKitSubject) -> None
     assert await subject.repository.get_ingress_receipt(ACCOUNT, KEY_SHA) == replacement
 
 
+async def receipt_claim_cutoff_comes_from_now(subject: ReceiptKitSubject) -> None:
+    first = receipt()
+    await subject.repository.claim_ingress_receipt(first, now=RECEIVED)
+    # A receipt built long after the first, but claimed while the first is still live.
+    early_now = RECEIVED + timedelta(hours=1)
+    future = receipt(ingress_id="ing_" + "5" * 32, created_at=RECEIVED + timedelta(hours=25))
+
+    assert await subject.repository.claim_ingress_receipt(future, now=early_now) == first
+
+    # A receipt built early, but claimed once the first has expired by `now`.
+    late_now = RECEIVED + timedelta(hours=24)
+    stale = receipt(ingress_id="ing_" + "6" * 32, created_at=RECEIVED + timedelta(seconds=1))
+    assert await subject.repository.claim_ingress_receipt(stale, now=late_now) == stale
+    assert await subject.repository.get_ingress_receipt(ACCOUNT, KEY_SHA) == stale
+
+
 async def receipt_mark_enqueued_is_conditioned(subject: ReceiptKitSubject) -> None:
     first = receipt()
     await subject.repository.claim_ingress_receipt(first, now=RECEIVED)
@@ -1225,14 +1307,32 @@ INGRESS_RECEIPT_CONTRACT = (
     receipt_claim_fresh,
     receipt_claim_race_returns_the_winner,
     receipt_claim_after_logical_expiry,
+    receipt_claim_cutoff_comes_from_now,
     receipt_mark_enqueued_is_conditioned,
+    _fault_scenario(
+        "receipt_get",
+        "get_ingress_receipt",
+        lambda s: s.repository.get_ingress_receipt(ACCOUNT, KEY_SHA),
+    ),
+    _fault_scenario(
+        "receipt_claim",
+        "claim_ingress_receipt",
+        lambda s: s.repository.claim_ingress_receipt(receipt(), now=RECEIVED),
+    ),
+    _fault_scenario(
+        "receipt_mark",
+        "mark_ingress_receipt_enqueued",
+        lambda s: s.repository.mark_ingress_receipt_enqueued(
+            ACCOUNT, KEY_SHA, INGRESS, at=RECEIVED
+        ),
+    ),
 )
 
 
 # Ingress queue -------------------------------------------------------------------------------
 
 
-class QueueKitSubject(Protocol):
+class QueueKitSubject(FaultInjectable, Protocol):
     producer: Any  # IngressQueueProducer
     consumer: Any  # IngressQueueConsumer
 
@@ -1349,6 +1449,18 @@ async def queue_accepts_an_envelope_at_the_exact_limit(subject: QueueKitSubject)
     assert received.body == message.to_json()
 
 
+async def queue_receive_honours_max_messages(subject: QueueKitSubject) -> None:
+    for index in range(3):
+        await subject.producer.send(envelope(ingress_id=f"ing_{index:032x}"))
+
+    first = await subject.consumer.receive(max_messages=2, wait_seconds=0, visibility_seconds=30)
+    rest = await _receive(subject)
+
+    assert len(first) == 2
+    assert len(rest) == 1
+    assert len({item.message_id for item in [*first, *rest]}) == 3
+
+
 async def queue_send_raw_keeps_the_body(subject: QueueKitSubject) -> None:
     body = '{"schema":"unknown@9","note":"redriven as-is"}'
 
@@ -1363,6 +1475,7 @@ INGRESS_QUEUE_CONTRACT = (
     queue_visibility_and_delete,
     queue_rejects_oversized_envelopes,
     queue_accepts_an_envelope_at_the_exact_limit,
+    queue_receive_honours_max_messages,
     queue_send_raw_keeps_the_body,
 )
 
@@ -1370,7 +1483,7 @@ INGRESS_QUEUE_CONTRACT = (
 # Quarantine ----------------------------------------------------------------------------------
 
 
-class QuarantineKitSubject(Protocol):
+class QuarantineKitSubject(FaultInjectable, Protocol):
     repository: Any  # QuarantineRepository
 
     def set_now(self, now: datetime) -> None: ...
@@ -1390,9 +1503,10 @@ async def _all_pages(
         if page.next_after_sk is None:
             return collected
         # A filtered page may be empty yet carry a cursor (Query with Limit plus a filter).
+        # The cursor may be the last EVALUATED sort key (Query Limit before the filter).
         if page.entries:
-            assert page.next_after_sk == page.entries[-1].entry_key
-        assert page.next_after_sk != after
+            assert page.next_after_sk >= page.entries[-1].entry_key
+        assert after is None or page.next_after_sk > after
         after = page.next_after_sk
     raise AssertionError("pagination did not terminate")
 
@@ -1539,7 +1653,7 @@ QUARANTINE_REPOSITORY_CONTRACT = (
 # Ingest state --------------------------------------------------------------------------------
 
 
-class IngestStateKitSubject(Protocol):
+class IngestStateKitSubject(FaultInjectable, Protocol):
     repository: Any  # IngestStateRepository
 
     # The port has no device-state read (P6 owns the views); the subject exposes the raw row.
@@ -1598,8 +1712,7 @@ async def state_marks_are_monotone(subject: IngestStateKitSubject) -> None:
     older = marks(observed_at=OBSERVED, sequence=99)
 
     await subject.repository.apply_ingest_marks(newer)
-    await subject.repository.apply_ingest_marks(older)
-    await subject.repository.apply_ingest_marks(newer)
+    await subject.repository.apply_ingest_marks(older)  # older after newer: must not regress
 
     state = (await subject.repository.get_component_states(TENANT, [COMPONENT]))[COMPONENT]
     device_state = await subject.device_state(DEVICE)
@@ -1615,6 +1728,51 @@ async def state_marks_are_monotone(subject: IngestStateKitSubject) -> None:
     health = await subject.repository.get_connector_health(TENANT, ACCOUNT)
     assert health is not None
     assert health.last_received_at == RECEIVED + timedelta(minutes=1)
+
+
+async def state_connector_marks_never_regress(subject: IngestStateKitSubject) -> None:
+    later = RECEIVED + timedelta(minutes=5)
+    newer = IngestMarks(
+        tenant_id=TENANT,
+        device_id=None,
+        integration_account_id=ACCOUNT,
+        component_marks=(),
+        device_mark=None,
+        connector_mark=ConnectorMark(
+            received_at=later,
+            accepted_at=later,
+            quarantined_at=later,
+            quarantine_reason="metric_unknown",
+            fenced_at=later,
+            fence_reason="account_revoked",
+        ),
+    )
+    older = newer.model_copy(
+        update={
+            "connector_mark": ConnectorMark(
+                received_at=RECEIVED,
+                accepted_at=RECEIVED,
+                quarantined_at=RECEIVED,
+                quarantine_reason="value_invalid",
+                fenced_at=RECEIVED,
+                fence_reason="integration_mismatch",
+            )
+        }
+    )
+
+    await subject.repository.apply_ingest_marks(newer)
+    await subject.repository.apply_ingest_marks(older)
+
+    assert await subject.repository.get_connector_health(TENANT, ACCOUNT) == ConnectorHealth(
+        tenant_id=TENANT,
+        integration_account_id=ACCOUNT,
+        last_received_at=later,
+        last_accepted_at=later,
+        last_quarantined_at=later,
+        last_quarantine_reason="metric_unknown",
+        last_fenced_at=later,
+        last_fence_reason="account_revoked",
+    )
 
 
 async def state_ties_are_order_independent(subject: IngestStateKitSubject) -> None:
@@ -1714,6 +1872,20 @@ async def state_empty_marks_write_nothing(subject: IngestStateKitSubject) -> Non
 
 
 INGEST_STATE_CONTRACT = (
+    state_connector_marks_never_regress,
+    _fault_scenario(
+        "state_apply", "apply_ingest_marks", lambda s: s.repository.apply_ingest_marks(marks())
+    ),
+    _fault_scenario(
+        "state_components",
+        "get_component_states",
+        lambda s: s.repository.get_component_states(TENANT, [COMPONENT]),
+    ),
+    _fault_scenario(
+        "state_health",
+        "get_connector_health",
+        lambda s: s.repository.get_connector_health(TENANT, ACCOUNT),
+    ),
     state_empty_marks_write_nothing,
     state_fence_reason_ties_are_order_independent,
     state_apply_then_read,
@@ -1757,7 +1929,7 @@ RATE_LIMITER_CONTRACT = (
 )
 
 
-class EntitlementKitSubject(Protocol):
+class EntitlementKitSubject(FaultInjectable, Protocol):
     check: Any  # IngressEntitlementCheck
 
 
@@ -1806,6 +1978,196 @@ TELEMETRY_METRICS_CONTRACT = (
     metrics_records_one_object_per_call,
     metrics_refuse_open_names_and_labels,
 )
+
+
+# Store-failure propagation, one scenario per port operation ---------------------------------
+#
+# A store failure is never swallowed: an authenticator must not answer None (401 instead of 503),
+# a mapping must not deny or fence, and a repository must not report "missing".
+
+
+async def _seed_credential_account(subject: Any) -> None:
+    await subject.seed_account(integration_account())
+
+
+async def _seed_issued_credential(subject: Any) -> None:
+    await subject.seed_account(integration_account())
+    await subject.repository.create_ingest_credential(credential(), AUDIT)
+
+
+async def _seed_full_mapping(subject: Any) -> None:
+    await _seed_mapping(subject, components=(component(),))
+
+
+async def _seed_quarantine(subject: Any) -> None:
+    subject.set_now(RECEIVED)
+    await subject.repository.put_quarantine_entries(fenced_entries())
+
+
+_RECEIVED_MESSAGES: dict[int, Any] = {}
+
+
+async def _seed_received_message(subject: Any) -> None:
+    await subject.producer.send(envelope())
+    (message,) = await _receive(subject)
+    _RECEIVED_MESSAGES[id(subject)] = message
+
+
+def queue_errors() -> tuple[BaseException, ...]:
+    return (
+        IngressQueueError("transient send failure", retryable=True),
+        IngressQueueError("permanent send failure", retryable=False),
+    )
+
+
+CREDENTIAL_REPOSITORY_CONTRACT += (
+    _fault_scenario(
+        "credential_get",
+        "get_ingest_credential",
+        lambda s: s.repository.get_ingest_credential(CREDENTIAL),
+    ),
+    _fault_scenario(
+        "credential_list",
+        "list_ingest_credentials",
+        lambda s: s.repository.list_ingest_credentials(TENANT, ACCOUNT),
+    ),
+    _fault_scenario(
+        "credential_create",
+        "create_ingest_credential",
+        lambda s: s.repository.create_ingest_credential(credential(), AUDIT),
+        prepare=_seed_credential_account,
+    ),
+    _fault_scenario(
+        "credential_revoke",
+        "revoke_ingest_credential",
+        lambda s: s.repository.revoke_ingest_credential(
+            TENANT, ACCOUNT, CREDENTIAL, expected_version=1, revoked_at=RECEIVED, audit=AUDIT
+        ),
+        prepare=_seed_issued_credential,
+    ),
+)
+CONNECTOR_AUTHENTICATOR_CONTRACT += (
+    _fault_scenario(
+        "authenticate",
+        "authenticate",
+        lambda s: s.authenticator.authenticate(ingest_token(CREDENTIAL, SECRET)),
+        prepare=_seed_authenticable,
+    ),
+)
+EXTERNAL_IDENTITY_RESOLVER_CONTRACT += (
+    _fault_scenario(
+        "resolve",
+        "resolve_external_identity",
+        lambda s: s.resolver.resolve_external_identity(PROVIDER, IDENTITY_HASH),
+    ),
+)
+INTEGRATION_LIFECYCLE_CONTRACT += (
+    _fault_scenario(
+        "lifecycle_account",
+        "transition_integration_account",
+        lambda s: s.repository.transition_integration_account(
+            TENANT,
+            ACCOUNT,
+            IntegrationAccountStatus.ERROR,
+            expected_version=1,
+            updated_at=RECEIVED,
+            audit=AUDIT,
+        ),
+        prepare=_seed_credential_account,
+    ),
+    _fault_scenario(
+        "lifecycle_device_integration",
+        "transition_device_integration",
+        lambda s: s.repository.transition_device_integration(
+            TENANT,
+            INTEGRATION,
+            DeviceIntegrationStatus.ERROR,
+            expected_version=1,
+            updated_at=RECEIVED,
+            audit=AUDIT,
+        ),
+        prepare=lambda s: s.seed_device_integration(device_integration()),
+    ),
+)
+CONSISTENT_DEVICE_READER_CONTRACT += (
+    _fault_scenario(
+        "device_read",
+        "get_device",
+        lambda s: s.reader.get_device(TENANT, DEVICE, consistent=True),
+        prepare=lambda s: s.seed_device(device()),
+    ),
+)
+TRUSTED_MAPPING_CONTRACT += (
+    _fault_scenario(
+        "admit",
+        "admit",
+        lambda s: s.mapping.admit(SOURCE, batch(COMPONENT)),
+        prepare=_seed_full_mapping,
+    ),
+    _fault_scenario(
+        "fence", "fence", lambda s: s.mapping.fence(envelope()), prepare=_seed_full_mapping
+    ),
+)
+INGRESS_QUEUE_CONTRACT += (
+    _fault_scenario(
+        "queue_send", "send", lambda s: s.producer.send(envelope()), errors=queue_errors
+    ),
+    _fault_scenario(
+        "queue_send_raw", "send_raw", lambda s: s.producer.send_raw("{}"), errors=queue_errors
+    ),
+    _fault_scenario("queue_receive", "receive", _receive),
+    _fault_scenario(
+        "queue_change_visibility",
+        "change_visibility",
+        lambda s: s.consumer.change_visibility(_RECEIVED_MESSAGES[id(s)], 30),
+        prepare=_seed_received_message,
+    ),
+    _fault_scenario(
+        "queue_delete",
+        "delete",
+        lambda s: s.consumer.delete(_RECEIVED_MESSAGES[id(s)]),
+        prepare=_seed_received_message,
+    ),
+)
+QUARANTINE_REPOSITORY_CONTRACT += (
+    _fault_scenario(
+        "quarantine_put",
+        "put_quarantine_entries",
+        lambda s: s.repository.put_quarantine_entries(fenced_entries()),
+        prepare=lambda s: _set_now(s, RECEIVED),
+    ),
+    _fault_scenario(
+        "quarantine_list",
+        "list_quarantine_entries",
+        lambda s: s.repository.list_quarantine_entries(TENANT, after_sk=None, limit=10),
+        prepare=_seed_quarantine,
+    ),
+    _fault_scenario(
+        "quarantine_get",
+        "get_quarantine_entry",
+        lambda s: s.repository.get_quarantine_entry(TENANT, fenced_entries()[0].entry_key),
+        prepare=_seed_quarantine,
+    ),
+    _fault_scenario(
+        "quarantine_transition",
+        "transition_quarantine_entry",
+        lambda s: s.repository.transition_quarantine_entry(
+            TENANT,
+            fenced_entries()[0].entry_key,
+            QuarantineEntryStatus.DISMISSED,
+            expected_version=1,
+            at=RECEIVED,
+        ),
+        prepare=_seed_quarantine,
+    ),
+)
+ENTITLEMENT_CHECK_CONTRACT += (
+    _fault_scenario("entitlement", "allows", lambda s: s.check.allows(TENANT, ACCOUNT, 1)),
+)
+
+
+async def _set_now(subject: Any, now: datetime) -> None:
+    subject.set_now(now)
 
 
 # DynamoDB expression vectors ------------------------------------------------------------------
