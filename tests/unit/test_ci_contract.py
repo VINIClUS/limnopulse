@@ -8,6 +8,7 @@ import sys
 from pathlib import Path
 from typing import Any
 
+import pytest
 import yaml
 
 ROOT = Path(__file__).resolve().parents[2]
@@ -353,7 +354,9 @@ def test_local_ingestion_runners_pin_their_artifacts_and_bind_loopback() -> None
     assert "elasticmq-server-1.6.16.jar" in elasticmq_text
     assert ELASTICMQ_JAR_SHA256 in elasticmq_text
     assert "${ELASTICMQ_PORT:-9324}" in elasticmq_text
-    assert re.search(r'node-address[\s\S]*host\s*=\s*"127\.0\.0\.1"', elasticmq_text)
+    # Both the advertised queue URLs and the REST listener stay on loopback.
+    assert re.search(r'node-address\s*\{[^}]*\bhost\s*=\s*"127\.0\.0\.1"', elasticmq_text)
+    assert re.search(r'rest-sqs\s*\{[^}]*\bbind-hostname\s*=\s*"127\.0\.0\.1"', elasticmq_text)
     assert re.search(r"sqs-limits\s*=\s*strict", elasticmq_text)
     assert "ListQueues" in elasticmq_text
     # No pre-declared queues: each test creates and deletes its own.
@@ -368,12 +371,15 @@ def test_local_ingestion_runners_pin_their_artifacts_and_bind_loopback() -> None
     assert "re-pin" in dynamodb_text.lower()
 
 
-def test_ingestion_tests_skip_cleanly_without_the_integration_flag() -> None:
+def _run_ingestion_suite(
+    *, set_flags: dict[str, str], extra_args: tuple[str, ...] = ()
+) -> tuple[int, str]:
     env = {
         name: value
         for name, value in os.environ.items()
         if name not in {"RUN_INGESTION_INTEGRATION", "RUN_INFLUX_INTEGRATION"}
     }
+    env.update(set_flags)
     # Unreachable endpoints: a test that did not skip would fail instead of passing silently.
     env.update(
         INGESTION_SQS_URL="http://127.0.0.1:9",
@@ -381,7 +387,17 @@ def test_ingestion_tests_skip_cleanly_without_the_integration_flag() -> None:
         INFLUX_INTEGRATION_URL="http://127.0.0.1:9",
     )
     result = subprocess.run(
-        [sys.executable, "-m", "pytest", "-q", "-rs", "-p", "no:cacheprovider", "tests/ingestion"],
+        [
+            sys.executable,
+            "-m",
+            "pytest",
+            "-q",
+            "-rs",
+            "-p",
+            "no:cacheprovider",
+            "tests/ingestion",
+            *extra_args,
+        ],
         cwd=ROOT,
         env=env,
         check=False,
@@ -389,13 +405,36 @@ def test_ingestion_tests_skip_cleanly_without_the_integration_flag() -> None:
         text=True,
         timeout=300,
     )
-    output = result.stdout + result.stderr
+    return result.returncode, result.stdout + result.stderr
 
-    assert result.returncode == 0, output
+
+# The ingestion flag alone gates tests/ingestion: the Influx flag does not open it.
+@pytest.mark.parametrize("set_flags", [{}, {"RUN_INFLUX_INTEGRATION": "1"}])
+def test_ingestion_tests_skip_cleanly_without_the_integration_flag(
+    set_flags: dict[str, str],
+) -> None:
+    returncode, output = _run_ingestion_suite(set_flags=set_flags)
+
+    assert returncode == 0, output
     summary = output.strip().splitlines()[-1]
-    assert re.fullmatch(r"\d+ skipped in [\d.]+s", summary), summary
+    assert re.fullmatch(r"\d+ skipped(, \d+ warnings?)? in [\d.]+s( \([^)]*\))?", summary), summary
     assert int(summary.split()[0]) >= 10
     assert "RUN_INGESTION_INTEGRATION=1" in output
+
+
+def test_ingestion_tests_fail_instead_of_skipping_under_the_integration_flag() -> None:
+    # Without RUN_INFLUX_INTEGRATION the reused influx_bucket fixture skips; under
+    # RUN_INGESTION_INTEGRATION=1 that skip must fail the run, never pass it silently.
+    returncode, output = _run_ingestion_suite(
+        set_flags={"RUN_INGESTION_INTEGRATION": "1"},
+        extra_args=("-k", "test_proxy_down_makes_influx_writes_retryable"),
+    )
+
+    assert returncode == 1, output
+    assert "1 failed" in output, output
+    assert "skipped" not in output.strip().splitlines()[-1]
+    assert "must not skip under RUN_INGESTION_INTEGRATION=1" in output
+    assert "RUN_INFLUX_INTEGRATION" in output
 
 
 def test_verification_docs_document_the_ingestion_gate() -> None:

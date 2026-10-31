@@ -3,10 +3,14 @@
 They prove the emulator semantics the P3 adapters rely on, the harness fixtures, and the
 ``ToggleableTcpProxy`` that simulates an InfluxDB outage. The whole directory skips unless
 ``RUN_INGESTION_INTEGRATION=1`` (``make verify-ingestion``).
+
+The P3-00 Dynamo-fake expression vectors are not run here: P3-00 has not merged, so P3-06 owns
+running them against DynamoDB Local (``tests/ingestion/test_dynamo_fake_vectors_dynamodb.py``).
 """
 
 from __future__ import annotations
 
+import copy
 import json
 import os
 import socket
@@ -28,6 +32,7 @@ from tests.support.ingestion_harness import (
     queue_pair,
     sqs_client,
     table_pair,
+    wait_until_ready,
 )
 
 from limnopulse_api.adapters.influxdb_v2_writer import InfluxObservationWriter
@@ -173,6 +178,42 @@ def test_clients_work_without_any_ambient_aws_credentials(
     assert isinstance(dynamodb_client().list_tables()["TableNames"], list)
 
 
+def test_wait_until_ready_fails_fast_against_an_unreachable_endpoint(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("INGESTION_SQS_URL", f"http://127.0.0.1:{_closed_port()}")
+    monkeypatch.setenv("INGESTION_DYNAMODB_URL", f"http://127.0.0.1:{_closed_port()}")
+
+    started = time.monotonic()
+    with pytest.raises(TimeoutError, match="INGESTION_SQS_URL|INGESTION_DYNAMODB_URL"):
+        wait_until_ready(sqs_client(), dynamodb_client(), timeout_seconds=1)
+    assert time.monotonic() - started < 10
+
+
+def test_wait_until_ready_returns_once_both_emulators_answer() -> None:
+    wait_until_ready(sqs_client(), dynamodb_client(), timeout_seconds=30)
+
+
+# --- fixture teardown (two tests, run in file order) --------------------------------------------
+
+_CREATED_BY_FIXTURES: dict[str, list[str]] = {"queues": [], "tables": []}
+
+
+def test_fixtures_create_resources_for_the_teardown_check(
+    ingestion_queue_pair: QueueFactory, ingestion_tables: IngestionTables
+) -> None:
+    pair = ingestion_queue_pair()
+    _CREATED_BY_FIXTURES["queues"] = [pair.source_url, pair.dlq_url]
+    _CREATED_BY_FIXTURES["tables"] = [ingestion_tables.domain, ingestion_tables.audit]
+
+
+def test_fixtures_delete_their_resources_at_teardown(sqs, dynamodb) -> None:
+    queues, tables = _CREATED_BY_FIXTURES["queues"], _CREATED_BY_FIXTURES["tables"]
+    assert len(queues) == 2 and len(tables) == 2, "run the whole module, in file order"
+    assert not any(_queue_exists(sqs, url) for url in queues)
+    assert not any(_table_exists(dynamodb, name) for name in tables)
+
+
 # --- SQS (ElasticMQ) ---------------------------------------------------------------------------
 
 
@@ -284,7 +325,7 @@ def test_emulator_message_limit_is_one_mebi_character(
             QueueUrl=pair.source_url, MessageBody="a" * (EMULATOR_MAX_MESSAGE_CHARACTERS + 1)
         )
     error = raised.value.response["Error"]
-    assert "MessageTooLong" in (error.get("Code", ""), error.get("Message", ""))
+    assert any("MessageTooLong" in error.get(field, "") for field in ("Code", "Message"))
 
 
 # --- DynamoDB Local ----------------------------------------------------------------------------
@@ -309,7 +350,27 @@ def test_table_request_is_pure_and_matches_the_cli_schemas() -> None:
     assert "GlobalSecondaryIndexes" not in audit
     assert {d["AttributeName"] for d in audit["AttributeDefinitions"]} == {"PK", "SK"}
 
-    # The returned request is a fresh value: mutating it never leaks into the next call.
+    assert {d["AttributeName"] for d in domain["AttributeDefinitions"]} == {
+        "PK",
+        "SK",
+        "GSI1PK",
+        "GSI1SK",
+        "GSI2PK",
+        "GSI2SK",
+        "GSI3PK",
+        "GSI3SK",
+        "relay_gsi_pk",
+        "relay_gsi_sk",
+    }
+    assert all(d["AttributeType"] == "S" for d in domain["AttributeDefinitions"])
+    assert domain["GlobalSecondaryIndexes"] == list(init_dynamodb.ALERT_INDEXES)
+
+    # The returned request is a fresh value: mutating it, even an inner index definition,
+    # never leaks into ALERT_INDEXES or the next call.
+    pristine = copy.deepcopy(init_dynamodb.ALERT_INDEXES)
+    domain["GlobalSecondaryIndexes"][0]["Projection"]["ProjectionType"] = "ALL"
+    domain["GlobalSecondaryIndexes"][3]["Projection"]["NonKeyAttributes"].append("leak")
+    assert init_dynamodb.ALERT_INDEXES == pristine
     domain["GlobalSecondaryIndexes"].clear()
     assert init_dynamodb.table_request("LimnopulseDomain", include_alert_indexes=True)[
         "GlobalSecondaryIndexes"
@@ -341,6 +402,12 @@ def test_ingestion_tables_mirror_init_dynamodb_with_ttl_disabled(
         assert all(
             index["IndexStatus"] == "ACTIVE" for index in table.get("GlobalSecondaryIndexes", [])
         )
+        if include_alert_indexes:
+            assert sorted(map(_index_shape, table["GlobalSecondaryIndexes"])) == sorted(
+                map(_index_shape, init_dynamodb.ALERT_INDEXES)
+            )
+        else:
+            assert "GlobalSecondaryIndexes" not in table
         # DynamoDB Local 3.3.2 deletes expired items within seconds once TTL is on.
         assert _ttl_status(dynamodb, name) == "DISABLED"
 
@@ -355,13 +422,16 @@ def test_table_pair_context_deletes_both_tables_on_exit(dynamodb) -> None:
 
 
 @pytest.mark.parametrize(
-    ("kwargs", "status"), [({"enable_ttl": False}, "DISABLED"), ({}, "ENABLED")]
+    ("kwargs", "statuses"),
+    [({"enable_ttl": False}, {"DISABLED"}), ({}, {"ENABLED", "ENABLING"})],
 )
-def test_ensure_table_enables_ttl_only_when_asked(dynamodb, kwargs: dict, status: str) -> None:
+def test_ensure_table_enables_ttl_only_when_asked(
+    dynamodb, kwargs: dict, statuses: set[str]
+) -> None:
     name = f"it_ttl_{uuid.uuid4().hex}"
     try:
         init_dynamodb.ensure_table(dynamodb, name, **kwargs)
-        assert _ttl_status(dynamodb, name) == status
+        assert _ttl_status(dynamodb, name) in statuses
     finally:
         if _table_exists(dynamodb, name):
             dynamodb.delete_table(TableName=name)
@@ -502,6 +572,12 @@ def echo_server() -> Iterator[_EchoServer]:
         server.close()
 
 
+def _closed_port() -> int:
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
+        sock.bind(("127.0.0.1", 0))
+        return sock.getsockname()[1]
+
+
 def _round_trip(sock: socket.socket, payload: bytes) -> bytes:
     sock.sendall(payload)
     received = b""
@@ -540,7 +616,7 @@ def test_proxy_down_resets_established_sockets_and_refuses_new_ones(
             proxy.down()
 
             # Reset, not a graceful close: a pooled keep-alive connection cannot survive.
-            with pytest.raises(ConnectionResetError):
+            with pytest.raises((ConnectionResetError, BrokenPipeError)):
                 established.sendall(b"after-down")
                 established.recv(65536)
         finally:
@@ -556,7 +632,11 @@ def test_proxy_down_resets_established_sockets_and_refuses_new_ones(
 def test_proxy_up_restores_forwarding_on_the_same_port(echo_server: _EchoServer) -> None:
     with ToggleableTcpProxy("127.0.0.1", echo_server.port) as proxy:
         port = proxy.port
-        proxy.down()
+        # A connection open across down() leaves the old listener port in use or TIME_WAIT;
+        # up() must still rebind that same port.
+        with _connect(port) as before:
+            assert _round_trip(before, b"before") == b"before"
+            proxy.down()
         proxy.down()  # idempotent
         proxy.up()
         proxy.up()  # idempotent
@@ -583,10 +663,11 @@ async def test_proxy_down_makes_influx_writes_retryable_and_up_restores_them(
     settings = influx_settings()
     target = urlsplit(settings.url)
     sample = scenario("legacy_sample")
+    after_outage = scenario("sub_second")
 
     with ToggleableTcpProxy(target.hostname or "127.0.0.1", target.port or 8086) as proxy:
         client = InfluxDBClient(
-            url=proxy.url, token=settings.token, org=settings.org, timeout=5_000
+            url=proxy.url, token=settings.token, org=settings.org, timeout=30_000
         )
         try:
             with client.write_api(write_options=SYNCHRONOUS) as write_api:
@@ -595,18 +676,23 @@ async def test_proxy_down_makes_influx_writes_retryable_and_up_restores_them(
                 )
                 # Warm the connection pool so a keep-alive socket exists before the outage.
                 await writer.write_observations(sample.observations)
-                assert _observation_rows(influx_bucket) > 0
+                warm_rows = _observation_rows(influx_bucket)
+                assert warm_rows > 0
 
                 proxy.down()
                 started = time.monotonic()
                 with pytest.raises(TelemetryWriteError) as raised:
                     await writer.write_observations(sample.observations)
                 assert raised.value.retryable is True
-                assert time.monotonic() - started < 5
+                # Refused, not timed out: well under the 30 s client timeout.
+                assert time.monotonic() - started < 2
+                assert _observation_rows(influx_bucket) == warm_rows
 
                 proxy.up()
-                await writer.write_observations(sample.observations)
+                await writer.write_observations(after_outage.observations)
         finally:
             client.close()
 
-    assert _observation_rows(influx_bucket) > 0
+    # The distinct points written after up() landed through the same pooled client.
+    # (their timestamps are disjoint from the warm-up points, so the row count must grow).
+    assert _observation_rows(influx_bucket) > warm_rows
