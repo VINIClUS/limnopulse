@@ -139,6 +139,8 @@ Also `docs/superpowers/specs/2026-08-25-limnopulse-v4-parallel-execution-design.
 - **Redaction.**
   - 422 bodies never echo input (`include_input=False`).
   - The `/ingest` route never raises `RequestValidationError`. It builds its 422 body from `ValidationError.errors(include_input=False, include_context=False, include_url=False)[:20]`, because `/ingest` is outside the `/v2` validation handler.
+  - It also **replaces every `msg` with a fixed string chosen by error `type`**, for example `"invalid value"`, `"field required"` or `"extra fields not permitted"`, because validator messages can embed input. `_require_metadata`, for instance, lists the unknown keys.
+  - P3-00 adds a vector in which an unknown `source_metadata` key, a bad id and a bad unit each contain a sentinel string. The 422 body must not contain the sentinel.
   - Settings errors never echo values (`hide_input_in_errors=True`).
 - **`external_identity_hash` is not a secret.** It is an unkeyed SHA-256 of a possibly low-entropy identifier, so it is pseudonymous. Never treat it as redaction.
 - **Constant-time comparison.** Token digests are compared with `hmac.compare_digest`. The unknown-credential path performs one dummy comparison.
@@ -764,7 +766,9 @@ class TelemetryMetrics(Protocol):
   - **Influx reuse.** The harness reuses `tests/support/influx_harness.py` for buckets.
 - **Make target.** `verify-ingestion` runs:
   1. `uv sync --locked --extra dev`;
-  2. `RUN_INGESTION_INTEGRATION=1 uv run --locked --no-sync python -m pytest -q tests/ingestion`.
+  2. `RUN_INGESTION_INTEGRATION=1 RUN_INFLUX_INTEGRATION=1 uv run --locked --no-sync python -m pytest -q tests/ingestion`.
+
+  Both flags are needed, because the reused `tests/support/influx_harness.py` bucket fixture skips unless `RUN_INFLUX_INTEGRATION=1`. A harness test asserts that the Influx-backed ingestion tests run, rather than skip, under `make verify-ingestion`.
 
   It is not added to the aggregate `verify` target, consistent with `verify-influx`.
 - **CI job `ingestion`.** One `make verify-ingestion` step. Its services are:
@@ -1572,3 +1576,4 @@ Applied inline. Sources:
 | A39 | Codex | `mapping_versions` is exempt from `exclude_defaults`, and a wire-format vector requires all three version strings. |
 | A40 | Codex | G1 exempts the post-send mark failure.<br>The component check uses bounded `get_component` reads (at most 32 distinct per request), since storage has no device-scoped component index.<br>Fenced messages write only verified connector marks, never device marks, with a cross-tenant regression vector. |
 | A41 | Codex | G9: a revoked account gets 401 and a DI decommission gets 403. The envelope is serialized with `ensure_ascii=False`, and a Unicode-expansion size vector is added. |
+| A42 | Codex | Ingest 422 messages are replaced with fixed strings chosen by error type, with a sentinel no-echo vector. `verify-ingestion` sets both `RUN_INGESTION_INTEGRATION` and `RUN_INFLUX_INTEGRATION`, and a no-skip assertion is added. |
