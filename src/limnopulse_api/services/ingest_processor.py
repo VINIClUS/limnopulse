@@ -10,7 +10,9 @@ metrics, and only then answer `delete`. Every failure follows the frozen worker 
 - a temporary fence (`IngressDefer`) and every retryable failure change the visibility by the
   full-jitter backoff; an unverified (forged) fence writes nothing and uses the permanent
   visibility, so `maxReceiveCount` moves it to the DLQ;
-- metrics follow the durable writes, so a retried message is never counted twice.
+- the processed and fenced metrics follow the durable writes, so a write failure never counts
+  them twice; the deferred, unverified-fence and write-failure counters count once per receive.
+  A failing metrics call is logged by metric name and never changes the decision.
 
 The processor never deletes or changes visibility itself; `IngestWorkerLoop` applies the
 decision. It never emits `ingress_messages_total` either (A46): the loop alone knows the final
@@ -153,7 +155,7 @@ class IngestMessageProcessor:
         try:
             return await self._process(envelope, message.receive_count)
         except TelemetryWriteError as error:
-            self.metrics.increment(
+            self._increment(
                 "ingress_write_failures_total", retryable="true" if error.retryable else "false"
             )
             return _Category.WRITE_RETRYABLE if error.retryable else _Category.WRITE_PERMANENT
@@ -169,7 +171,7 @@ class IngestMessageProcessor:
     ) -> IngressFailureCategory:
         result = await self.mapping.fence(envelope)
         if isinstance(result, IngressDefer):
-            self.metrics.increment("ingress_deferred_total", reason=result.reason.value)
+            self._increment("ingress_deferred_total", reason=result.reason.value)
             return _Category.DEFERRED
         if isinstance(result, IngressFence):
             return await self._fence(envelope, result)
@@ -180,12 +182,12 @@ class IngestMessageProcessor:
     ) -> IngressFailureCategory:
         if not fence.account_verified:
             # A forged envelope: nothing is written, and the DLQ keeps the raw body.
-            self.metrics.increment("ingress_fenced_total", reason=fence.reason.value)
+            self._increment("ingress_fenced_total", reason=fence.reason.value)
             return _Category.FENCED_UNVERIFIED
         rows = build_quarantine_entries(envelope, fence=fence, now=self.clock())
         await self.quarantine.put_quarantine_entries(rows)
         await self.state.record_fence(envelope, fence)
-        self.metrics.increment("ingress_fenced_total", reason=fence.reason.value)
+        self._increment("ingress_fenced_total", reason=fence.reason.value)
         return _Category.FENCED
 
     async def _ingest(
@@ -207,23 +209,33 @@ class IngestMessageProcessor:
     def _emit_processed(
         self, outcome: PipelineOutcome, events: tuple[SequenceEvent, ...], duration: float
     ) -> None:
-        metrics = self.metrics
         if outcome.accepted:
-            metrics.increment(
-                "ingress_observations_total", len(outcome.accepted), result="accepted"
-            )
+            self._increment("ingress_observations_total", len(outcome.accepted), result="accepted")
         if outcome.quarantined:
-            metrics.increment(
+            self._increment(
                 "ingress_observations_total", len(outcome.quarantined), result="quarantined"
             )
         reasons = Counter(item.reason.value for item in outcome.quarantined)
         for reason, count in sorted(reasons.items()):
-            metrics.increment("ingress_quarantined_total", count, reason=reason)
+            self._increment("ingress_quarantined_total", count, reason=reason)
         flags = Counter(
             flag.value for observation in outcome.accepted for flag in observation.quality.flags
         )
         for flag, count in sorted(flags.items()):
-            metrics.increment("ingress_quality_flags_total", count, flag=flag)
+            self._increment("ingress_quality_flags_total", count, flag=flag)
         for event, count in Counter(event.value for event in events).items():
-            metrics.increment("ingress_sequence_events_total", count, event=event)
-        metrics.observe("ingress_normalization_duration_seconds", duration)
+            self._increment("ingress_sequence_events_total", count, event=event)
+        try:
+            self.metrics.observe("ingress_normalization_duration_seconds", duration)
+        except Exception as error:  # noqa: BLE001 - metrics never decide.
+            _metric_failed("ingress_normalization_duration_seconds", error)
+
+    def _increment(self, name: str, value: int = 1, **labels: str) -> None:
+        try:
+            self.metrics.increment(name, value, **labels)
+        except Exception as error:  # noqa: BLE001 - metrics never decide.
+            _metric_failed(name, error)
+
+
+def _metric_failed(name: str, error: Exception) -> None:
+    logger.warning("ingress metric failed: metric=%s (%s)", name, type(error).__name__)
