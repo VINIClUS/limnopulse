@@ -364,7 +364,9 @@ async def test_revoke_classifies_404_or_409_from_the_cancelled_item() -> None:
         ).revoke_ingest_credential(
             TENANT, ACCOUNT, CREDENTIAL, expected_version=1, revoked_at=RECEIVED, audit=AUDIT
         )
-    # Active again but at a newer version than the one read and expected: a version 409.
+    # Restore the consistent active v1 row; the next race bumps it to an active v2 after the
+    # adapter's read: the cancelled item shows a newer version, so the answer is a version 409.
+    await subject.seed_credential(credential())
     with pytest.raises(ConflictError) as bumped:
         await racing(status="active", version=2).revoke_ingest_credential(
             TENANT, ACCOUNT, CREDENTIAL, expected_version=1, revoked_at=RECEIVED, audit=AUDIT

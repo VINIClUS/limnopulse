@@ -139,6 +139,7 @@ async def test_default_secret_factory_yields_43_char_base64url_secrets() -> None
         assert parsed is not None
         assert parsed[0] == issued.credential.ingest_credential_id
     assert first.token != second.token
+    assert parse_ingest_token(first.token)[1] != parse_ingest_token(second.token)[1]
     assert first.credential.ingest_credential_id != second.credential.ingest_credential_id
 
 

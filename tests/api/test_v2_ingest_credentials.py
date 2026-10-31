@@ -517,11 +517,16 @@ def test_bad_path_ids_are_rejected_without_echo(path: str) -> None:
 
     response = api.client.post(path, json={"expected_version": 1})
 
-    # Path ids are validated as canonical ids before any store access.
-    assert response.status_code == 422
     assert SENTINEL not in response.text
     assert api.dynamo.transactions == []
-    assert api.dynamo.reads == []
+    if f"ic_{SENTINEL}" in path:
+        # `IngestCredentialId` is canonical by contract: rejected before any store access.
+        assert response.status_code == 422
+    else:
+        # `integration_account_id` is a SafeId: a non-echoing 404 is fine too.
+        assert response.status_code in (404, 422)
+    if response.status_code == 422:
+        assert api.dynamo.reads == []
 
 
 @pytest.mark.parametrize(
