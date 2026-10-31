@@ -146,8 +146,10 @@ the API-only secrets.
   drain + wait + 5 s (A47): `TELEMETRY_INGEST_DRAIN_SECONDS` 30 + `TELEMETRY_INGEST_WORKER_WAIT_SECONDS`
   20 + the 5 s poll grace, more than 55 s at the defaults. SIGTERM first finishes the in-flight long
   poll, then drains; a shorter grace lets Docker's SIGKILL cut the drain short. Keep some headroom for
-  a boto3 call still in flight (`SHUTDOWN_CALL_BUDGET_SECONDS` in `workers/telemetry_ingest.py`), and
-  change the drain or wait settings and the grace together.
+  a boto3 call still in flight (`SHUTDOWN_CALL_BUDGET_SECONDS` in `workers/telemetry_ingest.py`).
+  `TELEMETRY_INGEST_DRAIN_SECONDS` and `TELEMETRY_INGEST_WORKER_WAIT_SECONDS` are not interpolated
+  into the worker's environment in either compose file (it has no `env_file`), so setting them in
+  `.env` has no effect: changing either needs a compose change, made together with the grace.
 - **Restart policy.** `restart: on-failure:5` may leave the worker stopped after a reboot, and the
   default deploy (without `--profile ingestion`) does not recreate it. Redeploy it with the profile
   so producer and consumer run the same image; the queue-age alarm covers a stopped worker.

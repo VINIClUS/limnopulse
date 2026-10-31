@@ -14,7 +14,6 @@ from limnopulse_api.api.dependencies import require_tenant_role
 from limnopulse_api.api.ingestion_dependencies import get_integration_lifecycle_repository
 from limnopulse_api.api.redacted_validation import _RedactedValidationRoute
 from limnopulse_api.api.v1.schemas.common import ErrorResponse
-from limnopulse_api.api.v2.dependencies import IntegrationRepositoryDep
 from limnopulse_api.api.v2.routers.integrations import DevicePathId
 from limnopulse_api.api.v2.schemas.common import V2_ERROR_RESPONSES
 from limnopulse_api.api.v2.schemas.integration_lifecycle import (
@@ -79,10 +78,9 @@ async def transition_integration_account(
     payload: V2IntegrationAccountStatusUpdate,
     request: Request,
     repository: LifecycleRepositoryDep,
-    integrations: IntegrationRepositoryDep,
     access: TenantWriterDep,
 ) -> IntegrationAccountResponse:
-    service = IntegrationLifecycleService(repository, integrations)
+    service = IntegrationLifecycleService(repository)
     try:
         account = await service.transition_integration_account(
             tenant_id,
@@ -108,10 +106,9 @@ async def transition_device_integration(
     payload: V2DeviceIntegrationStatusUpdate,
     request: Request,
     repository: LifecycleRepositoryDep,
-    integrations: IntegrationRepositoryDep,
     access: TenantWriterDep,
 ) -> DeviceIntegrationResponse:
-    service = IntegrationLifecycleService(repository, integrations)
+    service = IntegrationLifecycleService(repository)
     try:
         integration = await service.transition_device_integration(
             tenant_id,

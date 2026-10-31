@@ -214,7 +214,7 @@ TELEMETRY_V2_WRITE_ENABLED=true TELEMETRY_LEGACY_DUAL_WRITE_ENABLED=true \
 
 It uses the DynamoDB-backed M1 repositories and the configured InfluxDB, and prints one JSON object of counts (no secrets). With both write switches off it is a dry run: the reading is normalized and zero points are written. Exit codes: `0` nothing quarantined, `2` anything quarantined, `1` any error (nothing reported as written; ingest again).
 
-**Rollback:** before cutover (while Telegraf still writes `water_quality`), set the switches back to their defaults (`false`, and `legacy` for the read sources) and restart. No data deletion is needed; `water_quality` and the legacy reads are untouched while legacy dual write is off. After cutover, follow the post-cutover rollback in the runbook below: restore a `water_quality` producer before switching any read source back to `legacy`.
+**Rollback:** before cutover (while Telegraf still writes `water_quality`), set the switches back to their defaults (`false`, and `legacy` for the read sources) and recreate the services that read them (`docker compose up -d <service>`; `docker compose restart` keeps the old environment). No data deletion is needed; `water_quality` and the legacy reads are untouched while legacy dual write is off. After cutover, follow the post-cutover rollback in the runbook below: restore a `water_quality` producer before switching any read source back to `legacy`.
 
 The rollout sequence, release gate, keyed divergence checks and known limitations are in the [P2 telemetry rollout runbook](docs/p2-telemetry-rollout-runbook.md).
 
@@ -248,7 +248,7 @@ docker compose --profile ingestion up telemetry-ingest-worker
 
 The worker uses `restart: on-failure:5` in production, which may leave it stopped after a Docker daemon restart or host reboot, and the default deploy (`up -d` without `--profile ingestion`) does not recreate it with a new `IMAGE_TAG`. Once ingestion is enabled, start it again after a reboot and redeploy it with the profile so the API (producer) and worker (consumer) run the same image. The queue-age alarm covers a stopped worker.
 
-**Rollback:** unset `INGEST_V2_ENABLED` (restart the API) and stop the `ingestion` profile. Queued messages stay in the queue and the DLQ until the worker runs again. The rollout sequence, owner flips and drills are in the [P3 ingestion rollout runbook](docs/p3-ingestion-rollout-runbook.md).
+**Rollback:** set `INGEST_V2_ENABLED=false` and recreate the API (`docker compose --env-file .env --env-file .env.image -f compose.production.yaml up -d api`; `docker compose restart` keeps the old environment), then stop the `ingestion` profile, in the [rollback order](docs/p3-ingestion-rollout-runbook.md#rollback) of the runbook. Queued messages stay in the queue and the DLQ until the worker runs again. The rollout sequence, owner flips and drills are in the [P3 ingestion rollout runbook](docs/p3-ingestion-rollout-runbook.md).
 
 ## Local Telemetry Ingestion
 

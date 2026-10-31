@@ -37,14 +37,14 @@ def pytest_collection_modifyitems(config: pytest.Config, items: list[pytest.Item
 def pytest_runtest_makereport(item: pytest.Item, call: pytest.CallInfo[None]):
     report = yield
     # Under the gate, a skip (for example influx_bucket without RUN_INFLUX_INTEGRATION=1) would
-    # silently drop an Influx-backed test, so it fails the run instead.
-    if (
-        report.skipped
-        and os.environ.get(RUN_ENV) == "1"
-        and _in_this_directory(item)
-        and not hasattr(report, "wasxfail")
-    ):
-        reason = report.longrepr[2] if isinstance(report.longrepr, tuple) else report.longrepr
+    # silently drop an Influx-backed test, so it fails the run instead. So does an xfail (#116):
+    # it hides a failing test just as silently. An xpass already passed, so it is left alone.
+    if report.skipped and os.environ.get(RUN_ENV) == "1" and _in_this_directory(item):
+        if hasattr(report, "wasxfail"):
+            reason = f"xfail ({report.wasxfail})"
+            del report.wasxfail  # reported as a plain failure, never as "xfailed"
+        else:
+            reason = report.longrepr[2] if isinstance(report.longrepr, tuple) else report.longrepr
         report.outcome = "failed"
         report.longrepr = f"tests/ingestion must not skip under {RUN_ENV}=1: {reason}"
     return report

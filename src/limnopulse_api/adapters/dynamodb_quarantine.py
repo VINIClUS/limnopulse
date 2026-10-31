@@ -10,7 +10,9 @@ the worker principal has no `TransactWriteItems`/`BatchWriteItem`:
 
 Expiry is logical: a row is absent once `created_at + QUARANTINE_TTL <= now`; the numeric
 `expires_at` attribute only drives TTL cleanup. Listing is a `Query` resumed strictly after
-`after_sk`, filtered on status and reason in code. No Scan and no GSI.
+`after_sk`, filtered on status and reason in code. Each `Query` reads one row past the page, so
+a page that ends the partition says so without an empty follow-up page (#116); a row the code
+filters drop can still cost one. No Scan and no GSI.
 """
 
 from asyncio import to_thread
@@ -58,7 +60,8 @@ class DynamoQuarantineRepository(DynamoV2RepositoryBase):
         cursor = after_sk
         now = self.clock()
         while True:
-            items, resume = await to_thread(self._page_sync, tenant_id, cursor, limit)
+            # One row past the page: whether anything follows is known without another Query.
+            items, resume = await to_thread(self._page_sync, tenant_id, cursor, limit + 1)
             for index, item in enumerate(items):
                 entry = quarantine_entry_from_item(item)
                 if not self._is_live(entry, now) or not _matches(entry, status, reason):

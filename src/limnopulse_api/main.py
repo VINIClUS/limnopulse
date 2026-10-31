@@ -14,6 +14,7 @@ from influxdb_client.client.write_api import SYNCHRONOUS
 
 from limnopulse_api.adapters.alert_events import DynamoAlertEventRepository
 from limnopulse_api.adapters.alert_rules import DynamoAlertRuleRepository
+from limnopulse_api.adapters.aws_clients import dynamodb_client_kwargs, sqs_client_kwargs
 from limnopulse_api.adapters.dynamodb import DynamoDomainRepository
 from limnopulse_api.adapters.dynamodb_deployments import DynamoDeploymentRepository
 from limnopulse_api.adapters.dynamodb_devices_v2 import DynamoDeviceComponentRepository
@@ -54,24 +55,15 @@ from limnopulse_api.services.telegram_webhook_secret import (
 )
 from limnopulse_api.services.telemetry_v2_writes import ObservationWriteService
 from limnopulse_api.services.trusted_mapping import TrustedMappingService
-from limnopulse_api.workers.telemetry_ingest import sqs_client_kwargs
 
-__all__ = ["app", "create_app", "sqs_client_kwargs"]
+__all__ = ["app", "create_app", "dynamodb_client_kwargs", "sqs_client_kwargs"]
 
 
+# botocore's `max_attempts` counts retries: 1 is two attempts in all, so an SQS brownout costs an
+# admission at most 2 x (5 + 10) = 30 s before its 503 (the previous 3 meant 4 attempts, 60 s).
 _INGRESS_SQS_CONFIG = Config(
-    connect_timeout=5, read_timeout=10, retries={"mode": "standard", "max_attempts": 3}
+    connect_timeout=5, read_timeout=10, retries={"mode": "standard", "max_attempts": 1}
 )
-
-
-def _dynamodb_client_kwargs(settings: Settings) -> dict[str, str]:
-    kwargs: dict[str, str] = {"region_name": settings.aws_region}
-    if settings.dynamodb_endpoint_url is not None:
-        kwargs["endpoint_url"] = settings.dynamodb_endpoint_url
-    if settings.app_env in {"local", "test"} and settings.dynamodb_endpoint_url is not None:
-        kwargs["aws_access_key_id"] = "local"
-        kwargs["aws_secret_access_key"] = "local"
-    return kwargs
 
 
 def _cognito_client_kwargs(settings: Settings) -> dict[str, str]:
@@ -84,9 +76,12 @@ def _cognito_client_kwargs(settings: Settings) -> dict[str, str]:
 
 def _enable_metrics_logging() -> None:
     """Emit the INFO metric lines of `StructuredLogTelemetryMetrics` under uvicorn, which
-    configures only its own loggers (the root stays at WARNING with no handler)."""
+    configures only its own loggers (the root stays at WARNING with no handler). The lines stop
+    here: a root handler (a custom `--log-config`, gunicorn, or the worker in the same process)
+    would otherwise print each one twice."""
     metrics_logger = logging.getLogger(METRICS_LOGGER)
     metrics_logger.setLevel(logging.INFO)
+    metrics_logger.propagate = False
     if not any(getattr(h, "_limnopulse_metrics", False) for h in metrics_logger.handlers):
         handler = logging.StreamHandler()
         handler.setFormatter(logging.Formatter("%(message)s"))
@@ -173,7 +168,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         app.state.cache_repository = RedisCacheRepository(redis_client)
         dynamodb_client = boto3.client(
             "dynamodb",
-            **_dynamodb_client_kwargs(resolved_settings),
+            **dynamodb_client_kwargs(resolved_settings),
         )
         app.state.domain_repository = DynamoDomainRepository(
             table_name=resolved_settings.dynamodb_domain_table,

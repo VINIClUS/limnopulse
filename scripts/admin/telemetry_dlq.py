@@ -9,8 +9,10 @@
 Nothing here runs on its own: the DLQ is only touched when an operator runs a subcommand.
 
 Output is JSON lines on stdout. Exit codes: 0 ok (a dry run included), 1 error, 3 partial (an
-applied redrive with failures). Metrics go to an injected `TelemetryMetrics`; the default sink
-writes JSON lines to stderr.
+applied redrive with failures, or a redrive that stopped midway after it had seen messages: its
+summary then carries the counts so far and an `error` category). Metrics go to an injected
+`TelemetryMetrics`; the default sink writes JSON lines to stderr. A Ctrl-C during a receive
+waits for that receive and releases its messages (see `receive_held`).
 """
 
 import argparse
@@ -38,7 +40,7 @@ from limnopulse_api.repositories.ingestion import (
     IngressQueueProducer,
     TelemetryMetrics,
 )
-from limnopulse_api.services.ingress_redrive import redrive_dlq
+from limnopulse_api.services.ingress_redrive import RedriveProgress, receive_held, redrive_dlq
 
 EXIT_OK = 0
 EXIT_ERROR = 1
@@ -46,9 +48,7 @@ EXIT_PARTIAL = 3
 MAX_SAMPLE_LIMIT = 1_000
 MAX_REDRIVE = 10_000
 REDRIVEN_METRIC = "ingress_dlq_redriven_total"
-_MAX_BATCH = 10
-_WAIT_SECONDS = 1
-_HOLD_SECONDS = 300
+_MAX_BATCH = 10  # the receive wait and the hold are those of `receive_held`
 _LOGGER = logging.getLogger(__name__)
 
 
@@ -141,22 +141,33 @@ async def _redrive(
     max_messages: int,
     apply: bool,
 ) -> int:
-    report = await redrive_dlq(dlq=dlq, source=source, max_messages=max_messages, apply=apply)
+    progress = RedriveProgress()
+    error: str | None = None
+    try:
+        report = await redrive_dlq(
+            dlq=dlq, source=source, max_messages=max_messages, apply=apply, progress=progress
+        )
+    except Exception as failure:
+        if not progress.seen:
+            raise  # nothing was touched: the plain error exit
+        # Stopped midway: report what already moved instead of hiding it behind exit 1.
+        report = progress.report()
+        error = "queue_unavailable" if isinstance(failure, IngressQueueError) else "unexpected"
     if apply:
         for result, value in (("redriven", report.redriven), ("failed", report.failed)):
             if value:
                 metrics.increment(REDRIVEN_METRIC, value, result=result)
-    _emit(
-        out,
-        {
-            "command": "redrive",
-            "apply": apply,
-            "seen": report.seen,
-            "redriven": report.redriven,
-            "failed": report.failed,
-        },
-    )
-    return EXIT_PARTIAL if report.failed else EXIT_OK
+    summary: dict[str, Any] = {
+        "command": "redrive",
+        "apply": apply,
+        "seen": report.seen,
+        "redriven": report.redriven,
+        "failed": report.failed,
+    }
+    if error is not None:
+        summary["error"] = error
+    _emit(out, summary)
+    return EXIT_PARTIAL if report.failed or error is not None else EXIT_OK
 
 
 def _diagnose(message: IngressQueueMessage) -> dict[str, Any]:
@@ -187,11 +198,7 @@ async def _sample(dlq: IngressQueueConsumer, limit: int, out: TextIO) -> int:
     held: dict[str, IngressQueueMessage] = {}
     try:
         while len(held) < limit:
-            batch = await dlq.receive(
-                max_messages=min(_MAX_BATCH, limit - len(held)),
-                wait_seconds=_WAIT_SECONDS,
-                visibility_seconds=_HOLD_SECONDS,
-            )
+            batch = await receive_held(dlq, max_messages=min(_MAX_BATCH, limit - len(held)))
             if not batch:
                 break
             for message in batch:

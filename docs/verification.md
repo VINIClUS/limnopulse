@@ -113,8 +113,8 @@ against ElasticMQ 1.6.16 (an SQS emulator), DynamoDB Local 3.3.2 and InfluxDB
 2.7.11. It sets both `RUN_INGESTION_INTEGRATION=1` and
 `RUN_INFLUX_INTEGRATION=1`: the reused `influx_bucket` fixture skips without the
 second flag, so the Influx-backed tests would otherwise be skipped silently.
-Under the gate, `tests/ingestion/conftest.py` turns any skip in that directory
-into a failure. `make verify-ingestion` is not part of `make verify`, and the
+Under the gate, `tests/ingestion/conftest.py` turns any skip or `xfail` in that
+directory into a failure (an xfail hides a failing test just as silently). `make verify-ingestion` is not part of `make verify`, and the
 default `make verify-python` skips `tests/ingestion` cleanly without
 `RUN_INGESTION_INTEGRATION=1`, so it never needs these services.
 
@@ -156,6 +156,16 @@ ElasticMQ 1.6.16 counts message size in characters (1,048,576 at most) and
 ignores `MaximumMessageSize`. The 262,144-byte SQS limit is therefore enforced
 and tested in the P3 adapter, not in the emulator.
 
+ElasticMQ 1.6.16 is also more lenient than SQS on visibility: it accepts
+`ChangeMessageVisibility` on a message that is not in flight (SQS answers
+`MessageNotInflight`) and a visibility of 43201 s (SQS allows at most 43200).
+Neither can be caught against the emulator, so the unit fake,
+`FakeIngressQueue` in `tests/support/ingestion_fakes.py`, refuses both, and the
+P3 adapter clamps a visibility to 43200 before calling SQS. The fake's
+`send_raw` applies the same size guard as the adapter, and the unit DynamoDB
+fake rejects an unaliased reserved word (`state`, `status`, ...) as DynamoDB
+does.
+
 To run the gate locally without Docker (Linux x86_64, Java 17 or newer):
 
 ```
@@ -175,7 +185,9 @@ limits and declares no queues. It waits for `ListQueues` to answer.
 `v2.x/dynamodb_local_latest.tar.gz`, checks its SHA-256
 `7a94eb65f81aee270738751a4e5e3e6a7ad02a5d25194f55b83e08ec2ba6342b`
 (DynamoDB Local 3.3.2) and starts it with `-inMemory` on port
-`${DYNAMODB_LOCAL_PORT:-8001}`. That URL always serves the latest release, so a
+`${DYNAMODB_LOCAL_PORT:-8001}`. DynamoDB Local has no bind-address flag, so it
+listens on `0.0.0.0` (every interface), unlike the other two runners, which
+bind `127.0.0.1`; run it only on a trusted network or behind a host firewall. That URL always serves the latest release, so a
 checksum mismatch stops the script with a message asking for a deliberate
 re-pin of the checksum, the CI digest and this page.
 
