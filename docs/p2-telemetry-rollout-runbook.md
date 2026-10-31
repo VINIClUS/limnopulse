@@ -526,11 +526,14 @@ window.
 - **Go v2 reader IDs (#71).** The evaluator v2 reader escapes IDs in Flux literals rather than
   validating them, the same model as the legacy reader; this is an explicit exemption from the
   plan's "every ID is validated" constraint.
-- **Flux string literals (#84).** Python `flux_string_literal` and Go `fluxV2String`
-  (`internal/alertevaluator/influx/query_v2.go`) apply JSON escaping, then `${` → `\${`. They are
-  not lossless for `$${`, `$"` or non-ASCII characters, and Go `json.Marshal` also escapes `<`, `>`,
-  `&` and U+2028. They fail safe (no interpolation) and are unreachable with today's IDs; lossless
-  literals are backlog #84.
+- **Flux string literals (#84, plan D19).** Python `flux_string_literal` and Go `fluxV2String`
+  (`internal/alertevaluator/influx/query_v2.go`) build lossless literals: JSON without non-ASCII or
+  HTML escapes, with every `$` written as `\x24`. A literal decodes to exactly its value and can
+  neither interpolate nor end early. A value with a C0 control other than `\n`, `\r` or `\t`, or
+  text that is not valid Unicode, is rejected before any query: Python raises `ValueError`, and
+  the Go evaluator records `query_error` for that rule only. The legacy Go reader keeps its pinned
+  `json.Marshal` literals, so the v2 reader now reads rule IDs such as `${a}` or `<&>` for which
+  the legacy reader returns `query_error`.
 - **InfluxDB version.** CI pins the `influx` job to `influxdb:2.7.11@sha256:d92a10e9e75aff18eca38ff3a8f0b4a800706a5dd44d1b0ece264af04458525b`
   (a true 2.7.11; the `influxdb:2.7.11-alpine` tag drifted to 2.7.12, plan erratum r7.1).
   Production compose uses the floating `influxdb:2-alpine`. The projection's Flux shapes and the
@@ -556,5 +559,4 @@ window.
   are reserved; P6 decides their thresholds before writing them.
 - **#6:** presence-aware `Evaluation.Value` stays canonical in #6; the P2 Go reader reports values
   only through the unchanged `WindowResult`.
-- **#84:** lossless Flux string literals.
 - **#17:** health and online-status views built on `received_at`/`ingested_at` (P6).

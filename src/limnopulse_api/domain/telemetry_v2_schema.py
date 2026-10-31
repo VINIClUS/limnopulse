@@ -6,6 +6,7 @@ and every point carries the complete field set so a rewrite replaces every field
 
 import json
 import math
+import re
 from collections.abc import Callable, Iterable, Mapping
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
@@ -328,6 +329,22 @@ def build_legacy_points(
     return tuple(sorted(points, key=lambda p: (p.tenant_id, p.pond_id, p.device_id, p.observed_at)))
 
 
+# C0 controls other than \n, \r and \t: JSON writes them as `\b`, `\f` or `\u00XX`, and
+# Flux has none of those escapes.
+_FLUX_REJECTED_CONTROL = re.compile(r"[\x00-\x08\x0b\x0c\x0e-\x1f]")
+
+
 def flux_string_literal(value: str) -> str:
-    """JSON-escape, then defeat interpolation: `${` -> `\\${` (a lone `$` is unchanged)."""
-    return json.dumps(value).replace("${", "\\${")
+    """Build a lossless Flux string literal (P2 plan D19): unescaped JSON, every `$` as `\\x24`.
+
+    The literal decodes to exactly `value` and never interpolates. A C0 control other than
+    `\\n`, `\\r` and `\\t`, or a lone surrogate, cannot round-trip and raises `ValueError`.
+    """
+    control = _FLUX_REJECTED_CONTROL.search(value)
+    if control is not None:
+        raise ValueError(f"Flux string literal holds control character U+{ord(control[0]):04X}")
+    try:
+        value.encode("utf-8")
+    except UnicodeEncodeError as error:
+        raise ValueError("Flux string literal is not valid Unicode text") from error
+    return json.dumps(value, ensure_ascii=False).replace("$", "\\x24")
