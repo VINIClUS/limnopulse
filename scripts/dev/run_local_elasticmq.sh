@@ -58,13 +58,13 @@ wait_ready() {
   return 1
 }
 
-# True when the PID file names a live java process.
+# True when the PID file names a live java process running this JAR (not a reused pid).
 running() {
   local pid
   [[ -f "${PID_FILE}" ]] || return 1
   pid="$(cat "${PID_FILE}")"
   kill -0 "${pid}" 2>/dev/null || return 1
-  [[ ! -r "/proc/${pid}/comm" || "$(cat "/proc/${pid}/comm")" == "java" ]]
+  [[ ! -r "/proc/${pid}/cmdline" ]] || tr '\0' ' ' <"/proc/${pid}/cmdline" | grep -qF -- "${JAR_PATH}"
 }
 
 abort_start() {
@@ -77,7 +77,8 @@ abort_start() {
 }
 
 install_jar() {
-  WORK_DIR="$(mktemp -d)"
+  # Inside the cache directory, so the final mv is an atomic rename.
+  WORK_DIR="$(mktemp -d "${CACHE_DIR}/.tmp.XXXXXX")"
   curl --proto "=https" --tlsv1.2 -fsSL -o "${WORK_DIR}/${JAR}" "${DOWNLOAD_URL}"
   if ! echo "${JAR_SHA256}  ${WORK_DIR}/${JAR}" | sha256sum -c --status; then
     echo "sha256 checksum mismatch for ${JAR}; refusing to install it" >&2
@@ -140,6 +141,11 @@ echo "${PORT}" >"${PORT_FILE}"
 if ! wait_ready "${pid}" || ! kill -0 "${pid}" 2>/dev/null; then
   abort_start "${pid}" "ElasticMQ did not start on ${BASE_URL}; see ${LOG_FILE}"
 fi
+# The banner is logged just after the listener starts answering, so give it a moment.
+for _ in $(seq 1 20); do
+  if grep -q "ElasticMQ server (1.6.16) started" "${LOG_FILE}"; then break; fi
+  sleep 0.5
+done
 if ! grep -q "ElasticMQ server (1.6.16) started" "${LOG_FILE}"; then
   abort_start "${pid}" "the server on ${BASE_URL} is not ElasticMQ 1.6.16; see ${LOG_FILE}"
 fi

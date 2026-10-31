@@ -13,6 +13,7 @@ without stopping the server.
 from __future__ import annotations
 
 import contextlib
+import errno
 import json
 import os
 import socket
@@ -21,7 +22,7 @@ import threading
 import time
 import uuid
 from collections.abc import Callable, Iterator
-from typing import Any, NamedTuple
+from typing import Any, NamedTuple, Self
 
 import boto3
 import pytest
@@ -36,6 +37,9 @@ DYNAMODB_URL_ENV = "INGESTION_DYNAMODB_URL"
 DEFAULT_SQS_URL = "http://127.0.0.1:9324"
 DEFAULT_DYNAMODB_URL = "http://127.0.0.1:8001"
 READY_TIMEOUT_SECONDS = 60
+# A forwarded send blocked on a peer that stopped reading gives up after this long.
+_PROXY_SEND_TIMEOUT_SECONDS = 5
+_REBIND_ATTEMPTS = 20
 
 # Emulator-only placeholders; the emulators accept any value.
 _REGION = "us-east-1"
@@ -46,6 +50,8 @@ _CLIENT_CONFIG = Config(
     read_timeout=30,
     retries={"mode": "standard", "max_attempts": 2},
 )
+# Readiness probes fail fast, so the deadline holds even against a port that accepts but hangs.
+_PROBE_CONFIG = Config(connect_timeout=1, read_timeout=2, retries={"max_attempts": 1})
 
 
 class IngestionQueuePair(NamedTuple):
@@ -65,14 +71,14 @@ def _endpoint(variable: str, default: str) -> str:
     return os.environ.get(variable) or default
 
 
-def _client(service: str, endpoint_url: str) -> Any:
+def _client(service: str, endpoint_url: str, config: Config = _CLIENT_CONFIG) -> Any:
     return boto3.session.Session().client(
         service,
         region_name=_REGION,
         endpoint_url=endpoint_url,
         aws_access_key_id=_DUMMY_KEY,
         aws_secret_access_key=_DUMMY_KEY,
-        config=_CLIENT_CONFIG,
+        config=config,
     )
 
 
@@ -87,10 +93,14 @@ def dynamodb_client() -> Any:
 def wait_until_ready(sqs: Any, dynamodb: Any, *, timeout_seconds: float) -> None:
     """Poll ``ListQueues`` and ``ListTables`` until both answer, or raise ``TimeoutError``."""
     deadline = time.monotonic() + timeout_seconds
+    probes = (
+        _client("sqs", sqs.meta.endpoint_url, _PROBE_CONFIG),
+        _client("dynamodb", dynamodb.meta.endpoint_url, _PROBE_CONFIG),
+    )
     while True:
         try:
-            sqs.list_queues()
-            dynamodb.list_tables()
+            probes[0].list_queues()
+            probes[1].list_tables()
             return
         except (BotoCoreError, ClientError) as error:
             if time.monotonic() >= deadline:
@@ -104,16 +114,26 @@ def wait_until_ready(sqs: Any, dynamodb: Any, *, timeout_seconds: float) -> None
         time.sleep(0.2)
 
 
-_ready_endpoints: set[tuple[str, str]] = set()
+# Per endpoint pair: None once ready, or the error of the wait that already timed out.
+_readiness: dict[tuple[str, str], TimeoutError | None] = {}
 
 
 def ensure_services_ready() -> None:
-    """Wait once per endpoint pair, so a cold-started CI service is never hit too early."""
+    """Wait once per endpoint pair, so a cold-started CI service is never hit too early.
+
+    A wait that timed out is remembered, so later tests fail at once instead of waiting again.
+    """
     sqs, dynamodb = sqs_client(), dynamodb_client()
     key = (sqs.meta.endpoint_url, dynamodb.meta.endpoint_url)
-    if key not in _ready_endpoints:
-        wait_until_ready(sqs, dynamodb, timeout_seconds=READY_TIMEOUT_SECONDS)
-        _ready_endpoints.add(key)
+    if key not in _readiness:
+        try:
+            wait_until_ready(sqs, dynamodb, timeout_seconds=READY_TIMEOUT_SECONDS)
+        except TimeoutError as error:
+            _readiness[key] = error
+        else:
+            _readiness[key] = None
+    if (error := _readiness[key]) is not None:
+        raise TimeoutError(str(error))
 
 
 def _unique(prefix: str) -> str:
@@ -251,7 +271,7 @@ class ToggleableTcpProxy:
     def url(self) -> str:
         return f"http://{self._listen_host}:{self._port}"
 
-    def __enter__(self) -> ToggleableTcpProxy:
+    def __enter__(self) -> Self:
         return self
 
     def __exit__(self, *_exc: object) -> None:
@@ -267,7 +287,7 @@ class ToggleableTcpProxy:
             listener = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
             listener.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
             try:
-                listener.bind((self._listen_host, self._port))
+                self._bind(listener)
                 listener.listen(64)
             except OSError:
                 listener.close()
@@ -275,6 +295,20 @@ class ToggleableTcpProxy:
             self._port = listener.getsockname()[1]
             self._listener = listener
         threading.Thread(target=self._accept_loop, args=(listener,), daemon=True).start()
+
+    def _bind(self, listener: socket.socket) -> None:
+        # The first bind takes an ephemeral port. While down, an outgoing connection on the host
+        # can briefly hold that port, so retry the rebind for a short while.
+        for attempt in range(_REBIND_ATTEMPTS):
+            try:
+                listener.bind((self._listen_host, self._port))
+                return
+            except OSError as error:
+                if self._port == 0 or error.errno != errno.EADDRINUSE:
+                    raise
+                if attempt + 1 == _REBIND_ATTEMPTS:
+                    raise
+                time.sleep(0.1)
 
     def down(self) -> None:
         with self._lock:
@@ -302,6 +336,10 @@ class ToggleableTcpProxy:
             try:
                 upstream = socket.create_connection(self._target, timeout=5)
                 upstream.settimeout(None)
+                # Bounds a pump blocked in sendall, which neither SHUT_RD nor close can interrupt.
+                send_timeout = struct.pack("ll", _PROXY_SEND_TIMEOUT_SECONDS, 0)
+                for sock in (client, upstream):
+                    sock.setsockopt(socket.SOL_SOCKET, socket.SO_SNDTIMEO, send_timeout)
             except OSError:
                 _reset(client)
                 continue

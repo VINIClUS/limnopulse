@@ -64,13 +64,13 @@ wait_ready() {
   return 1
 }
 
-# True when the PID file names a live java process.
+# True when the PID file names a live java process running this JAR (not a reused pid).
 running() {
   local pid
   [[ -f "${PID_FILE}" ]] || return 1
   pid="$(cat "${PID_FILE}")"
   kill -0 "${pid}" 2>/dev/null || return 1
-  [[ ! -r "/proc/${pid}/comm" || "$(cat "/proc/${pid}/comm")" == "java" ]]
+  [[ ! -r "/proc/${pid}/cmdline" ]] || tr '\0' ' ' <"/proc/${pid}/cmdline" | grep -qF -- "${JAR_PATH}"
 }
 
 abort_start() {
@@ -83,7 +83,8 @@ abort_start() {
 }
 
 install_dynamodb_local() {
-  WORK_DIR="$(mktemp -d)"
+  # Inside the cache directory, so the final mv is an atomic rename.
+  WORK_DIR="$(mktemp -d "${CACHE_DIR}/.tmp.XXXXXX")"
   curl --proto "=https" --tlsv1.2 -fsSL -o "${WORK_DIR}/${TARBALL}" "${DOWNLOAD_URL}"
   if ! echo "${TARBALL_SHA256}  ${WORK_DIR}/${TARBALL}" | sha256sum -c --status; then
     echo "sha256 checksum mismatch for ${DOWNLOAD_URL}: the URL is mutable and now serves" \
