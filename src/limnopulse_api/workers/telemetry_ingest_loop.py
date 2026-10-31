@@ -264,11 +264,9 @@ async def _stop_heartbeat(heartbeat: asyncio.Task[None]) -> None:
     """
     heartbeat.cancel()
     try:
-        await asyncio.shield(heartbeat)
+        # `asyncio.wait` never raises for the heartbeat's own cancellation, only for ours.
+        await asyncio.wait({heartbeat})
     except asyncio.CancelledError:
-        current = asyncio.current_task()
-        if current is None or current.cancelling() == 0:
-            return  # only the heartbeat itself was cancelled
         await _until_done(heartbeat)
         raise
 
