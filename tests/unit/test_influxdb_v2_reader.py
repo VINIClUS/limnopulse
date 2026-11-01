@@ -212,7 +212,8 @@ def position(query: str, pattern: str) -> int:
 
 
 def assert_no_unescaped_interpolation(query: str) -> None:
-    assert re.search(r"(?<!\\)\$\{", query) is None, query
+    # P2 plan D19: every `$` is written as `\x24`, so no query keeps a raw `$`.
+    assert "$" not in query, query
 
 
 # --- protocol -----------------------------------------------------------------------------
@@ -396,7 +397,18 @@ async def test_bucket_is_always_a_helper_escaped_literal(bucket: str) -> None:
         assert f"from(bucket: {flux_string_literal(bucket)})" in query
         assert_no_unescaped_interpolation(query)
     if bucket == "raw$archive":
-        assert '"raw$archive"' in query
+        assert '"raw\\x24archive"' in query
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("bucket", ["raw\x00", "raw\x1b[0m", "raw\ud800"], ids=ascii)
+async def test_bucket_that_cannot_round_trip_is_rejected_before_any_query(bucket: str) -> None:
+    # P2 plan D19 (#84): the helper raises, so nothing reaches InfluxDB.
+    for run in (run_query, run_latest):
+        api = FakeQueryApi()
+        with pytest.raises(ValueError):
+            await run(api, bucket=bucket)
+        assert api.calls == []
 
 
 @pytest.mark.asyncio

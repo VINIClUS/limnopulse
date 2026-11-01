@@ -150,12 +150,13 @@ func TestBuildV2QueryUsesTheLegacyReaderWindowBounds(t *testing.T) {
 	}
 }
 
-func TestBuildV2QueryEscapesInterpolationButKeepsLoneDollar(t *testing.T) {
+func TestBuildV2QueryEscapesEveryDollarAndKeepsTextRaw(t *testing.T) {
+	// P2 plan D19 (#84): every `$` becomes `\x24`, non-ASCII and HTML characters stay raw.
 	start := time.Date(2026, 7, 9, 11, 55, 0, 0, time.UTC)
 	spec := alertevaluator.WindowSpec{Start: start, End: start.Add(time.Minute)}
 	tenant := "t${x}\"q${y}"
 	pond := "p${w}"
-	device := "a$b$${c}\n"
+	device := "a$b$${c}\né<&>\u2028"
 	rule := alertevaluator.EvaluationRule{
 		Rule:   alertevaluator.Rule{TenantID: tenant},
 		PondID: pond, DeviceID: device, Metric: "ph",
@@ -165,19 +166,19 @@ func TestBuildV2QueryEscapesInterpolationButKeepsLoneDollar(t *testing.T) {
 		t.Fatal(err)
 	}
 	for _, want := range []string{
-		`from(bucket: "raw$archive")`,
-		`r["tenant_id"] == "t\${x}\"q\${y}")`,
+		`from(bucket: "raw\x24archive")`,
+		`r["tenant_id"] == "t\x24{x}\"q\x24{y}")`,
 		`r["asset_id"] == "` + AssetIDForLegacyPond(tenant, pond) + `")`,
-		`r["device_id"] == "a$b$\${c}\n")`,
+		`r["device_id"] == "a\x24b\x24\x24{c}\né<&>` + "\u2028" + `")`,
 	} {
 		if !strings.Contains(query, want) {
 			t.Fatalf("query misses %q:\n%s", want, query)
 		}
 	}
-	if strings.Contains(strings.ReplaceAll(query, `\${`, ""), "${") {
-		t.Fatalf("query keeps an unescaped interpolation:\n%s", query)
+	if strings.Contains(query, "$") || strings.Contains(query, `\u`) {
+		t.Fatalf("query keeps a raw $ or a \\u escape:\n%s", query)
 	}
-	if strings.Contains(query, "p$") || strings.Contains(query, "pond_id") {
+	if strings.Contains(query, `p\x24`) || strings.Contains(query, "pond_id") {
 		t.Fatalf("query leaks the legacy pond instead of its asset:\n%s", query)
 	}
 
@@ -185,7 +186,7 @@ func TestBuildV2QueryEscapesInterpolationButKeepsLoneDollar(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if !strings.Contains(query, `from(bucket: "b\${z}")`) {
+	if !strings.Contains(query, `from(bucket: "b\x24{z}")`) {
 		t.Fatalf("bucket interpolation is not escaped:\n%s", query)
 	}
 }
