@@ -904,6 +904,10 @@ D16_DECISION = re.compile(r"HTTPS only \(#104\)")
 D16_OWNER_GATE_LINK = "(#d16-owner-gate)"
 EVALUATOR_FLIP = "`ALERT_EVALUATOR_TELEMETRY_SOURCE=v2`"
 V1_READ_FLIP = "`V1_TELEMETRY_READ_SOURCE=v2`"
+NO_PRODUCER = re.compile(r"[Nn]o MQTT → v2 producer is built")
+HTTPS_ONLY_INGEST = re.compile(r"only through the P3 HTTPS ingest")
+# The #15 record, not a claim about today: the first pilot (#125) came later and reports over HTTPS.
+ZERO_ITEMS = re.compile(r"(?<!\d)0 domain items")
 # The wording of the open producer-path decision that #104 settled: nothing waits for a producer.
 D16_SUPERSEDED = (
     "DEFERRED → #104",
@@ -911,8 +915,13 @@ D16_SUPERSEDED = (
     "D16 open gate",
     "still need a producer",
     "until #104 closes D16",
-    "producer-path decision",
     "decomposed only after",
+)
+# Runbook only: the plan keeps the historical P3 text that names the three original options.
+RUNBOOK_SUPERSEDED = (
+    *D16_SUPERSEDED,
+    "approved MQTT bridge",
+    "producer writes every legacy MQTT device",
 )
 D16_OWNER_GATE = (
     ("no legacy MQTT device", (r"[Cc]onfirm", r"still has no legacy MQTT device", r"stay off")),
@@ -922,6 +931,7 @@ D16_OWNER_GATE = (
             r"keyed divergence checks",
             r"p2-telemetry-rollout-runbook\.md#keyed-divergence-checks",
             r"D16 window",
+            r"\bzero\b",
             r"pass criterion",
         ),
     ),
@@ -930,9 +940,15 @@ D16_OWNER_GATE = (
 )
 
 
+def _one(rows: list[str], what: str) -> str:
+    assert len(rows) == 1, (what, rows)
+    return rows[0]
+
+
 def test_runbook_preconditions_name_the_d16_decision() -> None:
     text = section("Preconditions")
     assert D16_DECISION.search(text)
+    assert NO_PRODUCER.search(text)
     assert EVALUATOR_FLIP in text and V1_READ_FLIP in text
     assert D16_OWNER_GATE_LINK in text
 
@@ -942,12 +958,13 @@ def test_runbook_owner_actions_record_the_d16_https_only_decision() -> None:
     assert D16_DECISION.search(text)
     for pattern in (
         r"[Pp]roduction has no legacy MQTT device",
-        r"0 domain items as of 2026-10-31",
+        ZERO_ITEMS,
+        r"2026-10-31",
         r"issues/15#issuecomment-6548338824",
-        r"P3 HTTPS ingest",
+        HTTPS_ONLY_INGEST,
         r"`POST /ingest/v2/observations`",
         r"ingest credential",
-        r"[Nn]o MQTT → v2 producer is built",
+        NO_PRODUCER,
         r"#104 stays open until",
     ):
         assert re.search(pattern, text), pattern
@@ -956,7 +973,7 @@ def test_runbook_owner_actions_record_the_d16_https_only_decision() -> None:
 def test_runbook_d16_owner_gate_is_the_ordered_owner_checklist() -> None:
     owner_actions = markdown_section(runbook(), "Owner actions")
     raw = markdown_section(owner_actions, "D16 owner gate", level=3)
-    assert re.search(r"owner", raw) and re.search(r"in this order", raw)
+    assert re.search(r"only after", raw) and re.search(r"in this order", raw)
     items = numbered_items(raw)
     assert len(items) == len(D16_OWNER_GATE)
     for item, (step, patterns) in zip(items, D16_OWNER_GATE, strict=True):
@@ -970,8 +987,9 @@ def test_runbook_d16_owner_gate_is_the_ordered_owner_checklist() -> None:
 
 def test_runbook_adr_gate_map_d16_row_records_the_decision() -> None:
     raw = markdown_section(runbook(), "ADR gate map")
-    (row,) = [line for line in raw.splitlines() if line.startswith("| ADR-007 / D16")]
+    row = _one([line for line in raw.splitlines() if line.startswith("| ADR-007 / D16")], "row")
     assert D16_DECISION.search(row)
+    assert NO_PRODUCER.search(row)
     assert D16_OWNER_GATE_LINK in row
     assert "DEFERRED" not in row
     assert "::test_gate15_https_path_matches_the_independent_legacy_writer`" in row
@@ -979,7 +997,7 @@ def test_runbook_adr_gate_map_d16_row_records_the_decision() -> None:
 
 def test_runbook_no_longer_waits_for_a_legacy_mqtt_producer() -> None:
     text = " ".join(runbook().split())
-    for phrase in D16_SUPERSEDED:
+    for phrase in RUNBOOK_SUPERSEDED:
         assert phrase not in text, phrase
 
 
@@ -989,9 +1007,9 @@ def test_p2_runbook_d16_precondition_records_the_https_only_decision() -> None:
     assert D16_DECISION.search(text)
     for pattern in (
         r"[Pp]roduction has no legacy MQTT device",
-        r"P3 HTTPS ingest",
-        r"[Nn]o MQTT → v2 producer is built",
-        r"legacy MQTT devices? keeps? both read switches off",
+        HTTPS_ONLY_INGEST,
+        NO_PRODUCER,
+        r"legacy MQTT devices?\b.{0,80}\boff\b|\boff\b.{0,80}legacy MQTT devices?",
         r"\]\(p3-ingestion-rollout-runbook\.md#d16-owner-gate\)",
     ):
         assert re.search(pattern, text), pattern
@@ -1005,31 +1023,39 @@ def _plan_rows(heading: str, first_cell: str) -> list[str]:
 
 def test_plan_a48_amendment_records_the_d16_https_only_decision() -> None:
     rows = _plan_rows("Audit amendments (r2)", "A")
-    ids = [int(re.match(r"\| A(\d+) \|", row).group(1)) for row in rows]
-    assert ids == list(range(1, 49)), "A48 must be the next and last amendment"
-    row = rows[-1]
-    assert row.startswith("| A48 | owner decision on #104 |")
+    ids = [int(match[1]) for row in rows if (match := re.match(r"\| A(\d+) \|", row))]
+    assert len(ids) == len(rows) and ids[:48] == list(range(1, 49)), ids
+    row = rows[47]
+    assert re.match(r"\| A48 \| [^|]*#104[^|]* \|", row), row[:60]
     assert D16_DECISION.search(row)
     for pattern in (
         r"[Pp]roduction has no legacy MQTT device",
-        r"0 domain items as of 2026-10-31",
-        r"P3 HTTPS ingest",
-        r"[Nn]o MQTT → v2 producer is built",
+        ZERO_ITEMS,
+        HTTPS_ONLY_INGEST,
+        NO_PRODUCER,
         r"#104 stays open until",
         r"[Aa]pplied inline",
     ):
         assert re.search(pattern, row), pattern
-    gate = row[row.index("D16 owner gate") :]
-    steps = ("no legacy MQTT device", "keyed divergence", EVALUATOR_FLIP, V1_READ_FLIP)
-    positions = [gate.find(step) for step in steps]
-    assert -1 not in positions and positions == sorted(positions), positions
+    # The gate is written `D16 owner gate ... (1) ...; (2) ...; (3) ...; (4) ...`.
+    assert "D16 owner gate" in row
+    clauses = re.findall(r"\((\d)\)\s*([^;]+)", row[row.index("D16 owner gate") :])
+    assert [number for number, _ in clauses] == list("1234"), clauses
+    steps = (r"no legacy MQTT device", r"keyed divergence.*\bzero\b", EVALUATOR_FLIP, V1_READ_FLIP)
+    for (number, clause), step in zip(clauses, steps, strict=True):
+        assert re.search(re.escape(step) if step.startswith("`") else step, clause), number
+    assert [EVALUATOR_FLIP in clause for _, clause in clauses] == [False, False, True, False]
+    assert [V1_READ_FLIP in clause for _, clause in clauses] == [False, False, False, True]
 
 
 def test_plan_applies_a48_inline() -> None:
-    (decision,) = _plan_rows("Entry Decisions (frozen by this plan)", "D16 |")
-    (gate_map,) = _plan_rows("Final Acceptance Matrix", "ADR-007 / D16")
-    for row in (decision, gate_map):
-        assert D16_DECISION.search(row) and "A48" in row, row[:40]
+    decision = _one(_plan_rows("Entry Decisions (frozen by this plan)", "D16 |"), "D16 row")
+    gate_map = _one(_plan_rows("Final Acceptance Matrix", "ADR-007 / D16"), "matrix row")
+    for name, row in (("D16 row", decision), ("matrix row", gate_map)):
+        assert D16_DECISION.search(row), name
+        assert "A48" in row, name
+    assert NO_PRODUCER.search(decision)
+    assert "owner gate" in decision
     assert "stays open after P3" not in decision
     text = " ".join(PLAN.read_text(encoding="utf-8").split())
     for phrase in D16_SUPERSEDED:
@@ -1147,7 +1173,7 @@ ADR_GATE_SHA256 = MappingProxyType(
 )
 ADR_REFERENCES = {
     ADR_006: (r"\bP3\b", r"\bP6\b", r"#17\b", r"quarantine", r"connector health", r"INGEST_STATE"),
-    ADR_007: (r"\bP3\b", r"redrive", r"\bD16\b", r"Backlog", r"\bG15\b"),
+    ADR_007: (r"\bP3\b", r"redrive", r"\bD16\b", r"Backlog", r"\bG15\b", r"HTTPS only \(#104\)"),
     ADR_016: (r"\bP3\b", r"Idempotency-Key", r"(?i)entitlement", r"#20\b", r"DLQ redrive"),
 }
 
@@ -1170,6 +1196,8 @@ def test_adr_implementation_gate_ends_with_the_p3_phase_split(adr: Path) -> None
     phase_split = " ".join(paragraphs[-1].split())
     for reference in ADR_REFERENCES[adr]:
         assert re.search(reference, phase_split), reference
+    if adr == ADR_007:  # #104 settled the D16 producer path (A48): nothing stays open for it.
+        assert "stays open" not in phase_split
     assert "](../p3-ingestion-rollout-runbook.md)" in phase_split
 
 
