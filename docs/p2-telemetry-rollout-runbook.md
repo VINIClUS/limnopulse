@@ -79,8 +79,11 @@ deferral. Gate numbers refer to the P2-09 acceptance gate.
 
 ## D16 precondition
 
-P2 is a rehearsal only: production enablement of any read switch is a P3 exit step, after P3 delivers
-a producer that writes every legacy device to `observation_numeric`.
+P2 is a rehearsal only. P3 delivers the producer (its telemetry ingest worker), and #104 settles
+the legacy devices as **HTTPS only (#104)**: production has no legacy MQTT device, every new device
+reports only through the P3 HTTPS ingest, and no MQTT → v2 producer is built. The owner flips the
+read switches in production only through the P3 runbook's
+[D16 owner gate](p3-ingestion-rollout-runbook.md#d16-owner-gate).
 
 `ALERT_EVALUATOR_TELEMETRY_SOURCE=v2` and `V1_TELEMETRY_READ_SOURCE=v2` may be enabled only in an
 environment where both of these hold:
@@ -89,6 +92,10 @@ environment where both of these hold:
 - the [keyed divergence checks](#keyed-divergence-checks) report zero missing or different
   `(pond, device, metric, _time, value)` tuples over max(longest rule window, legacy read window),
   for every pond of every tenant in that environment.
+
+Under HTTPS only, the first condition holds while every device reports through the P3 HTTPS ingest.
+An environment that still has a legacy MQTT device keeps both read switches off: no deployed
+producer carries legacy MQTT readings into `observation_numeric`.
 
 ## Rollout sequence
 
