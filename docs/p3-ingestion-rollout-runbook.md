@@ -354,6 +354,12 @@ restore a `water_quality` producer and revert either read switch only once `wate
 both windows again. During this rollback, never stop legacy dual write or the worker while either
 read switch is `v2`: under HTTPS only they are the only producers of both measurements.
 
+Reverting the read switches is the whole D16 rollback: keep the HTTPS ingest, the worker and legacy
+dual write running, as in step 3 of the P2 after-cutover rollback. Under HTTPS only, the steps below
+remove the only telemetry producer for every device, and a pilot has no legacy path to route back
+to. Continue with them only once a verified replacement producer writes `water_quality`, or when
+stopping all telemetry intake is the intent.
+
 1. **Route pilots back** to their previous (legacy) path, so they stop calling the HTTPS endpoint.
 2. **Stop legacy dual write:** set `TELEMETRY_LEGACY_DUAL_WRITE_ENABLED=false` in the shared `.env`
    and recreate the worker (and the API, which reads it too), if it was on.
