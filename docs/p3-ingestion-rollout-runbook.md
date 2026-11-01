@@ -30,9 +30,10 @@ runbook](p2-telemetry-rollout-runbook.md).
 - **Dark by default.** P3 ships dark: with every switch off, the API behaves exactly as before P3, and nothing
   produces canonical telemetry in production (D16). The `/v1` OpenAPI is identical in every switch
   combination (G13).
-- **D16 stays open.** The legacy-device read switches (`V1_TELEMETRY_READ_SOURCE=v2`,
-  `ALERT_EVALUATOR_TELEMETRY_SOURCE=v2`) still need a producer for every legacy MQTT device. That is
-  Backlog issue #104, not this runbook (see [Owner actions](#owner-actions)).
+- **D16: HTTPS only (#104).** Production has no legacy MQTT device, and every new device reports
+  through this runbook's HTTPS ingest, so no MQTT → v2 producer is built for legacy devices. The
+  legacy-device read switches (`V1_TELEMETRY_READ_SOURCE=v2`, `ALERT_EVALUATOR_TELEMETRY_SOURCE=v2`)
+  stay off until the owner completes the [D16 owner gate](#d16-owner-gate).
 - **Queue properties (§21.2), provisioned by OpenTofu `ingestion_queues.tf`** behind the
   `telemetry_ingress` variable:
   - `limnopulse-telemetry-ingress` (standard queue): SSE (SQS-managed), 4 days retention, 60 s
@@ -96,13 +97,16 @@ Each step is a separate change. Verify each one before moving to the next.
      bypasses the route's membership check.
 5. **Divergence checks.** For every pilot that also reports through the legacy path, run the P2 keyed
    divergence checks between `observation_numeric` and `water_quality` over the pilot window; they
-   must report nothing (G15 proves the HTTPS path matches the independent legacy writer).
+   must report nothing (G15 proves the HTTPS path matches the independent legacy writer). Under
+   HTTPS only (#104) no production pilot reports through the legacy path; the production divergence
+   evidence is step 2 of the [D16 owner gate](#d16-owner-gate), after step 6.
 6. **Legacy dual write.** Set `TELEMETRY_LEGACY_DUAL_WRITE_ENABLED` to `true` (shared `.env`, then recreate the worker and the API) only after G7
    (the durable DLQ redrive gate) has passed on `main` and the DLQ drill below has been rehearsed in
    this environment.
 7. **Remaining P2 steps.** Continue with the [P2 telemetry rollout
    runbook](p2-telemetry-rollout-runbook.md) (its rollout sequence, stop-dual-write criteria and
-   retention). The read switches stay off until #104 closes D16.
+   retention). The read switches stay off until the owner completes the
+   [D16 owner gate](#d16-owner-gate).
 
 ## Production environment
 
@@ -340,6 +344,21 @@ uv run --locked python scripts/admin/telemetry_quarantine.py dismiss --tenant <t
 
 Rollback follows §24: route pilots back, disable the endpoint, retain the queued messages.
 
+If the [D16 owner gate](#d16-owner-gate) was completed, first return the read switches in reverse
+order: `V1_TELEMETRY_READ_SOURCE=legacy`, then `ALERT_EVALUATOR_TELEMETRY_SOURCE=legacy`, and
+recreate the API and the evaluator. Do this only while legacy dual write is still on, so
+`water_quality` holds both windows. If the P2 stop-dual-write criteria have already turned dual write
+off, follow the P2 [after-cutover rollback](p2-telemetry-rollout-runbook.md#rollback) instead:
+restore a `water_quality` producer and revert either read switch only once `water_quality` holds
+both windows again. During this rollback, never stop legacy dual write or the worker while either
+read switch is `v2`: under HTTPS only they are the only producers of both measurements.
+
+Reverting the read switches is the whole D16 rollback: keep the HTTPS ingest, the worker and legacy
+dual write running, as in step 3 of the P2 after-cutover rollback. Under HTTPS only, the steps below
+remove the only telemetry producer for every device, and a pilot has no legacy path to route back
+to. Continue with them only once a verified replacement producer writes `water_quality`, or when
+stopping all telemetry intake is the intent.
+
 1. **Route pilots back** to their previous (legacy) path, so they stop calling the HTTPS endpoint.
 2. **Stop legacy dual write:** set `TELEMETRY_LEGACY_DUAL_WRITE_ENABLED=false` in the shared `.env`
    and recreate the worker (and the API, which reads it too), if it was on.
@@ -364,14 +383,44 @@ Agents do not change production. These are owner actions, recorded on #15:
   `INGEST_V2_ENABLED` and `TELEMETRY_LEGACY_DUAL_WRITE_ENABLED` in production, and pilot onboarding.
   P3 exits with enablement permitted (G1–G15 green, drills executed); the flips themselves are the
   owner's.
-- **D16 open gate.** The read switches stay off until a producer writes every legacy MQTT device to
-  `observation_numeric`. That gate is owned by Backlog issue #104 (`[Backlog][P3 follow-up] Producer
-  path for legacy MQTT devices (D16 read-switch gate)`), decomposed only after its producer-path
-  decision (HTTPS firmware, an approved MQTT bridge, or P5 AWS IoT) is approved.
+- **D16 read switches: HTTPS only (#104).** The owner chose decision (a) for Backlog issue #104
+  (`[Backlog][P3 follow-up] Producer path for legacy MQTT devices (D16 read-switch gate)`).
+  Production has no legacy MQTT device: it held 0 domain items when
+  [#15](https://github.com/VINIClUS/limnopulse/issues/15#issuecomment-6548338824) recorded it on
+  2026-10-31, and the first (simulated) pilot, onboarded since (#125), reports over HTTPS. Every new
+  device reports only through the P3 HTTPS ingest: `POST /ingest/v2/observations` with an ingest
+  credential, onboarded as in enablement step 4. No MQTT → v2 producer is built for legacy devices:
+  neither an MQTT bridge nor the P5 AWS IoT adapter carries them. The read switches stay off until
+  the owner completes the [D16 owner gate](#d16-owner-gate), and #104 stays open until then.
 - **Required status checks.** Add the CI checks to the default-branch ruleset, with strict
   up-to-date branches and required thread resolution: `python`, `go`, `opentofu`, `compose`,
   `frontend`, `influx`, `ingestion` (from `verify.yml`) and `sonar`, plus the Trivy and build workflow
   jobs if wanted.
+
+### D16 owner gate
+
+The owner flips the read switches in production only after these steps, in this order. Steps 1
+and 2 are checks; steps 3 and 4 are separate changes. Record each step on #104.
+
+1. **No legacy MQTT device.** Confirm production still has no legacy MQTT device. No MQTT pipeline
+   writes production's `water_quality`: a Mosquitto → Telegraf pipeline may run outside the VPS and
+   write InfluxDB over `influx.limnopulse.com`, so confirm that any such Telegraf is stopped or maps
+   no production tenant. Every device that reports does so through an active `https_direct`
+   DeviceIntegration; a `/v1` device counts only once it is M1-backfilled (enablement step 4). If a
+   legacy MQTT device appears, stop: both read switches stay off, and #104 needs a producer for it.
+2. **Keyed divergence.** Run the P2 [keyed divergence
+   checks](p2-telemetry-rollout-runbook.md#keyed-divergence-checks) over the D16 window,
+   max(longest rule window, legacy read window), for every pond that has a backfilled `/v1` device
+   that reported in the window. Native `/v2` Components are never dual-written (D7), so they have no
+   `water_quality` points to compare. First confirm that both measurements have points for each pond
+   in the window; then every pond must report zero divergence under the checks' pass criterion.
+   Under HTTPS only, `water_quality` gets points only from legacy dual write (enablement step 6), so
+   it must be on for the whole window: the window starts after step 6.
+3. **Alert evaluator.** Set `ALERT_EVALUATOR_TELEMETRY_SOURCE=v2` as in P2 rollout step 5: in one
+   environment first, compared with a `legacy` evaluator there, expecting the D15 divergence.
+4. **`/v1` reads.** Set `V1_TELEMETRY_READ_SOURCE=v2` last, as in P2 rollout step 6: only after the
+   `observation_numeric` retention covers the legacy read window and `observation_numeric` already
+   holds data for all of it ([Retention](p2-telemetry-rollout-runbook.md#retention)).
 
 ## ADR gate map
 
@@ -382,7 +431,7 @@ Agents do not change production. These are owner actions, recorded on #15:
 | ADR-006: device and component last-seen, duplicate and sequence gap/regression state | `tests/ingestion/test_p3_acceptance_ingestion.py::test_gate10_truth_table_vectors_hold_end_to_end`, `tests/ingestion/test_p3_acceptance_ingestion.py::test_gate10_sequence_truth_table_end_to_end_and_marks_never_pass_the_first_receipt`; point-level flags **DEFERRED → #17** (D12) |
 | ADR-006: current-health views from receive or ingest time | **DEFERRED → #17** (P6), from the P3 `INGEST_STATE` rows |
 | ADR-007: durable SQS redrive after an InfluxDB outage, recovery without loss | `tests/ingestion/test_p3_acceptance_ingestion.py::test_gate7_influx_outage_reaches_the_dlq_and_redrive_reproduces_the_baseline` |
-| ADR-007 / D16: a producer for every legacy device before the read switches | **DEFERRED → #104**; P3 delivers `tests/ingestion/test_p3_acceptance_ingestion.py::test_gate15_https_path_matches_the_independent_legacy_writer` |
+| ADR-007 / D16: a producer for every legacy device before the read switches | **HTTPS only (#104)**: production has no legacy MQTT device and no MQTT → v2 producer is built for legacy devices; the owner flips the read switches through the [D16 owner gate](#d16-owner-gate). P3 delivers `tests/ingestion/test_p3_acceptance_ingestion.py::test_gate15_https_path_matches_the_independent_legacy_writer` |
 | ADR-016: accepted only after the durable SQS write | `tests/ingestion/test_p3_acceptance_ingestion.py::test_gate1_accepted_only_after_the_queue_write` |
 | ADR-016: at-least-once replay is safe; `Idempotency-Key` retry creates no second observation | `tests/ingestion/test_p3_acceptance_ingestion.py::test_gate5_idempotent_retries_keep_the_first_received_at`, `tests/ingestion/test_p3_acceptance_ingestion.py::test_gate6_redelivery_and_shuffling_converge_on_points_and_state` |
 | ADR-016: authenticate before resolving; reject missing, invalid or mismatched credentials | `tests/ingestion/test_p3_acceptance_ingestion.py::test_gate2_every_bad_credential_or_account_is_401_and_revocation_is_immediate` |
@@ -410,4 +459,4 @@ Agents do not change production. These are owner actions, recorded on #15:
 | G12 | closed metrics, no secret anywhere | `tests/contracts/test_p3_acceptance_gate.py::test_gate12_metrics_use_the_closed_name_and_label_sets`, `tests/ingestion/test_p3_acceptance_ingestion.py::test_gate12_no_secret_or_raw_identifier_in_logs_bodies_receipts_or_rows` |
 | G13 | switch matrix, worker start guard | `tests/contracts/test_p3_acceptance_gate.py::test_gate13_switch_matrix_keeps_v1_and_mounts_exactly_the_switched_routes`, `tests/contracts/test_p3_acceptance_gate.py::test_gate13_worker_exits_2_unless_it_can_write` |
 | G14 | storage rules, optional cache | `tests/contracts/test_p3_acceptance_gate.py::test_gate14_no_scan_no_new_index_no_new_table_and_no_cache_dependency`, `tests/contracts/test_p3_acceptance_gate.py::test_gate14_the_composed_ingest_route_has_no_cache_dependency` |
-| G15 | zero divergence against the independent legacy writer | `tests/ingestion/test_p3_acceptance_ingestion.py::test_gate15_https_path_matches_the_independent_legacy_writer`; the legacy-device producer DEFERRED → #104 |
+| G15 | zero divergence against the independent legacy writer | `tests/ingestion/test_p3_acceptance_ingestion.py::test_gate15_https_path_matches_the_independent_legacy_writer`; legacy devices: HTTPS only (#104), read switches behind the [D16 owner gate](#d16-owner-gate) |
