@@ -917,6 +917,10 @@ D16_SUPERSEDED = (
     "until #104 closes D16",
     "decomposed only after",
 )
+# Paraphrases of the same wait, wherever they are worded.
+D16_STALE = re.compile(
+    r"until a producer writes every legacy|(?:still )?(?:need|require)s? a producer for every legacy"
+)
 # Runbook only: the plan keeps the historical P3 text that names the three original options.
 RUNBOOK_SUPERSEDED = (
     *D16_SUPERSEDED,
@@ -973,7 +977,8 @@ def test_runbook_owner_actions_record_the_d16_https_only_decision() -> None:
 def test_runbook_d16_owner_gate_is_the_ordered_owner_checklist() -> None:
     owner_actions = markdown_section(runbook(), "Owner actions")
     raw = markdown_section(owner_actions, "D16 owner gate", level=3)
-    assert re.search(r"only after", raw) and re.search(r"in this order", raw)
+    text = " ".join(raw.split())
+    assert re.search(r"only after", text) and re.search(r"in this order", text)
     items = numbered_items(raw)
     assert len(items) == len(D16_OWNER_GATE)
     for item, (step, patterns) in zip(items, D16_OWNER_GATE, strict=True):
@@ -999,6 +1004,7 @@ def test_runbook_no_longer_waits_for_a_legacy_mqtt_producer() -> None:
     text = " ".join(runbook().split())
     for phrase in RUNBOOK_SUPERSEDED:
         assert phrase not in text, phrase
+    assert not D16_STALE.search(text), D16_STALE.search(text)
 
 
 def test_p2_runbook_d16_precondition_records_the_https_only_decision() -> None:
@@ -1060,6 +1066,7 @@ def test_plan_applies_a48_inline() -> None:
     text = " ".join(PLAN.read_text(encoding="utf-8").split())
     for phrase in D16_SUPERSEDED:
         assert phrase not in text, phrase
+    assert not D16_STALE.search(text), D16_STALE.search(text)
 
 
 TEST_ID = re.compile(r"`(tests/[\w/]+\.py)::(test_\w+)")
