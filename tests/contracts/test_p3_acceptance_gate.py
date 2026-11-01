@@ -928,7 +928,16 @@ RUNBOOK_SUPERSEDED = (
     "producer writes every legacy MQTT device",
 )
 D16_OWNER_GATE = (
-    ("no legacy MQTT device", (r"[Cc]onfirm", r"still has no legacy MQTT device", r"stay off")),
+    (
+        "no legacy MQTT device",
+        (
+            r"[Cc]onfirm",
+            r"still has no legacy MQTT device",
+            r"Telegraf",
+            r"backfilled",
+            r"stay off",
+        ),
+    ),
     (
         "keyed divergence",
         (
@@ -937,10 +946,21 @@ D16_OWNER_GATE = (
             r"D16 window",
             r"\bzero\b",
             r"pass criterion",
+            r"[Nn]ative `/v2`",
+            r"whole window",
         ),
     ),
     ("evaluator flip", (re.escape(EVALUATOR_FLIP), r"one environment first", r"D15")),
-    ("/v1 read flip", (re.escape(V1_READ_FLIP), r"retention", r"legacy read window")),
+    (
+        "/v1 read flip",
+        (
+            re.escape(V1_READ_FLIP),
+            r"retention",
+            r"legacy read window",
+            r"already holds data",
+            r"p2-telemetry-rollout-runbook\.md#retention",
+        ),
+    ),
 )
 
 
@@ -988,6 +1008,21 @@ def test_runbook_d16_owner_gate_is_the_ordered_owner_checklist() -> None:
     for index, item in enumerate(items):
         assert (EVALUATOR_FLIP in item) == (index == 2), index
         assert (V1_READ_FLIP in item) == (index == 3), index
+
+
+def test_runbook_rollback_returns_the_d16_read_switches_first() -> None:
+    """Under HTTPS only the worker writes both measurements, so the reads go back before it stops."""
+    raw = markdown_section(runbook(), "Rollback")
+    first_step = re.search(r"^1\. ", raw, flags=re.MULTILINE)
+    assert first_step, "the rollback order must be a numbered list"
+    lead = " ".join(raw[: first_step.start()].split())
+    assert D16_OWNER_GATE_LINK in lead
+    v1 = lead.find("`V1_TELEMETRY_READ_SOURCE=legacy`")
+    evaluator = lead.find("`ALERT_EVALUATOR_TELEMETRY_SOURCE=legacy`")
+    assert -1 < v1 < evaluator, (v1, evaluator)
+    assert re.search(
+        r"[Nn]ever stop legacy dual write or the worker while either read switch", lead
+    )
 
 
 def test_runbook_adr_gate_map_d16_row_records_the_decision() -> None:
