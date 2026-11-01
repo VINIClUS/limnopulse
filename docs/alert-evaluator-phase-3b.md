@@ -126,8 +126,10 @@ the legacy metric names. A query failure on either reader is recorded as
 Enable `v2` only where a producer writes every legacy device to
 `observation_numeric` and the keyed divergence check reports zero missing or
 different tuples over the longer of the longest rule window and the legacy read
-window (D16). Production enablement is a P3 exit step. To roll back, set the value
-to `legacy` or remove it.
+window (D16). In production the owner sets it only through the P3 runbook's
+[D16 owner gate](p3-ingestion-rollout-runbook.md#d16-owner-gate): legacy devices
+are HTTPS only (#104). To roll back, set the value to `legacy` or remove it; under
+HTTPS only, follow the [P3 rollback](p3-ingestion-rollout-runbook.md#rollback).
 
 ## Results and observability
 

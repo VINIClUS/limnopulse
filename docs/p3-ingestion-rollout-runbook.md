@@ -32,9 +32,8 @@ runbook](p2-telemetry-rollout-runbook.md).
   combination (G13).
 - **D16: HTTPS only (#104).** Production has no legacy MQTT device, and every new device reports
   through this runbook's HTTPS ingest, so no MQTT → v2 producer is built for legacy devices. The
-  legacy-device read
-  switches (`V1_TELEMETRY_READ_SOURCE=v2`, `ALERT_EVALUATOR_TELEMETRY_SOURCE=v2`) stay off until the
-  owner completes the [D16 owner gate](#d16-owner-gate).
+  legacy-device read switches (`V1_TELEMETRY_READ_SOURCE=v2`, `ALERT_EVALUATOR_TELEMETRY_SOURCE=v2`)
+  stay off until the owner completes the [D16 owner gate](#d16-owner-gate).
 - **Queue properties (§21.2), provisioned by OpenTofu `ingestion_queues.tf`** behind the
   `telemetry_ingress` variable:
   - `limnopulse-telemetry-ingress` (standard queue): SSE (SQS-managed), 4 days retention, 60 s

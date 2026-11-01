@@ -202,7 +202,7 @@ P2 adds canonical metric observations in the InfluxDB `observation_numeric` meas
 
 The two write switches are independent; the write path writes v2 first, then legacy, and any failure raises without reporting anything as written (D9).
 
-**D16 — P2 ships dark.** No deployed service calls the pipeline in P2, and Telegraf keeps writing only `water_quality`. `V1_TELEMETRY_READ_SOURCE=v2` and `ALERT_EVALUATOR_TELEMETRY_SOURCE=v2` may be enabled only where a producer writes every legacy device to `observation_numeric` and the keyed divergence check reports zero missing or different `(pond, device, metric, _time, value)` tuples over max(longest rule window, legacy read window). Production enablement is a P3 exit step.
+**D16 — P2 ships dark.** No deployed service calls the pipeline in P2, and Telegraf keeps writing only `water_quality`. `V1_TELEMETRY_READ_SOURCE=v2` and `ALERT_EVALUATOR_TELEMETRY_SOURCE=v2` may be enabled only where a producer writes every legacy device to `observation_numeric` and the keyed divergence check reports zero missing or different `(pond, device, metric, _time, value)` tuples over max(longest rule window, legacy read window). In production the owner flips them only through the P3 runbook's [D16 owner gate](docs/p3-ingestion-rollout-runbook.md#d16-owner-gate): legacy devices are HTTPS only (#104).
 
 The only P2 producer is the dev CLI `scripts/dev/ingest_reading_v2.py`. It builds the trusted source context (`legacy_mqtt`) from its arguments only; a tenant, pond or device in the payload is never authority. `--observed-at now` rewrites the payload `ts` so that a Deployment created at seed time covers it:
 

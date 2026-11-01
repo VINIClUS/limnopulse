@@ -462,6 +462,12 @@ Stopping dual write means setting `TELEMETRY_LEGACY_DUAL_WRITE_ENABLED=false`. I
 
 ## Rollback
 
+Under HTTPS only (#104), legacy dual write is the only `water_quality` producer, so the "before
+cutover" defaults below would leave `water_quality` with none. If the P3 runbook's D16 owner gate
+was completed, follow the D16 paragraphs of the
+[P3 rollback](p3-ingestion-rollout-runbook.md#rollback) instead: revert only the read switches and
+keep the producer running.
+
 Before cutover (while Telegraf still writes `water_quality`), rollback is by switches only. Set
 them back to their defaults and recreate the producer (the P3 worker; the dev CLI reads them per
 run), the API and the evaluator (`docker compose up -d <service>`, or redeploy;
