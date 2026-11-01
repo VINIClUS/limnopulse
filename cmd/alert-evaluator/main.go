@@ -1,128 +1,78 @@
+// Command alert-evaluator is the ADR-020 alert-evaluator role: one bounded pass over the
+// alert rules per invocation, started by its systemd timer. The schedule and active-alert
+// index backfills moved to cmd/limnopulse-admin.
+//
+// Exit codes: 0 success, 1 fatal, 2 partial (the next run retries), 78 configuration error.
 package main
 
 import (
 	"context"
-	"encoding/json"
-	"flag"
 	"fmt"
+	"io"
 	"os"
 	"os/signal"
-	"strings"
 	"syscall"
-	"time"
 
 	"github.com/VINIClUS/limnopulse/internal/alertevaluator"
 	dynamoadapter "github.com/VINIClUS/limnopulse/internal/alertevaluator/dynamo"
 	influxadapter "github.com/VINIClUS/limnopulse/internal/alertevaluator/influx"
 	"github.com/VINIClUS/limnopulse/internal/alertevaluator/telemetry"
-	"github.com/aws/aws-sdk-go-v2/aws"
-	awsconfig "github.com/aws/aws-sdk-go-v2/config"
-	"github.com/aws/aws-sdk-go-v2/credentials"
+	"github.com/VINIClUS/limnopulse/internal/workercmd"
+	"github.com/VINIClUS/limnopulse/internal/workerproc"
 	"github.com/aws/aws-sdk-go-v2/service/dynamodb"
 	influxdb2 "github.com/influxdata/influxdb-client-go/v2"
 	influxapi "github.com/influxdata/influxdb-client-go/v2/api"
 )
 
+type dependencies struct {
+	Output    io.Writer
+	LookupEnv func(string) (string, bool)
+	Evaluate  func(context.Context, alertevaluator.RunConfig, workercmd.AWSLoader) (alertevaluator.RunSummary, error)
+}
+
 func main() {
-	os.Exit(runMain(os.Args[1:]))
-}
-
-func runMain(args []string) int {
-	if len(args) == 0 {
-		return writeFailure("usage", "expected run or backfill-schedule")
-	}
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
-	defer stop()
-	switch args[0] {
-	case "run":
-		return runEvaluator(ctx, args[1:])
-	case "backfill-schedule":
-		return runBackfill(ctx, args[1:])
-	case "backfill-active-alert-index":
-		return runActiveAlertIndexBackfill(ctx, args[1:])
-	default:
-		return writeFailure("usage", fmt.Sprintf("unknown command %q", args[0]))
-	}
+	code := runMain(ctx, os.Args[1:], dependencies{Output: os.Stdout, LookupEnv: os.LookupEnv, Evaluate: evaluate})
+	stop()
+	os.Exit(code)
 }
 
-func runActiveAlertIndexBackfill(ctx context.Context, args []string) int {
-	config, err := parseActiveAlertIndexBackfillArgs(args)
-	if err != nil {
-		return writeFailure("configuration", err.Error())
+func runMain(ctx context.Context, args []string, deps dependencies) int {
+	if len(args) == 0 || args[0] != "run" {
+		return writeFailure(deps.Output, "usage", workerproc.Configuration(
+			fmt.Errorf("expected run; the backfills are limnopulse-admin commands"),
+		))
 	}
-	region := envOr("AWS_REGION", "us-east-1")
-	endpoint := envOr("DYNAMODB_ENDPOINT_URL", "")
-	awsConfig, err := loadAWSConfig(ctx, region, endpoint)
+	load, creds, err := workercmd.AWSLoaderFromEnv(deps.LookupEnv)
 	if err != nil {
-		return writeFailure("aws_configuration", err.Error())
+		return writeFailure(deps.Output, "credentials", err)
 	}
-	client := dynamodb.NewFromConfig(awsConfig, func(options *dynamodb.Options) {
-		if endpoint != "" {
-			options.BaseEndpoint = aws.String(endpoint)
-		}
-	})
-	store := dynamoadapter.Store{Table: envOr("DYNAMODB_DOMAIN_TABLE", "LimnopulseDomain"), Client: client}
-	summary, err := store.BackfillActiveAlertIndex(ctx, dynamoadapter.BackfillOptions{Tenants: config.tenants, Apply: config.apply, PageSize: config.pageSize, Limit: config.limit})
+	// Under systemd the token is the influxdb-token credential, never an env-file value.
+	lookup, err := workercmd.SecretLookup(deps.LookupEnv, creds, workerproc.CredentialInfluxDBToken, "INFLUXDB_TOKEN")
 	if err != nil {
-		writeJSON(struct {
-			Result  string                        `json:"result"`
-			Error   string                        `json:"error"`
-			Summary dynamoadapter.BackfillSummary `json:"summary"`
-		}{"fatal_failure", err.Error(), summary})
-		return alertevaluator.ExitFatal
+		return writeFailure(deps.Output, "credentials", err)
 	}
-	writeJSON(struct {
-		Result string                        `json:"result"`
-		Data   dynamoadapter.BackfillSummary `json:"summary"`
-	}{"success", summary})
-	return alertevaluator.ExitSuccess
+	config, err := alertevaluator.LoadRunConfig(args[1:], lookup)
+	if err != nil {
+		return writeFailure(deps.Output, "configuration", workerproc.Configuration(err))
+	}
+	summary, err := deps.Evaluate(ctx, config, load)
+	if err != nil {
+		return writeFailure(deps.Output, "aws_configuration", err)
+	}
+	workercmd.WriteJSON(deps.Output, summary)
+	return summary.ExitCode
 }
 
-type activeAlertIndexBackfillConfig struct {
-	tenants  stringList
-	apply    bool
-	pageSize int
-	limit    int
-}
-
-func parseActiveAlertIndexBackfillArgs(args []string) (activeAlertIndexBackfillConfig, error) {
-	fs := flag.NewFlagSet("alert-evaluator backfill-active-alert-index", flag.ContinueOnError)
-	fs.SetOutput(os.Stderr)
-	var config activeAlertIndexBackfillConfig
-	fs.Var(&config.tenants, "tenant", "explicit tenant id; repeat for multiple tenants")
-	fs.Var(&config.tenants, "tenant-id", "alias for --tenant; repeat for multiple tenants")
-	fs.BoolVar(&config.apply, "apply", false, "write the active-alert projection; default is dry-run")
-	fs.IntVar(&config.pageSize, "page-size", 25, "DynamoDB query page size")
-	fs.IntVar(&config.limit, "limit", 0, "maximum number of pending active-alert projections; zero means unlimited")
-	if err := fs.Parse(args); err != nil {
-		return activeAlertIndexBackfillConfig{}, err
-	}
-	if config.pageSize < 1 {
-		return activeAlertIndexBackfillConfig{}, fmt.Errorf("page size must be positive")
-	}
-	if config.limit < 0 {
-		return activeAlertIndexBackfillConfig{}, fmt.Errorf("limit cannot be negative")
-	}
-	return config, nil
-}
-
-func runEvaluator(ctx context.Context, args []string) int {
-	config, err := alertevaluator.LoadRunConfig(args, os.LookupEnv)
+// evaluate composes the DynamoDB and InfluxDB adapters, runs one pass and exports its metrics.
+func evaluate(ctx context.Context, config alertevaluator.RunConfig, load workercmd.AWSLoader) (alertevaluator.RunSummary, error) {
+	awsConfig, err := load(ctx, config.AWSRegion, config.DynamoDBEndpoint)
 	if err != nil {
-		return writeFailure("configuration", err.Error())
+		return alertevaluator.RunSummary{}, err
 	}
-	awsConfig, err := loadAWSConfig(ctx, config.AWSRegion, config.DynamoDBEndpoint)
-	if err != nil {
-		return writeFailure("aws_configuration", err.Error())
-	}
-	dynamoClient := dynamodb.NewFromConfig(awsConfig, func(options *dynamodb.Options) {
-		if config.DynamoDBEndpoint != "" {
-			options.BaseEndpoint = aws.String(config.DynamoDBEndpoint)
-		}
-	})
 	influxClient := influxdb2.NewClient(config.InfluxDBURL, config.InfluxDBToken)
 	defer influxClient.Close()
-	runner := newRunner(config, dynamoClient, influxClient.QueryAPI(config.InfluxDBOrg))
+	runner := newRunner(config, dynamodb.NewFromConfig(awsConfig), influxClient.QueryAPI(config.InfluxDBOrg))
 	summary := runner.Run(ctx, config)
 	metrics, metricsErr := telemetry.New(context.Background(), config.OTLPEndpoint)
 	if metricsErr != nil {
@@ -135,8 +85,7 @@ func runEvaluator(ctx context.Context, args []string) int {
 		}
 		cancel()
 	}
-	writeJSON(summary)
-	return summary.ExitCode
+	return summary, nil
 }
 
 func newRunner(config alertevaluator.RunConfig, dynamoClient *dynamodb.Client, queryAPI influxapi.QueryAPI) alertevaluator.Runner {
@@ -157,104 +106,20 @@ func windowReaderFor(config alertevaluator.RunConfig, queryAPI influxapi.QueryAP
 	return influxadapter.WindowReader{Bucket: config.InfluxDBBucket, Querier: influxadapter.ClientQuerier{API: queryAPI}}
 }
 
-type stringList []string
-
-func (values *stringList) String() string { return strings.Join(*values, ",") }
-func (values *stringList) Set(value string) error {
-	if strings.TrimSpace(value) == "" {
-		return fmt.Errorf("tenant cannot be empty")
-	}
-	*values = append(*values, value)
-	return nil
-}
-
-func runBackfill(ctx context.Context, args []string) int {
-	fs := flag.NewFlagSet("alert-evaluator backfill-schedule", flag.ContinueOnError)
-	fs.SetOutput(os.Stderr)
-	var tenants stringList
-	var evaluationTime string
-	var apply bool
-	var pageSize int
-	fs.Var(&tenants, "tenant", "explicit tenant id; repeat for multiple tenants")
-	fs.StringVar(&evaluationTime, "evaluation-time", "", "stable RFC3339 schedule time")
-	fs.BoolVar(&apply, "apply", false, "write schedules; default is dry-run")
-	fs.IntVar(&pageSize, "page-size", 25, "DynamoDB query page size")
-	if err := fs.Parse(args); err != nil {
-		return writeFailure("configuration", err.Error())
-	}
-	now := time.Now().UTC()
-	if evaluationTime != "" {
-		parsed, err := time.Parse(time.RFC3339Nano, evaluationTime)
-		if err != nil {
-			return writeFailure("configuration", fmt.Sprintf("evaluation-time: %v", err))
-		}
-		now = parsed.UTC()
-	}
-	region := envOr("AWS_REGION", "us-east-1")
-	endpoint := envOr("DYNAMODB_ENDPOINT_URL", "")
-	awsConfig, err := loadAWSConfig(ctx, region, endpoint)
-	if err != nil {
-		return writeFailure("aws_configuration", err.Error())
-	}
-	client := dynamodb.NewFromConfig(awsConfig, func(options *dynamodb.Options) {
-		if endpoint != "" {
-			options.BaseEndpoint = aws.String(endpoint)
-		}
-	})
-	store := dynamoadapter.Store{Table: envOr("DYNAMODB_DOMAIN_TABLE", "LimnopulseDomain"), Client: client}
-	summary, err := store.BackfillSchedule(ctx, dynamoadapter.BackfillOptions{
-		Tenants: tenants, EvaluationTime: now, Apply: apply, PageSize: pageSize,
-	})
-	if err != nil {
-		writeJSON(struct {
-			Result  string                        `json:"result"`
-			Error   string                        `json:"error"`
-			Summary dynamoadapter.BackfillSummary `json:"summary"`
-		}{Result: "fatal_failure", Error: err.Error(), Summary: summary})
-		return alertevaluator.ExitFatal
-	}
-	writeJSON(struct {
-		Result string                        `json:"result"`
-		Data   dynamoadapter.BackfillSummary `json:"summary"`
-	}{Result: "success", Data: summary})
-	return alertevaluator.ExitSuccess
-}
-
-func loadAWSConfig(ctx context.Context, region, endpoint string) (aws.Config, error) {
-	options := []func(*awsconfig.LoadOptions) error{awsconfig.WithRegion(region)}
-	if endpoint != "" {
-		options = append(options, awsconfig.WithCredentialsProvider(
-			credentials.NewStaticCredentialsProvider("local", "local", ""),
-		))
-	}
-	return awsconfig.LoadDefaultConfig(ctx, options...)
-}
-
-func envOr(key, fallback string) string {
-	if value, ok := os.LookupEnv(key); ok {
-		return value
-	}
-	return fallback
-}
-
-func writeFailure(category, message string) int {
-	writeJSON(struct {
-		Result           string         `json:"result"`
-		ExitCode         int            `json:"exit_code"`
-		ScopeCompleted   bool           `json:"scope_completed"`
-		RetryRecommended bool           `json:"retry_recommended"`
-		ErrorCategories  map[string]int `json:"error_categories"`
-		Error            string         `json:"error"`
+// writeFailure writes the failure line and returns its exit code: 78 for a configuration
+// error, which no rerun can fix, and 1 otherwise. No error here carries a secret value.
+func writeFailure(output io.Writer, category string, err error) int {
+	code := workerproc.ExitCode(err)
+	workercmd.WriteJSON(output, struct {
+		workercmd.Failure
+		Error string `json:"error"`
 	}{
-		Result: "fatal_failure", ExitCode: alertevaluator.ExitFatal,
-		ScopeCompleted: false, RetryRecommended: true,
-		ErrorCategories: map[string]int{category: 1}, Error: message,
+		Failure: workercmd.Failure{
+			Result: "fatal_failure", ExitCode: code,
+			RetryRecommended: code != workerproc.ExitConfiguration,
+			ErrorCategories:  map[string]int{category: 1},
+		},
+		Error: err.Error(),
 	})
-	return alertevaluator.ExitFatal
-}
-
-func writeJSON(value any) {
-	encoder := json.NewEncoder(os.Stdout)
-	encoder.SetEscapeHTML(false)
-	_ = encoder.Encode(value)
+	return code
 }
