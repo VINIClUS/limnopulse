@@ -163,22 +163,24 @@ services:
     # Park on 78 (ADR-020): Docker has no RestartPreventExitStatus, so this guard keeps the
     # container up but idle after exit 78 and Docker never sees that code; after a host reboot it
     # parks again. Any other exit passes through to `unless-stopped`. tini (`init: true`) signals
-    # only this shell, so the trap forwards SIGTERM and SIGINT and waits for the worker's drain.
-    # `$$` is a literal `$` for compose.
+    # only this shell, so the trap forwards SIGTERM and SIGINT and waits for the worker's drain;
+    # after a stop signal it never parks, so `docker stop` ends it. `$$` is a literal `$` for
+    # compose.
     entrypoint:
       - /bin/sh
       - -c
       - |
+        stopping=
         python -m limnopulse_api.workers.telemetry_ingest &
         worker=$$!
-        trap 'kill -TERM "$$worker" 2>/dev/null' TERM INT
+        trap 'stopping=1; kill -TERM "$$worker" 2>/dev/null' TERM INT
         wait "$$worker"
         code=$$?
         while kill -0 "$$worker" 2>/dev/null; do
           wait "$$worker"
           code=$$?
         done
-        if [ "$$code" -eq 78 ]; then
+        if [ "$$code" -eq 78 ] && [ -z "$$stopping" ]; then
           echo "telemetry ingest worker refused its configuration (exit 78); parked, not restarted" >&2
           exec sleep infinity
         fi

@@ -144,8 +144,10 @@ def stall_after_seconds(settings: Settings) -> int:
     call already in flight. A message holds its permit for the processing deadline, plus one
     InfluxDB write the deadline cannot interrupt (anyio waits for its thread), plus an in-flight
     heartbeat the loop awaits, plus the final action. That sum, 45 + 10 + 28 + 28 = 111 s at the
-    defaults, is the threshold: above any legitimate turn for every allowed setting, and the
-    point past which a permit held by one message counts as wedged (no more busy-tick marks).
+    defaults, is the threshold: above any legitimate turn for every allowed setting. It is also
+    the age past which the oldest in-flight message, while every permit is busy, stops the
+    busy-tick marks; the watchdog then needs another threshold of silence, so a wedge is caught
+    within about twice the threshold (about 222 s at the defaults).
     """
     return (
         settings.telemetry_ingest_processing_deadline_seconds

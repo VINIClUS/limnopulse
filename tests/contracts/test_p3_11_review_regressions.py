@@ -201,6 +201,8 @@ def test_runbook_documents_the_adr_020_restart_liveness_and_park_rules() -> None
         r"Every deploy passes `--profile ingestion`",
         r"`python -m limnopulse_api\.workers\.telemetry_ingest healthcheck`",
         r"45 \+ 10 \+ 28 \+ 28 = 111 s",
+        r"oldest in-flight message has held its permit past the threshold",
+        r"within up to 2 × the threshold \(about 222 s at the defaults\)",
         r"SIGTERM disarms the watchdog",
         r"\*\*Park on 78\.\*\*",
         r"exits 78",
@@ -210,7 +212,13 @@ def test_runbook_documents_the_adr_020_restart_liveness_and_park_rules() -> None
     ):
         assert re.search(pattern, text), pattern
     runbook = _runbook()
-    for stale in ("SHUTDOWN_CALL_BUDGET_SECONDS", "on-failure:5", "(exit 2)", "with exit 2"):
+    for stale in (
+        "SHUTDOWN_CALL_BUDGET_SECONDS",
+        "on-failure:5",
+        "(exit 2)",
+        "with exit 2",
+        "every permit wedged",
+    ):
         assert stale not in runbook, stale
     # A rollback that turns writes off leaves a parked worker, which a later deploy waits on.
     assert re.search(r"fails its health gate", _section("Rollback"))
@@ -222,6 +230,9 @@ def test_plan_marks_d7_and_d21_superseded_by_adr_020_and_keeps_their_text() -> N
     (d21,) = [line for line in text.splitlines() if line.startswith("| D21 |")]
     assert "a bounded `on-failure` restart in production" in d7
     assert "The default deploy does not start it." in d21
+    # Each superseded row points at its amendment where a reader meets it (like D16's `(A48)`).
+    assert "**Superseded by ADR-020 (A49).**" in d7
+    assert "**Superseded by ADR-020 (A49):** every deploy passes `--profile ingestion`." in d21
     raw = markdown_section(text, "Audit amendments (r2)")
     (a49,) = [line for line in raw.splitlines() if line.startswith("| A49 |")]
     for pattern in (

@@ -23,9 +23,12 @@ processing deadline and SIGTERM drain. Composition and the entrypoint belong to 
   final action, and no exception from a message task goes unobserved.
 - **Liveness (ADR-020).** `liveness()` is called at the top of every turn and after every receive.
   While every permit is busy the loop wakes every `liveness_tick_seconds` to mark, so a busy loop
-  never reads as a stalled one, unless its oldest message has held a permit longer than
-  `overdue_after_seconds` (the composition passes the worst legitimate message lifetime): every
-  permit wedged is no progress, so the marks stop. A failing mark is logged and never decides.
+  never reads as a stalled one, unless the oldest in-flight message has held its permit longer
+  than `overdue_after_seconds` (the composition passes the stall threshold, the worst legitimate
+  message lifetime). Then the busy marks stop, and if no permit frees up for another threshold
+  the watchdog sees silence: a wedge is caught within about twice the threshold. Only the
+  oldest message is checked; any free permit means a receive turn, which marks. A failing mark
+  is logged and never decides.
 
 Log lines carry closed categories only, never `exc_info` or an exception message: a queue
 error's `__cause__` can carry a receipt handle.

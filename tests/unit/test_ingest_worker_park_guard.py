@@ -50,6 +50,11 @@ class Guard:
                 echo ready >> "$GUARD_LOG"
                 while :; do {real_sleep} 0.02; done
                 ;;
+              stop78)
+                trap 'echo term >> "$GUARD_LOG"; exit 78' TERM
+                echo ready >> "$GUARD_LOG"
+                while :; do {real_sleep} 0.02; done
+                ;;
               *) exit "$FAKE_MODE" ;;
             esac
             """,
@@ -108,6 +113,22 @@ def test_every_other_exit_passes_through_to_the_restart_policy(tmp_path: Path, c
     assert PARK_LINE not in result.stderr
 
 
+def _stop_once_ready(guard: Guard, process: subprocess.Popen[str], signum: int) -> str:
+    """Send `signum` to the guard once the fake worker runs; return the guard's stderr."""
+    try:
+        deadline = time.monotonic() + BOUND_SECONDS
+        while "ready" not in guard.lines():
+            assert time.monotonic() < deadline, "the fake worker never started"
+            time.sleep(0.01)
+        process.send_signal(signum)
+        _, stderr = process.communicate(timeout=BOUND_SECONDS)
+    finally:
+        if process.poll() is None:
+            process.kill()
+            process.wait()
+    return stderr
+
+
 @pytest.mark.parametrize("signum", [signal.SIGTERM, signal.SIGINT], ids=["SIGTERM", "SIGINT"])
 def test_a_stop_signal_reaches_the_worker_and_waits_for_its_drain(
     tmp_path: Path, signum: int
@@ -116,18 +137,21 @@ def test_a_stop_signal_reaches_the_worker_and_waits_for_its_drain(
     would kill the worker mid-drain."""
     guard = Guard(tmp_path, "drain")
     process = guard.start()
-    try:
-        deadline = time.monotonic() + BOUND_SECONDS
-        while "ready" not in guard.lines():
-            assert time.monotonic() < deadline, "the fake worker never started"
-            time.sleep(0.01)
 
-        process.send_signal(signum)
-        process.wait(timeout=BOUND_SECONDS)
-    finally:
-        if process.poll() is None:
-            process.kill()
-            process.wait()
+    _stop_once_ready(guard, process, signum)
 
     assert process.returncode == 0
     assert guard.lines()[1:] == ["ready", "term", "drained"]
+
+
+def test_a_78_after_a_stop_signal_exits_instead_of_parking(tmp_path: Path) -> None:
+    """A parked container would hold `docker stop` for its whole grace: after a stop the guard
+    passes the 78 through, whatever made the worker exit with it."""
+    guard = Guard(tmp_path, "stop78")
+    process = guard.start()
+
+    stderr = _stop_once_ready(guard, process, signal.SIGTERM)
+
+    assert process.returncode == 78
+    assert guard.lines()[1:] == ["ready", "term"]  # no `sleep infinity`
+    assert PARK_LINE not in stderr

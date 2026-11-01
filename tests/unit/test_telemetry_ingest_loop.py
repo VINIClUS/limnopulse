@@ -844,8 +844,8 @@ async def test_the_loop_keeps_marking_while_every_permit_is_busy() -> None:
 
 
 async def test_a_permit_held_past_the_message_bound_stops_the_marks() -> None:
-    """Every permit wedged is no progress: the marks stop, so the watchdog can see it, and they
-    resume once the permit frees up."""
+    """The oldest message past the bound while every permit is busy is no progress: the marks
+    stop, so the watchdog can see it, and they resume once the permit frees up."""
     consumer = ScriptedConsumer([make_message(1)])
     processor = StubProcessor(consumer.events)
     processor.gate()

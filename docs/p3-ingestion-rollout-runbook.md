@@ -183,11 +183,12 @@ the API-only secrets.
   and every 5 s while all permits are busy. A watchdog thread exits 1 when no mark comes for the
   stall threshold: the worst legitimate message lifetime, the processing deadline + one 10 s
   InfluxDB write + an awaited heartbeat + the final action (45 + 10 + 28 + 28 = 111 s at the
-  defaults, `stall_after_seconds(settings)`). A permit held longer than that stops the busy marks,
-  so every permit wedged counts as a stall too. The compose healthcheck,
-  `python -m limnopulse_api.workers.telemetry_ingest healthcheck`, exits 1 once the stamp is older
-  than the threshold. SIGTERM disarms the watchdog, so the A47 drain and the 90 s grace above are
-  unchanged.
+  defaults, `stall_after_seconds(settings)`). Once the oldest in-flight message has held its
+  permit past the threshold while all permits are busy, the busy marks stop too, so a worker whose
+  permits stay wedged exits 1 within up to 2 × the threshold (about 222 s at the defaults). The
+  compose healthcheck, `python -m limnopulse_api.workers.telemetry_ingest healthcheck`, exits 1
+  once the stamp is older than the threshold. SIGTERM disarms the watchdog, so the A47 drain and
+  the 90 s grace above are unchanged.
 - **Park on 78.** A configuration error exits 78: writes off, an empty queue URL, empty own
   credentials or an invalid setting. Docker cannot skip a restart for one exit code, so the
   entrypoint's shell guard keeps the container up but idle (`sleep infinity`) instead: Docker never
