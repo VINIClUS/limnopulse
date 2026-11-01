@@ -1439,7 +1439,7 @@ def _reached(sources: _PythonSources, modules: Iterable[tuple[str, str]]) -> set
     The roots are what runs on import, every decorated function (its decorator may register it)
     and every dunder method (the interpreter calls those). A reached function reaches every
     function, in any module, whose name it mentions as a name or an attribute, and every function
-    nested in it. `from m import f as g` makes `g` name `f` too. A name match that is not a real
+    nested in it. `from m import f as g` makes `g` name `f` too, through any chain of re-exports. A name match that is not a real
     call only adds writes, so the coverage test fails closed on it.
     """
     aliases: dict[str, set[str]] = {}
@@ -1459,9 +1459,15 @@ def _reached(sources: _PythonSources, modules: Iterable[tuple[str, str]]) -> set
             nested.setdefault(function.parent, []).append(function)
 
     def named(mentioned: set[str]) -> Iterator[_Function]:
-        for name in mentioned:
-            for target in {name, *aliases.get(name, set())}:
-                yield from sources.functions.get(target, [])
+        # Re-exports chain aliases (`f as g`, then `g as h`): follow them to a fixed point.
+        targets = set(mentioned)
+        pending = list(mentioned)
+        while pending:
+            for target in aliases.get(pending.pop(), set()) - targets:
+                targets.add(target)
+                pending.append(target)
+        for target in targets:
+            yield from sources.functions.get(target, [])
 
     pending = [
         function
@@ -1841,6 +1847,36 @@ def test_a_transactional_write_the_worker_starts_to_reach_fails(
 _WORKER_IMPORT_ANCHOR = "import asyncio\n"
 
 
+def test_a_write_reached_through_a_chained_re_export_fails() -> None:
+    """`hidden_write` is renamed twice on its way to the worker; the walk must still reach it."""
+    modules = dict(_telemetry_ingest_modules())
+    text = modules[_WORKER_MODULE]
+    assert text.count(_WORKER_ANCHOR) == 1
+    assert text.count(_WORKER_IMPORT_ANCHOR) == 1
+    modules["src/limnopulse_api/workers/_hidden.py"] = (
+        "def hidden_write(devices):\n    return devices.create_component\n"
+    )
+    modules["src/limnopulse_api/workers/_reexport.py"] = (
+        "from limnopulse_api.workers._hidden import hidden_write as exported_write\n"
+    )
+    text = text.replace(
+        _WORKER_IMPORT_ANCHOR,
+        f"{_WORKER_IMPORT_ANCHOR}"
+        "from limnopulse_api.workers._reexport import exported_write as worker_write\n",
+    )
+    modules[_WORKER_MODULE] = text.replace(
+        _WORKER_ANCHOR, f"    write = worker_write(devices)\n{_WORKER_ANCHOR}"
+    )
+
+    problems = _telemetry_ingest_problems(_tofu_texts(), _worker_writes(tuple(modules.items())))
+
+    assert (
+        "uncovered: src/limnopulse_api/adapters/dynamodb_devices_v2.py::"
+        "DynamoDeviceComponentRepository.create_component ConditionCheck"
+        " -> dynamodb:ConditionCheckItem on domain"
+    ) in problems
+
+
 @pytest.mark.parametrize(
     ("imports", "lines", "site"),
     [
@@ -1881,9 +1917,11 @@ def test_reachability_follows_names_aliases_and_implicit_calls() -> None:
             "pkg/worker.py",
             """
 from pkg.repo import make as build
+from pkg.repo import ping as pong
 
 def main():
     store = build()
+    pong()
     return store.read()
 
 @register
@@ -1915,6 +1953,8 @@ class Repo:
 
 def make():
     return Repo()
+
+from pkg.worker import pong as ping
 """,
         ),
     )
