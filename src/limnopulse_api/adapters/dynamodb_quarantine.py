@@ -10,7 +10,10 @@ the worker principal has no `TransactWriteItems`/`BatchWriteItem`:
 
 Expiry is logical: a row is absent once `created_at + QUARANTINE_TTL <= now`; the numeric
 `expires_at` attribute only drives TTL cleanup. Listing is a `Query` resumed strictly after
-`after_sk`, filtered on status and reason in code. No Scan and no GSI.
+`after_sk`, filtered on status and reason in code. Each `Query` reads one row past the page, so
+a page that ends the partition says so without an empty follow-up page (#116); only a page cut
+where the partition goes on with rows the code filters drop can still cost one. No Scan and no
+GSI.
 """
 
 from asyncio import to_thread
@@ -58,14 +61,19 @@ class DynamoQuarantineRepository(DynamoV2RepositoryBase):
         cursor = after_sk
         now = self.clock()
         while True:
-            items, resume = await to_thread(self._page_sync, tenant_id, cursor, limit)
+            # One row past the page: whether anything follows is known without another Query.
+            items, resume = await to_thread(self._page_sync, tenant_id, cursor, limit + 1)
             for index, item in enumerate(items):
                 entry = quarantine_entry_from_item(item)
-                if not self._is_live(entry, now) or not _matches(entry, status, reason):
+                if not self._visible(entry, now, status, reason):
                     continue
                 entries.append(entry)
                 if len(entries) == limit:
-                    remaining = resume is not None or index < len(items) - 1
+                    # More follows if the partition goes on, or a later row of this read shows.
+                    remaining = resume is not None or any(
+                        self._visible(quarantine_entry_from_item(rest), now, status, reason)
+                        for rest in items[index + 1 :]
+                    )
                     return QuarantinePage(
                         entries=tuple(entries),
                         next_after_sk=entry.entry_key if remaining else None,
@@ -144,6 +152,16 @@ class DynamoQuarantineRepository(DynamoV2RepositoryBase):
     @staticmethod
     def _is_live(entry: QuarantineEntry, now: datetime) -> bool:
         return now < entry.expires_at
+
+    @classmethod
+    def _visible(
+        cls,
+        entry: QuarantineEntry,
+        now: datetime,
+        status: QuarantineEntryStatus | None,
+        reason: str | None,
+    ) -> bool:
+        return cls._is_live(entry, now) and _matches(entry, status, reason)
 
     def _page_sync(
         self, tenant_id: str, after_sk: str | None, limit: int

@@ -56,13 +56,14 @@ def test_opentofu_declares_telegram_queues_secret_containers_and_least_privilege
     for action in (
         '"dynamodb:GetItem"',
         '"dynamodb:UpdateItem"',
-        '"dynamodb:TransactWriteItems"',
         '"sqs:ReceiveMessage"',
         '"sqs:DeleteMessage"',
         '"sqs:ChangeMessageVisibility"',
         '"secretsmanager:GetSecretValue"',
     ):
         assert action in telegram
+    # IAM has no dynamodb:TransactWriteItems action: granting it authorizes nothing (issue #108).
+    assert '"dynamodb:TransactWriteItems"' not in telegram
     assert "telegram_notification_jobs_queue_name" in variables
     assert "telegram_notification_jobs_dlq_name" in variables
     assert 'output "telegram_notification_jobs_queue_url"' in outputs

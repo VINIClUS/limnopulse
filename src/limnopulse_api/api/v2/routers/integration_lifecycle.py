@@ -1,8 +1,9 @@
 """Unmounted `/v2` lifecycle routes for IntegrationAccounts and DeviceIntegrations (P3-04).
 
 Owner and admin only. P3-10 mounts the router under `/v2` when `INGEST_V2_ENABLED` is on. Every
-transition is version-fenced and writes one D23 audit item; a DeviceIntegration that the path
-Device does not own is 404.
+transition is version-fenced and writes one D23 audit item; a same-status request (for example
+active to active) is a 200 no-op that returns the row unchanged and audits nothing (#116). A
+DeviceIntegration that the path Device does not own is 404, before the version check.
 """
 
 from typing import Annotated
@@ -14,7 +15,6 @@ from limnopulse_api.api.dependencies import require_tenant_role
 from limnopulse_api.api.ingestion_dependencies import get_integration_lifecycle_repository
 from limnopulse_api.api.redacted_validation import _RedactedValidationRoute
 from limnopulse_api.api.v1.schemas.common import ErrorResponse
-from limnopulse_api.api.v2.dependencies import IntegrationRepositoryDep
 from limnopulse_api.api.v2.routers.integrations import DevicePathId
 from limnopulse_api.api.v2.schemas.common import V2_ERROR_RESPONSES
 from limnopulse_api.api.v2.schemas.integration_lifecycle import (
@@ -79,10 +79,9 @@ async def transition_integration_account(
     payload: V2IntegrationAccountStatusUpdate,
     request: Request,
     repository: LifecycleRepositoryDep,
-    integrations: IntegrationRepositoryDep,
     access: TenantWriterDep,
 ) -> IntegrationAccountResponse:
-    service = IntegrationLifecycleService(repository, integrations)
+    service = IntegrationLifecycleService(repository)
     try:
         account = await service.transition_integration_account(
             tenant_id,
@@ -108,10 +107,9 @@ async def transition_device_integration(
     payload: V2DeviceIntegrationStatusUpdate,
     request: Request,
     repository: LifecycleRepositoryDep,
-    integrations: IntegrationRepositoryDep,
     access: TenantWriterDep,
 ) -> DeviceIntegrationResponse:
-    service = IntegrationLifecycleService(repository, integrations)
+    service = IntegrationLifecycleService(repository)
     try:
         integration = await service.transition_device_integration(
             tenant_id,

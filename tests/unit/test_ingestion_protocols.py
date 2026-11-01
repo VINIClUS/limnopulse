@@ -108,6 +108,7 @@ PROTOCOLS: dict[str, dict[str, tuple[list[tuple[str, Any, Any]], Any, bool]]] = 
                 ("expected_version", K, int),
                 ("updated_at", K, datetime),
                 ("audit", K, AuditContext),
+                ("device_id", K, str | None),  # #116: ownership on the pre-read
             ],
             DeviceIntegration,
             True,
@@ -264,6 +265,10 @@ def test_protocol_defaults_are_frozen() -> None:
     assert listing["after_sk"].default is Parameter.empty
     assert listing["limit"].default is Parameter.empty
     assert transition["replayed_ingress_id"].default is None
+    lifecycle = inspect.signature(
+        ports.IntegrationLifecycleRepository.transition_device_integration
+    ).parameters
+    assert lifecycle["device_id"].default is None
 
 
 def test_ports_module_defines_exactly_the_p3_protocols() -> None:

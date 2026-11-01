@@ -406,9 +406,7 @@ async def test_audit_items_need_the_audit_table() -> None:
 
 
 def _service(subject: DynamoIngestionSubject) -> IntegrationLifecycleService:
-    return IntegrationLifecycleService(
-        subject.repository, subject.integrations, clock=lambda: LATER
-    )
+    return IntegrationLifecycleService(subject.repository, clock=lambda: LATER)
 
 
 @pytest.mark.asyncio

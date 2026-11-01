@@ -8,6 +8,7 @@ one-shot failure at or below the port boundary: `operation` is a port method nam
 These fakes are frozen with the P3-00 contract kits; waves 1-4 use them without editing them.
 """
 
+import asyncio
 import hmac
 import time
 from collections import OrderedDict, defaultdict
@@ -28,6 +29,7 @@ from limnopulse_api.domain.devices_v2 import ComponentStatus, DeviceComponent, D
 from limnopulse_api.domain.ids import default_component_id_for_legacy_device
 from limnopulse_api.domain.ingestion import (
     HTTPS_PROVIDER_KEYS,
+    INGRESS_SCHEMA_ATTRIBUTE_BYTES,
     MAX_INGRESS_MESSAGE_BYTES,
     MAX_VISIBILITY_SECONDS,
     AuthenticatedSource,
@@ -342,6 +344,8 @@ class FakeIntegrationLifecycleRepository:
             raise NotFoundError("integration account not found")
         if current.version != expected_version:
             raise ConflictError("integration account version conflict")
+        if current.status == target:
+            return current
         ensure_integration_account_transition(current.status, target)
         updated = IntegrationAccount.model_validate(
             {
@@ -374,13 +378,16 @@ class FakeIntegrationLifecycleRepository:
         expected_version: int,
         updated_at: datetime,
         audit: AuditContext,
+        device_id: str | None = None,
     ) -> DeviceIntegration:
         self.store.faults.check("transition_device_integration")
         current = self.store.device_integrations.get((tenant_id, device_integration_id))
-        if current is None:
+        if current is None or (device_id is not None and current.device_id != device_id):
             raise NotFoundError("device integration not found")
         if current.version != expected_version:
             raise ConflictError("device integration version conflict")
+        if current.status == target:
+            return current
         ensure_device_integration_transition(current.status, target)
         updated = DeviceIntegration.model_validate(
             {
@@ -550,11 +557,16 @@ class FakeIngressQueue:
 
     async def send_raw(self, body: str) -> str:
         self.faults.check("send_raw")
+        # The adapter's D6 guard: UTF-8 body bytes plus the schema attribute it always adds.
+        if len(body.encode("utf-8")) + INGRESS_SCHEMA_ATTRIBUTE_BYTES > MAX_INGRESS_MESSAGE_BYTES:
+            raise IngressMessageTooLarge("ingress message exceeds the message size guard")
         return self._append(body)
 
     async def receive(
         self, *, max_messages: int, wait_seconds: int, visibility_seconds: int
     ) -> list[IngressQueueMessage]:
+        # Suspend like a real receive, so `wait_for` can stop a scan loop that never ends.
+        await asyncio.sleep(0)
         self.faults.check("receive")
         _require_range("max_messages", max_messages, 1, 10)
         _require_range("wait_seconds", wait_seconds, 0, 20)

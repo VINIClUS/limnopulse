@@ -195,7 +195,7 @@ GET /v2/tenants/{tenant_id}/observations/latest
 
 **D16 — ships dark.** No deployed service calls the telemetry pipeline in P2, and Telegraf keeps writing only `water_quality`. The only producer is the dev CLI `scripts/dev/ingest_reading_v2.py`, which builds the trusted `legacy_mqtt` source context from its arguments (never from the payload), uses the DynamoDB-backed M1 repositories and the configured InfluxDB, and honors the two write switches (both off is a dry run). `V1_TELEMETRY_READ_SOURCE=v2` and `ALERT_EVALUATOR_TELEMETRY_SOURCE=v2` may be enabled only where a producer writes every legacy device to `observation_numeric` and the keyed divergence check reports zero missing or different `(pond, device, metric, _time, value)` tuples over max(longest rule window, legacy read window). Production enablement is a P3 exit step.
 
-**Rollback:** switch the flags back to their defaults and restart. No data deletion; legacy `water_quality` writes and reads never depend on a P2 switch.
+**Rollback:** switch the flags back to their defaults and recreate the services that read them (`docker compose up -d <service>`; `docker compose restart` keeps the old environment). No data deletion; legacy `water_quality` writes and reads never depend on a P2 switch.
 
 ## V4 P3 ingestion wiring (behind a disabled rollout switch)
 
@@ -207,7 +207,7 @@ Routes (D15): `INGEST_V2_ENABLED` mounts `POST /ingest/v2/observations` (not ten
 
 Worker (D7): `python -m limnopulse_api.workers.telemetry_ingest` runs from the API image as the `telemetry-ingest-worker` compose service in profile `ingestion` (both compose files; the default deploy does not start it, `docker compose --profile ingestion` does). `build_worker(settings)` composes the DynamoDB and SQS clients (finite botocore timeouts; the SQS read timeout outlasts the long poll), a synchronous InfluxDB write API, the P2 normalizer, pipeline and write service, the P3 repositories, `IngestMessageProcessor` and `IngestWorkerLoop`; it never calls `create_app`, so no optional cache client exists. `main()` exits 2 unless `TELEMETRY_V2_WRITE_ENABLED=true` and the queue URL is set, so the worker can never delete a message it did not write, and SIGTERM/SIGINT set the loop's stop for a bounded drain. In production it runs as the dedicated `telemetry_ingest` IAM user, from `TELEMETRY_INGEST_AWS_ACCESS_KEY_ID` / `TELEMETRY_INGEST_AWS_SECRET_ACCESS_KEY` and its own InfluxDB write token, and never loads the API's env file or keys.
 
-**Rollback:** unset `INGEST_V2_ENABLED`, restart the API and stop the `ingestion` profile. Queued messages are kept in the queue and the DLQ. The rollout runbook is `docs/p3-ingestion-rollout-runbook.md` (P3-11).
+**Rollback:** set `INGEST_V2_ENABLED=false` and recreate the API (`docker compose ... up -d api`; `docker compose restart` keeps the old environment), then stop the `ingestion` profile, in the rollback order of `docs/p3-ingestion-rollout-runbook.md` (P3-11). Queued messages are kept in the queue and the DLQ.
 
 ## Authentication and tenant authorization
 

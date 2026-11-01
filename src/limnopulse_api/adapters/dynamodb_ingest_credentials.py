@@ -159,10 +159,16 @@ class DynamoIngestCredentialRepository(DynamoV2RepositoryBase):
         try:
             await self._transact(actions)
         except DynamoConditionalConflict as exc:
-            if _ACCOUNT_CHECK in exc.failed_indexes and _old_item(exc, _ACCOUNT_CHECK) is None:
-                raise NotFoundError("integration account not found") from exc
-            raise ConflictError("ingest credential could not be issued") from exc
-        return credential
+            not_found = (
+                _ACCOUNT_CHECK in exc.failed_indexes and _old_item(exc, _ACCOUNT_CHECK) is None
+            )
+        else:
+            return credential
+        # Raised outside the handler, as on revoke: the cancelled transaction's frames hold the
+        # META Put with `secret_sha256`, so no cause or context may keep them reachable.
+        if not_found:
+            raise NotFoundError("integration account not found")
+        raise ConflictError("ingest credential could not be issued")
 
     async def revoke_ingest_credential(
         self,
@@ -267,9 +273,12 @@ class DynamoIngestCredentialRepository(DynamoV2RepositoryBase):
         try:
             await self.transact_write(actions)
         except ClientError as exc:
-            if _is_transaction_conflict(exc):
-                raise ConflictError("concurrent ingest credential change") from None
-            raise
+            if not _is_transaction_conflict(exc):
+                raise
+        else:
+            return
+        # Outside the handler, so the conflict carries no context (see `create_ingest_credential`).
+        raise ConflictError("concurrent ingest credential change")
 
     def _is_active_row(
         self, item: Mapping[str, Any] | None, tenant_id: str, integration_account_id: str
