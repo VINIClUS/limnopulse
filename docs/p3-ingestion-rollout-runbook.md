@@ -247,8 +247,8 @@ uv run --locked python scripts/admin/telemetry_dlq.py redrive --max 100 --apply
    summary, and the worker reports `ingress_messages_total{outcome="processed"}`. Exit code 3 means a
    partial redrive: rerun after checking the failures. A dry run also exits 3 when it stops midway
    after it has seen messages. The summary then carries an `error` category (`queue_unavailable` or
-   `unexpected`) next to the counts so far. A Ctrl-C prints that summary with `interrupted` and
-   still exits by the interrupt.
+   `unexpected`) next to the counts so far. A Ctrl-C after it has seen messages prints that summary
+   with the `error` category `interrupted` and still exits by the interrupt.
 
 ## Quarantine reconciliation drill
 
