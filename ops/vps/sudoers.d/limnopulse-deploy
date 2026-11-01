@@ -1,0 +1,5 @@
+# Installed by hand as /etc/sudoers.d/limnopulse-deploy (root:root, 0440) and checked with
+# `visudo -c`; see the workers bootstrap in ops/vps/README.md. The rule must stay exactly
+# activation.sudoers in ops/workers/roles.yaml. The helper validates its own arguments and
+# refuses its floor override whenever sudo sets SUDO_USER.
+limnopulse-deploy ALL=(root) NOPASSWD: /usr/local/sbin/limnopulse-workers-activate
