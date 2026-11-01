@@ -39,6 +39,7 @@ Build jobs for pull requests use read-only repository access and do not
 persist checkout credentials. Only the separate publisher, gated on a push
 to `main`, receives `packages: write`; both paths use the same four-image
 matrix and build steps. The parse-only production gate remains read-only.
+`tests/unit/test_build_workflow.py` pins both.
 
 Leave rollout variables unset for the normal test command so each test can
 choose its settings. Forcing `V1_POND_DEVICE_PROJECTION_ENABLED=false` in the

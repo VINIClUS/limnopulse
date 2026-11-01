@@ -23,3 +23,4 @@ These accepted records map the V4 architecture to explicit implementation gates.
 | [ADR-017](ADR-017-sns-is-provider-feedback-not-notification-service.md) | Phase 7C |
 | [ADR-018](ADR-018-eum-push-and-sms-are-provider-adapters.md) | Phases 7B–7C |
 | [ADR-019](ADR-019-redis-valkey-is-optional-acceleration.md) | Phase 7A |
+| [ADR-020](ADR-020-each-worker-role-is-a-supervised-process.md) | Before any Go worker runs in production |

@@ -93,6 +93,7 @@ EXPECTED_ADR_FILES = (
     "ADR-017-sns-is-provider-feedback-not-notification-service.md",
     "ADR-018-eum-push-and-sms-are-provider-adapters.md",
     "ADR-019-redis-valkey-is-optional-acceleration.md",
+    "ADR-020-each-worker-role-is-a-supervised-process.md",
 )
 EXPECTED_ADR_TITLES = {
     "ADR-001-aws-iot-is-an-integration-adapter.md": "# ADR-001 — AWS IoT is an integration adapter, not the Device domain.",
@@ -114,6 +115,10 @@ EXPECTED_ADR_TITLES = {
     "ADR-017-sns-is-provider-feedback-not-notification-service.md": "# ADR-017 — SNS is a narrow provider-event primitive, not the LimnoPulse notification service.",
     "ADR-018-eum-push-and-sms-are-provider-adapters.md": "# ADR-018 — AWS End User Messaging Push and SMS are the initial MVP delivery providers, not notification-domain authority.",
     "ADR-019-redis-valkey-is-optional-acceleration.md": "# ADR-019 — Redis/Valkey is optional acceleration; DynamoDB/SQS and bounded workers preserve correctness.",
+    "ADR-020-each-worker-role-is-a-supervised-process.md": (
+        "# ADR-020 — Each independently operated worker role has its own supervised "
+        "process; Go workers run as native systemd units."
+    ),
 }
 EXPECTED_ADR_ENTRY_PHASES = {
     "ADR-001-aws-iot-is-an-integration-adapter.md": "Phase 1 contract; Phase 5 adapter",
@@ -137,6 +142,7 @@ EXPECTED_ADR_ENTRY_PHASES = {
     "ADR-017-sns-is-provider-feedback-not-notification-service.md": "Phase 7C",
     "ADR-018-eum-push-and-sms-are-provider-adapters.md": "Phases 7B–7C",
     "ADR-019-redis-valkey-is-optional-acceleration.md": "Phase 7A",
+    "ADR-020-each-worker-role-is-a-supervised-process.md": "Before any Go worker runs in production",
 }
 EXPECTED_ADR_SECTION_HEADINGS = (
     "## Context",
@@ -508,6 +514,7 @@ REQUIRED_ADR_GATE_PATTERNS = {
         r"inactive membership must be rejected independently\b",
     ),
     "ADR-019-redis-valkey-is-optional-acceleration.md": (),
+    "ADR-020-each-worker-role-is-a-supervised-process.md": (),
 }
 FORBIDDEN_ADR_GATE_PATTERNS = {
     "ADR-001-aws-iot-is-an-integration-adapter.md": (
@@ -765,6 +772,7 @@ FORBIDDEN_ADR_GATE_PATTERNS = {
         r"\bPush registration may accept a missing, invalid, or mismatched principal\b",
     ),
     "ADR-019-redis-valkey-is-optional-acceleration.md": (),
+    "ADR-020-each-worker-role-is-a-supervised-process.md": (),
     "ADR-010-stripe-is-an-adapter-internal-entitlements-are-canonical.md": (
         r"\bStripe webhook ingress may return 2xx before durable queue acceptance\b",
         r"\btransient Stripe enqueue failure may return 2xx instead of 5xx\b",
@@ -1728,7 +1736,76 @@ CODEX_REVIEW_GATE_CASES += tuple(
             "Phase 4 Stripe reconciliation must be order-independent: an older valid event arriving after a newer suspension/restriction must not overwrite the newer durable EntitlementSnapshot; processing must use monotonic provider-state/version checks or current Stripe-object retrieval, and reverse-order fixtures must converge to the same state.",
             "Phase 4 may let an older Stripe event overwrite a newer suspension or restriction or skip monotonic state and current-object checks when events arrive out of order.",
         ),
+        (
+            "worker role supervised process",
+            "ADR-020-each-worker-role-is-a-supervised-process.md",
+            "Each independently operated worker role must have its own supervised process, failure boundary, configuration and observability.",
+            "Independently operated worker roles may share one supervised process, failure boundary, configuration or observability.",
+        ),
+        (
+            "separate SES consumers",
+            "ADR-020-each-worker-role-is-a-supervised-process.md",
+            "The email-jobs consumer and the SES-feedback consumer must run as separate units with separate IAM principals, queue alarms and unit-health metrics; the SES routing DLQ must have its own alarm.",
+            "The email-jobs consumer and the SES-feedback consumer may share one unit, IAM principal, queue alarm or unit-health metric.",
+        ),
+        (
+            "one-shot evaluator and relay",
+            "ADR-020-each-worker-role-is-a-supervised-process.md",
+            "The alert evaluator and the notification relay must stay one-shot with their schedule in systemd timers outside the domain; overlapping invocations must remain safe through the existing leases, fencing and conditional writes.",
+            "The alert evaluator or the notification relay may run its own loop, sleep or polling schedule inside the domain.",
+        ),
+        (
+            "one release tag and verified bundle",
+            "ADR-020-each-worker-role-is-a-supervised-process.md",
+            "Every promotion and rollback must move the API image, the Compose workers in the deploy profile list and the workers bundle to the same release tag; the deploy must verify the bundle SHA-256 and its `SHA256SUMS` manifest before installing anything.",
+            "A promotion or rollback may leave the API image, the Compose workers or the workers bundle on different release tags, or install a bundle before verifying its SHA-256 and `SHA256SUMS` manifest.",
+        ),
+        (
+            "continuous worker stall exit",
+            "ADR-020-each-worker-role-is-a-supervised-process.md",
+            "A continuous worker must exit non-zero when its loop stops making progress, and its supervisor must restart it, including after a host or container-daemon restart.",
+            "A continuous worker may keep running after its loop stops making progress, or stay stopped after a host or container-daemon restart.",
+        ),
+        (
+            "configuration error exit 78",
+            "ADR-020-each-worker-role-is-a-supervised-process.md",
+            "A configuration error must exit `78`, and no supervisor may restart a unit on that code.",
+            "A supervisor may restart a unit that exited `78` for a configuration error.",
+        ),
+        (
+            "disabled role unit health",
+            "ADR-020-each-worker-role-is-a-supervised-process.md",
+            "A unit-health alarm must stay disabled while its role is disabled, and a disabled role must publish no unit-health metric.",
+            "A disabled role may publish a unit-health metric or keep its unit-health alarm enabled.",
+        ),
     )
+)
+# The clause ends in a code span, so its pattern cannot close with a word boundary.
+CODEX_REVIEW_GATE_CASES += (
+    {
+        "name": "worker shared lifecycle justification",
+        "filename": "ADR-020-each-worker-role-is-a-supervised-process.md",
+        "required_pattern": (
+            r"\bMultiple roles may share a compiled executable and internal libraries, "
+            r"but must not share a runtime lifecycle unless explicitly justified;\s+a "
+            r"shared lifecycle must be recorded with its justification in "
+            r"`ops/workers/roles\.yaml`"
+        ),
+        "required_clause": (
+            "Multiple roles may share a compiled executable and internal libraries, but "
+            "must not share a runtime lifecycle unless explicitly justified; a shared "
+            "lifecycle must be recorded with its justification in "
+            "`ops/workers/roles.yaml`."
+        ),
+        "inverted_clause": (
+            "Multiple roles may share a runtime lifecycle without recording a "
+            "justification in roles.yaml."
+        ),
+        "forbidden_pattern": (
+            r"\bMultiple roles may share a runtime lifecycle without recording a "
+            r"justification\b"
+        ),
+    },
 )
 
 
@@ -1917,6 +1994,22 @@ def remove_adr_fragment(adr_root: Path, filename: str, fragment: str) -> None:
         filename,
         lambda record: record.replace(fragment, "", 1),
     )
+
+
+def remove_adr_gate_fragment(adr_root: Path, filename: str, fragment: str) -> None:
+    """Remove the fragment from the implementation gate, not an earlier section.
+
+    ADR-020 repeats its first gate clause verbatim in its Decision.
+    """
+
+    def remove_from_gate(record: str) -> str:
+        gate_start = record.index("## Implementation gate\n")
+        gate_end = record.index("## Non-goals\n", gate_start)
+        gate = record[gate_start:gate_end]
+        assert fragment in gate, fragment
+        return record[:gate_start] + gate.replace(fragment, "", 1) + record[gate_end:]
+
+    mutate_adr_record(adr_root, filename, remove_from_gate)
 
 
 def replace_adr_fragment(
@@ -3682,7 +3775,7 @@ def test_codex_review_gate_rejects_missing_requirement(
     case: dict[str, str],
 ) -> None:
     adr_root = copy_adr_fixture(tmp_path)
-    remove_adr_fragment(adr_root, case["filename"], case["required_clause"])
+    remove_adr_gate_fragment(adr_root, case["filename"], case["required_clause"])
 
     assert_adr_rejected(adr_root, match="normative implementation gate markers missing")
 
