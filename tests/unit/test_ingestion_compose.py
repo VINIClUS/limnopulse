@@ -6,13 +6,16 @@ import os
 import re
 import shutil
 import subprocess
-from pathlib import Path
+import tempfile
+from pathlib import Path, PurePosixPath
 from typing import Any
 
 import pytest
 import yaml
 
 from limnopulse_api.core.config import Settings
+from limnopulse_api.workers.telemetry_ingest_liveness import LIVENESS_FILE_NAME, liveness_path
+from tests.support.worker_roles import load_roles, roles_by_name
 
 ROOT = Path(__file__).resolve().parents[2]
 COMPOSE = ROOT / "compose.yaml"
@@ -296,6 +299,33 @@ def test_production_worker_has_a_liveness_healthcheck() -> None:
     # Startup is the ~1.6 s import (slower under the 0.5-CPU limit) and the first loop turn,
     # which marks at once; a parked worker never marks and turns unhealthy after it.
     assert 20 <= _seconds(healthcheck["start_period"]) <= 120
+
+
+def test_production_worker_matches_its_adr_020_role(monkeypatch: pytest.MonkeyPatch) -> None:
+    """`ops/workers/roles.yaml` is normative (ADR-020): the service, its restart policy, its
+    healthcheck and the liveness file the worker writes match the `telemetry-ingest` role."""
+    role = roles_by_name(load_roles())["telemetry-ingest"]
+    worker = _services(PRODUCTION_COMPOSE)[role["compose_service"]]
+    script = _guard_script(worker)
+
+    assert role["compose_service"] == WORKER
+    assert worker["profiles"] == [role["compose_profile"]]
+    assert worker["restart"] == role["restart"] == "unless-stopped"
+    assert role["entrypoint"] == " ".join(ENTRYPOINT)
+    assert f"{role['entrypoint']} &" in script.splitlines()
+    assert worker["healthcheck"]["test"] == ["CMD", *role["healthcheck"].split()]
+    assert role["configuration_error"] == "park" and "exec sleep infinity" in script
+    # The worker writes the stamp under the temp directory: the container's /tmp tmpfs, since
+    # its environment sets no TMPDIR.
+    liveness_file = PurePosixPath(role["liveness_file"])
+    assert liveness_file.name == LIVENESS_FILE_NAME
+    assert liveness_file.parent == PurePosixPath("/tmp")
+    assert "/tmp" in worker["tmpfs"]
+    assert not {"TMPDIR", "TEMP", "TMP"} & set(_environment(worker))
+    for name in ("TMPDIR", "TEMP", "TMP"):
+        monkeypatch.delenv(name, raising=False)
+    monkeypatch.setattr(tempfile, "tempdir", None)
+    assert str(liveness_path()) == role["liveness_file"]
 
 
 def test_production_influxdb_is_published_on_host_loopback_only() -> None:
