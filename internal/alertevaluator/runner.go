@@ -173,6 +173,9 @@ func (runner Runner) processCandidate(ctx context.Context, candidate Candidate, 
 		return candidateResult{fatal: true, withError: 1, category: "claim"}
 	}
 	state, err := runner.Store.LoadState(ctx, work)
+	if errors.Is(err, ErrUnsupportedStateSchema) {
+		return candidateResult{fatal: true, withError: 1, category: "state_schema"}
+	}
 	if err != nil {
 		return candidateResult{fatal: true, withError: 1, category: "state_read"}
 	}
@@ -191,14 +194,18 @@ func (runner Runner) processCandidate(ctx context.Context, candidate Candidate, 
 	ruleCtx, cancel := context.WithTimeout(ctx, config.PerRuleTimeout)
 	window, windowErr := runner.Windows.Evaluate(ruleCtx, work.Rule, windowSpec)
 	cancel()
-	evaluation := Evaluation{Slot: slot, Quality: window.Quality, Value: window.Value, MissedSlots: missed}
+	evaluation := Evaluation{Slot: slot, Quality: window.Quality, MissedSlots: missed}
 	if windowErr != nil {
 		evaluation.Quality = QualityQueryError
 		result.withError = 1
 		result.category = "window_query"
-	} else if window.Quality == QualitySufficient {
-		evaluation.Breached = compare(work.Rule.Operator, window.Value, work.Rule.Threshold)
+	} else {
+		evaluation.Value = window.Measurement()
+		if value, ok := evaluation.Value.Get(); ok {
+			evaluation.Breached = compare(work.Rule.Operator, value, work.Rule.Threshold)
+		}
 	}
+	evaluation = evaluation.Normalized()
 	decision := Decide(work.Rule.Rule, state.State, evaluation, EvaluationCadence)
 	if err := runner.Store.Commit(ctx, CommitRequest{
 		Work: work, PreviousState: state, Evaluation: evaluation, Decision: decision,

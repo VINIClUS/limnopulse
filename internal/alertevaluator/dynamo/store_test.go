@@ -332,7 +332,7 @@ func TestCommitOpeningAtomicallyWritesEventTransitionAndOutboxes(t *testing.T) {
 		t.Fatal(err)
 	}
 	work.Rule.Duration = time.Minute
-	evaluation := alertevaluator.Evaluation{Slot: slot, Quality: alertevaluator.QualitySufficient, Breached: true, Value: 4.2}
+	evaluation := alertevaluator.Evaluation{Slot: slot, Quality: alertevaluator.QualitySufficient, Breached: true, Value: alertevaluator.Measured(4.2)}
 	decision := alertevaluator.Decide(work.Rule.Rule, alertevaluator.State{}, evaluation, time.Minute)
 
 	err = store.Commit(context.Background(), alertevaluator.CommitRequest{
@@ -428,7 +428,7 @@ func TestCommitRecoveryAddsDependencyRelayIndexOnlyToEmailOutbox(t *testing.T) {
 			alertevaluator.ChannelTelegram: "outbox_open_telegram",
 		},
 	}
-	evaluation := alertevaluator.Evaluation{Slot: slot, Quality: alertevaluator.QualitySufficient, Value: 8.1}
+	evaluation := alertevaluator.Evaluation{Slot: slot, Quality: alertevaluator.QualitySufficient, Value: alertevaluator.Measured(8.1)}
 	decision := alertevaluator.Decide(work.Rule.Rule, current, evaluation, time.Minute)
 
 	err = store.Commit(context.Background(), alertevaluator.CommitRequest{
@@ -501,7 +501,7 @@ func TestCommitIndexesTelegramOutboxWithV2OnlyWhenWriterEnabled(t *testing.T) {
 	}
 	work.Rule.Duration = time.Minute
 	evaluation := alertevaluator.Evaluation{
-		Slot: slot, Quality: alertevaluator.QualitySufficient, Breached: true, Value: 4.2,
+		Slot: slot, Quality: alertevaluator.QualitySufficient, Breached: true, Value: alertevaluator.Measured(4.2),
 	}
 	decision := alertevaluator.Decide(work.Rule.Rule, alertevaluator.State{}, evaluation, time.Minute)
 	if err := store.Commit(context.Background(), alertevaluator.CommitRequest{
@@ -535,7 +535,7 @@ func TestCommitMarksDisabledTelegramOutboxForBackfill(t *testing.T) {
 	}
 	work.Rule.Duration = time.Minute
 	evaluation := alertevaluator.Evaluation{
-		Slot: slot, Quality: alertevaluator.QualitySufficient, Breached: true, Value: 4.2,
+		Slot: slot, Quality: alertevaluator.QualitySufficient, Breached: true, Value: alertevaluator.Measured(4.2),
 	}
 	decision := alertevaluator.Decide(work.Rule.Rule, alertevaluator.State{}, evaluation, time.Minute)
 	if err := store.Commit(context.Background(), alertevaluator.CommitRequest{
@@ -580,10 +580,10 @@ func TestCommitStoresEvaluationValueOnlyForSufficientQuality(t *testing.T) {
 				Mode:          alertevaluator.ModeActive,
 				ActiveEventID: "alert_1",
 				ActiveStatus:  alertevaluator.StatusOpen,
-				LastValue:     4.2,
+				LastValue:     alertevaluator.Measured(4.2),
 			}
 			evaluation := alertevaluator.Evaluation{
-				Slot: slot, Quality: test.quality, Value: test.value, Breached: true,
+				Slot: slot, Quality: test.quality, Value: alertevaluator.Measured(test.value), Breached: true,
 			}
 			decision := alertevaluator.Decide(work.Rule.Rule, current, evaluation, time.Minute)
 			request := alertevaluator.CommitRequest{

@@ -1,0 +1,159 @@
+{
+  "_comment": "P2 plan D19 (#84) Flux string literal cases, shared by tests/unit/test_telemetry_v2_schema.py, tests/influx/test_flux_literal_round_trip_influx.py and internal/alertevaluator/influx/query_v2_*_test.go so Python and Go emit identical literals. `literals` pairs a value with its exact literal; `round_trip` lists the values the live tests send to InfluxDB 2.7.11.",
+  "literals": [
+    {
+      "value": "plain",
+      "literal": "\"plain\""
+    },
+    {
+      "value": "",
+      "literal": "\"\""
+    },
+    {
+      "value": "say \"hi\"",
+      "literal": "\"say \\\"hi\\\"\""
+    },
+    {
+      "value": "back\\slash",
+      "literal": "\"back\\\\slash\""
+    },
+    {
+      "value": "line\nbreak\r\tx",
+      "literal": "\"line\\nbreak\\r\\tx\""
+    },
+    {
+      "value": "${x}",
+      "literal": "\"\\x24{x}\""
+    },
+    {
+      "value": "a${b}c${d}",
+      "literal": "\"a\\x24{b}c\\x24{d}\""
+    },
+    {
+      "value": "raw$archive",
+      "literal": "\"raw\\x24archive\""
+    },
+    {
+      "value": "$",
+      "literal": "\"\\x24\""
+    },
+    {
+      "value": "{x}",
+      "literal": "\"{x}\""
+    },
+    {
+      "value": "$${a}",
+      "literal": "\"\\x24\\x24{a}\""
+    },
+    {
+      "value": "\\${z}",
+      "literal": "\"\\\\\\x24{z}\""
+    },
+    {
+      "value": "$\"",
+      "literal": "\"\\x24\\\"\""
+    },
+    {
+      "value": "\\x24",
+      "literal": "\"\\\\x24\""
+    },
+    {
+      "value": "\\u2028",
+      "literal": "\"\\\\u2028\""
+    },
+    {
+      "value": "\\\\u2028",
+      "literal": "\"\\\\\\\\u2028\""
+    },
+    {
+      "value": "\\\u2028",
+      "literal": "\"\\\\\u2028\""
+    },
+    {
+      "value": "\\\u2029",
+      "literal": "\"\\\\\u2029\""
+    },
+    {
+      "value": "\\u0001",
+      "literal": "\"\\\\u0001\""
+    },
+    {
+      "value": "\\u001f",
+      "literal": "\"\\\\u001f\""
+    },
+    {
+      "value": "\\b",
+      "literal": "\"\\\\b\""
+    },
+    {
+      "value": "\\f",
+      "literal": "\"\\\\f\""
+    },
+    {
+      "value": "\u00e9",
+      "literal": "\"\u00e9\""
+    },
+    {
+      "value": "<&>",
+      "literal": "\"<&>\""
+    },
+    {
+      "value": "\u2028\u2029",
+      "literal": "\"\u2028\u2029\""
+    },
+    {
+      "value": "\ud83d\ude00",
+      "literal": "\"\ud83d\ude00\""
+    },
+    {
+      "value": "a\u007fb\u0085",
+      "literal": "\"a\u007fb\u0085\""
+    },
+    {
+      "value": "\ufffd",
+      "literal": "\"\ufffd\""
+    },
+    {
+      "value": "\ue000",
+      "literal": "\"\ue000\""
+    },
+    {
+      "value": "\udbff\udfff",
+      "literal": "\"\udbff\udfff\""
+    }
+  ],
+  "round_trip": [
+    "$${a}",
+    "${a}",
+    "$",
+    "t$\n",
+    "\\${z}",
+    "$$$${{a}}",
+    "a$\\${b}",
+    "\u00e9",
+    "<&>",
+    "a\"b\\c",
+    "\u2028",
+    "\u2029",
+    "$\"",
+    "raw$archive",
+    "\r\t",
+    "a\u007fb\u0085",
+    "\ud83d\ude00",
+    "\\u2028",
+    "\\x24",
+    "\\",
+    "}{$",
+    "",
+    "\\\u2028",
+    "\\\\u2028",
+    "\\u0001",
+    "\\b",
+    "\ufffd",
+    "\ue000",
+    "\udbff\udfff",
+    "\ufeff",
+    "\ufffe\uffff",
+    "\u00a0\u0080\u009f\u200b"
+  ]
+}
