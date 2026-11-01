@@ -1,0 +1,238 @@
+# ADR-020 normative worker role table. tests/unit/test_worker_roles.py validates it, and
+# the workers bundle ships it as roles.json for worker-monitor. Keep it the single source
+# for unit names, paths, credentials, IAM principals, alarms and enable variables.
+#
+# shared_lifecycles lists roles that share one supervised process (the same service unit
+# or Compose service). Each entry needs {roles: [...], justification: "..."}. None today.
+
+schema_version: 1
+
+exit_codes:
+  success: 0
+  runtime_failure: 1
+  partial_run: 2
+  configuration_error: 78
+
+paths:
+  workers_root: /opt/limnopulse/workers
+  releases: /opt/limnopulse/workers/releases
+  current: /opt/limnopulse/workers/current
+  state: /opt/limnopulse/workers/state
+  config: /etc/limnopulse/workers
+  credentials: /etc/limnopulse/workers/credentials
+  units: /etc/systemd/system
+
+unit_health:
+  namespace: Limnopulse/Workers
+  metric: UnitHealthy
+  dimension: Role
+  # A one-shot role is unhealthy when its last successful run is older than this many
+  # schedule intervals, or when its timer is not active.
+  oneshot_stale_after_intervals: 3
+  # Published only for roles whose service (continuous) or timer (one-shot) has
+  # UnitFileState=enabled. A disabled role publishes nothing.
+  published_when: unit_file_enabled
+  treat_missing_data: breaching
+
+bundle:
+  format: 1
+  oci_repository: ghcr.io/viniclus/limnopulse/workers
+  artifact_type: application/vnd.limnopulse.workers.bundle.v1
+  layer_media_type: application/vnd.limnopulse.workers.bundle.v1.tar+gzip
+  file: limnopulse-workers-{tag}.tar.gz
+  checksum_manifest: SHA256SUMS
+  metadata: bundle.env
+  role_table: roles.json
+  binaries: bin
+  units: systemd
+  releases_kept: 2
+
+activation:
+  helper: /usr/local/sbin/limnopulse-workers-activate
+  commands: [stage, activate, deactivate, status]
+  exit_codes:
+    success: 0
+    failure: 1
+    floor_refused: 3
+    usage: 78
+  sudoers: "limnopulse-deploy ALL=(root) NOPASSWD: /usr/local/sbin/limnopulse-workers-activate"
+
+deploy:
+  forced_command: "^main-[0-9a-f]{40} [0-9a-f]{64}$"
+  compose_profiles: [ingestion]
+
+shared_lifecycles: []
+
+roles:
+  - name: alert-evaluator
+    entrypoint: cmd/alert-evaluator
+    lifecycle: oneshot
+    work: rules → outbox
+    schedule_seconds: 60
+    timeout_start_seconds: 50
+    units:
+      service: limnopulse-alert-evaluator.service
+      timer: limnopulse-alert-evaluator.timer
+    binary: /opt/limnopulse/workers/current/bin/alert-evaluator
+    env_file: /etc/limnopulse/workers/alert-evaluator.env
+    credentials: [aws-access-key-id, aws-secret-access-key, influxdb-token]
+    iam_principal: alert_evaluator
+    enable_variable: alert_evaluator_enabled
+    unit_health: systemd
+    queues: []
+    alarms: [unit-health]
+    rollback:
+      epoch: 1
+      floor: 0
+
+  - name: notification-relay
+    entrypoint: cmd/notification-relay
+    lifecycle: oneshot
+    work: outbox → channel SQS lanes
+    schedule_seconds: 60
+    timeout_start_seconds: 50
+    units:
+      service: limnopulse-notification-relay.service
+      timer: limnopulse-notification-relay.timer
+    binary: /opt/limnopulse/workers/current/bin/notification-relay
+    env_file: /etc/limnopulse/workers/notification-relay.env
+    credentials: [aws-access-key-id, aws-secret-access-key]
+    iam_principal: notification_relay
+    enable_variable: notification_relay_enabled
+    unit_health: systemd
+    queues:
+      - {queue: notification_jobs, access: produce}
+      - {queue: telegram_notification_jobs, access: produce}
+    alarms: [unit-health]
+    rollback:
+      epoch: 1
+      floor: 0
+
+  - name: email-worker
+    entrypoint: cmd/email-worker
+    lifecycle: continuous
+    work: SQS email jobs → SES (SES consumer 1)
+    single_instance: false
+    stall_after_seconds: 90
+    watchdog_seconds: 120
+    timeout_stop_seconds: 45
+    units:
+      service: limnopulse-email-worker.service
+    binary: /opt/limnopulse/workers/current/bin/email-worker
+    env_file: /etc/limnopulse/workers/email-worker.env
+    credentials: [aws-access-key-id, aws-secret-access-key]
+    iam_principal: email_worker
+    enable_variable: email_worker_enabled
+    unit_health: systemd
+    queues:
+      - {queue: notification_jobs, access: consume}
+    alarms: [unit-health, queue-age, queue-depth, queue-dlq]
+    rollback:
+      epoch: 1
+      floor: 0
+
+  - name: ses-feedback-worker
+    entrypoint: cmd/ses-feedback-worker
+    lifecycle: continuous
+    work: SQS SES events → delivery state (SES consumer 2)
+    single_instance: true
+    stall_after_seconds: 90
+    watchdog_seconds: 120
+    timeout_stop_seconds: 45
+    units:
+      service: limnopulse-ses-feedback-worker.service
+    binary: /opt/limnopulse/workers/current/bin/ses-feedback-worker
+    env_file: /etc/limnopulse/workers/ses-feedback-worker.env
+    credentials: [aws-access-key-id, aws-secret-access-key]
+    iam_principal: ses_feedback_worker
+    enable_variable: ses_feedback_worker_enabled
+    unit_health: systemd
+    queues:
+      - {queue: ses_events, access: consume}
+    alarms: [unit-health, queue-age, queue-depth, queue-dlq]
+    rollback:
+      # Raise floor to this release's epoch when it changes feedback recovery semantics;
+      # automatic rollback then refuses to activate an older epoch for this role.
+      epoch: 1
+      floor: 0
+
+  - name: telegram-worker
+    entrypoint: cmd/telegram-worker
+    lifecycle: continuous
+    work: SQS Telegram jobs → Bot API
+    single_instance: false
+    stall_after_seconds: 90
+    watchdog_seconds: 120
+    timeout_stop_seconds: 45
+    units:
+      service: limnopulse-telegram-worker.service
+    binary: /opt/limnopulse/workers/current/bin/telegram-worker
+    env_file: /etc/limnopulse/workers/telegram-worker.env
+    credentials: [aws-access-key-id, aws-secret-access-key]
+    iam_principal: telegram_worker
+    enable_variable: telegram_worker_enabled
+    unit_health: systemd
+    queues:
+      - {queue: telegram_notification_jobs, access: consume}
+    alarms: [unit-health, queue-age, queue-depth, queue-dlq]
+    rollback:
+      epoch: 1
+      floor: 0
+
+  - name: worker-monitor
+    entrypoint: cmd/worker-monitor
+    lifecycle: oneshot
+    work: unit health → CloudWatch
+    schedule_seconds: 60
+    timeout_start_seconds: 50
+    units:
+      service: limnopulse-worker-monitor.service
+      timer: limnopulse-worker-monitor.timer
+    binary: /opt/limnopulse/workers/current/bin/worker-monitor
+    env_file: /etc/limnopulse/workers/worker-monitor.env
+    credentials: [aws-access-key-id, aws-secret-access-key]
+    iam_principal: worker_monitor
+    enable_variable: worker_monitor_enabled
+    unit_health: systemd
+    queues: []
+    alarms: [unit-health]
+    rollback:
+      epoch: 1
+      floor: 0
+
+  - name: limnopulse-admin
+    entrypoint: cmd/limnopulse-admin
+    lifecycle: cli
+    work: backfills
+    binary: /opt/limnopulse/workers/current/bin/limnopulse-admin
+    # An operator runs it by hand with operator-supplied credentials; it has no unit.
+    iam_principal: limnopulse_admin
+    unit_health: none
+    unit_health_reason: operator CLI with no unit
+    queues: []
+    alarms: []
+    rollback:
+      epoch: 1
+      floor: 0
+
+  - name: telemetry-ingest
+    entrypoint: python -m limnopulse_api.workers.telemetry_ingest
+    lifecycle: compose
+    work: SQS telemetry ingress → observations
+    compose_service: telemetry-ingest-worker
+    compose_profile: ingestion
+    iam_principal: telemetry_ingest
+    enable_variable: telemetry_ingress
+    unit_health: none
+    unit_health_reason: >-
+      worker-monitor gets no Docker socket; the Compose healthcheck and the
+      telemetry-ingress queue age, depth and DLQ alarms observe this role
+    queues:
+      - {queue: telemetry_ingress, access: consume}
+    alarms: [queue-age, queue-depth, queue-dlq]
+
+standalone_alarms:
+  # The EventBridge SES routing DLQ has its own alarm, gated with the SES event routing.
+  - name: ses-events-routing-dlq
+    queue: ses_events_routing_dlq
+    gate_variable: email_delivery
