@@ -60,7 +60,7 @@ _POLL_GRACE_SECONDS = 5.0
 LIVENESS_TICK_SECONDS = 5.0
 
 
-def _no_liveness() -> None:
+def no_liveness() -> None:
     return None
 
 
@@ -108,7 +108,7 @@ class IngestWorkerLoop:
         config: IngestWorkerConfig,
         metrics: TelemetryMetrics,
         clock: Callable[[], datetime] = utc_now,
-        liveness: Callable[[], None] = _no_liveness,
+        liveness: Callable[[], None] = no_liveness,
         liveness_tick_seconds: float = LIVENESS_TICK_SECONDS,
         overdue_after_seconds: float = math.inf,
     ) -> None:

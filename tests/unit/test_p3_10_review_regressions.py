@@ -3,8 +3,9 @@
 - A failure while composing the worker exits non-zero and logs a category only.
 - Bounded botocore retries on the worker clients and fail-fast timeouts on the API's SQS
   client, so neither the drain (A47) nor an admission request can hang on SQS.
-- Outside local/test the worker refuses (exit 2) when its own AWS keys or InfluxDB write token
-  are empty, instead of polling with no credentials while the API keeps answering 202.
+- Outside local/test the worker refuses (exit 78 since ADR-020) when its own AWS keys or
+  InfluxDB write token are empty, instead of polling with no credentials while the API keeps
+  answering 202.
 - The production worker passes its tuning knobs through (except drain and wait, which A47 binds
   to the stop grace) and disables the instance-metadata credential lookup.
 - Codex review on #120: the shutdown budget (poll grace + drain + the longest in-flight boto3
@@ -179,7 +180,7 @@ def _prod_environment(monkeypatch: pytest.MonkeyPatch, **overrides: str) -> None
 
 class _Done:
     async def run(self, stop: asyncio.Event) -> None:
-        return None
+        stop.set()  # stands in for SIGTERM: only a stop exits 0 (ADR-020)
 
 
 @pytest.mark.parametrize("empty", ["AWS_ACCESS_KEY_ID", "AWS_SECRET_ACCESS_KEY", "INFLUXDB_TOKEN"])
@@ -192,7 +193,7 @@ def test_production_worker_refuses_empty_credentials(
         telemetry_ingest, "build_worker", lambda settings, **kwargs: built.append(settings)
     )
 
-    assert main() == 2
+    assert main() == 78
     assert built == []
 
 

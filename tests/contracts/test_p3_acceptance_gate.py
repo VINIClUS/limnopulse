@@ -457,7 +457,7 @@ def test_gate13_switch_matrix_keeps_v1_and_mounts_exactly_the_switched_routes(
         ),
     ],
 )
-def test_gate13_worker_exits_2_unless_it_can_write(
+def test_gate13_worker_exits_78_unless_it_can_write(
     tmp_path: Path, environment: dict[str, str], case: str
 ) -> None:
     env = {
@@ -475,7 +475,8 @@ def test_gate13_worker_exits_2_unless_it_can_write(
         timeout=60,
         check=False,
     )
-    assert completed.returncode == telemetry_ingest.EXIT_REFUSED == 2, (case, completed.stderr)
+    # ADR-020: a refusal is a configuration error (78); compose parks the container on it.
+    assert completed.returncode == telemetry_ingest.EXIT_CONFIG == 78, (case, completed.stderr)
     # Refused by the start guard itself, not by an unrelated settings error.
     assert f"refused to start: {case}" in completed.stderr, completed.stderr
 
