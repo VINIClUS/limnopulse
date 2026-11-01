@@ -21,6 +21,11 @@ processing deadline and SIGTERM drain. Composition and the entrypoint belong to 
   reappear when their visibility lapses.
 - **Metrics never decide.** A failing metrics call is logged by metric name and never changes a
   final action, and no exception from a message task goes unobserved.
+- **Liveness (ADR-020).** `liveness()` is called at the top of every turn and after every receive.
+  While every permit is busy the loop wakes every `liveness_tick_seconds` to mark, so a busy loop
+  never reads as a stalled one, unless its oldest message has held a permit longer than
+  `overdue_after_seconds` (the composition passes the worst legitimate message lifetime): every
+  permit wedged is no progress, so the marks stop. A failing mark is logged and never decides.
 
 Log lines carry closed categories only, never `exc_info` or an exception message: a queue
 error's `__cause__` can carry a receipt handle.
@@ -29,6 +34,8 @@ error's `__cause__` can carry a receipt handle.
 import asyncio
 import contextlib
 import logging
+import math
+import time
 from collections.abc import Callable
 from dataclasses import dataclass
 from datetime import datetime
@@ -49,6 +56,12 @@ logger = logging.getLogger("limnopulse.telemetry.ingest")
 _RECEIVE_ERROR_PAUSE_SECONDS = 0.5
 # How long past `wait_seconds` a stop waits for an in-flight long poll before abandoning it.
 _POLL_GRACE_SECONDS = 5.0
+# How often the loop wakes to mark liveness while every permit is busy.
+LIVENESS_TICK_SECONDS = 5.0
+
+
+def _no_liveness() -> None:
+    return None
 
 
 class HeartbeatingConsumer(IngressQueueConsumer, Protocol):
@@ -95,24 +108,39 @@ class IngestWorkerLoop:
         config: IngestWorkerConfig,
         metrics: TelemetryMetrics,
         clock: Callable[[], datetime] = utc_now,
+        liveness: Callable[[], None] = _no_liveness,
+        liveness_tick_seconds: float = LIVENESS_TICK_SECONDS,
+        overdue_after_seconds: float = math.inf,
     ) -> None:
         self.consumer = consumer
         self.processor = processor
         self.config = config
         self.metrics = metrics
         self.clock = clock
+        self.liveness = liveness
+        self.liveness_tick_seconds = liveness_tick_seconds
+        self.overdue_after_seconds = overdue_after_seconds
         self.final_action_failures = 0
 
     async def run(self, stop: asyncio.Event) -> None:
-        in_flight: set[asyncio.Task[None]] = set()
+        # Each in-flight task with the monotonic time it started.
+        in_flight: dict[asyncio.Task[None], float] = {}
         stopped = asyncio.ensure_future(stop.wait())
         try:
             while not stop.is_set():
                 free = self.config.concurrency - len(in_flight)
                 if free <= 0:
-                    await asyncio.wait({*in_flight, stopped}, return_when=asyncio.FIRST_COMPLETED)
+                    if not self._overdue(in_flight):
+                        self._mark_alive()
+                    await asyncio.wait(
+                        {*in_flight, stopped},
+                        timeout=self.liveness_tick_seconds,
+                        return_when=asyncio.FIRST_COMPLETED,
+                    )
                     continue
+                self._mark_alive()
                 messages = await self._receive(min(self.config.max_messages, free), stopped)
+                self._mark_alive()
                 if stop.is_set():
                     await self._release(messages)
                     break
@@ -164,19 +192,31 @@ class IngestWorkerLoop:
                 self.final_action_failures += 1
                 logger.warning("ingress release on stop failed (%s)", type(error).__name__)
 
-    def _start(self, message: IngressQueueMessage, in_flight: set[asyncio.Task[None]]) -> None:
+    def _mark_alive(self) -> None:
+        try:
+            self.liveness()
+        except Exception as error:  # noqa: BLE001 - liveness never decides.
+            logger.warning("ingress liveness mark failed (%s)", type(error).__name__)
+
+    def _overdue(self, in_flight: dict[asyncio.Task[None], float]) -> bool:
+        oldest = min(in_flight.values(), default=time.monotonic())
+        return time.monotonic() - oldest > self.overdue_after_seconds
+
+    def _start(
+        self, message: IngressQueueMessage, in_flight: dict[asyncio.Task[None], float]
+    ) -> None:
         task = asyncio.create_task(self._handle(message))
-        in_flight.add(task)
+        in_flight[task] = time.monotonic()
 
         def done(finished: asyncio.Task[None]) -> None:
-            in_flight.discard(finished)
+            in_flight.pop(finished, None)
             if not finished.cancelled() and (error := finished.exception()) is not None:
                 # Observed here, so asyncio never logs the traceback or the message.
                 logger.error("ingress message handler failed (%s)", type(error).__name__)
 
         task.add_done_callback(done)
 
-    async def _drain(self, in_flight: set[asyncio.Task[None]]) -> None:
+    async def _drain(self, in_flight: dict[asyncio.Task[None], float]) -> None:
         if not in_flight:
             return
         _, pending = await asyncio.wait(set(in_flight), timeout=self.config.drain_seconds)

@@ -768,3 +768,112 @@ async def test_a_quarantine_failure_behind_the_loop_never_deletes() -> None:
 
     assert consumer.named("delete") == []
     assert messages_total(metrics) == [{"outcome": "retry", "category": "store_unavailable"}]
+
+
+# ADR-020 S5: liveness marks ------------------------------------------------------------------
+
+
+class LivenessMarks:
+    """Records every liveness mark into the consumer's shared event log."""
+
+    def __init__(self, events: list[tuple[Any, ...]]) -> None:
+        self.events = events
+        self.count = 0
+
+    def __call__(self) -> None:
+        self.count += 1
+        self.events.append(("liveness",))
+
+
+def liveness_loop(
+    consumer: ScriptedConsumer,
+    processor: Any,
+    marks: Callable[[], None],
+    *,
+    tick: float = 0.01,
+    overdue_after: float = float("inf"),
+    **overrides: Any,
+) -> IngestWorkerLoop:
+    return IngestWorkerLoop(
+        consumer=consumer,
+        processor=processor,
+        config=config(**overrides),
+        metrics=RecordingTelemetryMetrics(),
+        clock=lambda: NOW,
+        liveness=marks,
+        liveness_tick_seconds=tick,
+        overdue_after_seconds=overdue_after,
+    )
+
+
+async def test_the_loop_marks_liveness_at_the_top_of_every_turn_and_after_every_receive() -> None:
+    consumer = ScriptedConsumer()
+    marks = LivenessMarks(consumer.events)
+    loop = liveness_loop(consumer, StubProcessor(consumer.events), marks)
+
+    await run_until(loop, lambda: len(consumer.receives) >= 4)
+
+    turns = [event[0] for event in consumer.events if event[0] in {"liveness", "receive"}]
+    assert turns[:9] == ["liveness", "receive", "liveness"] * 3
+
+
+async def test_a_loop_without_liveness_runs_as_before() -> None:
+    consumer = ScriptedConsumer([make_message(1)])
+    loop, _ = make_loop(consumer, StubProcessor(consumer.events))
+
+    await run_until(loop, lambda: bool(consumer.named("delete")))
+
+    assert consumer.named("liveness") == []
+
+
+async def test_the_loop_keeps_marking_while_every_permit_is_busy() -> None:
+    """The permits-full wait ticks, so a busy loop never reads as a stalled one."""
+    consumer = ScriptedConsumer([make_message(1)])
+    processor = StubProcessor(consumer.events)
+    processor.gate()
+    marks = LivenessMarks(consumer.events)
+    loop = liveness_loop(consumer, processor, marks, concurrency=1)
+
+    async with running(loop):
+        await wait_for(lambda: processor.active == 1)
+        receives, before = len(consumer.receives), marks.count
+        await wait_for(lambda: marks.count >= before + 5)
+        assert len(consumer.receives) == receives  # all of it from the busy branch
+        processor.release("m1")
+        await wait_for(lambda: bool(consumer.named("delete")))
+
+
+async def test_a_permit_held_past_the_message_bound_stops_the_marks() -> None:
+    """Every permit wedged is no progress: the marks stop, so the watchdog can see it, and they
+    resume once the permit frees up."""
+    consumer = ScriptedConsumer([make_message(1)])
+    processor = StubProcessor(consumer.events)
+    processor.gate()
+    marks = LivenessMarks(consumer.events)
+    loop = liveness_loop(consumer, processor, marks, concurrency=1, overdue_after=0.1)
+
+    async with running(loop):
+        await wait_for(lambda: processor.active == 1)
+        await asyncio.sleep(0.15)  # past the bound
+        stopped_at = marks.count
+        await asyncio.sleep(0.1)
+        assert marks.count == stopped_at
+        processor.release("m1")
+        await wait_for(lambda: marks.count >= stopped_at + 3)
+
+
+async def test_a_failing_liveness_mark_never_stops_the_loop(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    consumer = ScriptedConsumer([make_message(1), make_message(2)])
+
+    def broken() -> None:
+        raise RuntimeError("sentinel-liveness-detail")
+
+    loop = liveness_loop(consumer, StubProcessor(consumer.events), broken)
+    caplog.set_level(logging.WARNING)
+
+    await run_until(loop, lambda: len(consumer.named("delete")) == 2)
+
+    assert "ingress liveness mark failed (RuntimeError)" in caplog.text
+    assert "sentinel-liveness-detail" not in caplog.text
