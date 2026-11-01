@@ -67,8 +67,9 @@ Each step is a separate change. Verify each one before moving to the next.
    set `TELEMETRY_V2_WRITE_ENABLED` to `true` and `SQS_TELEMETRY_INGRESS_QUEUE_URL`, and start the
    `telemetry-ingest-worker` service with the `ingestion` profile. It runs as its own principal, the
    `telemetry_ingest` IAM user, never the API or the shared `workers` user. It refuses to start
-   (exit 2) without v2 writes and a queue, so it can never delete a message it did not write.
-   Confirm it logs `telemetry ingest worker started` and the queue-age alarm stays green.
+   (exit 78, a configuration error: the container parks) without v2 writes and a queue, so it can
+   never delete a message it did not write. Confirm it logs `telemetry ingest worker started`,
+   `docker compose ps` shows it `healthy`, and the queue-age alarm stays green.
 3. **Endpoint.** Set `INGEST_V2_ENABLED` to `true` (it requires `API_V2_ENABLED=true`,
    `TELEMETRY_V2_WRITE_ENABLED=true` and a non-empty `SQS_TELEMETRY_INGRESS_QUEUE_URL`; the API refuses
    to start otherwise) and recreate the API (see **Applying a change** below). Exactly `POST /ingest/v2/observations` and the five
@@ -131,8 +132,8 @@ the API-only secrets.
   write its `token` field straight into `.env` without printing it.
 - **Every interpolated name must be defined.** An empty interpolation is passed to the container as
   an empty string and overrides the Settings default. Outside `local`/`test` the worker refuses to
-  start with exit 2 when its AWS keys or InfluxDB token are empty, so a missing variable fails fast
-  instead of polling forever. Define each of these in the production `.env`, never in `.env.image`:
+  start with exit 78 when its AWS keys or InfluxDB token are empty, so a missing variable fails fast
+  (the container parks; see **Park on 78**) instead of polling forever. Define each of these in the production `.env`, never in `.env.image`:
   every promotion through the deploy script rewrites `.env.image` with `IMAGE_TAG` alone, so anything
   else there is gone after the next deploy:
 
@@ -167,19 +168,38 @@ the API-only secrets.
   drain + wait + 5 s (A47): `TELEMETRY_INGEST_DRAIN_SECONDS` 30 + `TELEMETRY_INGEST_WORKER_WAIT_SECONDS`
   20 + the 5 s poll grace, more than 55 s at the defaults. SIGTERM first finishes the in-flight long
   poll, then drains; a shorter grace lets Docker's SIGKILL cut the drain short. Keep some headroom for
-  a boto3 call still in flight (`SHUTDOWN_CALL_BUDGET_SECONDS` in `workers/telemetry_ingest.py`).
+  a boto3 call still in flight (`shutdown_call_budget_seconds(settings)` in
+  `workers/telemetry_ingest.py`, 28 s at the defaults).
   `TELEMETRY_INGEST_DRAIN_SECONDS` and `TELEMETRY_INGEST_WORKER_WAIT_SECONDS` are not interpolated
   into the worker's environment in either compose file (it has no `env_file`), so setting them in
   `.env` has no effect: changing either needs a compose change, made together with the grace.
-- **Restart policy.** `restart: on-failure:5` may leave the worker stopped after a reboot, and the
-  default deploy (without `--profile ingestion`) does not recreate it. Redeploy it with the profile
-  so producer and consumer run the same image; the queue-age alarm covers a stopped worker.
+- **Restart policy (ADR-020).** The worker restarts `unless-stopped`, so it comes back after a
+  crash, a stall, a Docker daemon restart or a host reboot. Every deploy passes
+  `--profile ingestion` and waits for the worker's health, so a promotion or a rollback moves the
+  API (producer) and the worker (consumer) to the same tag. This supersedes the P3 plan's bounded
+  `on-failure` restart (D7) and its opt-in start (D21).
+- **Liveness and healthcheck.** The loop marks a liveness stamp
+  (`/tmp/limnopulse-telemetry-ingest.liveness`) at the top of every turn and after every receive,
+  and every 5 s while all permits are busy. A watchdog thread exits 1 when no mark comes for the
+  stall threshold: the worst legitimate message lifetime, the processing deadline + one 10 s
+  InfluxDB write + an awaited heartbeat + the final action (45 + 10 + 28 + 28 = 111 s at the
+  defaults, `stall_after_seconds(settings)`). A permit held longer than that stops the busy marks,
+  so every permit wedged counts as a stall too. The compose healthcheck,
+  `python -m limnopulse_api.workers.telemetry_ingest healthcheck`, exits 1 once the stamp is older
+  than the threshold. SIGTERM disarms the watchdog, so the A47 drain and the 90 s grace above are
+  unchanged.
+- **Park on 78.** A configuration error exits 78: writes off, an empty queue URL, empty own
+  credentials or an invalid setting. Docker cannot skip a restart for one exit code, so the
+  entrypoint's shell guard keeps the container up but idle (`sleep infinity`) instead: Docker never
+  restarts it on 78, it parks again after a reboot, and with no stamp its healthcheck reports it
+  `unhealthy`, which fails the deploy health gate. Read the refusal in its log
+  (`refused to start: ...`), fix `.env`, and recreate it with the profile.
 
 ## Alarms and deadlines
 
 | Alarm | Fires when | First response |
 |---|---|---|
-| `<project>-<env>-telemetry-ingress-age` (queue age) | the oldest message is older than `telemetry_ingress_age_alarm_threshold_seconds` (default 300 s) | is the worker running? Check its logs and bring it back with `up -d` and the profile; a stopped worker is the usual cause |
+| `<project>-<env>-telemetry-ingress-age` (queue age) | the oldest message is older than `telemetry_ingress_age_alarm_threshold_seconds` (default 300 s) | is the worker running and `healthy`? A stopped or parked (exit 78) worker is the usual cause: read its log, fix the cause and bring it back with `up -d` and the profile |
 | `<project>-<env>-telemetry-ingress-depth` | more than `telemetry_ingress_depth_alarm_threshold` (default 1000) visible messages for 5 minutes | worker throughput or an outage; check `ingress_messages_total{outcome="retry"}` by category |
 | `<project>-<env>-telemetry-ingress-dlq` | the DLQ is not empty | run the [DLQ drill](#dlq-drill) |
 
@@ -367,7 +387,10 @@ stopping all telemetry intake is the intent.
 4. **Let the worker drain** the source queue (queue depth and age back to zero), unless the worker
    itself is the reason for the rollback.
 5. **Stop the worker:** stop the `ingestion` profile and set `TELEMETRY_V2_WRITE_ENABLED=false`.
-   Unprocessed messages simply stay on the queue or the DLQ.
+   Unprocessed messages simply stay on the queue or the DLQ. Since ADR-020 every deploy passes
+   `--profile ingestion` and waits for the worker's health: with writes off the worker refuses to
+   start (exit 78), parks and stays `unhealthy`, so a later deploy fails its health gate until the
+   worker can run again.
 6. **Retain the queues.** Never purge the source queue or the DLQ, and keep `telemetry_ingress = true`:
    accepted data stays recoverable for 4 days in the source queue and 14 days in the DLQ, and
    quarantine rows for 14 days. Turning the worker back on resumes processing.
