@@ -33,10 +33,11 @@ backstop. After a stop signal, a loop that returns `nil` or its context's error 
 `workerproc.Credentials` reads `LoadCredential=` files from `$CREDENTIALS_DIRECTORY`. Each
 unit loads every credential `<name>` from `paths.credential_source`,
 `/etc/limnopulse/workers/credentials/<role>/<name>`. The names repeat across roles, but
-each role's directory holds its own principal's keys. Under systemd (`INVOCATION_ID` or
-`NOTIFY_SOCKET` set), a missing `CREDENTIALS_DIRECTORY` is a configuration error, so a unit
-never falls back to the AWS default chain. Local runs have neither variable and use the
-default chain. Secrets never go in the env file: the Telegram worker's Redis password is
+each role's directory holds its own principal's keys. Every Go unit also sets
+`LIMNOPULSE_SUPERVISOR=systemd`. With it, a missing `CREDENTIALS_DIRECTORY` is a
+configuration error, so a unit never falls back to the AWS default chain. Local runs leave
+it unset and use the default chain. `INVOCATION_ID` cannot serve as the marker: terminals
+and CI runners started by systemd inherit it. Secrets never go in the env file: the Telegram worker's Redis password is
 the `redis-password` credential.
 
 ## Unit health

@@ -37,16 +37,21 @@ func TestCredentialsWithoutDirectoryKeepTheDefaultChain(t *testing.T) {
 }
 
 func TestSupervisedProcessWithoutCredentialsDirectoryIsAConfigurationError(t *testing.T) {
-	for _, name := range []string{"INVOCATION_ID", "NOTIFY_SOCKET"} {
-		_, err := CredentialsFromEnv(env(map[string]string{name: "/run/systemd/notify"}))
-		if !IsConfiguration(err) {
-			t.Errorf("%s set without CREDENTIALS_DIRECTORY: got %v", name, err)
-		}
+	if _, err := CredentialsFromEnv(env(map[string]string{SupervisorEnv: "systemd"})); !IsConfiguration(err) {
+		t.Fatalf("worker unit without CREDENTIALS_DIRECTORY: got %v", err)
 	}
 	dir := credentialDir(t, nil)
-	creds, err := CredentialsFromEnv(env(map[string]string{"INVOCATION_ID": "abc", "CREDENTIALS_DIRECTORY": dir}))
+	creds, err := CredentialsFromEnv(env(map[string]string{SupervisorEnv: "systemd", "CREDENTIALS_DIRECTORY": dir}))
 	if err != nil || !creds.Available() {
-		t.Fatalf("supervised process with a credentials directory: %v", err)
+		t.Fatalf("worker unit with a credentials directory: %v", err)
+	}
+}
+
+func TestAnyUnitInvocationIsNotAWorkerUnit(t *testing.T) {
+	// A terminal or CI runner started by systemd inherits INVOCATION_ID.
+	creds, err := CredentialsFromEnv(env(map[string]string{"INVOCATION_ID": "abc"}))
+	if err != nil || creds.Available() {
+		t.Fatalf("INVOCATION_ID alone: %v", err)
 	}
 }
 

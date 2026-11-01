@@ -67,10 +67,13 @@ deploy:
   forced_command: "^main-[0-9a-f]{40} [0-9a-f]{64}$"
   compose_profiles: [ingestion]
 
-# Set on every Go unit: an unrecovered panic then dies by SIGABRT instead of exiting 2,
-# so it cannot pass for a partial run.
+# Set on every Go unit. GOTRACEBACK=crash: an unrecovered panic dies by SIGABRT instead
+# of exiting 2, so it cannot pass for a partial run. LIMNOPULSE_SUPERVISOR=systemd: the
+# worker then requires CREDENTIALS_DIRECTORY instead of falling back to the AWS default
+# chain (INVOCATION_ID cannot tell, terminals and CI runners inherit it).
 go_unit_environment:
   GOTRACEBACK: crash
+  LIMNOPULSE_SUPERVISOR: systemd
 
 shared_lifecycles: []
 

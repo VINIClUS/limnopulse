@@ -341,6 +341,12 @@ def test_go_exit_codes_match_the_table():
     }
 
 
+def test_go_reads_the_supervisor_marker_the_units_set(table):
+    source = (WORKERPROC / "credentials.go").read_text(encoding="utf-8")
+    name = re.search(r'^const SupervisorEnv = "(\w+)"$', source, flags=re.MULTILINE).group(1)
+    assert table["go_unit_environment"][name] == "systemd"
+
+
 def test_go_credential_names_cover_every_role_credential(table):
     source = (WORKERPROC / "credentials.go").read_text(encoding="utf-8")
     declared = set(re.findall(r'^\s+Credential\w+\s+= "([a-z0-9-]+)"$', source, flags=re.MULTILINE))

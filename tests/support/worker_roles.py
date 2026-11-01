@@ -50,7 +50,7 @@ EXPECTED_BUNDLE_FILES = {
 }
 ACTIVATION_EXIT_CODES = {"success": 0, "failure": 1, "floor_refused": 3, "usage": 78}
 FORCED_COMMAND = "^main-[0-9a-f]{40} [0-9a-f]{64}$"
-GO_UNIT_ENVIRONMENT = {"GOTRACEBACK": "crash"}
+GO_UNIT_ENVIRONMENT = {"GOTRACEBACK": "crash", "LIMNOPULSE_SUPERVISOR": "systemd"}
 SES_CONSUMERS = frozenset({"email-worker", "ses-feedback-worker"})
 SES_ROUTING_ALARM = {
     "name": "ses-events-routing-dlq",

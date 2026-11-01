@@ -46,15 +46,14 @@ func CredentialsFromEnv(lookup LookupEnv) (Credentials, error) {
 	return Credentials{dir: dir}, nil
 }
 
-// supervised reports whether systemd started this process: it sets INVOCATION_ID for
-// every unit and NOTIFY_SOCKET for Type=notify services.
+// SupervisorEnv is set to "systemd" by every worker unit (go_unit_environment in
+// ops/workers/roles.yaml). INVOCATION_ID is no marker: desktop terminals and CI runners
+// inherit it from their own units.
+const SupervisorEnv = "LIMNOPULSE_SUPERVISOR"
+
 func supervised(get LookupEnv) bool {
-	for _, name := range []string{"INVOCATION_ID", "NOTIFY_SOCKET"} {
-		if value, _ := get(name); value != "" {
-			return true
-		}
-	}
-	return false
+	value, _ := get(SupervisorEnv)
+	return value == "systemd"
 }
 
 func (creds Credentials) Available() bool {
