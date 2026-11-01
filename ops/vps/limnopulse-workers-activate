@@ -1,0 +1,786 @@
+#!/usr/bin/python3 -I
+"""Stage, activate and deactivate ADR-020 workers bundles on the VPS.
+
+Installed by hand as /usr/local/sbin/limnopulse-workers-activate (root:root, 0755); see the
+bootstrap in ops/vps/README.md. `limnopulse-deploy` runs it only through
+ops/vps/sudoers.d/limnopulse-deploy, which allows any arguments, so the helper validates its
+own. The contract is ops/workers/roles.yaml (`paths`, `bundle`, `activation`) and the
+"Activation helper" section of ops/workers/README.md.
+
+    stage <tag> <sha256> [--override-floor]   pull, verify and extract; changes no unit
+    activate <tag> [--override-floor]         re-verify, install units, swap `current`
+    deactivate                                stop and remove the installed units and `current`
+    status                                    print the current tag, releases and floors
+
+Exit codes: 0 ok, 1 failure, 3 rollback floor refused, 78 usage.
+
+It is Python 3 stdlib because the VPS has python3 but no jq: it parses bundle.env with a
+regex instead of sourcing it as root, reads roles.json with the json module, checks every tar
+member before writing it, and swaps `current` with os.replace.
+"""
+
+from __future__ import annotations
+
+import fcntl
+import hashlib
+import hmac
+import json
+import os
+import re
+import shutil
+import stat
+import subprocess
+import sys
+import tarfile
+import tempfile
+from dataclasses import dataclass
+from pathlib import Path
+
+# Mirrors ops/workers/roles.yaml; tests/unit/test_workers_activate.py checks the drift.
+WORKERS_ROOT = "/opt/limnopulse/workers"
+RELEASES = "/opt/limnopulse/workers/releases"
+CURRENT = "/opt/limnopulse/workers/current"
+STATE = "/opt/limnopulse/workers/state"
+UNITS_DIR = "/etc/systemd/system"
+OCI_REPOSITORY = "ghcr.io/viniclus/limnopulse/workers"
+BUNDLE_FILE = "limnopulse-workers-{tag}.tar.gz"
+CHECKSUM_MANIFEST = "SHA256SUMS"
+METADATA = "bundle.env"
+ROLE_TABLE = "roles.json"
+BINARIES = "bin"
+UNITS = "systemd"
+BUNDLE_FORMAT = 1
+RELEASES_KEPT = 2
+COMMANDS = ("stage", "activate", "deactivate", "status")
+EXIT_OK, EXIT_FAILURE, EXIT_FLOOR_REFUSED, EXIT_USAGE = 0, 1, 3, 78
+
+OVERRIDE_FLOOR = "--override-floor"
+# Honoured only when the helper runs unprivileged, so the tests can run it against a temp
+# root with fake oras and systemctl on PATH. As root it always uses the paths above.
+TEST_ROOT_ENV = "LIMNOPULSE_WORKERS_ACTIVATE_TEST_ROOT"
+SAFE_PATH = "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
+PULL_TIMEOUT_SECONDS = 600
+SYSTEMCTL_TIMEOUT_SECONDS = 300
+
+TAG_RE = re.compile(r"main-[0-9a-f]{40}")
+SHA256_RE = re.compile(r"[0-9a-f]{64}")
+NAME_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9._@-]*")
+ROLE_RE = re.compile(r"[a-z][a-z0-9-]*")
+UNIT_RE = re.compile(r"limnopulse-[a-z0-9-]+\.(service|timer)")
+ENV_LINE_RE = re.compile(r"([A-Z][A-Z0-9_]*)=([A-Za-z0-9._-]*)")
+INT_RE = re.compile(r"[0-9]{1,9}")
+SUMS_LINE_RE = re.compile(r"([0-9a-f]{64}) [ *](\S+)")
+TOP_FILES = frozenset({CHECKSUM_MANIFEST, METADATA, ROLE_TABLE})
+BUNDLE_DIRS = frozenset({BINARIES, UNITS})
+GO_LIFECYCLES = frozenset({"continuous", "oneshot", "cli"})
+UNIT_LIFECYCLES = frozenset({"continuous", "oneshot"})
+ENABLED_STATES = frozenset({"enabled", "enabled-runtime"})
+
+FLOORS_FILE = "floors.json"
+UNITS_FILE = "units.json"
+LOCK_FILE = ".lock"
+STAGE_PREFIX = ".stage-"
+CURRENT_TMP_PREFIX = ".current-"
+
+
+class Failure(Exception):
+    code = EXIT_FAILURE
+
+
+class FloorRefused(Failure):
+    code = EXIT_FLOOR_REFUSED
+
+
+class Usage(Failure):
+    code = EXIT_USAGE
+
+
+@dataclass(frozen=True)
+class Paths:
+    root: Path
+    releases: Path
+    current: Path
+    state: Path
+    units: Path
+    owner: int
+
+
+@dataclass(frozen=True)
+class Metadata:
+    epochs: dict[str, int]
+    floors: dict[str, int]
+    units: tuple[str, ...]
+    continuous: tuple[str, ...]
+
+
+def log(message: str) -> None:
+    print(f"limnopulse-workers-activate: {message}", file=sys.stderr, flush=True)
+
+
+# --- arguments -------------------------------------------------------------------------
+
+
+def parse_args(argv: list[str]) -> tuple[str, list[str], bool]:
+    """Return (command, operands, override); anything else is a usage error (78)."""
+    if not argv or argv[0] not in COMMANDS:
+        raise Usage(f"usage: {' | '.join(COMMANDS)}")
+    command, rest = argv[0], list(argv[1:])
+    override = False
+    if command in ("stage", "activate") and rest and rest[-1] == OVERRIDE_FLOOR:
+        override = True
+        rest.pop()
+    arity = {"stage": 2, "activate": 1, "deactivate": 0, "status": 0}[command]
+    if len(rest) != arity:
+        raise Usage(f"{command} takes {arity} operand(s)")
+    if command in ("stage", "activate") and not TAG_RE.fullmatch(rest[0]):
+        raise Usage("the tag must be main-<40 lowercase hex>")
+    if command == "stage" and not SHA256_RE.fullmatch(rest[1]):
+        raise Usage("the bundle SHA-256 must be 64 lowercase hex")
+    if override and "SUDO_USER" in os.environ:
+        raise Usage(f"{OVERRIDE_FLOOR} is for root itself and is refused under sudo")
+    return command, rest, override
+
+
+def resolve_paths() -> Paths:
+    test_root = os.environ.get(TEST_ROOT_ENV)
+    if os.geteuid() == 0:
+        if test_root is not None:
+            raise Usage(f"{TEST_ROOT_ENV} is only for unprivileged tests")
+        os.environ["PATH"] = SAFE_PATH
+        prefix, owner = "", 0
+    else:
+        if not test_root or not os.path.isabs(test_root):
+            raise Failure("must run as root")
+        prefix, owner = test_root.rstrip("/"), os.geteuid()
+    return Paths(
+        root=Path(prefix + WORKERS_ROOT),
+        releases=Path(prefix + RELEASES),
+        current=Path(prefix + CURRENT),
+        state=Path(prefix + STATE),
+        units=Path(prefix + UNITS_DIR),
+        owner=owner,
+    )
+
+
+def check_private_dir(path: Path, owner: int) -> None:
+    """A directory the helper trusts must be real, owned by root and writable only by it."""
+    try:
+        info = os.lstat(path)
+    except FileNotFoundError:
+        raise Failure(f"{path} is missing; run the workers bootstrap") from None
+    if not stat.S_ISDIR(info.st_mode):
+        raise Failure(f"{path} is not a directory")
+    if info.st_uid != owner or info.st_mode & 0o022:
+        raise Failure(f"{path} must be owned by root and writable only by root")
+
+
+def check_layout(paths: Paths) -> None:
+    for path in (paths.root, paths.releases, paths.state, paths.units):
+        check_private_dir(path, paths.owner)
+
+
+# --- files ------------------------------------------------------------------------------
+
+
+def sha256_file(path: Path) -> str:
+    digest = hashlib.sha256()
+    with open(path, "rb") as handle:
+        for chunk in iter(lambda: handle.read(1 << 20), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def fsync_dir(path: Path) -> None:
+    fd = os.open(path, os.O_RDONLY | os.O_DIRECTORY)
+    try:
+        os.fsync(fd)
+    finally:
+        os.close(fd)
+
+
+def write_atomic(path: Path, data: bytes, mode: int = 0o644) -> None:
+    tmp = path.with_name(f".{path.name}.tmp")
+    if os.path.lexists(tmp):
+        os.unlink(tmp)
+    fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, mode)
+    try:
+        os.fchmod(fd, mode)
+        os.write(fd, data)
+        os.fsync(fd)
+    finally:
+        os.close(fd)
+    os.replace(tmp, path)
+    fsync_dir(path.parent)
+
+
+def read_json(path: Path) -> object | None:
+    try:
+        return json.loads(path.read_bytes())
+    except FileNotFoundError:
+        return None
+    except ValueError:
+        raise Failure(f"{path} is not valid JSON") from None
+
+
+def write_json(path: Path, value: object) -> None:
+    write_atomic(path, (json.dumps(value, indent=2, sort_keys=True) + "\n").encode())
+
+
+# --- bundle verification ----------------------------------------------------------------
+
+
+def bundle_path(name: str) -> str | None:
+    """Map a tar member or SHA256SUMS name to a bundle path, or None for the bundle root."""
+    name = name.removeprefix("./").rstrip("/")
+    if name in ("", "."):
+        return None
+    parts = name.split("/")
+    if not all(NAME_RE.fullmatch(part) for part in parts):
+        raise Failure(f"bundle entry {name!r} has an unsafe name")
+    if len(parts) == 1 and (parts[0] in TOP_FILES or parts[0] in BUNDLE_DIRS):
+        return name
+    if len(parts) == 2 and parts[0] in BUNDLE_DIRS:
+        return name
+    raise Failure(f"bundle entry {name!r} is outside the bundle layout")
+
+
+def file_mode(path: str) -> int:
+    return 0o755 if path.startswith(f"{BINARIES}/") else 0o644
+
+
+def open_tarball(tarball: Path) -> tarfile.TarFile:
+    try:
+        return tarfile.open(tarball, mode="r:gz")
+    except (tarfile.TarError, OSError) as error:
+        raise Failure(f"the bundle is not a gzip tarball: {error}") from None
+
+
+def extract(tarball: Path, target: Path) -> None:
+    """Write each verified tar member ourselves: no links, devices, owners or tar modes."""
+    os.mkdir(target, 0o755)
+    os.chmod(target, 0o755)
+    seen: set[str] = set()
+    with open_tarball(tarball) as archive:
+        try:
+            members = archive.getmembers()
+        except (tarfile.TarError, OSError, EOFError) as error:
+            raise Failure(f"the bundle tarball is corrupt: {error}") from None
+        for member in members:
+            path = bundle_path(member.name)
+            if path is None:
+                if not member.isdir():
+                    raise Failure(f"bundle entry {member.name!r} is not a directory")
+                continue
+            if path in seen:
+                raise Failure(f"bundle entry {path!r} appears twice")
+            seen.add(path)
+            if member.isdir():
+                if path not in BUNDLE_DIRS:
+                    raise Failure(f"bundle entry {path!r} is an unexpected directory")
+                ensure_dir(target / path)
+                continue
+            if not member.isreg() or path in BUNDLE_DIRS:
+                raise Failure(f"bundle entry {path!r} is not a regular file")
+            if "/" in path:
+                ensure_dir(target / path.split("/")[0])
+            source = archive.extractfile(member)
+            if source is None:
+                raise Failure(f"bundle entry {path!r} has no content")
+            mode = file_mode(path)
+            fd = os.open(target / path, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, mode)
+            with os.fdopen(fd, "wb") as handle:
+                os.fchmod(handle.fileno(), mode)
+                shutil.copyfileobj(source, handle, 1 << 20)
+
+
+def ensure_dir(path: Path) -> None:
+    if not os.path.lexists(path):
+        os.mkdir(path, 0o755)
+        os.chmod(path, 0o755)
+    elif not stat.S_ISDIR(os.lstat(path).st_mode):
+        raise Failure(f"{path.name} is not a directory")
+
+
+def tree_files(directory: Path, owner: int) -> set[str]:
+    """List the release's files, refusing anything outside the layout or writable by others."""
+    files: set[str] = set()
+
+    def checked(path: Path) -> os.stat_result:
+        info = os.lstat(path)
+        if info.st_uid != owner or info.st_mode & 0o022:
+            raise Failure(f"{path} must be owned by root and writable only by root")
+        return info
+
+    checked(directory)
+    for entry in sorted(os.listdir(directory)):
+        info = checked(directory / entry)
+        if stat.S_ISDIR(info.st_mode) and entry in BUNDLE_DIRS:
+            for name in sorted(os.listdir(directory / entry)):
+                if not stat.S_ISREG(checked(directory / entry / name).st_mode):
+                    raise Failure(f"release entry {entry}/{name} is not a regular file")
+                files.add(bundle_path(f"{entry}/{name}") or "")
+        elif stat.S_ISREG(info.st_mode) and entry in TOP_FILES:
+            files.add(entry)
+        else:
+            raise Failure(f"release entry {entry!r} is outside the bundle layout")
+    return files
+
+
+def verify_manifest(directory: Path, owner: int) -> tuple[str, set[str]]:
+    """Check SHA256SUMS against every other file both ways.
+
+    Returns the manifest's own SHA-256 and the release's file list.
+    """
+    files = tree_files(directory, owner)
+    if CHECKSUM_MANIFEST not in files:
+        raise Failure(f"the bundle has no {CHECKSUM_MANIFEST}")
+    raw = (directory / CHECKSUM_MANIFEST).read_bytes()
+    try:
+        text = raw.decode("ascii")
+    except UnicodeDecodeError:
+        raise Failure(f"{CHECKSUM_MANIFEST} is not ASCII") from None
+    listed: dict[str, str] = {}
+    for line in text.split("\n"):
+        if not line:
+            continue
+        match = SUMS_LINE_RE.fullmatch(line)
+        if match is None:
+            raise Failure(f"{CHECKSUM_MANIFEST} has a malformed line")
+        path = bundle_path(match.group(2))
+        if path is None or path in BUNDLE_DIRS or path == CHECKSUM_MANIFEST:
+            raise Failure(f"{CHECKSUM_MANIFEST} lists {match.group(2)!r}")
+        if path in listed:
+            raise Failure(f"{CHECKSUM_MANIFEST} lists {path!r} twice")
+        listed[path] = match.group(1)
+    expected = files - {CHECKSUM_MANIFEST}
+    if set(listed) != expected:
+        missing = sorted(expected - set(listed))
+        absent = sorted(set(listed) - expected)
+        raise Failure(f"{CHECKSUM_MANIFEST} mismatch: unlisted {missing}, missing {absent}")
+    for path, digest in sorted(listed.items()):
+        if not hmac.compare_digest(sha256_file(directory / path), digest):
+            raise Failure(f"{CHECKSUM_MANIFEST} check failed for {path}")
+    return hashlib.sha256(raw).hexdigest(), files
+
+
+def env_key(role: str) -> str:
+    return role.upper().replace("-", "_")
+
+
+def read_metadata(directory: Path, tag: str, present: set[str]) -> Metadata:
+    """Parse bundle.env and roles.json and check them against each other and the tree."""
+    values: dict[str, str] = {}
+    try:
+        text = (directory / METADATA).read_bytes().decode("ascii")
+    except UnicodeDecodeError:
+        raise Failure(f"{METADATA} is not ASCII") from None
+    for line in text.split("\n"):
+        if not line:
+            continue
+        match = ENV_LINE_RE.fullmatch(line)
+        if match is None or match.group(1) in values:
+            raise Failure(f"{METADATA} has a malformed or repeated line")
+        values[match.group(1)] = match.group(2)
+    if values.get("BUNDLE_FORMAT") != str(BUNDLE_FORMAT):
+        raise Failure(f"{METADATA} BUNDLE_FORMAT must be {BUNDLE_FORMAT}")
+    if values.get("BUNDLE_TAG") != tag:
+        raise Failure(f"{METADATA} BUNDLE_TAG does not match {tag}")
+
+    table = read_json(directory / ROLE_TABLE)
+    roles = table.get("roles") if isinstance(table, dict) else None
+    if not isinstance(roles, list):
+        raise Failure(f"{ROLE_TABLE} has no role list")
+    epochs: dict[str, int] = {}
+    floors: dict[str, int] = {}
+    units: list[str] = []
+    continuous: list[str] = []
+    binaries: set[str] = set()
+    for role in roles:
+        name = role.get("name") if isinstance(role, dict) else None
+        if not isinstance(name, str) or not ROLE_RE.fullmatch(name):
+            raise Failure(f"{ROLE_TABLE} has a role with an invalid name")
+        lifecycle = role.get("lifecycle")
+        if lifecycle not in GO_LIFECYCLES:
+            continue
+        binaries.add(f"{BINARIES}/{name}")
+        rollback = role.get("rollback") or {}
+        key = env_key(name)
+        for field, target in (("epoch", epochs), ("floor", floors)):
+            raw = values.pop(f"{field.upper()}_{key}", None)
+            pinned = rollback.get(field)
+            valid = raw is not None and INT_RE.fullmatch(raw) and type(pinned) is int
+            if not valid or pinned != int(raw):
+                raise Failure(f"{METADATA} {field.upper()}_{key} must match {ROLE_TABLE}")
+            target[name] = int(raw)
+        if not 0 <= floors[name] <= epochs[name] or epochs[name] < 1:
+            raise Failure(f"{name}: rollback needs 0 <= floor <= epoch >= 1")
+        if lifecycle in UNIT_LIFECYCLES:
+            declared = role.get("units") or {}
+            kinds = ("service", "timer") if lifecycle == "oneshot" else ("service",)
+            for kind in kinds:
+                unit = declared.get(kind)
+                if not isinstance(unit, str) or not UNIT_RE.fullmatch(unit):
+                    raise Failure(f"{name}: {ROLE_TABLE} declares an invalid {kind} unit")
+                units.append(unit)
+            if lifecycle == "continuous":
+                continuous.append(declared["service"])
+    stray = sorted(key for key in values if key.startswith(("EPOCH_", "FLOOR_")))
+    if stray:
+        raise Failure(f"{METADATA} sets {stray} for no Go role in {ROLE_TABLE}")
+    if len(set(units)) != len(units):
+        raise Failure(f"{ROLE_TABLE} declares a unit twice")
+    expected = {METADATA, ROLE_TABLE, CHECKSUM_MANIFEST} | binaries
+    expected |= {f"{UNITS}/{unit}" for unit in units}
+    if present != expected:
+        raise Failure(
+            f"the bundle does not match {ROLE_TABLE}: extra {sorted(present - expected)}, "
+            f"missing {sorted(expected - present)}"
+        )
+    return Metadata(epochs, floors, tuple(sorted(units)), tuple(sorted(continuous)))
+
+
+# --- state --------------------------------------------------------------------------------
+
+
+def read_record(paths: Paths, tag: str) -> dict[str, str] | None:
+    record = read_json(paths.state / f"{tag}.json")
+    if record is None:
+        return None
+    if not (
+        isinstance(record, dict)
+        and record.get("tag") == tag
+        and all(
+            isinstance(record.get(key), str) and SHA256_RE.fullmatch(record[key])
+            for key in ("tarball_sha256", "manifest_sha256")
+        )
+    ):
+        raise Failure(f"the state record for {tag} is malformed")
+    return record
+
+
+def read_floors(paths: Paths) -> dict[str, int]:
+    floors = read_json(paths.state / FLOORS_FILE) or {}
+    if not isinstance(floors, dict) or not all(
+        isinstance(role, str) and type(value) is int and value >= 0
+        for role, value in floors.items()
+    ):
+        raise Failure(f"{FLOORS_FILE} is malformed")
+    return floors
+
+
+def read_installed_units(paths: Paths) -> list[str]:
+    units = read_json(paths.state / UNITS_FILE) or []
+    if not isinstance(units, list) or not all(
+        isinstance(unit, str) and UNIT_RE.fullmatch(unit) for unit in units
+    ):
+        raise Failure(f"{UNITS_FILE} is malformed")
+    return units
+
+
+def current_tag(paths: Paths) -> str | None:
+    try:
+        info = os.lstat(paths.current)
+    except FileNotFoundError:
+        return None
+    if not stat.S_ISLNK(info.st_mode):
+        raise Failure(f"{paths.current} is not a symlink")
+    target = os.readlink(paths.current)
+    prefix = os.path.relpath(paths.releases, paths.current.parent) + "/"
+    tag = target[len(prefix) :] if target.startswith(prefix) else ""
+    if not TAG_RE.fullmatch(tag):
+        raise Failure(f"{paths.current} points at {target!r}, not a release")
+    return tag
+
+
+def check_floors(meta: Metadata, recorded: dict[str, int], override: bool) -> None:
+    """Refuse (3) a release whose epoch for a role is below the highest recorded floor."""
+    below = [
+        f"{role} epoch {meta.epochs.get(role, 0)} < floor {floor}"
+        for role, floor in sorted(recorded.items())
+        if meta.epochs.get(role, 0) < floor
+    ]
+    if not below:
+        return
+    if not override:
+        raise FloorRefused(f"rollback floor refused: {', '.join(below)}")
+    log(f"root overrides the rollback floor: {', '.join(below)}")
+
+
+def load_release(paths: Paths, tag: str) -> Metadata:
+    """Re-verify a staged release against the SHA256SUMS digest recorded by `stage`."""
+    directory = paths.releases / tag
+    record = read_record(paths, tag)
+    if record is None or not os.path.lexists(directory):
+        raise Failure(f"{tag} is not staged")
+    check_private_dir(directory, paths.owner)
+    manifest, files = verify_manifest(directory, paths.owner)
+    if not hmac.compare_digest(manifest, record["manifest_sha256"]):
+        raise Failure(f"{CHECKSUM_MANIFEST} of {tag} changed since it was staged")
+    return read_metadata(directory, tag, files)
+
+
+def prune(paths: Paths, keep: set[str | None]) -> None:
+    """Keep `keep` (the current release and its rollback target) up to RELEASES_KEPT."""
+    protected = {tag for tag in keep if tag}
+    tags = [name for name in os.listdir(paths.releases) if TAG_RE.fullmatch(name)]
+    others = sorted(
+        (tag for tag in tags if tag not in protected),
+        key=lambda tag: os.lstat(paths.releases / tag).st_mtime_ns,
+        reverse=True,
+    )
+    survivors = protected | set(others[: max(0, RELEASES_KEPT - len(protected))])
+    for tag in tags:
+        if tag not in survivors:
+            log(f"pruning release {tag}")
+            shutil.rmtree(paths.releases / tag)
+    for name in os.listdir(paths.state):
+        if name.endswith(".json") and TAG_RE.fullmatch(name[:-5]) and name[:-5] not in survivors:
+            os.unlink(paths.state / name)
+
+
+def clean_leftovers(paths: Paths) -> None:
+    for name in os.listdir(paths.root):
+        path = paths.root / name
+        if name.startswith(STAGE_PREFIX) and stat.S_ISDIR(os.lstat(path).st_mode):
+            shutil.rmtree(path)
+        elif name.startswith(CURRENT_TMP_PREFIX):
+            os.unlink(path)
+
+
+# --- systemd ------------------------------------------------------------------------------
+
+
+def systemctl(*args: str, capture: bool = False) -> subprocess.CompletedProcess[str]:
+    try:
+        return subprocess.run(
+            ["systemctl", *args],
+            check=not capture,
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.PIPE if capture else sys.stderr,
+            stderr=sys.stderr,
+            text=True,
+            timeout=SYSTEMCTL_TIMEOUT_SECONDS,
+        )
+    except FileNotFoundError:
+        raise Failure("systemctl is not installed") from None
+    except subprocess.CalledProcessError as error:
+        raise Failure(f"systemctl {' '.join(args)} exited {error.returncode}") from None
+    except subprocess.TimeoutExpired:
+        raise Failure(f"systemctl {' '.join(args)} timed out") from None
+
+
+def is_enabled(unit: str) -> bool:
+    return systemctl("is-enabled", unit, capture=True).stdout.strip() in ENABLED_STATES
+
+
+def stop_and_remove(paths: Paths, units: list[str]) -> bool:
+    """Stop and delete unit files the helper installed; return whether any file was removed."""
+    present = [unit for unit in units if os.path.lexists(paths.units / unit)]
+    if present:
+        # Timers first, so no stopped service is started again by its timer.
+        systemctl("stop", *sorted(present, key=lambda unit: not unit.endswith(".timer")))
+        for unit in present:
+            os.unlink(paths.units / unit)
+        fsync_dir(paths.units)
+    return bool(present)
+
+
+def install_units(paths: Paths, tag: str, units: tuple[str, ...]) -> None:
+    for unit in units:
+        data = (paths.releases / tag / UNITS / unit).read_bytes()
+        write_atomic(paths.units / unit, data, 0o644)
+
+
+def swap_current(paths: Paths, tag: str) -> None:
+    """Point `current` at the release with one rename, so it never dangles or vanishes."""
+    if os.path.lexists(paths.current) and not os.path.islink(paths.current):
+        raise Failure(f"{paths.current} is not a symlink")
+    target = os.path.join(os.path.relpath(paths.releases, paths.current.parent), tag)
+    tmp = paths.current.with_name(f"{CURRENT_TMP_PREFIX}{os.getpid()}")
+    if os.path.lexists(tmp):
+        os.unlink(tmp)
+    os.symlink(target, tmp)
+    os.replace(tmp, paths.current)
+    fsync_dir(paths.current.parent)
+
+
+# --- commands -----------------------------------------------------------------------------
+
+
+def pull(paths: Paths, tag: str, workdir: Path) -> Path:
+    download = workdir / "download"
+    os.mkdir(download, 0o700)
+    reference = f"{OCI_REPOSITORY}:{tag}"
+    try:
+        subprocess.run(
+            ["oras", "pull", "--no-tty", "-o", str(download), reference],
+            check=True,
+            stdin=subprocess.DEVNULL,
+            stdout=sys.stderr,
+            stderr=sys.stderr,
+            timeout=PULL_TIMEOUT_SECONDS,
+        )
+    except FileNotFoundError:
+        raise Failure("oras is not installed") from None
+    except subprocess.CalledProcessError as error:
+        raise Failure(f"oras pull {reference} exited {error.returncode}; no bundle?") from None
+    except subprocess.TimeoutExpired:
+        raise Failure(f"oras pull {reference} timed out") from None
+    name = BUNDLE_FILE.format(tag=tag)
+    if sorted(os.listdir(download)) != [name]:
+        raise Failure(f"{reference} must contain exactly {name}")
+    tarball = download / name
+    if not stat.S_ISREG(os.lstat(tarball).st_mode):
+        raise Failure(f"{name} is not a regular file")
+    return tarball
+
+
+def stage(paths: Paths, tag: str, digest: str, override: bool) -> None:
+    release = paths.releases / tag
+    current = current_tag(paths)
+    floors = read_floors(paths)
+    if os.path.lexists(release):
+        record = read_record(paths, tag)
+        if record is not None and hmac.compare_digest(record["tarball_sha256"], digest):
+            try:
+                meta = load_release(paths, tag)
+            except FloorRefused:
+                raise
+            except Failure as error:
+                if tag == current:
+                    raise
+                log(f"restaging {tag}: {error}")
+            else:
+                check_floors(meta, floors, override)
+                log(f"{tag} is already staged and verified")
+                prune(paths, {current, tag})
+                return
+        elif tag == current:
+            raise Failure(f"{tag} is current and was staged with a different SHA-256")
+    clean_leftovers(paths)
+    workdir = Path(tempfile.mkdtemp(prefix=STAGE_PREFIX, dir=paths.root))
+    try:
+        tarball = pull(paths, tag, workdir)
+        if not hmac.compare_digest(sha256_file(tarball), digest):
+            raise Failure("the bundle tarball does not match the requested SHA-256")
+        candidate = workdir / "release"
+        extract(tarball, candidate)
+        manifest, files = verify_manifest(candidate, paths.owner)
+        check_floors(read_metadata(candidate, tag, files), floors, override)
+        if os.path.lexists(release):
+            os.rename(release, workdir / "replaced")
+        os.rename(candidate, release)
+        fsync_dir(paths.releases)
+        write_json(
+            paths.state / f"{tag}.json",
+            {"tag": tag, "tarball_sha256": digest, "manifest_sha256": manifest},
+        )
+    finally:
+        shutil.rmtree(workdir, ignore_errors=True)
+    log(f"staged {tag}")
+    prune(paths, {current, tag})
+
+
+def activate(paths: Paths, tag: str, override: bool) -> None:
+    meta = load_release(paths, tag)
+    floors = read_floors(paths)
+    check_floors(meta, floors, override)
+    previous = current_tag(paths)
+    installed = read_installed_units(paths)
+    # Record the union first, so a deactivate after a partial failure still finds every unit.
+    write_json(paths.state / UNITS_FILE, sorted(set(installed) | set(meta.units)))
+    stop_and_remove(paths, [unit for unit in installed if unit not in meta.units])
+    install_units(paths, tag, meta.units)
+    write_json(paths.state / UNITS_FILE, list(meta.units))
+    systemctl("daemon-reload")
+    swap_current(paths, tag)
+    restart_failed = []
+    for unit in meta.continuous:
+        if is_enabled(unit):
+            try:
+                systemctl("try-restart", unit)
+            except Failure as error:
+                log(str(error))
+                restart_failed.append(unit)
+    if restart_failed:
+        raise Failure(f"try-restart failed for {restart_failed}")
+    for role, floor in meta.floors.items():
+        floors[role] = max(floors.get(role, 0), floor)
+    write_json(paths.state / FLOORS_FILE, floors)
+    log(f"activated {tag}")
+    prune(paths, {tag, previous})
+
+
+def deactivate(paths: Paths) -> None:
+    units = set(read_installed_units(paths))
+    current = current_tag(paths)
+    if current is not None and os.path.isdir(paths.releases / current / UNITS):
+        units |= {
+            name for name in os.listdir(paths.releases / current / UNITS) if UNIT_RE.fullmatch(name)
+        }
+    if not units and current is None:
+        log("no workers bundle is active")
+        return
+    removed = stop_and_remove(paths, sorted(units))
+    write_json(paths.state / UNITS_FILE, [])
+    if current is not None:
+        os.unlink(paths.current)
+        fsync_dir(paths.current.parent)
+    if removed:
+        systemctl("daemon-reload")
+    log("deactivated the workers bundle")
+
+
+def status(paths: Paths) -> None:
+    current = current_tag(paths)
+    print(f"current {current or 'none'}")
+    for tag in sorted(name for name in os.listdir(paths.releases) if TAG_RE.fullmatch(name)):
+        record = read_record(paths, tag)
+        digest = record["tarball_sha256"] if record else "unrecorded"
+        print(f"release {tag} sha256={digest}{' current' if tag == current else ''}")
+    for role, floor in sorted(read_floors(paths).items()):
+        print(f"floor {role} {floor}")
+    for unit in read_installed_units(paths):
+        print(f"unit {unit}")
+
+
+def locked(paths: Paths) -> int:
+    fd = os.open(paths.state / LOCK_FILE, os.O_RDWR | os.O_CREAT | os.O_NOFOLLOW, 0o600)
+    try:
+        fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except BlockingIOError:
+        os.close(fd)
+        raise Failure("another activation is running") from None
+    return fd
+
+
+def main(argv: list[str]) -> int:
+    os.umask(0o022)
+    try:
+        command, operands, override = parse_args(argv)
+        paths = resolve_paths()
+        check_layout(paths)
+        if command == "status":
+            status(paths)
+            return EXIT_OK
+        lock = locked(paths)
+        try:
+            if command == "stage":
+                stage(paths, operands[0], operands[1], override)
+            elif command == "activate":
+                activate(paths, operands[0], override)
+            else:
+                deactivate(paths)
+        finally:
+            os.close(lock)
+    except Failure as error:
+        log(str(error))
+        return error.code
+    except Exception as error:  # noqa: BLE001 - any other error is a failed run, never 0
+        log(f"failed: {type(error).__name__}: {error}")
+        return EXIT_FAILURE
+    return EXIT_OK
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv[1:]))
