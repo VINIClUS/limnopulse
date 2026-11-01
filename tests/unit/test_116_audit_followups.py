@@ -58,9 +58,7 @@ async def two_page_listing(repository: Any) -> None:
     reads rows 3 and 4 and ends the partition, but row 4 still shows, so page 1 is [2, 3] with a
     cursor and page 2 is [4] without one. Without the lookahead, row 4 is never listed."""
     await repository.put_quarantine_entries(fenced_entries(4))
-    ordered = (
-        await repository.list_quarantine_entries(TENANT, after_sk=None, limit=10)
-    ).entries
+    ordered = (await repository.list_quarantine_entries(TENANT, after_sk=None, limit=10)).entries
     assert len(ordered) == 5
     for index in (0, 1):
         await repository.transition_quarantine_entry(
@@ -206,6 +204,12 @@ def test_the_worker_logs_a_crash_or_composition_error_by_category_only(
 # Finding 3 (ingress): `_unavailable` logs the category only ------------------------------------
 
 
+def _assert_unchained(rejected: IngestRejected) -> None:
+    """`raise ... from None`: a traceback of the 503 cannot render the store error's text."""
+    assert rejected.__cause__ is None
+    assert rejected.__suppress_context__ is True
+
+
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
     ("operation", "step", "error"),
@@ -226,11 +230,12 @@ async def test_the_unavailable_warning_carries_the_category_never_the_text(
     await ingress.seed()
     ingress.subject.fail_next(operation, error)
 
-    with pytest.raises(IngestRejected):
+    with pytest.raises(IngestRejected) as rejected:
         await ingress.admit()
 
     assert f"ingest {step} failed: {type(error).__name__}" in caplog.text
     assert SENTINEL not in caplog.text
+    _assert_unchained(rejected.value)
 
 
 @pytest.mark.asyncio
@@ -260,11 +265,12 @@ async def test_an_authentication_store_error_is_logged_by_category_only(
     await ingress.seed()
     ingress.subject.fail_next("authenticate", _sentinel_store_error())
 
-    with pytest.raises(IngestRejected):
+    with pytest.raises(IngestRejected) as rejected:
         await ingress.service.authenticate(BEARER)
 
     assert "ingest authentication failed: ClientError" in caplog.text
     assert SENTINEL not in caplog.text
+    _assert_unchained(rejected.value)
 
 
 # Finding 4: the lookup-row fence and the metrics-handler dedupe ----------------------------------
@@ -332,9 +338,21 @@ def test_the_p2_rollback_recreates_instead_of_restarting() -> None:
     """`docker compose restart` keeps a container's old environment, so a switch rollback that
     only restarts leaves the switches on (the README P2 rollback already says recreate)."""
     text = _section("docs/p2-telemetry-rollout-runbook.md", "Rollback")
-    assert "restart (or redeploy)" not in text
+    caveat = "`docker compose restart` keeps the old environment"
+    assert caveat in text
+    # Every "restart" in the section is that caveat, so no paraphrase of the old advice remains.
+    assert len(re.findall(r"restart", text, re.IGNORECASE)) == text.count(caveat)
     assert re.search(r"recreate", text) and re.search(r"`docker compose up -d", text)
-    assert re.search(r"`docker compose restart` keeps the old environment", text)
+
+
+def test_the_p2_rollback_sends_an_ingest_on_rollback_through_the_p3_order() -> None:
+    """Now that the rollback really recreates, `TELEMETRY_V2_WRITE_ENABLED=false` with P3 ingest on
+    stops the API from starting (`INGEST_V2_ENABLED requires TELEMETRY_V2_WRITE_ENABLED=true`)."""
+    text = _section("docs/p2-telemetry-rollout-runbook.md", "Rollback")
+    assert re.search(
+        r"`INGEST_V2_ENABLED=true`.{0,200}\(p3-ingestion-rollout-runbook\.md#rollback\)", text
+    )
+    assert "refuses to start with `INGEST_V2_ENABLED=true`" in text
 
 
 def test_the_dlq_drill_says_a_dry_run_can_exit_3_with_an_error_category() -> None:
