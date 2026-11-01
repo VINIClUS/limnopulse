@@ -81,8 +81,8 @@ deferral. Gate numbers refer to the P2-09 acceptance gate.
 
 P2 is a rehearsal only. P3 delivers the producer (its telemetry ingest worker), and #104 settles
 the legacy devices as **HTTPS only (#104)**: production has no legacy MQTT device, every new device
-reports only through the P3 HTTPS ingest, and no MQTT → v2 producer is built. The owner flips the
-read switches in production only through the P3 runbook's
+reports only through the P3 HTTPS ingest, and no MQTT → v2 producer is built for legacy devices.
+The owner flips the read switches in production only through the P3 runbook's
 [D16 owner gate](p3-ingestion-rollout-runbook.md#d16-owner-gate).
 
 `ALERT_EVALUATOR_TELEMETRY_SOURCE=v2` and `V1_TELEMETRY_READ_SOURCE=v2` may be enabled only in an
@@ -106,7 +106,9 @@ Each step is a separate change with its own soak time. Never skip a step; roll b
    Only `observation_numeric` is written; legacy reads and alerts are unchanged.
 2. Run the keyed divergence checks for every pond until they pass (see the pass criterion) over the
    D16 window.
-   Telegraf still writes `water_quality`, so the checks compare the two producers.
+   Telegraf still writes `water_quality`, so the checks compare the two producers. Under HTTPS only
+   (#104) no device reports through Telegraf, so the checks have nothing to compare until legacy
+   dual write (step 3) is on; the P3 runbook's D16 owner gate runs them then.
 3. Set `TELEMETRY_LEGACY_DUAL_WRITE_ENABLED=true` only after the P3 durable redrive test passes
    (#15): a legacy write that fails after acceptance must be redelivered, never dropped. P3 proves
    it with G7 ([P3 ingestion rollout runbook](p3-ingestion-rollout-runbook.md), DLQ drill).
