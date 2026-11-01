@@ -12,8 +12,9 @@ cache client is never built, and it runs as the dedicated `telemetry_ingest` pri
   local/test it also exits 78 when its own AWS keys or InfluxDB write token are empty. Invalid
   settings and unknown arguments exit 78 too.
 - **Liveness (ADR-020).** The loop marks a stamp (`telemetry_ingest_liveness`) every turn. A
-  watchdog thread cancels a loop that stays silent for `stall_after_seconds(settings)` and exits 1,
-  and `healthcheck` answers from the stamp alone, before any setting is read.
+  watchdog thread cancels a loop that stays silent for `stall_after_seconds(settings)` and exits 1;
+  if the process still runs after the A47 stop budget it forces `os._exit(1)`. `healthcheck`
+  answers from the stamp alone, before any setting is read.
 - **Shutdown.** SIGTERM and SIGINT disarm the watchdog and set the loop's `stop`; the P3-08 loop
   drains in-flight messages for `TELEMETRY_INGEST_DRAIN_SECONDS`. The InfluxDB client is closed
   on every exit: a stop, a crash, a stall, or a composition failure after it was created.
