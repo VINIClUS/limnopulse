@@ -20,20 +20,29 @@ authorized against the table. Grants that other files attach behind a feature fl
 (`ingestion_queues.tf`, `telegram.tf`, `ses.tf`) are out of scope: the base grants must hold
 without them. Every source shape the scanners do not understand fails the tests instead of being
 guessed.
+
+A third principal, `telemetry_ingest`, runs the telemetry ingest worker (`workers/`). The user and
+its grants exist only behind `var.telemetry_ingress` (`ingestion_queues.tf`). Its writes are the
+ones reachable from the worker's compose entrypoint. The same scanner derives them over the modules
+the worker imports, and they must be granted on the right table by the attachments that come with
+the user.
 """
 
 import ast
+import copy
 import functools
 import os
 import re
-from collections.abc import Callable, Iterator
+from collections.abc import Callable, Iterable, Iterator, Mapping
 from dataclasses import dataclass, field
 from pathlib import Path
 
 import pytest
 
+from tests.unit.test_ingestion_compose import ENTRYPOINT
+
 # The minimal HCL reader of the P3-02 infra tests; `tests/api` imports unit-test helpers the same way.
-from tests.unit.test_opentofu_infra import _list_items, _parse_hcl_body, _unquote
+from tests.unit.test_opentofu_infra import _list_items, _matching_brace, _parse_hcl_body, _unquote
 
 ROOT = Path(__file__).resolve().parents[2]
 IAM_RUNTIME = ROOT / "infra" / "opentofu" / "iam_runtime.tf"
@@ -696,16 +705,25 @@ class _PythonSources:
                 return True
         return False
 
-    def writes(self) -> list[_Write]:
+    def writes(self, reached: set[_Function] | None = None) -> list[_Write]:
+        """Every derived write, or with `reached` only those built in one of these functions.
+
+        Writes outside `reached` are skipped before resolution: their call sites may lie outside
+        the sources.
+        """
         writes: list[_Write] = []
         for operation, value, function, where in self.items:
             assert function is not None, f"{where}: a transaction item outside a function"
+            if reached is not None and function not in reached:
+                continue
             tables = self.request_tables(value, _Scope(function))
             site = f"{function.module}::{function.qualname}"
             writes.append(
                 _Write(site, operation, ITEM_ACTIONS[operation], frozenset(tables), False)
             )
         for method, action, requests, table, function, where in self._write_sites():
+            if reached is not None and function not in reached:
+                continue
             scope = _Scope(function)
             if table is not None:
                 tables = self.table(table, scope)
@@ -1280,3 +1298,731 @@ const url = "http://example.test/types.Update{"
         ("ConditionCheck", False),
         ("DeleteItem", True),
     ]
+
+
+# --- telemetry_ingest: the writes the ingest worker reaches ------------------------------------
+
+TOFU_DIR = ROOT / "infra" / "opentofu"
+WORKERS_PACKAGE = API_PACKAGE / "workers"
+# The module the compose services run (`python -m limnopulse_api.workers.telemetry_ingest`).
+TELEMETRY_INGEST_ENTRY = ENTRYPOINT[-1]
+TELEMETRY_INGEST_USER = "aws_iam_user.telemetry_ingest"
+TELEMETRY_INGEST_FLOOR = {("dynamodb:PutItem", "domain"), ("dynamodb:UpdateItem", "domain")}
+TELEMETRY_INGEST_WRITE_SITES = {
+    (
+        "src/limnopulse_api/adapters/dynamodb_quarantine.py",
+        "DynamoQuarantineRepository.put_quarantine_entries",
+    ),
+    (
+        "src/limnopulse_api/adapters/dynamodb_ingest_state.py",
+        "DynamoIngestStateRepository._advance",
+    ),
+}
+# The worker's entry and the reads it makes through the repositories it builds. If the walk
+# stopped early, it would derive no write and pass.
+TELEMETRY_INGEST_REACHED = {
+    ("src/limnopulse_api/workers/telemetry_ingest.py", "main"),
+    ("src/limnopulse_api/workers/telemetry_ingest.py", "build_worker"),
+    (
+        "src/limnopulse_api/adapters/dynamodb_devices_v2.py",
+        "DynamoDeviceComponentRepository.get_component",
+    ),
+    (
+        "src/limnopulse_api/adapters/dynamodb_integrations.py",
+        "DynamoIntegrationRepository.resolve_external_identity",
+    ),
+    (
+        "src/limnopulse_api/adapters/dynamodb_deployments.py",
+        "DynamoDeploymentRepository.get_deployment_at",
+    ),
+    ("src/limnopulse_api/adapters/dynamodb_sites_assets.py", "DynamoSiteAssetRepository.get_asset"),
+}
+# Calls that name an attribute or a module at run time. A constant name counts as a mention.
+# Anything else must be reviewed here by hand, because the walk cannot follow it.
+_DYNAMIC_ATTRIBUTE_CALLS = {"getattr", "attrgetter", "methodcaller"}
+_DYNAMIC_CODE = {"__import__", "import_module", "exec", "eval"}
+DYNAMIC_ATTRIBUTE_SITES = {
+    # Reads the pydantic fields of the envelope it serializes: no function is reached.
+    "src/limnopulse_api/domain/ingestion.py::IngressEnvelope.to_json",
+}
+
+
+def _module_path(name: str) -> Path | None:
+    path = API_PACKAGE.parent.joinpath(*name.split("."))
+    if (path / "__init__.py").is_file():
+        return path / "__init__.py"
+    module = path.parent / f"{path.name}.py"
+    return module if module.is_file() else None
+
+
+def _imported_names(name: str, path: Path, tree: ast.Module) -> Iterator[str]:
+    """Dotted names that `tree` imports, anywhere in it. Not all of them are modules."""
+    package = name.split(".") if path.name == "__init__.py" else name.split(".")[:-1]
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Import):
+            yield from (alias.name for alias in node.names)
+        elif isinstance(node, ast.ImportFrom):
+            base = package[: len(package) - node.level + 1] if node.level else []
+            module = ".".join([*base, *([node.module] if node.module else [])])
+            yield module
+            yield from (f"{module}.{alias.name}" for alias in node.names)
+
+
+@functools.cache
+def _telemetry_ingest_modules() -> tuple[tuple[str, str], ...]:
+    """(path, text) of every package module the worker entry imports, transitively.
+
+    Imports inside functions count as well. A package module outside this set never runs in the
+    worker process, unless it is imported dynamically, which `_dynamic_sites` rejects.
+    """
+    found: dict[str, Path] = {}
+    pending = [TELEMETRY_INGEST_ENTRY]
+    while pending:
+        name = pending.pop()
+        if name in found or name.split(".")[0] != API_PACKAGE.name:
+            continue
+        path = _module_path(name)
+        if path is None:
+            continue  # a function, class or constant imported from a module
+        found[name] = path
+        parts = name.split(".")
+        pending.extend(".".join(parts[:index]) for index in range(1, len(parts)))
+        pending.extend(_imported_names(name, path, ast.parse(path.read_text(encoding="utf-8"))))
+    assert TELEMETRY_INGEST_ENTRY in found
+    return tuple(
+        sorted(
+            (path.relative_to(ROOT).as_posix(), path.read_text(encoding="utf-8"))
+            for path in found.values()
+        )
+    )
+
+
+def _node_mentions(node: ast.AST) -> set[str]:
+    if isinstance(node, ast.Name):
+        return {node.id}
+    if isinstance(node, ast.Attribute):
+        return {node.attr}
+    if isinstance(node, ast.Call) and _name_of(node.func) in _DYNAMIC_ATTRIBUTE_CALLS:
+        return {
+            part
+            for argument in node.args
+            if isinstance(argument, ast.Constant) and isinstance(argument.value, str)
+            for part in argument.value.split(".")
+        }
+    return set()
+
+
+def _mentions(node: ast.AST) -> set[str]:
+    return set().union(*(_node_mentions(child) for child in ast.walk(node)))
+
+
+def _import_time_mentions(tree: ast.Module) -> set[str]:
+    """Names mentioned by what runs on import: module and class bodies (the `__main__` guard among
+    them), decorators and default values, but no function body."""
+    names: set[str] = set()
+    pending: list[ast.AST] = [tree]
+    while pending:
+        node = pending.pop()
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+            pending.extend(node.decorator_list)
+            pending.extend(node.args.defaults)
+            pending.extend(default for default in node.args.kw_defaults if default is not None)
+            continue
+        names |= _node_mentions(node)
+        pending.extend(ast.iter_child_nodes(node))
+    return names
+
+
+def _reached(sources: _PythonSources, modules: Iterable[tuple[str, str]]) -> set[_Function]:
+    """Every function of `sources` that may run, followed by name. This over-approximates.
+
+    The roots are what runs on import, every decorated function (its decorator may register it)
+    and every dunder method (the interpreter calls those). A reached function reaches every
+    function, in any module, whose name it mentions as a name or an attribute, and every function
+    nested in it. `from m import f as g` makes `g` name `f` too, through any chain of re-exports. A name match that is not a real
+    call only adds writes, so the coverage test fails closed on it.
+    """
+    aliases: dict[str, set[str]] = {}
+    names: set[str] = set()
+    for _, text in modules:
+        tree = ast.parse(text)
+        names |= _import_time_mentions(tree)
+        for node in ast.walk(tree):
+            if isinstance(node, (ast.Import, ast.ImportFrom)):
+                for alias in node.names:
+                    if alias.asname:
+                        aliases.setdefault(alias.asname, set()).add(alias.name.rsplit(".")[-1])
+    functions = [function for candidates in sources.functions.values() for function in candidates]
+    nested: dict[_Function, list[_Function]] = {}
+    for function in functions:
+        if function.parent is not None:
+            nested.setdefault(function.parent, []).append(function)
+
+    def named(mentioned: set[str]) -> Iterator[_Function]:
+        # Re-exports chain aliases (`f as g`, then `g as h`): follow them to a fixed point.
+        targets = set(mentioned)
+        pending = list(mentioned)
+        while pending:
+            for target in aliases.get(pending.pop(), set()) - targets:
+                targets.add(target)
+                pending.append(target)
+        for target in targets:
+            yield from sources.functions.get(target, [])
+
+    pending = [
+        function
+        for function in functions
+        if function.node.decorator_list
+        or (function.node.name.startswith("__") and function.node.name.endswith("__"))
+    ]
+    pending.extend(named(names))
+    reached: set[_Function] = set()
+    while pending:
+        function = pending.pop()
+        if function in reached:
+            continue
+        reached.add(function)
+        pending.extend(named(_mentions(function.node)))
+        pending.extend(nested.get(function, []))
+    return reached
+
+
+def _dynamic_sites(modules: Iterable[tuple[str, str]]) -> set[str]:
+    """`module::qualname` of every attribute or module named at run time, which the walk cannot
+    follow.
+
+    A dynamic helper counts only when it is called by its own name. One that is imported under
+    another name (`from builtins import getattr as lookup`) or used as a value (`lookup =
+    getattr`, `partial(getattr, ...)`) is a site itself, because its calls are invisible here and
+    to the walk.
+    """
+    sites: set[str] = set()
+    helpers = {*_DYNAMIC_ATTRIBUTE_CALLS, *_DYNAMIC_CODE}
+
+    def constant_names(call: ast.Call) -> bool:
+        name = _name_of(call.func)
+        named = (
+            call.args[1:2]
+            if name == "getattr"
+            else call.args[:1]
+            if name == "methodcaller"
+            else call.args
+        )
+        return bool(named) and all(
+            isinstance(argument, ast.Constant) and isinstance(argument.value, str)
+            for argument in named
+        )
+
+    def dynamic(node: ast.AST, called: set[int]) -> bool:
+        if isinstance(node, (ast.Import, ast.ImportFrom)):
+            return any(
+                alias.asname not in {None, alias.name} and alias.name.rsplit(".")[-1] in helpers
+                for alias in node.names
+            )
+        if isinstance(node, (ast.Name, ast.Attribute)):
+            name = _name_of(node)
+            return name in _DYNAMIC_CODE or (
+                name in _DYNAMIC_ATTRIBUTE_CALLS and id(node) not in called
+            )
+        return (
+            isinstance(node, ast.Call)
+            and _name_of(node.func) in _DYNAMIC_ATTRIBUTE_CALLS
+            and not constant_names(node)
+        )
+
+    def visit(node: ast.AST, module: str, owner: str, called: set[int]) -> None:
+        for child in ast.iter_child_nodes(node):
+            if isinstance(child, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+                visit(child, module, f"{owner}.{child.name}" if owner else child.name, called)
+                continue
+            if dynamic(child, called):
+                sites.add(f"{module}::{owner or '<module>'}")
+            visit(child, module, owner, called)
+
+    for module, text in modules:
+        tree = ast.parse(text)
+        called = {id(node.func) for node in ast.walk(tree) if isinstance(node, ast.Call)}
+        visit(tree, module, "", called)
+    return sites
+
+
+def _worker_writes(modules: tuple[tuple[str, str], ...]) -> tuple[_Write, ...]:
+    sources = _PythonSources(list(modules))
+    return tuple(sources.writes(_reached(sources, modules)))
+
+
+@functools.cache
+def _telemetry_ingest_sources() -> _PythonSources:
+    return _PythonSources(list(_telemetry_ingest_modules()))
+
+
+@functools.cache
+def _telemetry_ingest_writes() -> tuple[_Write, ...]:
+    sources = _telemetry_ingest_sources()
+    return tuple(sources.writes(_reached(sources, _telemetry_ingest_modules())))
+
+
+# --- telemetry_ingest: the grants of its user --------------------------------------------------
+
+
+def _tofu_texts() -> dict[str, str]:
+    return {path.name: path.read_text(encoding="utf-8") for path in sorted(TOFU_DIR.glob("*.tf"))}
+
+
+def _references(block, needle: str) -> bool:
+    return any(needle in value for value in block.attrs.values()) or any(
+        _references(inner, needle) for inner in block.blocks
+    )
+
+
+def _telemetry_ingest_grants(texts: Mapping[str, str]) -> set[tuple[str, str]]:
+    """DynamoDB grants of the `telemetry_ingest` user that hold whenever the user exists.
+
+    These are its policy attachments, each gated exactly like the user (today on
+    `var.telemetry_ingress`), or unconditional if the user ever is. A grant behind another flag,
+    a reference this reader does not model, or a wildcard fails instead of counting.
+    """
+    blocks = [block for text in texts.values() for block in _parse_hcl_body(text)[1]]
+    users = [
+        block
+        for block in blocks
+        if block.kind == "resource" and block.labels == ("aws_iam_user", "telemetry_ingest")
+    ]
+    assert len(users) == 1, "exactly one telemetry_ingest user"
+    (user,) = users
+    assert "permissions_boundary" not in user.attrs, "a permissions boundary is not modelled"
+    gate = user.attrs.get("count")
+    index = "[0]" if gate is not None else ""
+    documents = {
+        block.labels[1]: block
+        for block in blocks
+        if block.kind == "data" and block.labels[0] == "aws_iam_policy_document"
+    }
+    policies = {
+        block.labels[1]: block
+        for block in blocks
+        if block.kind == "resource" and block.labels[0] == "aws_iam_policy"
+    }
+    grants: set[tuple[str, str]] = set()
+    for block in blocks:
+        if block is user or block.kind == "output" or not _references(block, TELEMETRY_INGEST_USER):
+            continue
+        assert block.kind == "resource" and block.labels[0] == "aws_iam_user_policy_attachment", (
+            f"unmodelled reference to the telemetry_ingest user: {block.kind} {block.labels}"
+        )
+        assert block.attrs["user"] == f"{TELEMETRY_INGEST_USER}{index}.name", block.labels
+        policy = re.fullmatch(
+            rf"aws_iam_policy\.(\w+){re.escape(index)}\.arn", block.attrs["policy_arn"]
+        )
+        assert policy is not None, block.labels
+        document = re.fullmatch(
+            rf"data\.aws_iam_policy_document\.(\w+){re.escape(index)}\.json",
+            policies[policy.group(1)].attrs["policy"],
+        )
+        assert document is not None, policy.group(1)
+        statements = documents[document.group(1)]
+        for gated in (block, policies[policy.group(1)], statements):
+            assert gated.attrs.get("count") == gate, (
+                f"{gated.labels[1]} is gated on {gated.attrs.get('count')}, not on {gate}"
+            )
+        for statement in statements.nested("statement"):
+            for action in _list_items(statement.attrs["actions"]):
+                assert "*" not in action, (
+                    f"wildcard action {_unquote(action)} in {statements.labels[1]}"
+                )
+        # `_statement_grants` reads an unconditional document; the gate was checked above.
+        plain = copy.copy(statements)
+        plain.attrs = {name: value for name, value in statements.attrs.items() if name != "count"}
+        grants |= _statement_grants(plain)
+    assert grants, "no DynamoDB grant reaches the telemetry_ingest user"
+    return grants
+
+
+def _telemetry_ingest_problems(texts: Mapping[str, str], writes: tuple[_Write, ...]) -> list[str]:
+    granted = _telemetry_ingest_grants(texts)
+    derived = _norm(_required(writes))
+    unused = sorted(
+        f"unused write grant: {action} on {table}"
+        for action, table in _table_grants(granted)
+        if action in WRITE_ACTIONS and (action, table) not in derived
+    )
+    return [*(f"uncovered: {line}" for line in _uncovered(writes, granted)), *unused]
+
+
+# --- Tests: telemetry_ingest -------------------------------------------------------------------
+
+
+def test_telemetry_ingest_policy_grants_every_write_the_worker_reaches() -> None:
+    assert _telemetry_ingest_problems(_tofu_texts(), _telemetry_ingest_writes()) == []
+
+
+def test_telemetry_ingest_derivation_reaches_the_known_reads_and_writes() -> None:
+    sources = _telemetry_ingest_sources()
+    reached = {(f.module, f.qualname) for f in _reached(sources, _telemetry_ingest_modules())}
+    writes = _telemetry_ingest_writes()
+
+    assert reached >= TELEMETRY_INGEST_REACHED
+    assert _required(writes) >= TELEMETRY_INGEST_FLOOR
+    assert {tuple(write.site.split("::")) for write in writes} >= TELEMETRY_INGEST_WRITE_SITES
+
+
+def test_telemetry_ingest_scan_covers_every_worker_module_and_fails_closed() -> None:
+    modules = dict(_telemetry_ingest_modules())
+    sources = _telemetry_ingest_sources()
+
+    # The api scan skips `workers/`, so every worker module must run under this principal.
+    workers = {path.relative_to(ROOT).as_posix() for path in WORKERS_PACKAGE.rglob("*.py")}
+    assert workers <= set(modules)
+    assert sources.stray_operations == []
+    assert sources.unclassified_access == []
+    assert sources.table_mutations == []
+    assert _dynamic_sites(modules.items()) == DYNAMIC_ATTRIBUTE_SITES
+    # The other modules are api modules, whose table settings the api test already checks.
+    for module, text in modules.items():
+        if module.startswith("src/limnopulse_api/workers/"):
+            assert set(re.findall(r"\bdynamodb_\w+_table\b", text)) <= {"dynamodb_domain_table"}
+            assert "LimnopulseAudit" not in text, module
+    assert not any(
+        where.startswith("src/limnopulse_api/workers/") for *_, where in sources.table_assignments
+    )
+
+
+_WORKER_DOCUMENT = 'data "aws_iam_policy_document" "telemetry_ingest_worker" {'
+_WORKER_ATTACHMENT = 'resource "aws_iam_user_policy_attachment" "telemetry_ingest_worker" {'
+_DOMAIN_RESOURCES = "resources = [aws_dynamodb_table.domain.arn]"
+_QUARANTINE_PUT = (
+    "src/limnopulse_api/adapters/dynamodb_quarantine.py::"
+    "DynamoQuarantineRepository.put_quarantine_entries put_item -> dynamodb:PutItem on domain"
+)
+_STATE_UPDATE = (
+    "src/limnopulse_api/adapters/dynamodb_ingest_state.py::"
+    "DynamoIngestStateRepository._advance update_item -> dynamodb:UpdateItem on domain"
+)
+
+
+def _edit_block(text: str, header: str, old: str, new: str) -> str:
+    """Replace `old` once inside the block that opens with `header`, and nowhere else."""
+    assert text.count(header) == 1, header
+    start = text.index(header)
+    end = _matching_brace(text, start + len(header) - 1)
+    block = text[start:end]
+    assert block.count(old) == 1, f"the mutant anchor {old!r} drifted in {header}"
+    return text[:start] + block.replace(old, new) + text[end:]
+
+
+@pytest.mark.parametrize(
+    ("header", "old", "new", "expected"),
+    [
+        pytest.param(
+            _WORKER_DOCUMENT,
+            '"dynamodb:PutItem",',
+            "",
+            f"uncovered: {_QUARANTINE_PUT}",
+            id="drop-put-item",
+        ),
+        pytest.param(
+            _WORKER_DOCUMENT,
+            '"dynamodb:UpdateItem",',
+            "",
+            f"uncovered: {_STATE_UPDATE}",
+            id="drop-update-item",
+        ),
+        pytest.param(
+            _WORKER_DOCUMENT,
+            _DOMAIN_RESOURCES,
+            "resources = [aws_dynamodb_table.audit.arn]",
+            f"uncovered: {_QUARANTINE_PUT}",
+            id="wrong-table",
+        ),
+        pytest.param(
+            _WORKER_DOCUMENT,
+            _DOMAIN_RESOURCES,
+            'resources = ["${aws_dynamodb_table.domain.arn}/index/*"]',
+            f"uncovered: {_STATE_UPDATE}",
+            id="index-instead-of-table",
+        ),
+        pytest.param(
+            _WORKER_DOCUMENT,
+            '"dynamodb:PutItem",',
+            '"dynamodb:*",',
+            "wildcard action dynamodb:* in telemetry_ingest_worker",
+            id="widen-action",
+        ),
+        pytest.param(
+            _WORKER_DOCUMENT,
+            _DOMAIN_RESOURCES,
+            'resources = ["*"]',
+            'unexpected resource "*"',
+            id="widen-resource",
+        ),
+        pytest.param(
+            _WORKER_DOCUMENT,
+            '"dynamodb:UpdateItem",',
+            '"dynamodb:UpdateItem", "dynamodb:DeleteItem",',
+            "unused write grant: dynamodb:deleteitem on domain",
+            id="unused-write-grant",
+        ),
+        pytest.param(
+            _WORKER_ATTACHMENT,
+            "count = var.telemetry_ingress ? 1 : 0",
+            "count = var.telemetry_ingress_worker_grants ? 1 : 0",
+            "telemetry_ingest_worker is gated on var.telemetry_ingress_worker_grants ? 1 : 0",
+            id="other-gate",
+        ),
+        pytest.param(
+            _WORKER_ATTACHMENT,
+            "aws_iam_user.telemetry_ingest[0].name",
+            "aws_iam_user.api.name",
+            "no DynamoDB grant reaches the telemetry_ingest user",
+            id="detached",
+        ),
+    ],
+)
+def test_telemetry_ingest_policy_mutants_fail(
+    header: str, old: str, new: str, expected: str
+) -> None:
+    texts = _tofu_texts()
+    texts["ingestion_queues.tf"] = _edit_block(texts["ingestion_queues.tf"], header, old, new)
+
+    try:
+        problems = _telemetry_ingest_problems(texts, _telemetry_ingest_writes())
+    except AssertionError as error:
+        problems = [str(error)]
+
+    assert any(expected in problem for problem in problems), problems
+
+
+_WORKER_MODULE = "src/limnopulse_api/workers/telemetry_ingest.py"
+_WORKER_ANCHOR = "    metrics = StructuredLogTelemetryMetrics()\n"
+
+
+@pytest.mark.parametrize(
+    ("reference", "expected"),
+    [
+        pytest.param(
+            "devices.create_component",
+            "src/limnopulse_api/adapters/dynamodb_devices_v2.py::"
+            "DynamoDeviceComponentRepository.create_component ConditionCheck"
+            " -> dynamodb:ConditionCheckItem on domain",
+            id="devices",
+        ),
+        pytest.param(
+            "integrations.transition_integration_account",
+            "src/limnopulse_api/adapters/dynamodb_integrations.py::"
+            "DynamoIntegrationRepository.transition_integration_account Put"
+            " -> dynamodb:PutItem on audit",
+            id="integrations",
+        ),
+        pytest.param(
+            "DynamoDeploymentRepository(table, dynamodb).end_deployment",
+            "src/limnopulse_api/adapters/dynamodb_deployments.py::"
+            "DynamoDeploymentRepository.end_deployment Delete -> dynamodb:DeleteItem on domain",
+            id="deployments",
+        ),
+        pytest.param(
+            "DynamoSiteAssetRepository(table, dynamodb).create_asset",
+            "src/limnopulse_api/adapters/dynamodb_sites_assets.py::"
+            "DynamoSiteAssetRepository.create_asset ConditionCheck"
+            " -> dynamodb:ConditionCheckItem on domain",
+            id="site-assets",
+        ),
+    ],
+)
+def test_a_transactional_write_the_worker_starts_to_reach_fails(
+    reference: str, expected: str
+) -> None:
+    """The worker uses these repositories for reads only. Reaching one of their transactions
+    needs an item action that `telemetry_ingest` lacks, and would fail with AccessDenied."""
+    modules = dict(_telemetry_ingest_modules())
+    assert modules[_WORKER_MODULE].count(_WORKER_ANCHOR) == 1
+    modules[_WORKER_MODULE] = modules[_WORKER_MODULE].replace(
+        _WORKER_ANCHOR, f"    write = {reference}\n{_WORKER_ANCHOR}"
+    )
+
+    problems = _telemetry_ingest_problems(_tofu_texts(), _worker_writes(tuple(modules.items())))
+
+    assert f"uncovered: {expected}" in problems
+
+
+_WORKER_IMPORT_ANCHOR = "import asyncio\n"
+
+
+def test_a_write_reached_through_a_chained_re_export_fails() -> None:
+    """`hidden_write` is renamed twice on its way to the worker; the walk must still reach it."""
+    modules = dict(_telemetry_ingest_modules())
+    text = modules[_WORKER_MODULE]
+    assert text.count(_WORKER_ANCHOR) == 1
+    assert text.count(_WORKER_IMPORT_ANCHOR) == 1
+    modules["src/limnopulse_api/workers/_hidden.py"] = (
+        "def hidden_write(devices):\n    return devices.create_component\n"
+    )
+    modules["src/limnopulse_api/workers/_reexport.py"] = (
+        "from limnopulse_api.workers._hidden import hidden_write as exported_write\n"
+    )
+    text = text.replace(
+        _WORKER_IMPORT_ANCHOR,
+        f"{_WORKER_IMPORT_ANCHOR}"
+        "from limnopulse_api.workers._reexport import exported_write as worker_write\n",
+    )
+    modules[_WORKER_MODULE] = text.replace(
+        _WORKER_ANCHOR, f"    write = worker_write(devices)\n{_WORKER_ANCHOR}"
+    )
+
+    problems = _telemetry_ingest_problems(_tofu_texts(), _worker_writes(tuple(modules.items())))
+
+    assert (
+        "uncovered: src/limnopulse_api/adapters/dynamodb_devices_v2.py::"
+        "DynamoDeviceComponentRepository.create_component ConditionCheck"
+        " -> dynamodb:ConditionCheckItem on domain"
+    ) in problems
+
+
+@pytest.mark.parametrize(
+    ("imports", "lines", "site"),
+    [
+        pytest.param(
+            "from builtins import getattr as lookup\n",
+            '    write = lookup(devices, "create_component")\n',
+            f"{_WORKER_MODULE}::<module>",
+            id="aliased-import",
+        ),
+        pytest.param(
+            "",
+            '    lookup = getattr\n    write = lookup(devices, "create_component")\n',
+            f"{_WORKER_MODULE}::build_worker",
+            id="helper-as-value",
+        ),
+    ],
+)
+def test_a_dynamic_lookup_the_worker_hides_behind_another_name_fails(
+    imports: str, lines: str, site: str
+) -> None:
+    """A renamed `getattr` reaches `create_component` invisibly to the walk, so it must be
+    reported as a dynamic site that nobody has reviewed."""
+    modules = dict(_telemetry_ingest_modules())
+    text = modules[_WORKER_MODULE]
+    assert text.count(_WORKER_ANCHOR) == 1
+    assert text.count(_WORKER_IMPORT_ANCHOR) == 1
+    text = text.replace(_WORKER_IMPORT_ANCHOR, f"{_WORKER_IMPORT_ANCHOR}{imports}")
+    modules[_WORKER_MODULE] = text.replace(_WORKER_ANCHOR, f"{lines}{_WORKER_ANCHOR}")
+
+    sites = _dynamic_sites(modules.items())
+
+    assert sites - DYNAMIC_ATTRIBUTE_SITES == {site}
+
+
+def test_reachability_follows_names_aliases_and_implicit_calls() -> None:
+    modules = (
+        (
+            "pkg/worker.py",
+            """
+from pkg.repo import make as build
+from pkg.repo import ping as pong
+
+def main():
+    store = build()
+    pong()
+    return store.read()
+
+@register
+def hook():
+    return getattr(Repo, "check")
+
+if __name__ == "__main__":
+    main()
+""",
+        ),
+        (
+            "pkg/repo.py",
+            """
+class Repo:
+    def __init__(self):
+        self.table_name = table_name
+    def __enter__(self):
+        return self
+    def read(self):
+        def inner():
+            return self.helper()
+        return inner()
+    def helper(self):
+        return None
+    def check(self, key):
+        return {"ConditionCheck": {"TableName": self.table_name, "Key": key}}
+    def write(self, key):
+        return {"Delete": {"TableName": self.table_name, "Key": key}}
+
+def make():
+    return Repo()
+
+from pkg.worker import pong as ping
+""",
+        ),
+    )
+    sources = _PythonSources(list(modules))
+    reached = {function.qualname for function in _reached(sources, modules)}
+
+    assert reached == {
+        "main",
+        "hook",
+        "make",
+        "Repo.__init__",
+        "Repo.__enter__",
+        "Repo.read",
+        "Repo.read.inner",
+        "Repo.helper",
+        "Repo.check",
+    }
+    assert [(write.operation, write.site) for write in _worker_writes(modules)] == [
+        ("ConditionCheck", "pkg/repo.py::Repo.check")
+    ]
+
+
+def test_dynamic_names_are_reported_by_site() -> None:
+    modules = (
+        (
+            "pkg/worker.py",
+            """
+import importlib
+from operator import attrgetter, methodcaller
+
+class Loader:
+    def load(self, name):
+        return importlib.import_module(name)
+    def read(self, record, field):
+        return getattr(record, field)
+    def fixed(self, record):
+        return getattr(record, "id"), attrgetter("a.b")(record), methodcaller("close")(record)
+    def chosen(self, record, method):
+        return methodcaller(method)(record)
+
+handler = __import__("pkg.handlers")
+""",
+        ),
+        (
+            "pkg/renamed.py",
+            """
+import functools
+from builtins import getattr as lookup
+from operator import attrgetter, methodcaller as caller
+
+class Renamed:
+    def escaped(self, record):
+        fetch = getattr
+        return fetch(record, "id")
+    def bound(self, record):
+        return functools.partial(getattr, record)("id")
+    def qualified(self, record):
+        return attrgetter("id")(record)
+""",
+        ),
+    )
+
+    assert _dynamic_sites(modules) == {
+        "pkg/worker.py::Loader.load",
+        "pkg/worker.py::Loader.read",
+        "pkg/worker.py::Loader.chosen",
+        "pkg/worker.py::<module>",
+        "pkg/renamed.py::<module>",
+        "pkg/renamed.py::Renamed.escaped",
+        "pkg/renamed.py::Renamed.bound",
+    }
