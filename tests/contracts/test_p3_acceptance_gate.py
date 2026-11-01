@@ -9,6 +9,9 @@
   plan-sync list), the `**Phase split (P3).**` paragraphs of ADR-006, ADR-007 and ADR-016, the
   README link line and the P2 runbook cross-links. Commands and test ids cited by the runbook
   are resolved against the code, so the runbook cannot drift from it.
+- **D16 (#104, A48):** the owner chose decision (a), HTTPS only. The runbook's D16 owner gate,
+  the P2 runbook's `D16 precondition` and the plan's A48 amendment record it, and none of them
+  may still wait for a legacy MQTT producer.
 """
 
 import ast
@@ -72,6 +75,7 @@ ROOT = Path(__file__).resolve().parents[2]
 RUNBOOK = ROOT / "docs/p3-ingestion-rollout-runbook.md"
 RUNBOOK_LINK = "docs/p3-ingestion-rollout-runbook.md"
 P2_RUNBOOK = ROOT / "docs/p2-telemetry-rollout-runbook.md"
+PLAN = ROOT / "docs/superpowers/plans/2026-10-30-limnopulse-v4-p3-ingress-integration.md"
 README = ROOT / "README.md"
 GOLDEN = ROOT / "tests/contracts/openapi/v1.json"
 INGESTION_GATE = ROOT / "tests/ingestion/test_p3_acceptance_ingestion.py"
@@ -674,7 +678,10 @@ ENABLEMENT_STEPS = (
     ("pilot onboarding", (r"account.*credential.*DeviceIntegration.*activ", r"pilot")),
     ("divergence checks", (r"divergence",)),
     ("legacy dual write", (r"`TELEMETRY_LEGACY_DUAL_WRITE_ENABLED`", r"G7")),
-    ("remaining P2 steps", (r"p2-telemetry-rollout-runbook\.md",)),
+    (
+        "remaining P2 steps",
+        (r"p2-telemetry-rollout-runbook\.md", r"\[D16 owner gate\]\(#d16-owner-gate\)"),
+    ),
 )
 
 
@@ -877,7 +884,8 @@ def test_runbook_owner_actions() -> None:
     text = section("Owner actions")
     for pattern in (
         r"D16",
-        r"#104",
+        r"HTTPS only \(#104\)",
+        r"### D16 owner gate",
         r"Backlog",
         r"owner",
         r"production switch",
@@ -888,6 +896,144 @@ def test_runbook_owner_actions() -> None:
         assert re.search(pattern, text, re.IGNORECASE), pattern
     for check in required_checks():
         assert f"`{check}`" in text, check
+
+
+# --- D16 read switches: #104 decision (a), HTTPS only (A48) --------------------------------------
+
+D16_DECISION = re.compile(r"HTTPS only \(#104\)")
+D16_OWNER_GATE_LINK = "(#d16-owner-gate)"
+EVALUATOR_FLIP = "`ALERT_EVALUATOR_TELEMETRY_SOURCE=v2`"
+V1_READ_FLIP = "`V1_TELEMETRY_READ_SOURCE=v2`"
+# The wording of the open producer-path decision that #104 settled: nothing waits for a producer.
+D16_SUPERSEDED = (
+    "DEFERRED → #104",
+    "D16 stays open",
+    "D16 open gate",
+    "still need a producer",
+    "until #104 closes D16",
+    "producer-path decision",
+    "decomposed only after",
+)
+D16_OWNER_GATE = (
+    ("no legacy MQTT device", (r"[Cc]onfirm", r"still has no legacy MQTT device", r"stay off")),
+    (
+        "keyed divergence",
+        (
+            r"keyed divergence checks",
+            r"p2-telemetry-rollout-runbook\.md#keyed-divergence-checks",
+            r"D16 window",
+            r"pass criterion",
+        ),
+    ),
+    ("evaluator flip", (re.escape(EVALUATOR_FLIP), r"one environment first", r"D15")),
+    ("/v1 read flip", (re.escape(V1_READ_FLIP), r"retention", r"legacy read window")),
+)
+
+
+def test_runbook_preconditions_name_the_d16_decision() -> None:
+    text = section("Preconditions")
+    assert D16_DECISION.search(text)
+    assert EVALUATOR_FLIP in text and V1_READ_FLIP in text
+    assert D16_OWNER_GATE_LINK in text
+
+
+def test_runbook_owner_actions_record_the_d16_https_only_decision() -> None:
+    text = section("Owner actions")
+    assert D16_DECISION.search(text)
+    for pattern in (
+        r"[Pp]roduction has no legacy MQTT device",
+        r"0 domain items as of 2026-10-31",
+        r"issues/15#issuecomment-6548338824",
+        r"P3 HTTPS ingest",
+        r"`POST /ingest/v2/observations`",
+        r"ingest credential",
+        r"[Nn]o MQTT → v2 producer is built",
+        r"#104 stays open until",
+    ):
+        assert re.search(pattern, text), pattern
+
+
+def test_runbook_d16_owner_gate_is_the_ordered_owner_checklist() -> None:
+    owner_actions = markdown_section(runbook(), "Owner actions")
+    raw = markdown_section(owner_actions, "D16 owner gate", level=3)
+    assert re.search(r"owner", raw) and re.search(r"in this order", raw)
+    items = numbered_items(raw)
+    assert len(items) == len(D16_OWNER_GATE)
+    for item, (step, patterns) in zip(items, D16_OWNER_GATE, strict=True):
+        for pattern in patterns:
+            assert re.search(pattern, item), (step, pattern)
+    # Each read switch has its own step: the evaluator first, the `/v1` reads last.
+    for index, item in enumerate(items):
+        assert (EVALUATOR_FLIP in item) == (index == 2), index
+        assert (V1_READ_FLIP in item) == (index == 3), index
+
+
+def test_runbook_adr_gate_map_d16_row_records_the_decision() -> None:
+    raw = markdown_section(runbook(), "ADR gate map")
+    (row,) = [line for line in raw.splitlines() if line.startswith("| ADR-007 / D16")]
+    assert D16_DECISION.search(row)
+    assert D16_OWNER_GATE_LINK in row
+    assert "DEFERRED" not in row
+    assert "::test_gate15_https_path_matches_the_independent_legacy_writer`" in row
+
+
+def test_runbook_no_longer_waits_for_a_legacy_mqtt_producer() -> None:
+    text = " ".join(runbook().split())
+    for phrase in D16_SUPERSEDED:
+        assert phrase not in text, phrase
+
+
+def test_p2_runbook_d16_precondition_records_the_https_only_decision() -> None:
+    raw = markdown_section(P2_RUNBOOK.read_text(encoding="utf-8"), "D16 precondition")
+    text = " ".join(raw.split())
+    assert D16_DECISION.search(text)
+    for pattern in (
+        r"[Pp]roduction has no legacy MQTT device",
+        r"P3 HTTPS ingest",
+        r"[Nn]o MQTT → v2 producer is built",
+        r"legacy MQTT devices? keeps? both read switches off",
+        r"\]\(p3-ingestion-rollout-runbook\.md#d16-owner-gate\)",
+    ):
+        assert re.search(pattern, text), pattern
+    assert "after P3 delivers a producer" not in text
+
+
+def _plan_rows(heading: str, first_cell: str) -> list[str]:
+    raw = markdown_section(PLAN.read_text(encoding="utf-8"), heading)
+    return [line for line in raw.splitlines() if line.startswith(f"| {first_cell}")]
+
+
+def test_plan_a48_amendment_records_the_d16_https_only_decision() -> None:
+    rows = _plan_rows("Audit amendments (r2)", "A")
+    ids = [int(re.match(r"\| A(\d+) \|", row).group(1)) for row in rows]
+    assert ids == list(range(1, 49)), "A48 must be the next and last amendment"
+    row = rows[-1]
+    assert row.startswith("| A48 | owner decision on #104 |")
+    assert D16_DECISION.search(row)
+    for pattern in (
+        r"[Pp]roduction has no legacy MQTT device",
+        r"0 domain items as of 2026-10-31",
+        r"P3 HTTPS ingest",
+        r"[Nn]o MQTT → v2 producer is built",
+        r"#104 stays open until",
+        r"[Aa]pplied inline",
+    ):
+        assert re.search(pattern, row), pattern
+    gate = row[row.index("D16 owner gate") :]
+    steps = ("no legacy MQTT device", "keyed divergence", EVALUATOR_FLIP, V1_READ_FLIP)
+    positions = [gate.find(step) for step in steps]
+    assert -1 not in positions and positions == sorted(positions), positions
+
+
+def test_plan_applies_a48_inline() -> None:
+    (decision,) = _plan_rows("Entry Decisions (frozen by this plan)", "D16 |")
+    (gate_map,) = _plan_rows("Final Acceptance Matrix", "ADR-007 / D16")
+    for row in (decision, gate_map):
+        assert D16_DECISION.search(row) and "A48" in row, row[:40]
+    assert "stays open after P3" not in decision
+    text = " ".join(PLAN.read_text(encoding="utf-8").split())
+    for phrase in D16_SUPERSEDED:
+        assert phrase not in text, phrase
 
 
 TEST_ID = re.compile(r"`(tests/[\w/]+\.py)::(test_\w+)")
@@ -928,8 +1074,11 @@ def test_runbook_acceptance_matrix_maps_every_gate() -> None:
         for path, name in cited:
             _assert_test_id(path, name)
     text = " ".join(raw.split())
-    for owner in (r"DEFERRED → #20", r"DEFERRED → #17", r"DEFERRED → #104"):
+    for owner in (r"DEFERRED → #20", r"DEFERRED → #17"):
         assert re.search(owner, text), owner
+    # G15 keeps the legacy-device decision next to its proof: #104 chose HTTPS only (A48).
+    assert D16_DECISION.search(rows[15]) and D16_OWNER_GATE_LINK in rows[15]
+    assert "DEFERRED → #104" not in text
 
 
 def test_every_test_id_in_the_runbook_exists() -> None:
