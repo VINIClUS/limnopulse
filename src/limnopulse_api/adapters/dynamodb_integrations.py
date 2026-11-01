@@ -322,6 +322,8 @@ class DynamoIntegrationRepository(DynamoV2RepositoryBase):
         current = integration_account_from_item(item)
         if current.version != expected_version:
             raise ConflictError("integration account version conflict")
+        if current.status == target:
+            return current  # a no-op: no version bump and no audit item for a non-change
         ensure_integration_account_transition(current.status, target)
         updated = IntegrationAccount.model_validate(
             {
@@ -363,6 +365,7 @@ class DynamoIntegrationRepository(DynamoV2RepositoryBase):
         expected_version: int,
         updated_at: datetime,
         audit: AuditContext,
+        device_id: str | None = None,
     ) -> DeviceIntegration:
         audit_table = self._require_audit_table()
         key = self.keys.device_integration(tenant_id, device_integration_id)
@@ -374,8 +377,14 @@ class DynamoIntegrationRepository(DynamoV2RepositoryBase):
         ):
             raise NotFoundError("device integration not found")
         current = device_integration_from_item(item)
+        # Ownership on this consistent pre-read, before the version: another Device's
+        # DeviceIntegration is 404 even with a stale version, never a 409 that confirms it.
+        if device_id is not None and current.device_id != device_id:
+            raise NotFoundError("device integration not found")
         if current.version != expected_version:
             raise ConflictError("device integration version conflict")
+        if current.status == target:
+            return current  # a no-op: neither row is bumped and no audit item is written
         ensure_device_integration_transition(current.status, target)
         updated = DeviceIntegration.model_validate(
             {

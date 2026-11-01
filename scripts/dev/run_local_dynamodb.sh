@@ -5,6 +5,10 @@
 # server in the background (or reuses the one it started before) and waits until it answers.
 # Safe to re-run. The download URL always serves the latest release, so a checksum mismatch
 # means a newer release was published: the script then stops and asks for a deliberate re-pin.
+#
+# DynamoDB Local has no bind-address flag: it listens on 0.0.0.0 (every interface), not only on
+# 127.0.0.1 like the ElasticMQ and influxd runners. It holds throwaway test data, but run it only
+# on a trusted network or behind a host firewall.
 set -euo pipefail
 
 TARBALL_PATH="v2.x/dynamodb_local_latest.tar.gz"

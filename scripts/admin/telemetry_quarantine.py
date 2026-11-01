@@ -372,6 +372,9 @@ async def _dismiss(args: argparse.Namespace, context: _Context) -> int:
             )
         except (ConflictError, NotFoundError):
             results.record(entry.entry_key, "failed", reason="conflict")
+        except (BotoCoreError, ClientError):
+            # Like replay: the row stays open, the run goes on, and a rerun dismisses it.
+            results.record(entry.entry_key, "failed", reason="store_unavailable")
         else:
             results.record(entry.entry_key, "dismissed")
     return results.finish()

@@ -122,7 +122,12 @@ class IntegrationLifecycleRepository(Protocol):
         expected_version: int,
         updated_at: datetime,
         audit: AuditContext,
-    ) -> DeviceIntegration: ...
+        device_id: str | None = None,
+    ) -> DeviceIntegration:
+        """A same-status target is a no-op (no write, no audit) behind the version fence. With
+        `device_id`, a DeviceIntegration of another Device is 404, decided on the consistent
+        pre-read before the version check."""
+        ...
 
 
 @runtime_checkable

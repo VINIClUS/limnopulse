@@ -61,7 +61,12 @@ _ADMITTED = "ingest_observations_admitted_total"
 _COMPONENT_DENIALS = frozenset(
     {IngressAdmissionDenied.COMPONENT_REQUIRED, IngressAdmissionDenied.COMPONENT_INVALID}
 )
-_CLAIM_ATTEMPTS = 2  # a lost race re-reads once (the claim returns the winner); then 503
+# A lost claim returns the winner, which the replay table then decides. The adapter's claim
+# condition and `decide_receipt_replay` use the same cutoff at the same `now`, so a winner it
+# returns is live and the table never says ADMIT again: the second attempt (and the "lost twice"
+# 503) is reachable only if the two ever disagree on liveness. It stays as a bounded guard; if
+# they are made provably equal by construction, the loop can become a single claim.
+_CLAIM_ATTEMPTS = 2
 
 
 class IngestRejected(Exception):

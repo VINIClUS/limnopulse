@@ -8,6 +8,9 @@ adapters need: `SK > :sk_lower` key conditions, `REMOVE` update clauses, and
 UpdateItem, and `fail_next(operation, exc, pk_prefix=...)` so adapter kit subjects can fault a
 store read below their port boundary. Operations that are not listed (Scan, BatchWriteItem,
 BatchGetItem, ...) still raise, and so do unsupported request parameters such as `IndexName`.
+Like DynamoDB, an expression that names a reserved word (`state`, `status`, ...) without a `#`
+alias is a `ValidationException` (#116), so an unaliased name fails here, not only on DynamoDB
+Local.
 """
 
 import re
@@ -19,6 +22,7 @@ from botocore.exceptions import ClientError
 
 from tests.contracts import m1_fakes
 from tests.contracts.m1_fakes import ConditionalDynamoClient, _split_top_level
+from tests.support.dynamodb_reserved_words import DYNAMODB_RESERVED_WORDS
 
 _ALL_OLD = "ALL_OLD"
 _RETURN_VALUES = frozenset({"NONE", "ALL_NEW", "ALL_OLD"})
@@ -31,6 +35,26 @@ _EXPRESSIONS = (
     "KeyConditionExpression",
     "FilterExpression",
 )
+
+
+# A bare attribute name: not a `#name`/`:value` placeholder, not inside one, and not a function.
+_BARE_NAME = re.compile(r"(?<![#:\w])([A-Za-z_]\w*)\b(?!\s*\()")
+# Reserved words the expression grammar itself uses; as syntax they need no alias.
+_SYNTAX = frozenset({"AND", "OR", "NOT", "IN", "BETWEEN", "SET", "REMOVE", "ADD", "DELETE"})
+
+
+def _reject_reserved_words(request: dict[str, Any], operation: str) -> None:
+    """DynamoDB rejects a reserved word used as a bare attribute name; so does the fake."""
+    for name in _EXPRESSIONS:
+        for word in _BARE_NAME.findall(request.get(name, "")):
+            if word.upper() in DYNAMODB_RESERVED_WORDS and word.upper() not in _SYNTAX:
+                message = (
+                    f"Invalid {name}: Attribute name is a reserved keyword; "
+                    f"reserved keyword: {word}"
+                )
+                raise ClientError(
+                    {"Error": {"Code": "ValidationException", "Message": message}}, operation
+                )
 
 
 def _assert_placeholders_used(request: dict[str, Any]) -> None:
@@ -81,6 +105,7 @@ class IngestionDynamoClient(ConditionalDynamoClient):
         return super().get_item(**kwargs)
 
     def query(self, **kwargs: Any) -> dict[str, Any]:
+        _reject_reserved_words(kwargs, "Query")
         unsupported = _UNSUPPORTED & set(kwargs)
         assert not unsupported, f"unsupported Query parameters: {sorted(unsupported)}"
         _assert_placeholders_used(kwargs)
@@ -101,11 +126,13 @@ class IngestionDynamoClient(ConditionalDynamoClient):
         return response
 
     def put_item(self, **kwargs: Any) -> dict[str, Any]:
+        _reject_reserved_words(kwargs, "PutItem")
         _assert_placeholders_used(kwargs)
         self._check_fault("put_item", self._pk(kwargs.get("Item")))
         return super().put_item(**kwargs)
 
     def update_item(self, **kwargs: Any) -> dict[str, Any]:
+        _reject_reserved_words(kwargs, "UpdateItem")
         _assert_placeholders_used(kwargs)
         self._check_fault("update_item", self._pk(kwargs.get("Key")))
         return_values = kwargs.get("ReturnValues", "NONE")
@@ -119,6 +146,7 @@ class IngestionDynamoClient(ConditionalDynamoClient):
         return {}
 
     def delete_item(self, **kwargs: Any) -> dict[str, Any]:
+        _reject_reserved_words(kwargs, "DeleteItem")
         _assert_placeholders_used(kwargs)
         self._check_fault("delete_item", self._pk(kwargs.get("Key")))
         return super().delete_item(**kwargs)
@@ -134,6 +162,7 @@ class IngestionDynamoClient(ConditionalDynamoClient):
         assert 1 <= len(actions) <= 100
         for action in actions:
             for body in action.values():
+                _reject_reserved_words(body, "TransactWriteItems")
                 _assert_placeholders_used(body)
         # A partition-scoped fault fires when ANY item of the transaction is in that partition.
         self._check_fault(

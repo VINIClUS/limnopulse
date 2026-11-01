@@ -307,13 +307,17 @@ PLAN_METRICS: dict[str, dict[str, frozenset[str]]] = {
 
 
 def test_gate12_metrics_use_the_closed_name_and_label_sets(
-    caplog: pytest.LogCaptureFixture,
+    caplog: pytest.LogCaptureFixture, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     assert {name: dict(labels) for name, labels in INGEST_METRICS.items()} == {
         name: {label: frozenset(str(v) for v in values) for label, values in labels.items()}
         for name, labels in PLAN_METRICS.items()
     }
     caplog.set_level(logging.INFO, logger=METRICS_LOGGER)
+    # #116: the API sets `propagate=False` on the metrics logger; capture on it directly.
+    metrics_logger = logging.getLogger(METRICS_LOGGER)
+    monkeypatch.setattr(metrics_logger, "propagate", False)
+    monkeypatch.setattr(metrics_logger, "handlers", [caplog.handler])
     metrics = StructuredLogTelemetryMetrics()
     metrics.increment("ingress_fenced_total", reason="account_revoked")
     for name, labels in (
@@ -935,11 +939,27 @@ def test_every_test_id_in_the_runbook_exists() -> None:
         _assert_test_id(path, name)
 
 
+AWS_ACCESS_KEY_ID = re.compile(r"(?<![A-Z0-9])(?:AKIA|ASIA)[0-9A-Z]{16}(?![A-Z0-9])")
+# 40 characters of the secret-key alphabet, mixed case, bounded on both sides (a hex digest is not).
+AWS_SECRET_ACCESS_KEY = re.compile(
+    r"(?<![A-Za-z0-9/+=])(?=[A-Za-z0-9/+]*[a-z])(?=[A-Za-z0-9/+]*[A-Z])"
+    r"[A-Za-z0-9/+]{40}(?![A-Za-z0-9/+=])"
+)
+
+
 def test_runbook_never_carries_a_secret() -> None:
     text = runbook()
     assert not re.search(r"lpi_ic_[0-9a-f]{32}_[A-Za-z0-9_-]{43}", text)
     assert not re.search(r"Bearer [A-Za-z0-9_-]{20,}", text)
     assert "local-dev-token" not in text
+    # #116: AWS access key ids and 40-character secret access keys, with positive controls built
+    # at runtime so neither pattern can silently stop matching.
+    assert AWS_ACCESS_KEY_ID.search("id " + "AKIA" + "Q7" * 8 + " end")
+    secret_control = "wJalrXUtnFEMI/K7MDENG/bPxRfiCY" + "Ab3/xY9+Zq"
+    assert AWS_SECRET_ACCESS_KEY.search(f"key {secret_control}.")
+    assert not AWS_SECRET_ACCESS_KEY.search("sha " + "0123456789abcdef" * 2 + "01234567")
+    assert not AWS_ACCESS_KEY_ID.search(text)
+    assert not AWS_SECRET_ACCESS_KEY.search(text)
 
 
 def test_runbook_and_p2_runbook_cross_link() -> None:
@@ -1008,7 +1028,8 @@ def test_adr_016_records_the_entitlement_deferral_and_the_pre_enqueue_hook() -> 
     paragraphs = markdown_section(ADR_016.read_text(encoding="utf-8"), "Implementation gate")
     phase_split = " ".join(paragraphs.strip().split("\n\n")[-1].split())
     assert re.search(r"entitlement enforcement[^.]*\bP4\b[^.]*#20", phase_split, re.IGNORECASE)
-    assert re.search(r"\bP3\b[^.]*pre-enqueue[^.]*hook", phase_split, re.IGNORECASE)
+    assert re.search(r"\bP3\b[^.]*\bships\b[^.]*pre-enqueue[^.]*hook", phase_split, re.IGNORECASE)
+    assert not re.search(r"(?:\bnot|n't|\bnever) ship", phase_split, re.IGNORECASE)  # #116
 
 
 def test_adr_016_phase_split_avoids_the_forbidden_phrases() -> None:

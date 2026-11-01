@@ -219,7 +219,7 @@ def test_production_worker_passes_tuning_knobs_except_drain_and_wait() -> None:
     ):
         name = field.upper()
         assert environment[name] == f"${{{name}:-{getattr(defaults, field)}}}", name
-    # A47 binds these two to the 75 s stop grace; they stay at their defaults.
+    # A47 binds these two to the 90 s stop grace; they stay at their defaults.
     assert "TELEMETRY_INGEST_DRAIN_SECONDS" not in environment
     assert "TELEMETRY_INGEST_WORKER_WAIT_SECONDS" not in environment
 
@@ -287,6 +287,7 @@ def test_api_emits_info_ingest_metrics_when_ingest_is_on(monkeypatch: pytest.Mon
     metrics_logger = logging.getLogger("limnopulse.telemetry.metrics")
     monkeypatch.setattr(metrics_logger, "level", logging.NOTSET)
     monkeypatch.setattr(metrics_logger, "handlers", [])
+    monkeypatch.setattr(metrics_logger, "propagate", True)  # #116: the app turns it off
     app = create_app(
         Settings(
             _env_file=None,
@@ -304,6 +305,7 @@ def test_api_emits_info_ingest_metrics_when_ingest_is_on(monkeypatch: pytest.Mon
 
     assert metrics_logger.isEnabledFor(logging.INFO)
     assert metrics_logger.handlers, "uvicorn configures no handler for this logger"
+    assert metrics_logger.propagate is False, "a root handler would print every line twice"
 
 
 def test_seed_script_hard_codes_no_aws_access_keys() -> None:

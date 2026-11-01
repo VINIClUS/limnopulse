@@ -8,7 +8,8 @@ cache client is never built, and it runs as the dedicated `telemetry_ingest` pri
   `SQS_TELEMETRY_INGRESS_QUEUE_URL` is set: a worker that cannot write must never delete. Outside
   local/test it also exits 2 when its own AWS keys or InfluxDB write token are empty.
 - **Shutdown.** SIGTERM and SIGINT set the loop's `stop`; the P3-08 loop drains in-flight
-  messages for `TELEMETRY_INGEST_DRAIN_SECONDS`.
+  messages for `TELEMETRY_INGEST_DRAIN_SECONDS`. The InfluxDB client is closed on every exit:
+  a stop, a crash, or a composition failure after it was created.
 - **Timeouts.** botocore connect and read timeouts stay finite, because the drain waits for an
   in-flight heartbeat or final action to return; the SQS read timeout outlasts the long poll.
 
@@ -29,6 +30,7 @@ from influxdb_client import InfluxDBClient
 from influxdb_client.client.write_api import SYNCHRONOUS
 from pydantic import ValidationError
 
+from limnopulse_api.adapters.aws_clients import dynamodb_client_kwargs, sqs_client_kwargs
 from limnopulse_api.adapters.dynamodb_deployments import DynamoDeploymentRepository
 from limnopulse_api.adapters.dynamodb_devices_v2 import DynamoDeviceComponentRepository
 from limnopulse_api.adapters.dynamodb_ingest_state import DynamoIngestStateRepository
@@ -47,6 +49,8 @@ from limnopulse_api.services.telemetry_pipeline import TelemetryPipeline
 from limnopulse_api.services.telemetry_v2_writes import ObservationWriteService
 from limnopulse_api.services.trusted_mapping import TrustedMappingService
 from limnopulse_api.workers.telemetry_ingest_loop import IngestWorkerConfig, IngestWorkerLoop
+
+__all__ = ["build_worker", "dynamodb_client_kwargs", "main", "sqs_client_kwargs"]
 
 logger = logging.getLogger("limnopulse.telemetry.ingest")
 
@@ -80,27 +84,6 @@ def shutdown_call_budget_seconds(settings: Settings) -> int:
 
 
 _LOCAL_ENVIRONMENTS = {"local", "test"}
-
-
-def dynamodb_client_kwargs(settings: Settings) -> dict[str, str]:
-    kwargs: dict[str, str] = {"region_name": settings.aws_region}
-    if settings.dynamodb_endpoint_url is not None:
-        kwargs["endpoint_url"] = settings.dynamodb_endpoint_url
-        if settings.app_env in _LOCAL_ENVIRONMENTS:
-            kwargs["aws_access_key_id"] = "local"
-            kwargs["aws_secret_access_key"] = "local"
-    return kwargs
-
-
-def sqs_client_kwargs(settings: Settings) -> dict[str, str]:
-    """Mirrors the DynamoDB kwargs: dummy credentials only for a local endpoint in local/test."""
-    kwargs: dict[str, str] = {"region_name": settings.aws_region}
-    if settings.sqs_endpoint_url is not None:
-        kwargs["endpoint_url"] = settings.sqs_endpoint_url
-        if settings.app_env in _LOCAL_ENVIRONMENTS:
-            kwargs["aws_access_key_id"] = "local"
-            kwargs["aws_secret_access_key"] = "local"
-    return kwargs
 
 
 def build_worker(
@@ -192,8 +175,27 @@ def build_worker(
 
 
 async def _run(settings: Settings) -> int:
+    influx_clients: list[Any] = []
+
+    def open_influx(**kwargs: Any) -> Any:
+        # Looked up at call time, and kept so the client is closed on every exit (#116).
+        client = InfluxDBClient(**kwargs)
+        influx_clients.append(client)
+        return client
+
     try:
-        worker = build_worker(settings)
+        return await _run_worker(settings, open_influx)
+    finally:
+        for client in influx_clients:
+            try:
+                client.close()
+            except Exception as error:  # noqa: BLE001 - closing must not mask the exit code
+                logger.warning("influx client close failed (%s)", type(error).__name__)
+
+
+async def _run_worker(settings: Settings, open_influx: Callable[..., Any]) -> int:
+    try:
+        worker = build_worker(settings, influx_client_factory=open_influx)
     except Exception as error:  # noqa: BLE001 - by category only, never the message
         logger.error("telemetry ingest worker could not be composed (%s)", type(error).__name__)
         return 1
