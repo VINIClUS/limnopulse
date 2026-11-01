@@ -6,6 +6,8 @@ import (
 	"io"
 	"strconv"
 	"time"
+
+	"github.com/VINIClUS/limnopulse/internal/workerproc"
 )
 
 type LookupEnv func(string) (string, bool)
@@ -110,7 +112,7 @@ func LoadRunConfig(args []string, lookup LookupEnv) (RunConfig, error) {
 	fs.DurationVar(&config.AllowedLateness, "allowed-lateness", config.AllowedLateness, "telemetry lateness allowance")
 	fs.DurationVar(&config.MaximumSampleAge, "max-sample-age", config.MaximumSampleAge, "maximum sample age")
 	fs.StringVar(&config.TelemetrySource, "telemetry-source", config.TelemetrySource, "window reader source: legacy or v2")
-	if err := fs.Parse(args); err != nil {
+	if err := workerproc.ParseFlags(fs, args); err != nil {
 		return RunConfig{}, err
 	}
 	fs.Visit(func(item *flag.Flag) {
