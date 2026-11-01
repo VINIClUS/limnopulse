@@ -1023,6 +1023,10 @@ def test_runbook_rollback_returns_the_d16_read_switches_first() -> None:
     assert re.search(
         r"[Nn]ever stop legacy dual write or the worker while either read switch", lead
     )
+    # After the P2 stop-dual-write criteria, `water_quality` is stale: P2's after-cutover rollback.
+    assert re.search(r"only while legacy dual write is still on", lead)
+    assert re.search(r"stop-dual-write criteria", lead)
+    assert "](p2-telemetry-rollout-runbook.md#rollback)" in lead
 
 
 def test_runbook_adr_gate_map_d16_row_records_the_decision() -> None:
