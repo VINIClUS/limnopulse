@@ -5,6 +5,8 @@ import (
 	"strings"
 	"testing"
 	"time"
+
+	"github.com/VINIClUS/limnopulse/internal/workerproc"
 )
 
 func TestLoadDefaultsAndWorkerEnvironment(t *testing.T) {
@@ -142,6 +144,82 @@ func TestLoadRejectsInvalidSESConfigurationSetName(t *testing.T) {
 		if _, err := Load(nil, lookup(base)); err == nil || !strings.Contains(err.Error(), "SES_CONFIGURATION_SET_NAME") {
 			t.Fatalf("configuration set %q error = %v", name, err)
 		}
+	}
+}
+
+func TestLoadEmailNeedsNoFeedbackQueueAndAcceptsNoFeedbackSetting(t *testing.T) {
+	base := map[string]string{
+		"APP_ENV": "local", "AWS_REGION": "sa-east-1", "DYNAMODB_DOMAIN_TABLE": "domain",
+		"SQS_NOTIFICATION_JOBS_URL": "https://sqs/jobs", "SES_FROM_EMAIL": "alerts@example.com",
+		// The email-only loader never reads these, so neither a shared queue nor a bad
+		// number can fail it.
+		"SQS_SES_EVENTS_URL": "https://sqs/jobs", "NOTIFICATION_FEEDBACK_CONCURRENCY": "many",
+	}
+	loaded, err := LoadEmail([]string{"--send-concurrency=3"}, lookup(base))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if loaded.SQSFeedbackURL != "" || loaded.FeedbackConcurrency != 0 ||
+		loaded.SQSQueueURL != "https://sqs/jobs" || loaded.SendConcurrency != 3 {
+		t.Fatalf("email config = %#v", loaded)
+	}
+	if _, err := LoadEmail([]string{"--feedback-concurrency=2"}, lookup(base)); !workerproc.IsConfiguration(err) {
+		t.Fatalf("email-only loader accepted a feedback flag: %v", err)
+	}
+}
+
+func TestLoadReportsBadFlagsAsConfigurationErrors(t *testing.T) {
+	base := map[string]string{
+		"APP_ENV": "local", "AWS_REGION": "sa-east-1", "DYNAMODB_DOMAIN_TABLE": "domain",
+		"SQS_NOTIFICATION_JOBS_URL": "https://sqs/jobs", "SES_FROM_EMAIL": "alerts@example.com",
+	}
+	for _, args := range [][]string{{"--unknown"}, {"--send-concurrency=x"}, {"--receive-wait"}} {
+		if _, err := LoadEmail(args, lookup(base)); !workerproc.IsConfiguration(err) {
+			t.Fatalf("LoadEmail(%v) error = %v, want a configuration error", args, err)
+		}
+	}
+	base["NOTIFICATION_SEND_BURST"] = "x"
+	if _, err := LoadEmail(nil, lookup(base)); err == nil || !strings.Contains(err.Error(), "NOTIFICATION_SEND_BURST") {
+		t.Fatalf("bad burst error = %v", err)
+	}
+}
+
+func TestLoadTakesAnExplicitProductionRateFromTheFlag(t *testing.T) {
+	loaded, err := LoadEmail([]string{"--max-send-rate=2"}, lookup(map[string]string{
+		"APP_ENV": "prod", "AWS_REGION": "sa-east-1", "DYNAMODB_DOMAIN_TABLE": "domain",
+		"SQS_NOTIFICATION_JOBS_URL": "https://sqs/jobs", "SES_FROM_EMAIL": "alerts@example.com",
+	}))
+	if err != nil || loaded.MaxSendRate != 2 {
+		t.Fatalf("config=%#v err=%v", loaded, err)
+	}
+}
+
+func TestHostedEnvironmentAndQueueTiming(t *testing.T) {
+	for appEnv, want := range map[string]bool{"local": false, "test": false, "staging": true, "prod": true} {
+		if hosted, err := HostedEnvironment(appEnv); err != nil || hosted != want {
+			t.Fatalf("HostedEnvironment(%q) = %t, %v", appEnv, hosted, err)
+		}
+	}
+	if _, err := HostedEnvironment("dev"); err == nil {
+		t.Fatal("unknown APP_ENV was accepted")
+	}
+	for _, test := range []struct {
+		hosted            bool
+		wait, visibility  time.Duration
+		wantErrorFragment string
+	}{
+		{hosted: true, wait: 0, visibility: InvalidVisibility, wantErrorFragment: "zero receive wait"},
+		{hosted: true, wait: ReceiveWait, visibility: time.Second, wantErrorFragment: "short invalid visibility"},
+		{wait: 21 * time.Second, visibility: InvalidVisibility, wantErrorFragment: "receive wait"},
+		{wait: ReceiveWait, visibility: 13 * time.Hour, wantErrorFragment: "invalid visibility"},
+	} {
+		err := ValidateQueueTiming(test.hosted, test.wait, test.visibility)
+		if err == nil || !strings.Contains(err.Error(), test.wantErrorFragment) {
+			t.Fatalf("ValidateQueueTiming(%+v) = %v", test, err)
+		}
+	}
+	if err := ValidateQueueTiming(true, ReceiveWait, InvalidVisibility); err != nil {
+		t.Fatal(err)
 	}
 }
 

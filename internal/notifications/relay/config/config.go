@@ -9,6 +9,7 @@ import (
 	"time"
 
 	"github.com/VINIClUS/limnopulse/internal/notifications"
+	"github.com/VINIClUS/limnopulse/internal/workerproc"
 )
 
 const (
@@ -126,7 +127,7 @@ func Load(args []string, lookup LookupEnv) (RunConfig, error) {
 	fs.IntVar(&config.WorkParallelism, "work-parallelism", config.WorkParallelism, "parallel relay work")
 	fs.IntVar(&config.MaxWork, "max-work", config.MaxWork, "maximum work items per run")
 	fs.IntVar(&config.FanoutPageSize, "fanout-page-size", config.FanoutPageSize, "fanout transaction page size")
-	if err = fs.Parse(args); err != nil {
+	if err = workerproc.ParseFlags(fs, args); err != nil {
 		return RunConfig{}, err
 	}
 	if len(fs.Args()) != 0 {
