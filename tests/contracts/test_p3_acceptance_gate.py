@@ -676,11 +676,17 @@ ENABLEMENT_STEPS = (
     ("worker", (r"`TELEMETRY_V2_WRITE_ENABLED`", r"telemetry_ingest", r"principal|IAM user")),
     ("endpoint", (r"`INGEST_V2_ENABLED`",)),
     ("pilot onboarding", (r"account.*credential.*DeviceIntegration.*activ", r"pilot")),
-    ("divergence checks", (r"divergence",)),
+    (
+        "divergence checks",
+        (r"divergence", r"Under HTTPS only \(#104\)", r"\[D16 owner gate\]\(#d16-owner-gate\)"),
+    ),
     ("legacy dual write", (r"`TELEMETRY_LEGACY_DUAL_WRITE_ENABLED`", r"G7")),
     (
         "remaining P2 steps",
-        (r"p2-telemetry-rollout-runbook\.md", r"\[D16 owner gate\]\(#d16-owner-gate\)"),
+        (
+            r"p2-telemetry-rollout-runbook\.md",
+            r"stay off until the owner completes the \[D16 owner gate\]\(#d16-owner-gate\)",
+        ),
     ),
 )
 
@@ -919,7 +925,16 @@ D16_SUPERSEDED = (
 )
 # Paraphrases of the same wait, wherever they are worded.
 D16_STALE = re.compile(
-    r"until a producer writes every legacy|(?:still )?(?:need|require)s? a producer for every legacy"
+    r"until a producer writes every legacy"
+    r"|(?:still )?(?:need|require)s? a producer for every legacy"
+)
+# Until the owner completes the gate, every mention says the read switches are still off.
+STAY_OFF = re.compile(
+    r"stay off until the owner completes the \[D16 owner gate\]\(#d16-owner-gate\)"
+)
+GATE_INTRO = (
+    "The owner flips the read switches in production only after these steps, in this order. "
+    "Steps 1 and 2 are checks; steps 3 and 4 are separate changes. Record each step on #104."
 )
 # Runbook only: the plan keeps the historical P3 text that names the three original options.
 RUNBOOK_SUPERSEDED = (
@@ -948,6 +963,7 @@ D16_OWNER_GATE = (
             r"pass criterion",
             r"[Nn]ative `/v2`",
             r"whole window",
+            r"both measurements have points",
         ),
     ),
     ("evaluator flip", (re.escape(EVALUATOR_FLIP), r"one environment first", r"D15")),
@@ -975,6 +991,7 @@ def test_runbook_preconditions_name_the_d16_decision() -> None:
     assert NO_PRODUCER.search(text)
     assert EVALUATOR_FLIP in text and V1_READ_FLIP in text
     assert D16_OWNER_GATE_LINK in text
+    assert STAY_OFF.search(text)
 
 
 def test_runbook_owner_actions_record_the_d16_https_only_decision() -> None:
@@ -989,6 +1006,7 @@ def test_runbook_owner_actions_record_the_d16_https_only_decision() -> None:
         r"`POST /ingest/v2/observations`",
         r"ingest credential",
         NO_PRODUCER,
+        STAY_OFF,
         r"#104 stays open until",
     ):
         assert re.search(pattern, text), pattern
@@ -999,6 +1017,10 @@ def test_runbook_d16_owner_gate_is_the_ordered_owner_checklist() -> None:
     raw = markdown_section(owner_actions, "D16 owner gate", level=3)
     text = " ".join(raw.split())
     assert re.search(r"only after", text) and re.search(r"in this order", text)
+    first_step = re.search(r"^1\. ", raw, flags=re.MULTILINE)
+    assert first_step, "the gate must be a numbered list"
+    # Nothing between the heading and step 1 but the intro: no claim that a step is done.
+    assert " ".join(raw[: first_step.start()].split()) == GATE_INTRO
     items = numbered_items(raw)
     assert len(items) == len(D16_OWNER_GATE)
     for item, (step, patterns) in zip(items, D16_OWNER_GATE, strict=True):
@@ -1011,7 +1033,7 @@ def test_runbook_d16_owner_gate_is_the_ordered_owner_checklist() -> None:
 
 
 def test_runbook_rollback_returns_the_d16_read_switches_first() -> None:
-    """Under HTTPS only the worker writes both measurements, so the reads go back before it stops."""
+    """Under HTTPS only the worker writes both measurements: the reads go back before it stops."""
     raw = markdown_section(runbook(), "Rollback")
     first_step = re.search(r"^1\. ", raw, flags=re.MULTILINE)
     assert first_step, "the rollback order must be a numbered list"
@@ -1062,6 +1084,39 @@ def test_p2_runbook_d16_precondition_records_the_https_only_decision() -> None:
     ):
         assert re.search(pattern, text), pattern
     assert "after P3 delivers a producer" not in text
+    assert "The owner flips the read switches in production only through" in text
+    for phrase in D16_SUPERSEDED:
+        assert phrase not in text, phrase
+    assert not D16_STALE.search(text), D16_STALE.search(text)
+
+
+def test_p2_runbook_rollout_and_rollback_cover_https_only() -> None:
+    p2 = P2_RUNBOOK.read_text(encoding="utf-8")
+    step_2 = numbered_items(markdown_section(p2, "Rollout sequence"))[1]
+    assert re.search(r"keyed divergence", step_2)
+    assert re.search(r"Under HTTPS only \(#104\)", step_2)
+    assert re.search(r"D16 owner gate", step_2)
+    rollback = " ".join(markdown_section(p2, "Rollback").split())
+    assert re.search(
+        r"Under HTTPS only \(#104\), legacy dual write is the only `water_quality` producer",
+        rollback,
+    )
+    assert "](p3-ingestion-rollout-runbook.md#rollback)" in rollback
+
+
+P2_ERA_D16_DOCS = {
+    README: "](docs/p3-ingestion-rollout-runbook.md#d16-owner-gate)",
+    ROOT / "docs/architecture.md": "](p3-ingestion-rollout-runbook.md#d16-owner-gate)",
+    ROOT / "docs/alert-evaluator-phase-3b.md": "](p3-ingestion-rollout-runbook.md#d16-owner-gate)",
+}
+
+
+@pytest.mark.parametrize("doc", list(P2_ERA_D16_DOCS), ids=lambda p: p.name)
+def test_p2_era_d16_lines_point_to_the_owner_gate(doc: Path) -> None:
+    text = " ".join(doc.read_text(encoding="utf-8").split())
+    assert "Production enablement is a P3 exit step" not in text
+    assert P2_ERA_D16_DOCS[doc] in text
+    assert D16_DECISION.search(text)
 
 
 def _plan_rows(heading: str, first_cell: str) -> list[str]:
@@ -1092,6 +1147,7 @@ def test_plan_a48_amendment_records_the_d16_https_only_decision() -> None:
     steps = (r"no legacy MQTT device", r"keyed divergence.*\bzero\b", EVALUATOR_FLIP, V1_READ_FLIP)
     for (number, clause), step in zip(clauses, steps, strict=True):
         assert re.search(re.escape(step) if step.startswith("`") else step, clause), number
+    assert "whole window" in clauses[1][1], clauses[1]
     assert [EVALUATOR_FLIP in clause for _, clause in clauses] == [False, False, True, False]
     assert [V1_READ_FLIP in clause for _, clause in clauses] == [False, False, False, True]
 
@@ -1247,6 +1303,11 @@ def test_adr_implementation_gate_ends_with_the_p3_phase_split(adr: Path) -> None
         assert re.search(reference, phase_split), reference
     if adr == ADR_007:  # #104 settled the D16 producer path (A48): nothing stays open for it.
         assert "stays open" not in phase_split
+        flips = "the owner flips the read switches through the runbook's D16 owner gate"
+        assert flips in phase_split
+        for phrase in D16_SUPERSEDED:
+            assert phrase not in phase_split, phrase
+        assert not D16_STALE.search(phase_split), D16_STALE.search(phase_split)
     assert "](../p3-ingestion-rollout-runbook.md)" in phase_split
 
 
