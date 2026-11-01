@@ -454,8 +454,9 @@ Stopping dual write means setting `TELEMETRY_LEGACY_DUAL_WRITE_ENABLED=false`. I
 ## Rollback
 
 Before cutover (while Telegraf still writes `water_quality`), rollback is by switches only. Set
-them back to their defaults and restart (or redeploy) the producer (the P3 worker; the dev CLI reads
-them per run), the API and the evaluator:
+them back to their defaults and recreate (`docker compose up -d <service>`, or redeploy) the
+producer (the P3 worker; the dev CLI reads them per run), the API and the evaluator;
+`docker compose restart` keeps the old environment:
 
 - `TELEMETRY_V2_WRITE_ENABLED=false`
 - `TELEMETRY_LEGACY_DUAL_WRITE_ENABLED=false`
