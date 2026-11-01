@@ -14,6 +14,49 @@ import (
 	"github.com/VINIClUS/limnopulse/internal/workerproc"
 )
 
+// Role is one consumer entrypoint: the loader of its configuration and the composition that
+// runs it. Main is the whole process.
+type Role[C any] struct {
+	Load func(args []string, lookup func(string) (string, bool)) (C, error)
+	Run  func(context.Context, C, workercmd.AWSLoader, worker.Loop) (worker.RunSummary, error)
+	// Secret, when set, is an env key whose value comes from a credential under systemd.
+	Secret *Secret
+}
+
+// Secret names the LoadCredential= credential that replaces an env key.
+type Secret struct {
+	Credential string
+	Key        string
+}
+
+// Main reads the role's credentials and configuration, then supervises it. A missing
+// credential, a bad flag or a bad setting exits 78 before anything connects.
+func (role Role[C]) Main(
+	ctx context.Context,
+	args []string,
+	output io.Writer,
+	lookup func(string) (string, bool),
+	supervisor workerproc.Continuous,
+) int {
+	load, creds, err := workercmd.AWSLoaderFromEnv(lookup)
+	if err != nil {
+		return workercmd.Fail(output, err, "credentials")
+	}
+	if role.Secret != nil {
+		lookup, err = workercmd.SecretLookup(lookup, creds, role.Secret.Credential, role.Secret.Key)
+		if err != nil {
+			return workercmd.Fail(output, err, "credentials")
+		}
+	}
+	config, err := role.Load(args, lookup)
+	if err != nil {
+		return workercmd.Fail(output, workerproc.Configuration(err), "configuration")
+	}
+	return Run(ctx, supervisor, output, func(ctx context.Context, loop worker.Loop) (worker.RunSummary, error) {
+		return role.Run(ctx, config, load, loop)
+	})
+}
+
 // Consume composes one consumer and runs it until ctx is cancelled. An error means it could
 // not start; a workerproc.Configuration error then exits 78.
 type Consume func(context.Context, worker.Loop) (worker.RunSummary, error)

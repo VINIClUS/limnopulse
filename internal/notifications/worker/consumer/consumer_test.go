@@ -7,11 +7,13 @@ import (
 	"errors"
 	"fmt"
 	"os"
+	"path/filepath"
 	"syscall"
 	"testing"
 	"time"
 
 	"github.com/VINIClUS/limnopulse/internal/notifications/worker"
+	"github.com/VINIClUS/limnopulse/internal/workercmd"
 	"github.com/VINIClUS/limnopulse/internal/workerproc"
 )
 
@@ -178,5 +180,115 @@ func TestRunRefusesAnInvalidSupervisorWithoutStartingTheConsumer(t *testing.T) {
 	}
 	if summary := decode(t, &output); summary.ErrorCategories["configuration"] != 1 {
 		t.Fatalf("summary = %#v", summary)
+	}
+}
+
+type roleConfig struct{ setting, secret string }
+
+func roleEnv(values map[string]string) func(string) (string, bool) {
+	return func(key string) (string, bool) {
+		value, ok := values[key]
+		return value, ok
+	}
+}
+
+func testRole(loads, runs *int) Role[roleConfig] {
+	return Role[roleConfig]{
+		Load: func(args []string, lookup func(string) (string, bool)) (roleConfig, error) {
+			*loads++
+			setting, _ := lookup("SETTING")
+			secret, _ := lookup("SECRET")
+			if setting == "" || len(args) != 0 {
+				return roleConfig{}, errors.New("SETTING is required")
+			}
+			return roleConfig{setting: setting, secret: secret}, nil
+		},
+		Run: func(ctx context.Context, config roleConfig, load workercmd.AWSLoader, loop worker.Loop) (worker.RunSummary, error) {
+			*runs++
+			if load == nil || config.setting != "on" {
+				return worker.RunSummary{}, fmt.Errorf("config = %#v", config)
+			}
+			if err := loop.Ready(); err != nil {
+				return worker.RunSummary{}, err
+			}
+			<-ctx.Done()
+			return worker.RunSummary{Result: "success", Graceful: true}, nil
+		},
+	}
+}
+
+func TestRoleMainLoadsItsConfigurationAndRunsUntilStopped(t *testing.T) {
+	signals := make(chan os.Signal, 1)
+	signals <- syscall.SIGTERM
+	loads, runs := 0, 0
+	var output bytes.Buffer
+	code := testRole(&loads, &runs).Main(context.Background(), nil, &output,
+		roleEnv(map[string]string{"SETTING": "on"}), newSupervisor(time.Second, signals))
+	if code != workerproc.ExitSuccess || loads != 1 || runs != 1 {
+		t.Fatalf("exit=%d loads=%d runs=%d output=%s", code, loads, runs, output.String())
+	}
+}
+
+func TestRoleMainExits78BeforeRunningOnABadSettingOrFlag(t *testing.T) {
+	for name, args := range map[string][]string{"missing setting": nil, "extra argument": {"extra"}} {
+		loads, runs := 0, 0
+		var output bytes.Buffer
+		environment := map[string]string{}
+		if args != nil {
+			environment["SETTING"] = "on"
+		}
+		code := testRole(&loads, &runs).Main(context.Background(), args, &output, roleEnv(environment),
+			newSupervisor(time.Second, make(chan os.Signal)))
+		if code != workerproc.ExitConfiguration || loads != 1 || runs != 0 {
+			t.Fatalf("%s: exit=%d loads=%d runs=%d", name, code, loads, runs)
+		}
+	}
+}
+
+func TestRoleMainExits78WithoutCredentialsUnderSystemd(t *testing.T) {
+	loads, runs := 0, 0
+	var output bytes.Buffer
+	code := testRole(&loads, &runs).Main(context.Background(), nil, &output,
+		roleEnv(map[string]string{"SETTING": "on", workerproc.SupervisorEnv: "systemd"}),
+		newSupervisor(time.Second, make(chan os.Signal)))
+	if code != workerproc.ExitConfiguration || loads != 0 || runs != 0 {
+		t.Fatalf("exit=%d loads=%d runs=%d", code, loads, runs)
+	}
+}
+
+func TestRoleMainServesTheSecretFromItsCredentialOnly(t *testing.T) {
+	dir := t.TempDir()
+	for name, value := range map[string]string{
+		workerproc.CredentialAWSAccessKeyID: "AKID", workerproc.CredentialAWSSecretAccessKey: "secret",
+		workerproc.CredentialRedisPassword: "credential-password",
+	} {
+		if err := os.WriteFile(filepath.Join(dir, name), []byte(value), 0o600); err != nil {
+			t.Fatal(err)
+		}
+	}
+	var loaded roleConfig
+	role := Role[roleConfig]{
+		Load: func(_ []string, lookup func(string) (string, bool)) (roleConfig, error) {
+			loaded.secret, _ = lookup("SECRET")
+			return loaded, nil
+		},
+		Run: func(context.Context, roleConfig, workercmd.AWSLoader, worker.Loop) (worker.RunSummary, error) {
+			return worker.RunSummary{}, errors.New("stop here")
+		},
+		Secret: &Secret{Credential: workerproc.CredentialRedisPassword, Key: "SECRET"},
+	}
+	var output bytes.Buffer
+	role.Main(context.Background(), nil, &output, roleEnv(map[string]string{"CREDENTIALS_DIRECTORY": dir}),
+		newSupervisor(time.Second, make(chan os.Signal)))
+	if loaded.secret != "credential-password" {
+		t.Fatalf("secret = %q", loaded.secret)
+	}
+	loaded = roleConfig{}
+	output.Reset()
+	code := role.Main(context.Background(), nil, &output,
+		roleEnv(map[string]string{"CREDENTIALS_DIRECTORY": dir, "SECRET": "env-file-password"}),
+		newSupervisor(time.Second, make(chan os.Signal)))
+	if code != workerproc.ExitConfiguration || loaded.secret != "" || bytes.Contains(output.Bytes(), []byte("password")) {
+		t.Fatalf("exit=%d secret=%q output=%s", code, loaded.secret, output.String())
 	}
 }
