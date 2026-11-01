@@ -469,7 +469,10 @@ switches:
 Roll back in the reverse order of the [rollout sequence](#rollout-sequence); each switch is
 independent. Set `API_V2_TELEMETRY_ENABLED=false` before or with any change to `API_V2_ENABLED`
 (the API refuses to start with the telemetry routes on and `API_V2_ENABLED=false`); reset
-`API_V2_ENABLED` only if it was `false` before step 4.
+`API_V2_ENABLED` only if it was `false` before step 4. If P3 ingestion is on
+(`INGEST_V2_ENABLED=true`), first follow the [P3 rollback](p3-ingestion-rollout-runbook.md#rollback)
+through its step 5: the API refuses to start with `INGEST_V2_ENABLED=true` and
+`TELEMETRY_V2_WRITE_ENABLED=false`.
 
 **After cutover** (the stop-dual-write criteria have retired every `water_quality` producer), the
 defaults above are not safe on their own: with Telegraf retired and dual write off, nothing writes
