@@ -1027,6 +1027,9 @@ def test_runbook_rollback_returns_the_d16_read_switches_first() -> None:
     assert re.search(r"only while legacy dual write is still on", lead)
     assert re.search(r"stop-dual-write criteria", lead)
     assert "](p2-telemetry-rollout-runbook.md#rollback)" in lead
+    # Under HTTPS only the shutdown steps below remove the only producer: the D16 rollback keeps it.
+    assert re.search(r"keep the HTTPS ingest, the worker and legacy dual write running", lead)
+    assert re.search(r"verified replacement producer", lead)
 
 
 def test_runbook_adr_gate_map_d16_row_records_the_decision() -> None:
