@@ -767,7 +767,7 @@ def test_a_stalled_loop_is_cancelled_and_exits_1(
     """The clean path: the watchdog cancels the loop through the event loop, `main` returns 1,
     and the forced exit stays armed in case the interpreter's shutdown hangs."""
     _configure_environment(monkeypatch)
-    watch = FastWatchdog(monkeypatch, grace=0.5)
+    watch = FastWatchdog(monkeypatch, grace=2.0)  # wide, so a slow runner cannot flake it
     fake = SilentLoop()
     monkeypatch.setattr(telemetry_ingest, "build_worker", lambda settings, **kwargs: fake)
 

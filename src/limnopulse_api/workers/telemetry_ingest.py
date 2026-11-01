@@ -309,19 +309,20 @@ async def _run_worker(settings: Settings, open_influx: Callable[..., Any]) -> in
     watchdog.start()
     try:
         logger.info("telemetry ingest worker started")
-        await run
-    except asyncio.CancelledError:
-        if not watchdog.stalled:
-            raise
-        logger.error("telemetry ingest worker loop cancelled after a stall")
-        return EXIT_FAILURE
-    except Exception as error:  # noqa: BLE001 - a crash exits non-zero, by category only
-        logger.error("telemetry ingest worker crashed (%s)", type(error).__name__)
-        return EXIT_FAILURE
+        # Never raises for the loop's own end; its outcome is read from the task below.
+        await asyncio.wait({run})
     finally:
         watchdog.close()
         for signum in signals:
             loop.remove_signal_handler(signum)
+    if run.cancelled() and watchdog.stalled:
+        logger.error("telemetry ingest worker loop cancelled after a stall")
+        return EXIT_FAILURE
+    try:
+        run.result()  # re-raises any cancellation that was not the watchdog's
+    except Exception as error:  # noqa: BLE001 - a crash exits non-zero, by category only
+        logger.error("telemetry ingest worker crashed (%s)", type(error).__name__)
+        return EXIT_FAILURE
     if not stop.is_set():
         logger.error("telemetry ingest worker loop ended without a stop")
         return EXIT_FAILURE
