@@ -454,8 +454,11 @@ Stopping dual write means setting `TELEMETRY_LEGACY_DUAL_WRITE_ENABLED=false`. I
 ## Rollback
 
 Before cutover (while Telegraf still writes `water_quality`), rollback is by switches only. Set
-them back to their defaults and restart (or redeploy) the producer (the P3 worker; the dev CLI reads
-them per run), the API and the evaluator:
+them back to their defaults and recreate the producer (the P3 worker; the dev CLI reads them per
+run), the API and the evaluator (`docker compose up -d <service>`, or redeploy;
+`docker compose restart` keeps the old environment). The production flags are in the
+[P3 ingestion rollout runbook](p3-ingestion-rollout-runbook.md), Production environment. The
+switches:
 
 - `TELEMETRY_V2_WRITE_ENABLED=false`
 - `TELEMETRY_LEGACY_DUAL_WRITE_ENABLED=false`
@@ -466,7 +469,10 @@ them per run), the API and the evaluator:
 Roll back in the reverse order of the [rollout sequence](#rollout-sequence); each switch is
 independent. Set `API_V2_TELEMETRY_ENABLED=false` before or with any change to `API_V2_ENABLED`
 (the API refuses to start with the telemetry routes on and `API_V2_ENABLED=false`); reset
-`API_V2_ENABLED` only if it was `false` before step 4.
+`API_V2_ENABLED` only if it was `false` before step 4. If P3 ingestion is on
+(`INGEST_V2_ENABLED=true`), first follow the [P3 rollback](p3-ingestion-rollout-runbook.md#rollback)
+through its step 5: the API refuses to start with `INGEST_V2_ENABLED=true` and
+`TELEMETRY_V2_WRITE_ENABLED=false`.
 
 **After cutover** (the stop-dual-write criteria have retired every `water_quality` producer), the
 defaults above are not safe on their own: with Telegraf retired and dual write off, nothing writes
