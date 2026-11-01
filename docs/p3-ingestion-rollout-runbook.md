@@ -178,6 +178,11 @@ the API-only secrets.
   `--profile ingestion` and waits for the worker's health, so a promotion or a rollback moves the
   API (producer) and the worker (consumer) to the same tag. This supersedes the P3 plan's bounded
   `on-failure` restart (D7) and its opt-in start (D21).
+- **Until the ADR-020 deploy slice lands:** `ops/vps/limnopulse-deploy.sh` still runs `up -d`
+  without `--profile ingestion` and waits only for the API, so after every deploy recreate the
+  worker by hand with
+  `docker compose --env-file .env --env-file .env.image -f compose.production.yaml --profile ingestion up -d telemetry-ingest-worker`
+  and check it turns `healthy`.
 - **Liveness and healthcheck.** The loop marks a liveness stamp
   (`/tmp/limnopulse-telemetry-ingest.liveness`) at the top of every turn and after every receive,
   and every 5 s while all permits are busy. A watchdog thread exits 1 when no mark comes for the
