@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"os"
+	"strings"
 	"syscall"
 	"testing"
 	"time"
@@ -146,18 +147,42 @@ func TestStopSignalDisarmsStallDetectionDuringDrain(t *testing.T) {
 }
 
 func TestParentCancellationIsAStop(t *testing.T) {
-	parent, cancel := context.WithCancel(context.Background())
-	outcome := runAsync(Continuous{
-		StallAfter: time.Second,
-		Lookup:     env(nil),
-		Signals:    make(chan os.Signal),
-	}, parent, func(ctx context.Context, loop Loop) error {
-		<-ctx.Done()
-		return nil
-	})
-	cancel()
-	if got := waitOutcome(t, outcome); got.ExitCode != ExitSuccess {
-		t.Fatalf("got %+v", got)
+	path, messages := listenNotify(t)
+	// A worker that returns the instant its context ends must still be classified as a
+	// stop; repeat to catch a select that sees the worker's return before the cancellation.
+	for attempt := range 200 {
+		parent, cancel := context.WithCancel(context.Background())
+		causes := make(chan error, 1)
+		outcome := runAsync(Continuous{
+			StallAfter: time.Second,
+			Lookup:     env(map[string]string{"NOTIFY_SOCKET": path}),
+			Signals:    make(chan os.Signal),
+		}, parent, func(ctx context.Context, loop Loop) error {
+			<-ctx.Done()
+			causes <- context.Cause(ctx)
+			return nil
+		})
+		cancel()
+		if got := waitOutcome(t, outcome); got.ExitCode != ExitSuccess || got.Reason != ReasonStopped {
+			t.Fatalf("attempt %d: got %+v", attempt, got)
+		}
+		if cause := <-causes; !errors.Is(cause, ErrStopSignal) {
+			t.Fatalf("attempt %d: run saw cause %v", attempt, cause)
+		}
+		expectMessage(t, messages, "STOPPING=1")
+	}
+}
+
+func TestProgressKeepsTheMonotonicClockReading(t *testing.T) {
+	loop := &loopState{notifier: &Notifier{}, now: time.Now, start: time.Now()}
+	loop.Progress()
+	// time.Time prints its monotonic reading as "m=..."; a wall-clock-only timestamp
+	// would let a clock step delay or force a stall.
+	if last := loop.last().String(); !strings.Contains(last, " m=") {
+		t.Fatalf("progress timestamp lost its monotonic reading: %s", last)
+	}
+	if age := time.Since(loop.last()); age < 0 || age > time.Second {
+		t.Fatalf("unexpected progress age %v", age)
 	}
 }
 

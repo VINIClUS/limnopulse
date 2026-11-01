@@ -92,9 +92,11 @@ func (supervisor Continuous) Run(parent context.Context, run func(context.Contex
 		grace = defaultStallExitGrace
 	}
 
-	ctx, cancel := context.WithCancelCause(parent)
+	// Only the supervisor cancels the worker: a parent cancellation goes through stop()
+	// first, so the drain is always classified as a stop and announced with STOPPING=1.
+	ctx, cancel := context.WithCancelCause(context.WithoutCancel(parent))
 	defer cancel(nil)
-	loop := &loopState{notifier: notifier, now: now}
+	loop := &loopState{notifier: notifier, now: now, start: now()}
 	loop.Progress()
 	done := make(chan error, 1)
 	go func() { done <- run(ctx, loop) }()
@@ -168,9 +170,12 @@ func configurationOutcome(err error) Outcome {
 }
 
 type loopState struct {
-	notifier  *Notifier
-	now       func() time.Time
-	lastNanos atomic.Int64
+	notifier *Notifier
+	now      func() time.Time
+	// start keeps time.Now's monotonic reading; progress is stored as the elapsed time
+	// since start so wall-clock steps never shift stall detection.
+	start     time.Time
+	elapsed   atomic.Int64
 	readyOnce sync.Once
 	readyErr  error
 }
@@ -182,9 +187,9 @@ func (loop *loopState) Ready() error {
 }
 
 func (loop *loopState) Progress() {
-	loop.lastNanos.Store(loop.now().UnixNano())
+	loop.elapsed.Store(int64(loop.now().Sub(loop.start)))
 }
 
 func (loop *loopState) last() time.Time {
-	return time.Unix(0, loop.lastNanos.Load())
+	return loop.start.Add(time.Duration(loop.elapsed.Load()))
 }
