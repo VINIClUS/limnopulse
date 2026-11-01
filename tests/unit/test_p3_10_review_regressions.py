@@ -88,7 +88,7 @@ def test_worker_clients_use_bounded_standard_retries(service_name: str) -> None:
 
     config = clients.calls[service_name]["config"]
     assert config.retries["mode"] == "standard"
-    assert 1 <= config.retries["max_attempts"] <= 3
+    assert 1 <= config.retries["total_max_attempts"] <= 3
 
 
 def test_api_sqs_client_fails_fast(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -259,7 +259,7 @@ def test_shutdown_call_budget_matches_the_built_clients(service_name: str) -> No
     build_worker(settings, client_factory=clients.client, influx_client_factory=clients.influx)
 
     config = clients.calls[service_name]["config"]
-    worst = config.retries["max_attempts"] * (config.connect_timeout + config.read_timeout)
+    worst = config.retries["total_max_attempts"] * (config.connect_timeout + config.read_timeout)
     assert worst <= telemetry_ingest.shutdown_call_budget_seconds(settings)
 
 
