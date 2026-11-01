@@ -1483,8 +1483,15 @@ def _reached(sources: _PythonSources, modules: Iterable[tuple[str, str]]) -> set
 
 def _dynamic_sites(modules: Iterable[tuple[str, str]]) -> set[str]:
     """`module::qualname` of every attribute or module named at run time, which the walk cannot
-    follow."""
+    follow.
+
+    A dynamic helper counts only when it is called by its own name. One that is imported under
+    another name (`from builtins import getattr as lookup`) or used as a value (`lookup =
+    getattr`, `partial(getattr, ...)`) is a site itself, because its calls are invisible here and
+    to the walk.
+    """
     sites: set[str] = set()
+    helpers = {*_DYNAMIC_ATTRIBUTE_CALLS, *_DYNAMIC_CODE}
 
     def constant_names(call: ast.Call) -> bool:
         name = _name_of(call.func)
@@ -1500,23 +1507,36 @@ def _dynamic_sites(modules: Iterable[tuple[str, str]]) -> set[str]:
             for argument in named
         )
 
-    def visit(node: ast.AST, module: str, owner: str) -> None:
+    def dynamic(node: ast.AST, called: set[int]) -> bool:
+        if isinstance(node, (ast.Import, ast.ImportFrom)):
+            return any(
+                alias.asname not in {None, alias.name} and alias.name.rsplit(".")[-1] in helpers
+                for alias in node.names
+            )
+        if isinstance(node, (ast.Name, ast.Attribute)):
+            name = _name_of(node)
+            return name in _DYNAMIC_CODE or (
+                name in _DYNAMIC_ATTRIBUTE_CALLS and id(node) not in called
+            )
+        return (
+            isinstance(node, ast.Call)
+            and _name_of(node.func) in _DYNAMIC_ATTRIBUTE_CALLS
+            and not constant_names(node)
+        )
+
+    def visit(node: ast.AST, module: str, owner: str, called: set[int]) -> None:
         for child in ast.iter_child_nodes(node):
             if isinstance(child, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
-                visit(child, module, f"{owner}.{child.name}" if owner else child.name)
+                visit(child, module, f"{owner}.{child.name}" if owner else child.name, called)
                 continue
-            if (
-                _name_of(child) in _DYNAMIC_CODE
-                if isinstance(child, (ast.Name, ast.Attribute))
-                else isinstance(child, ast.Call)
-                and _name_of(child.func) in _DYNAMIC_ATTRIBUTE_CALLS
-                and not constant_names(child)
-            ):
+            if dynamic(child, called):
                 sites.add(f"{module}::{owner or '<module>'}")
-            visit(child, module, owner)
+            visit(child, module, owner, called)
 
     for module, text in modules:
-        visit(ast.parse(text), module, "")
+        tree = ast.parse(text)
+        called = {id(node.func) for node in ast.walk(tree) if isinstance(node, ast.Call)}
+        visit(tree, module, "", called)
     return sites
 
 
@@ -1818,6 +1838,43 @@ def test_a_transactional_write_the_worker_starts_to_reach_fails(
     assert f"uncovered: {expected}" in problems
 
 
+_WORKER_IMPORT_ANCHOR = "import asyncio\n"
+
+
+@pytest.mark.parametrize(
+    ("imports", "lines", "site"),
+    [
+        pytest.param(
+            "from builtins import getattr as lookup\n",
+            '    write = lookup(devices, "create_component")\n',
+            f"{_WORKER_MODULE}::<module>",
+            id="aliased-import",
+        ),
+        pytest.param(
+            "",
+            '    lookup = getattr\n    write = lookup(devices, "create_component")\n',
+            f"{_WORKER_MODULE}::build_worker",
+            id="helper-as-value",
+        ),
+    ],
+)
+def test_a_dynamic_lookup_the_worker_hides_behind_another_name_fails(
+    imports: str, lines: str, site: str
+) -> None:
+    """A renamed `getattr` reaches `create_component` invisibly to the walk, so it must be
+    reported as a dynamic site that nobody has reviewed."""
+    modules = dict(_telemetry_ingest_modules())
+    text = modules[_WORKER_MODULE]
+    assert text.count(_WORKER_ANCHOR) == 1
+    assert text.count(_WORKER_IMPORT_ANCHOR) == 1
+    text = text.replace(_WORKER_IMPORT_ANCHOR, f"{_WORKER_IMPORT_ANCHOR}{imports}")
+    modules[_WORKER_MODULE] = text.replace(_WORKER_ANCHOR, f"{lines}{_WORKER_ANCHOR}")
+
+    sites = _dynamic_sites(modules.items())
+
+    assert sites - DYNAMIC_ATTRIBUTE_SITES == {site}
+
+
 def test_reachability_follows_names_aliases_and_implicit_calls() -> None:
     modules = (
         (
@@ -1901,6 +1958,23 @@ class Loader:
 handler = __import__("pkg.handlers")
 """,
         ),
+        (
+            "pkg/renamed.py",
+            """
+import functools
+from builtins import getattr as lookup
+from operator import attrgetter, methodcaller as caller
+
+class Renamed:
+    def escaped(self, record):
+        fetch = getattr
+        return fetch(record, "id")
+    def bound(self, record):
+        return functools.partial(getattr, record)("id")
+    def qualified(self, record):
+        return attrgetter("id")(record)
+""",
+        ),
     )
 
     assert _dynamic_sites(modules) == {
@@ -1908,4 +1982,7 @@ handler = __import__("pkg.handlers")
         "pkg/worker.py::Loader.read",
         "pkg/worker.py::Loader.chosen",
         "pkg/worker.py::<module>",
+        "pkg/renamed.py::<module>",
+        "pkg/renamed.py::Renamed.escaped",
+        "pkg/renamed.py::Renamed.bound",
     }
