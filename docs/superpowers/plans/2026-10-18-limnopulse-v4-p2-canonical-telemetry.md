@@ -56,6 +56,7 @@ Every dependency boundary is a merge to `main`. P2 ships **dark** (D16): no depl
   - small wording fixes.
 - r7.1 (P2-01 review): CI InfluxDB image pinned by digest to a true 2.7.11; Go integration tests run with -count=1.
 - r7.2 (P2-07 review): /v1 projection Flux shape corrected on InfluxDB 2.7.11 (map-free Flux plus Python shaping; summary means within rel 1e-12).
+- r7.3 (#84; the owner approved the issue's proposal as an amendment of the locked P2-00 `flux_string_literal` contract and the P2-05 v2 escaping, relayed by the backlog orchestrator on 2026-10-31): v2 Flux string literals are lossless or rejected (D19). Every `$` becomes `\x24`, non-ASCII and HTML characters stay raw, and C0 controls other than `\n`, `\r` and `\t` are rejected. Two steps go beyond the issue's text because its goal needs them: Go maps the U+2028/U+2029 escapes `encoding/json` always emits back to raw characters, and text that is not valid Unicode is rejected. The legacy Go `fluxString` is unchanged.
 
 ## Global Constraints
 
@@ -92,7 +93,7 @@ Every dependency boundary is a merge to `main`. P2 ships **dark** (D16): no depl
 - **Coverage.** Sonar runs only the default suites, so new production code must reach ≥80% line coverage from unit tests alone. `tests/**` and `scripts/dev/**` are excluded from coverage.
 
 ### Safety
-- **Flux literals.** Every Flux literal built from a runtime value goes through the escaping helper: JSON escaping, then `${` → `\${` to defeat interpolation (`\${` is the only Flux escape for `$`; a lone `$` stays as is, so a bucket such as `raw$archive` keeps working). Every ID is validated before a query is built.
+- **Flux literals.** Every Flux literal built from a runtime value goes through the escaping helper (r7.3, D19): JSON escaping without non-ASCII or HTML escapes, C0 controls other than `\n`, `\r` and `\t` and text that is not valid Unicode rejected, Go's U+2028/U+2029 escapes mapped back to raw characters, then every `$` → `\x24` to defeat interpolation (a bucket such as `raw$archive` becomes `"raw\x24archive"` and keeps working). Every ID is validated before a query is built.
 - **Issue #6.** Presence-aware `Evaluation.Value` stays canonical in #6 and out of P2 scope. The P2 Go reader reports values only through the unchanged `WindowResult`.
 
 ### Evidence
@@ -126,6 +127,7 @@ Epic #22 requires the metric/unit and dual-write contracts to be frozen before d
 | D16 | P2 ships dark | No deployed service calls the pipeline in P2; only `scripts/dev/ingest_reading_v2.py` does, and Telegraf keeps writing only `water_quality`. `ALERT_EVALUATOR_TELEMETRY_SOURCE=v2` and `V1_TELEMETRY_READ_SOURCE=v2` may be enabled only where a producer writes every legacy device to `observation_numeric` and the keyed divergence check reports zero missing or different `(pond, device, metric, _time, value)` tuples over max(longest rule window, legacy read window). Production enablement is a P3 exit step. |
 | D17 | AlertRuleV2 deferred | `/v2/alert-rules`, §16.2 selectors, §16.3 declared quality policies and §7.3 `metric_key` rules are deferred to a separate backlog issue, to start after P3/P6. They need health condition keys and non-null confidence. P2 delivers only the `/v1`-rule v2 read adapter (§24 Phase 2 "move the v2 alert adapter first", §16.4). |
 | D18 | ADR phase split recorded | P2-09 appends a `**Phase split (P2).**` paragraph, with no new Markdown heading, at the end of `## Implementation gate` in ADR-006 and ADR-007. The paragraph names what P2 proves and what P3 must prove before production canonical writes. `tests/unit/test_architecture_inventory.py` pins each ADR's exact heading tuple, so it stays unmodified and green. The orchestrator records the same entry gates on Epic #15. |
+| D19 | Lossless Flux string literals (r7.3, #84) | Amends the locked P2-00 helper and the P2-05 v2 escaping, as proposed on #84 and approved by the owner. Python `flux_string_literal` and Go `fluxV2String` build every v2 Flux string literal in three steps. (1) JSON-encode the value without non-ASCII or HTML escaping: `json.dumps(value, ensure_ascii=False)` in Python, a `json.Encoder` with `SetEscapeHTML(false)` and its trailing newline trimmed in Go. (2) Reject C0 control characters other than `\n`, `\r` and `\t` (U+0000–U+001F; DEL and C1 stay accepted). Python raises `ValueError`. Go returns an error: `BuildV2Query` already returns errors and the runner records `query_error` for that rule only, so nothing is sent and no panic can stop a run. (3) Replace every `$` with `\x24`. Two implementation notes keep the guarantee "lossless or rejected". Go `encoding/json` escapes U+2028 and U+2029 even with `SetEscapeHTML(false)`, so step 3 also maps those two escapes back to the raw characters, in one backslash-aware `strings.Replacer` pass (a plain `ReplaceAll` would corrupt a literal backslash followed by `u2028`). Text that is not valid Unicode (Python lone surrogates, Go invalid UTF-8) is rejected in step 2: Go would turn it into U+FFFD and Python would fail at send time. Both languages then emit byte-identical literals that use only the Flux escapes `\"`, `\\`, `\n`, `\r`, `\t` and `\x24`. A literal holds no `\u` escape (Flux has none) and no unescaped `$`, so it can neither interpolate nor end early, and it decodes to exactly the input. The legacy Go `fluxString` stays byte-identical, because the legacy query text is pinned. Consequence: the v2 evaluator reader now reads IDs such as `${a}` and `<&>` that the legacy reader cannot (it returns `query_error`); the runbook records this divergence. Tests: the shared cases in `testdata/flux_literals/d19_cases.json` (exact literals and the #84 round-trip list) drive the P2-00 and P2-05 tests and live round trips on InfluxDB 2.7.11. |
 
 ### Spec deltas (V4 §10 → this plan)
 
@@ -435,7 +437,7 @@ The identity deliberately excludes mapping versions, quality, `received_at`, `in
 - IDs must match their validators, `metric_key` must be in the catalog, and `schema_version` must equal `"2"`.
 - Event IDs, `source_event_id`, firmware, integration IDs, quality, source type and metadata are never tags.
 
-**Flux literal helper:** `flux_string_literal` returns `json.dumps(value)` with every `${` replaced by `\${`. A lone `$` is left unchanged, and tests cover both `${x}` and `raw$archive`. P2-03, P2-04 and P2-07 use it. Go code applies the same rule in its v2 query.
+**Flux literal helper (r7.3, D19):** `flux_string_literal` returns `json.dumps(value, ensure_ascii=False)` with every `$` replaced by `\x24`, after rejecting C0 controls other than `\n`, `\r` and `\t` and lone surrogates with `ValueError`. Tests cover `${x}`, `raw$archive`, non-ASCII text and the D19 round-trip list. P2-03, P2-04 and P2-07 use it. Go code applies the same rule in its v2 query and emits byte-identical literals.
 
 ### Legacy `water_quality` dual-write point
 
@@ -693,7 +695,7 @@ from(bucket: <b>)
 ```
 
 **Escaping and identifiers:**
-- Every literal goes through `fluxString`; the v2 query also replaces `${` with `\${`, and a lone `$` is unchanged.
+- Every literal goes through `fluxV2String` (r7.3, D19): the lossless rule of `flux_string_literal`, returned as an error from `BuildV2Query` for a rejected value. The legacy query keeps `fluxString` unchanged.
 - `AssetIDForLegacyPond` and `DefaultComponentIDForLegacyDevice` use `uuid.NewSHA1(uuid.NameSpaceURL, …)` with the Python discriminators and return `"<prefix>_" + hex` without dashes. They must equal the Python vectors.
 
 **Rows to samples:**
@@ -704,13 +706,13 @@ from(bucket: <b>)
 - Scenarios: `legacy_sample`, `sub_second`, `delayed_replay`, `relocation`, `unit_converted` and `multi_point_series`.
 - `out_of_range` asserts the documented divergence.
 - `two_probes_same_metric` asserts that a `/v1` rule sees no data from native probes.
-- Query errors take the same `query_error` path as legacy.
+- Query errors take the same `query_error` path as legacy, except for the IDs only the D19 literals can express (r7.3).
 
 ## File Ownership Map
 
 | Task | Exclusive responsibility | Restriction |
 |---|---|---|
-| P2-00 | `domain/telemetry_v2.py`, `domain/metric_catalog.py`, `domain/telemetry_v2_schema.py`, `repositories/telemetry_v2.py`, `TelemetryWriteError` in `core/errors.py`, `testdata/telemetry_v2/`, `scripts/dev/export_telemetry_v2_vectors.py`, `tests/support/telemetry_v2_vectors.py` | No adapters, services, routers, settings or Go code |
+| P2-00 | `domain/telemetry_v2.py`, `domain/metric_catalog.py`, `domain/telemetry_v2_schema.py`, `repositories/telemetry_v2.py`, `TelemetryWriteError` in `core/errors.py`, `testdata/telemetry_v2/`, `testdata/flux_literals/` (r7.3), `scripts/dev/export_telemetry_v2_vectors.py`, `tests/support/telemetry_v2_vectors.py` | No adapters, services, routers, settings or Go code |
 | P2-01 | `tests/support/influx_harness.py`, `tests/influx/conftest.py`, `tests/influx/test_influx_harness_smoke.py`, `internal/alertevaluator/influx/integration_harness_test.go`, `scripts/dev/run_local_influxd.sh`, `Makefile` (`verify-influx` only), `.github/workflows/verify.yml` (`influx` job only), `tests/unit/test_ci_contract.py`, `docs/verification.md` | No runtime code |
 | P2-02 | `domain/telemetry_units.py`, `domain/telemetry_quality.py` | Pure functions only; no I/O |
 | P2-03 | `adapters/influxdb_v2_writer.py`, `services/telemetry_v2_writes.py` | No settings, `main.py` or `/v1` files |
@@ -775,7 +777,7 @@ Each task also owns the new test files named in its section.
   - The optional `probe_id` tag is omitted when absent. Optional fields are always written, with sentinels `sequence=-1i`, `source_event_id=""` and `integration_id=""`. JSON fields over 512 bytes, non-finite values and datetimes outside `[MIN_TELEMETRY_TIME, MAX_TELEMETRY_TIME)` are rejected.
   - The guard rejects unknown or missing tags, invalid IDs, unknown metrics, `quality_state`/`source_type`/event IDs/metadata as tags, and a wrong `schema_version`.
   - `build_legacy_points` + `encode_legacy_line` honor D7, D8 and the grouping/tie-break rules, with exact sub-second time, constant `source=mqtt` and `topic` tags for every source type, and `rssi`/`seq` as integers.
-  - `flux_string_literal` escapes quotes, backslashes, newlines and `${`.
+  - `flux_string_literal` escapes quotes, backslashes, newlines and every `$` (`\x24`), keeps non-ASCII text raw and rejects other C0 controls (r7.3, D19).
 - [ ] **Step 3: Write the failing Telegraf identity test.**
   - It parses `infra/telegraf/telegraf.conf` and asserts measurement `water_quality`, static tags `source="mqtt"`/`schema_version="1"`, topic `limnopulse/v1/devices/+/readings`, `topic_parsing` device tag, and **no** `topic_tag` override.
   - It also asserts that D8's encoder reproduces that identity.
@@ -1018,7 +1020,7 @@ Each task also owns the new test files named in its section.
 
 - [ ] **Step 1: Write failing Go unit tests.**
   - ID and metric vectors from `testdata/telemetry_v2/contract_vectors.json`, with the repository-root path resolved via `runtime.Caller`.
-  - Flux fragments, with escaping (`${` → `\${`; a lone `$` unchanged; `raw$archive` bucket).
+  - Flux fragments, with escaping (every `$` → `\x24`, including the `raw$archive` bucket; C0 controls rejected; r7.3, D19).
   - An unknown metric and an invalid window are rejected.
   - Row parsing for float/int `value` and `sequence`, including the `-1` sentinel → `Seq = 0`.
   - Non-default components dropped; NaN dropped.

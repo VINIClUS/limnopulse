@@ -8,6 +8,10 @@ import (
 
 var ErrLeaseConflict = errors.New("alert evaluation lease conflict")
 
+// ErrUnsupportedStateSchema reports a stored state document written by a newer
+// evaluator. Reading it would drop fields on the next write, so it fails closed.
+var ErrUnsupportedStateSchema = errors.New("unsupported alert evaluation state schema")
+
 type Candidate struct {
 	PK     string
 	SK     string

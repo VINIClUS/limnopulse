@@ -1,8 +1,10 @@
 import dataclasses
 import json
 import math
+import random
 import re
 from datetime import UTC, datetime, timedelta
+from pathlib import Path
 
 import pytest
 from limnopulse_api.domain.telemetry_v2 import (
@@ -802,30 +804,128 @@ def test_legacy_rssi_is_an_integer_field() -> None:
     assert encode_legacy_line(point).endswith(" rssi=-67i 1783598400000000000")
 
 
-# --- flux literal ---------------------------------------------------------------------------
+# --- flux literal (P2 plan D19, #84) --------------------------------------------------------
+
+# A literal decodes to exactly its input, or the input is rejected. Python and Go read the same
+# cases, so both languages emit identical literals.
+D19_CASES = json.loads(
+    (Path(__file__).resolve().parents[2] / "testdata/flux_literals/d19_cases.json").read_text(
+        encoding="utf-8"
+    )
+)
+FLUX_LITERAL_CASES = [(case["value"], case["literal"]) for case in D19_CASES["literals"]]
+FLUX_ROUND_TRIP_VALUES = D19_CASES["round_trip"]
+assert len(FLUX_LITERAL_CASES) >= 20, "D19 literal cases are incomplete"
+assert len(FLUX_ROUND_TRIP_VALUES) >= 20, "D19 round-trip values are incomplete"
+
+# C0 controls JSON can only write as `\b`, `\f` or `\u00XX`, none of which Flux accepts.
+REJECTED_C0 = [chr(code) for code in range(0x20) if chr(code) not in "\n\r\t"]
+
+_FLUX_SIMPLE_ESCAPES = {"n": "\n", "r": "\r", "t": "\t", '"': '"', "\\": "\\"}
+
+
+def decode_flux_string_literal(literal: str) -> str:
+    """Decode a literal with the Flux string escapes the D19 rule emits, and nothing else.
+
+    Stricter than Flux: an unescaped `$`, a raw C0 control or any `\\x` escape other than
+    `\\x24` is an error here.
+    """
+    assert len(literal) >= 2 and literal[0] == literal[-1] == '"', literal
+    body, out, index = literal[1:-1], [], 0
+    while index < len(body):
+        char = body[index]
+        if char == "\\":
+            escape = body[index + 1 : index + 2]
+            if escape == "x":
+                assert body[index : index + 4] == "\\x24", f"\\x other than \\x24 in {literal!r}"
+                out.append("$")
+                index += 4
+                continue
+            assert escape in _FLUX_SIMPLE_ESCAPES, f"invalid Flux escape \\{escape} in {literal!r}"
+            out.append(_FLUX_SIMPLE_ESCAPES[escape])
+            index += 2
+            continue
+        assert char != '"', f"unescaped quote ends {literal!r} early"
+        assert char != "$", f"unescaped $ in {literal!r}"
+        assert not ("\x00" <= char < " "), f"raw control character in {literal!r}"
+        out.append(char)
+        index += 1
+    return "".join(out)
 
 
 @pytest.mark.parametrize(
-    ("value", "expected"),
+    "literal",
     [
-        ("plain", '"plain"'),
-        ('say "hi"', '"say \\"hi\\""'),
-        ("back\\slash", '"back\\\\slash"'),
-        ("line\nbreak", '"line\\nbreak"'),
-        ("${x}", '"\\${x}"'),
-        ("a${b}c${d}", '"a\\${b}c\\${d}"'),
-        ("raw$archive", '"raw$archive"'),
-        ("$", '"$"'),
-        ("{x}", '"{x}"'),
+        "plain",
+        '"',
+        '"$"',
+        '"\\/"',
+        '"\\b"',
+        '"\\u2028"',
+        '"a"b"',
+        '"\n"',
+        '"\\"',
+        '"\\xZZ"',
+        '"\\x2"',
+        '"\\x7b"',
+        '"\\xc3\\xa9"',
     ],
+    ids=ascii,
 )
-def test_flux_string_literal_escapes_json_and_interpolation(value, expected) -> None:
+def test_flux_literal_decoder_rejects_what_d19_never_emits(literal) -> None:
+    with pytest.raises(AssertionError):
+        decode_flux_string_literal(literal)
+
+
+@pytest.mark.parametrize(("value", "expected"), FLUX_LITERAL_CASES, ids=ascii)
+def test_flux_string_literal_follows_the_lossless_rule(value, expected) -> None:
     assert flux_string_literal(value) == expected
 
 
-@pytest.mark.parametrize("value", ["tnt_local_001", 'q"\\\n\t', "x${y}$z", "é"])
-def test_flux_string_literal_is_json_dumps_with_interpolation_escape(value) -> None:
-    assert flux_string_literal(value) == json.dumps(value).replace("${", "\\${")
+@pytest.mark.parametrize("value", ["tnt_local_001", 'q"\\\n\t\r', "x${y}$z", "é<&>", "\u2028"])
+def test_flux_string_literal_is_unescaped_json_with_every_dollar_as_hex(value) -> None:
+    assert flux_string_literal(value) == json.dumps(value, ensure_ascii=False).replace("$", "\\x24")
+
+
+@pytest.mark.parametrize("value", FLUX_ROUND_TRIP_VALUES, ids=ascii)
+def test_flux_string_literal_decodes_to_its_input(value) -> None:
+    literal = flux_string_literal(value)
+    assert "\\u" not in literal.replace("\\\\", "")
+    assert "$" not in literal
+    assert decode_flux_string_literal(literal) == value
+
+
+def test_flux_string_literal_round_trips_random_text() -> None:
+    # Multi-character tokens make the escape neighbours (`\` before U+2028, `\u2028` text,
+    # `$` before `{`) frequent.
+    tokens = ["$", "{", "}", "${", "\\", "\\\\", '"', "\n", "\r", "\t", " ", "x", "\\u2028"]
+    tokens += ["\\x24", "\\b", "\u2028", "\u2029", "é", "<&>", "😀", "\x7f", "\x85", "\ufffd"]
+    rng = random.Random(84)
+    for _ in range(2000):
+        value = "".join(rng.choice(tokens) for _ in range(rng.randrange(9)))
+        assert decode_flux_string_literal(flux_string_literal(value)) == value, ascii(value)
+
+
+@pytest.mark.parametrize("control", REJECTED_C0, ids=lambda control: f"U+{ord(control):04X}")
+def test_flux_string_literal_rejects_c0_controls(control) -> None:
+    for value in (control, f"a{control}b", f"$${{{control}}}"):
+        with pytest.raises(ValueError, match="control"):
+            flux_string_literal(value)
+
+
+@pytest.mark.parametrize(
+    "value",
+    ["\n", "\r", "\t", " ", "\x7f", "\x85", "\x9f", "\ufffd", "\\u0001", "\\b", "\\f"],
+    ids=ascii,
+)
+def test_flux_string_literal_accepts_the_allowed_controls_and_the_c0_boundary(value) -> None:
+    assert decode_flux_string_literal(flux_string_literal(value)) == value
+
+
+@pytest.mark.parametrize("value", ["\ud800", "a\udfffb", "\udbff$"], ids=ascii)
+def test_flux_string_literal_rejects_text_that_is_not_valid_unicode(value) -> None:
+    with pytest.raises(ValueError):
+        flux_string_literal(value)
 
 
 # --- review regressions (added after approval of 029c55c) -----------------------------------

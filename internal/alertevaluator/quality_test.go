@@ -306,3 +306,141 @@ func TestDeterministicOrderKeepsOtherResultFields(t *testing.T) {
 		}
 	}
 }
+
+func fullWindow(spec WindowSpec, device string, value func(index int) float64) []Sample {
+	var samples []Sample
+	index := 0
+	for offset := time.Duration(0); offset < spec.End.Sub(spec.Start); offset += spec.ExpectedSampleInterval {
+		samples = append(samples, Sample{Time: spec.Start.Add(offset + time.Second), DeviceID: device, Value: value(index), Seq: int64(index)})
+		index++
+	}
+	return samples
+}
+
+func TestSufficientZeroAggregateIsAPresentMeasurement(t *testing.T) {
+	for _, aggregation := range []Aggregation{AggregationMin, AggregationMax, AggregationMean, AggregationLast} {
+		spec := qualitySpec(aggregation)
+		result := EvaluateSamples(spec, fullWindow(spec, "dev_1", func(int) float64 { return 0 }))
+
+		value, ok := result.Measurement().Get()
+		if result.Quality != QualitySufficient || !ok || value != 0 {
+			t.Fatalf("%s: result = %#v, measurement = %v, want present 0", aggregation, result, result.Measurement())
+		}
+	}
+}
+
+func TestNonFiniteAggregateIsInvalidAndAbsent(t *testing.T) {
+	// Each sample is finite, but their sum overflows to +Inf.
+	spec := qualitySpec(AggregationMean)
+	result := EvaluateSamples(spec, fullWindow(spec, "dev_1", func(int) float64 { return math.MaxFloat64 }))
+
+	if result.Quality != QualityInsufficientData || result.Measurement().IsPresent() {
+		t.Fatalf("overflowing mean = %#v, measurement = %v, want absent insufficient_data", result, result.Measurement())
+	}
+
+	last := qualitySpec(AggregationLast)
+	samples := append(
+		fullWindow(last, "dev_a", func(int) float64 { return -math.MaxFloat64 }),
+		fullWindow(last, "dev_b", func(int) float64 { return -math.MaxFloat64 })...,
+	)
+	result = EvaluateSamples(last, samples)
+	if result.Quality != QualityInsufficientData || result.Measurement().IsPresent() {
+		t.Fatalf("overflowing last = %#v, measurement = %v, want absent insufficient_data", result, result.Measurement())
+	}
+
+	// One bucket overflows to +Inf and the next to -Inf, so the mean is NaN.
+	// This relies on the fixed summation order pinned by
+	// TestMeanSumsBucketsAndDevicesInAscendingOrder.
+	nanSpec := qualitySpec(AggregationMean)
+	var nanSamples []Sample
+	for bucket := 0; bucket < 6; bucket++ {
+		value := math.MaxFloat64
+		if bucket%2 == 1 {
+			value = -math.MaxFloat64
+		}
+		at := nanSpec.Start.Add(time.Duration(bucket)*nanSpec.ExpectedSampleInterval + time.Second)
+		nanSamples = append(nanSamples,
+			Sample{Time: at, DeviceID: "dev_a", Value: value},
+			Sample{Time: at, DeviceID: "dev_b", Value: value})
+	}
+	result = EvaluateSamples(nanSpec, nanSamples)
+	if result.Quality != QualityInsufficientData || result.Measurement().IsPresent() {
+		t.Fatalf("NaN mean = %#v, measurement = %v, want absent insufficient_data", result, result.Measurement())
+	}
+}
+
+func TestOutOfRangeAggregateIsInvalidBeforeStaleClassification(t *testing.T) {
+	spec := qualitySpec(AggregationMax)
+	spec.MinimumCoverageRatio = 0.4
+	var samples []Sample
+	for offset := time.Duration(0); offset < 30*time.Second; offset += spec.ExpectedSampleInterval {
+		samples = append(samples, Sample{Time: spec.Start.Add(offset + time.Second), DeviceID: "dev_1", Value: 1e30})
+	}
+
+	result := EvaluateSamples(spec, samples)
+
+	if result.Quality != QualityInsufficientData || result.Measurement().IsPresent() {
+		t.Fatalf("stale out-of-range window = %#v, want insufficient_data", result)
+	}
+}
+
+func TestOutOfRangeAggregateIsInvalidAndAbsent(t *testing.T) {
+	for _, test := range []struct {
+		aggregation Aggregation
+		value       float64
+	}{
+		{AggregationMax, 1e30},
+		{AggregationMin, -1e200},
+		{AggregationMean, 1e-120},
+		{AggregationLast, 5e-324},
+	} {
+		spec := qualitySpec(test.aggregation)
+		result := EvaluateSamples(spec, fullWindow(spec, "dev_1", func(int) float64 { return test.value }))
+
+		if result.Quality != QualityInsufficientData || result.Measurement().IsPresent() {
+			t.Fatalf("%s of %v = %#v, want absent insufficient_data", test.aggregation, test.value, result)
+		}
+	}
+}
+
+func TestWindowMeasurementIsPresentOnlyForSufficientWindowsWithPoints(t *testing.T) {
+	tests := []struct {
+		result      WindowResult
+		wantPresent bool
+	}{
+		{WindowResult{Quality: QualitySufficient, ValidPointCount: 1, Value: 0}, true},
+		{WindowResult{Quality: QualitySufficient, ValidPointCount: 6, Value: -3.5}, true},
+		{WindowResult{Quality: QualityStaleData, ValidPointCount: 3, Value: 9.9}, false},
+		{WindowResult{Quality: QualityInsufficientData}, false},
+		{WindowResult{Quality: QualityQueryError, ValidPointCount: 1, Value: 1}, false},
+		{WindowResult{}, false},
+		// A sufficient result that counted no point carries no value, not zero.
+		{WindowResult{Quality: QualitySufficient}, false},
+		{WindowResult{Quality: QualitySufficient, Value: 4.2}, false},
+		{WindowResult{Quality: QualitySufficient, ValidPointCount: 1, Value: math.Inf(1)}, false},
+		{WindowResult{Quality: QualitySufficient, ValidPointCount: 1, Value: math.NaN()}, false},
+		{WindowResult{Quality: QualitySufficient, ValidPointCount: 1, Value: 1e200}, false},
+	}
+	for _, test := range tests {
+		value, ok := test.result.Measurement().Get()
+		if ok != test.wantPresent || (ok && value != test.result.Value) {
+			t.Fatalf("Measurement(%#v) = (%v, %v), want present=%v", test.result, value, ok, test.wantPresent)
+		}
+	}
+}
+
+func TestStaleWindowKeepsItsRawAggregateButNoMeasurement(t *testing.T) {
+	spec := qualitySpec(AggregationMin)
+	spec.MaximumSampleAge = 30 * time.Second
+	var samples []Sample
+	for offset := time.Duration(0); offset < 30*time.Second; offset += spec.ExpectedSampleInterval {
+		samples = append(samples, Sample{Time: spec.Start.Add(offset + time.Second), DeviceID: "dev_1", Value: 9.9})
+	}
+	spec.MinimumCoverageRatio = 0.4
+
+	result := EvaluateSamples(spec, samples)
+
+	if result.Quality != QualityStaleData || result.Value != 9.9 || result.Measurement().IsPresent() {
+		t.Fatalf("stale result = %#v, measurement = %v", result, result.Measurement())
+	}
+}
