@@ -60,13 +60,16 @@ resource "aws_secretsmanager_secret" "telegram_bot_token" {
 data "aws_iam_policy_document" "telegram_worker" {
   count = var.telegram_delivery ? 1 : 0
 
+  # Both actions duplicate the base workers policy in iam_runtime.tf. The
+  # worker's transactions go through the shared worker/dynamo Store, and their
+  # Put and ConditionCheck items are authorized by the PutItem and
+  # ConditionCheckItem that policy grants: IAM has no TransactWriteItems action.
   statement {
     sid    = "TelegramDeliveryState"
     effect = "Allow"
     actions = [
       "dynamodb:GetItem",
       "dynamodb:UpdateItem",
-      "dynamodb:TransactWriteItems",
     ]
     resources = [aws_dynamodb_table.domain.arn]
   }

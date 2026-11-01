@@ -101,12 +101,16 @@ resource "aws_sqs_queue_policy" "telemetry_ingress_dlq" {
 }
 
 # API principal (iam_runtime.tf's aws_iam_user.api): send-only on ingress.
-# IAM cannot restrict an item action to use inside TransactWriteItems, so the
-# DeleteItem and audit PutItem grants are also usable standalone.
 # TransactWriteItems sub-operations are authorized per item action, so the
 # credential and lifecycle transactions need explicit DeleteItem and
 # ConditionCheckItem on the domain table, and PutItem on the audit table for
-# the D23 audit items (iam_runtime.tf grants only TransactWriteItems there).
+# the D23 audit items. Since issue #108 the base api policy in iam_runtime.tf
+# grants the same three actions unconditionally, so the two DynamoDB
+# statements below duplicate it. They stay on purpose: dropping them changes
+# this policy without changing what the API may do.
+# Neither policy sets the dynamodb:EnclosingOperation condition key, which
+# would restrict an item action to use inside a transaction, so the DeleteItem
+# and audit PutItem grants are also usable standalone.
 data "aws_iam_policy_document" "telemetry_ingress_api" {
   count = var.telemetry_ingress ? 1 : 0
 
