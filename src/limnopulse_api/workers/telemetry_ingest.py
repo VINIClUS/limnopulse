@@ -60,25 +60,35 @@ EXIT_REFUSED = 2
 # (heartbeat, delete, visibility change or a DynamoDB request). Each client's worst single call
 # is bounded below, and SHUTDOWN_CALL_BUDGET_SECONDS is the larger of the two, so
 # `wait + 5 + drain + SHUTDOWN_CALL_BUDGET_SECONDS` must stay below the compose stop grace.
+# The retries use `total_max_attempts`, the attempts in all: botocore's `max_attempts` counts
+# retries, so `max_attempts: N` would make N + 1 attempts.
 _CONNECT_TIMEOUT_SECONDS = 3
 # SQS: no botocore retry (the loop retries a failed poll, and a failed heartbeat, delete or
 # visibility change only means a later redelivery). The read timeout must outlast the long poll.
 _SQS_READ_TIMEOUT_MARGIN_SECONDS = 5
-_SQS_RETRIES = {"mode": "standard", "max_attempts": 1}
+_SQS_RETRIES = {"mode": "standard", "total_max_attempts": 1}
 # DynamoDB: one bounded retry for throttling or a transient error.
 _DYNAMODB_READ_TIMEOUT_SECONDS = 10
-_DYNAMODB_RETRIES = {"mode": "standard", "max_attempts": 2}
+_DYNAMODB_RETRIES = {"mode": "standard", "total_max_attempts": 2}
+
+
+def _worst_call_seconds(retries: dict[str, Any], attempt_seconds: int) -> int:
+    """Every attempt timing out, plus the longest backoff botocore's standard mode sleeps before
+    each retry (at most min(2 ** (i - 1), 20) s before retry i)."""
+    attempts = retries["total_max_attempts"]
+    return attempts * attempt_seconds + sum(min(2 ** (i - 1), 20) for i in range(1, attempts))
 
 
 def shutdown_call_budget_seconds(settings: Settings) -> int:
     """The longest a single in-flight SQS or DynamoDB call can take, retries included."""
-    sqs = _SQS_RETRIES["max_attempts"] * (
+    sqs = _worst_call_seconds(
+        _SQS_RETRIES,
         _CONNECT_TIMEOUT_SECONDS
         + settings.telemetry_ingest_worker_wait_seconds
-        + _SQS_READ_TIMEOUT_MARGIN_SECONDS
+        + _SQS_READ_TIMEOUT_MARGIN_SECONDS,
     )
-    dynamodb = _DYNAMODB_RETRIES["max_attempts"] * (
-        _CONNECT_TIMEOUT_SECONDS + _DYNAMODB_READ_TIMEOUT_SECONDS
+    dynamodb = _worst_call_seconds(
+        _DYNAMODB_RETRIES, _CONNECT_TIMEOUT_SECONDS + _DYNAMODB_READ_TIMEOUT_SECONDS
     )
     return max(sqs, dynamodb)
 
