@@ -153,10 +153,11 @@ func runOutcome(err error, stopping bool) Outcome {
 	switch {
 	case IsConfiguration(err):
 		return Outcome{ExitCode: ExitConfiguration, Reason: ReasonConfiguration, Err: err}
+	case stopping && (err == nil || errors.Is(err, ErrStopSignal) || errors.Is(err, context.Canceled)):
+		// A worker that drains and returns its context's error still stopped cleanly.
+		return Outcome{ExitCode: ExitSuccess, Reason: ReasonStopped}
 	case err != nil:
 		return Outcome{ExitCode: ExitFailure, Reason: ReasonFailure, Err: err}
-	case stopping:
-		return Outcome{ExitCode: ExitSuccess, Reason: ReasonStopped}
 	default:
 		return Outcome{
 			ExitCode: ExitFailure, Reason: ReasonUnexpectedExit,

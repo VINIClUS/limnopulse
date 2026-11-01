@@ -11,6 +11,8 @@ import yaml
 
 ROOT = Path(__file__).resolve().parents[2]
 ROLES_PATH = ROOT / "ops/workers/roles.yaml"
+OPENTOFU_DIR = ROOT / "infra/opentofu"
+PRODUCTION_COMPOSE = ROOT / "compose.production.yaml"
 
 ADR_ROLES = (
     "alert-evaluator",
@@ -27,6 +29,33 @@ EXIT_CODES = {
     "runtime_failure": 1,
     "partial_run": 2,
     "configuration_error": 78,
+}
+EXPECTED_PATHS = {
+    "workers_root": "/opt/limnopulse/workers",
+    "releases": "/opt/limnopulse/workers/releases",
+    "current": "/opt/limnopulse/workers/current",
+    "state": "/opt/limnopulse/workers/state",
+    "config": "/etc/limnopulse/workers",
+    "credentials": "/etc/limnopulse/workers/credentials",
+    "credential_source": "/etc/limnopulse/workers/credentials/{role}/{credential}",
+    "units": "/etc/systemd/system",
+}
+EXPECTED_BUNDLE_FILES = {
+    "format": 1,
+    "checksum_manifest": "SHA256SUMS",
+    "metadata": "bundle.env",
+    "role_table": "roles.json",
+    "binaries": "bin",
+    "units": "systemd",
+}
+ACTIVATION_EXIT_CODES = {"success": 0, "failure": 1, "floor_refused": 3, "usage": 78}
+FORCED_COMMAND = "^main-[0-9a-f]{40} [0-9a-f]{64}$"
+GO_UNIT_ENVIRONMENT = {"GOTRACEBACK": "crash"}
+SES_CONSUMERS = frozenset({"email-worker", "ses-feedback-worker"})
+SES_ROUTING_ALARM = {
+    "name": "ses-events-routing-dlq",
+    "queue": "ses_events_routing_dlq",
+    "gate_variable": "email_delivery",
 }
 AWS_CREDENTIALS = ("aws-access-key-id", "aws-secret-access-key")
 LIFECYCLES = {"continuous", "oneshot", "cli", "compose"}
@@ -69,6 +98,10 @@ LIFECYCLE_FIELDS = {
     "compose": (
         "compose_service",
         "compose_profile",
+        "restart",
+        "liveness_file",
+        "healthcheck",
+        "configuration_error",
         "enable_variable",
         "unit_health_reason",
     ),
@@ -91,6 +124,27 @@ def roles_by_name(table: dict[str, Any]) -> dict[str, dict[str, Any]]:
     return {role["name"]: role for role in table["roles"]}
 
 
+def load_credential_lines(table: dict[str, Any], role: dict[str, Any]) -> list[str]:
+    """Render a unit role's `LoadCredential=` values from the table's credential source."""
+    source = table["paths"]["credential_source"]
+    return [
+        f"{credential}:{source.format(role=role['name'], credential=credential)}"
+        for credential in role["credentials"]
+    ]
+
+
+def opentofu_names(directory: Path = OPENTOFU_DIR) -> tuple[set[str], set[str]]:
+    """Return the SQS queue resource names and the variable names OpenTofu declares."""
+    source = "\n".join(path.read_text(encoding="utf-8") for path in directory.glob("*.tf"))
+    queues = set(re.findall(r'^resource "aws_sqs_queue" "(\w+)"', source, flags=re.MULTILINE))
+    variables = set(re.findall(r'^variable "(\w+)"', source, flags=re.MULTILINE))
+    return queues, variables
+
+
+def compose_services(path: Path = PRODUCTION_COMPOSE) -> dict[str, dict[str, Any]]:
+    return yaml.safe_load(path.read_text(encoding="utf-8"))["services"]
+
+
 def validate_roles(table: dict[str, Any]) -> list[str]:
     problems: list[str] = []
     problems += _validate_top_level(table)
@@ -105,6 +159,8 @@ def validate_roles(table: dict[str, Any]) -> list[str]:
     for role in table["roles"]:
         problems += _validate_role(role, paths, table, shared_roles)
     problems += _validate_uniqueness(table["roles"], declared)
+    problems += _validate_queues(table, declared)
+    problems += _validate_compose(table["roles"])
     return problems
 
 
@@ -134,9 +190,33 @@ def _validate_top_level(table: dict[str, Any]) -> list[str]:
         problems.append("unit_health must publish Limnopulse/Workers UnitHealthy by Role")
     if health.get("published_when") != "unit_file_enabled":
         problems.append("unit_health must publish only for enabled units")
-    alarms = {alarm.get("name") for alarm in table.get("standalone_alarms", [])}
-    if "ses-events-routing-dlq" not in alarms:
-        problems.append("the SES routing DLQ needs its own standalone alarm")
+    if health.get("treat_missing_data") != "breaching":
+        problems.append("unit_health alarms must treat missing data as breaching")
+    stale = health.get("oneshot_stale_after_intervals")
+    if type(stale) is not int or stale < 1:
+        problems.append("unit_health oneshot_stale_after_intervals must be a positive integer")
+    if health.get("oneshot_success_exit_codes") != [EXIT_CODES["success"]]:
+        problems.append("unit_health counts only exit 0 as a successful one-shot run")
+    if table.get("paths") != EXPECTED_PATHS:
+        problems.append(f"paths must be exactly {EXPECTED_PATHS}")
+    bundle = table.get("bundle", {})
+    if {key: bundle.get(key) for key in EXPECTED_BUNDLE_FILES} != EXPECTED_BUNDLE_FILES:
+        problems.append(f"bundle layout must be {EXPECTED_BUNDLE_FILES}")
+    activation = table.get("activation", {})
+    if activation.get("exit_codes") != ACTIVATION_EXIT_CODES:
+        problems.append(f"activation exit_codes must be exactly {ACTIVATION_EXIT_CODES}")
+    expected_sudoers = (
+        f"limnopulse-deploy ALL=(root) NOPASSWD: {activation.get('helper')}"
+    )
+    if activation.get("sudoers") != expected_sudoers:
+        problems.append(f"activation sudoers must be exactly {expected_sudoers!r}")
+    if table.get("deploy", {}).get("forced_command") != FORCED_COMMAND:
+        problems.append(f"deploy forced_command must be exactly {FORCED_COMMAND!r}")
+    if table.get("go_unit_environment") != GO_UNIT_ENVIRONMENT:
+        problems.append(f"go_unit_environment must be exactly {GO_UNIT_ENVIRONMENT}")
+    alarms = table.get("standalone_alarms", [])
+    if SES_ROUTING_ALARM not in alarms:
+        problems.append(f"the SES routing DLQ needs its own standalone alarm: {SES_ROUTING_ALARM}")
     return problems
 
 
@@ -150,6 +230,8 @@ def _declared_shared_lifecycles(
             problems.append(f"a shared lifecycle needs at least two roles: {entry}")
         if not str(entry.get("justification") or "").strip():
             problems.append(f"shared lifecycle {roles} has no justification")
+        if SES_CONSUMERS <= set(roles):
+            problems.append(f"the SES consumers never share a lifecycle: {roles}")
         declared.append(frozenset(roles))
     return declared
 
@@ -229,6 +311,14 @@ def _validate_role(
             problems.append(f"{name}: its Compose profile must be in the deploy profile list")
         if role.get("rollback") is not None:
             problems.append(f"{name}: a Compose role is not in the workers bundle")
+        if role["restart"] != "unless-stopped":
+            problems.append(f"{name}: a Compose worker restarts unless-stopped")
+        if role["configuration_error"] != "park":
+            problems.append(f"{name}: a Compose worker parks after a configuration error")
+        if role["healthcheck"] != f"{role['entrypoint']} healthcheck":
+            problems.append(f"{name}: healthcheck must be {role['entrypoint']} healthcheck")
+        if not str(role["liveness_file"]).startswith("/tmp/"):
+            problems.append(f"{name}: liveness_file lives under the container's /tmp")
     if name == "ses-feedback-worker" and role.get("single_instance") is not True:
         problems.append("ses-feedback-worker runs as a single instance")
     return problems
@@ -301,4 +391,52 @@ def _validate_uniqueness(
     for shared in declared:
         if not any(frozenset(members) == shared for members in processes.values()):
             problems.append(f"declared shared lifecycle {sorted(shared)} shares no process")
+    return problems
+
+
+def _validate_queues(table: dict[str, Any], declared: list[frozenset[str]]) -> list[str]:
+    problems: list[str] = []
+    queues, variables = opentofu_names()
+    consumers: dict[str, set[str]] = {}
+    for role in table["roles"]:
+        name = role.get("name")
+        for queue in role.get("queues", []):
+            if queue.get("queue") not in queues:
+                problems.append(f"{name}: queue {queue.get('queue')} is not an OpenTofu SQS queue")
+            if queue.get("queue") == SES_ROUTING_ALARM["queue"]:
+                problems.append(f"{name}: no role reads the SES routing DLQ")
+            if queue.get("access") == "consume":
+                consumers.setdefault(queue.get("queue"), set()).add(name)
+        if role.get("lifecycle") == "compose" and role.get("enable_variable") not in variables:
+            problems.append(
+                f"{name}: enable_variable {role.get('enable_variable')} is not an OpenTofu variable"
+            )
+    for queue, members in consumers.items():
+        if len(members) > 1 and frozenset(members) not in declared:
+            problems.append(f"queue {queue} has more than one consumer role: {sorted(members)}")
+    for alarm in table.get("standalone_alarms", []):
+        if alarm.get("queue") not in queues:
+            problems.append(f"{alarm.get('name')}: queue {alarm.get('queue')} is not an OpenTofu SQS queue")
+        if alarm.get("gate_variable") not in variables:
+            problems.append(
+                f"{alarm.get('name')}: gate_variable {alarm.get('gate_variable')} is not an OpenTofu variable"
+            )
+    return problems
+
+
+def _validate_compose(roles: list[dict[str, Any]]) -> list[str]:
+    problems: list[str] = []
+    services = compose_services()
+    for role in roles:
+        if role.get("lifecycle") != "compose":
+            continue
+        name, service = role.get("name"), services.get(role.get("compose_service"))
+        if service is None:
+            problems.append(
+                f"{name}: compose_service {role.get('compose_service')} is not in compose.production.yaml"
+            )
+        elif role.get("compose_profile") not in service.get("profiles", []):
+            problems.append(
+                f"{name}: compose.production.yaml does not put it in profile {role.get('compose_profile')}"
+            )
     return problems

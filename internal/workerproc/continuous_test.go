@@ -3,6 +3,7 @@ package workerproc
 import (
 	"context"
 	"errors"
+	"fmt"
 	"os"
 	"strings"
 	"syscall"
@@ -53,6 +54,29 @@ func TestStopSignalExitsZeroAfterReadyAndStopping(t *testing.T) {
 		t.Fatalf("run saw cause %v", cause)
 	}
 	expectMessage(t, messages, "STOPPING=1")
+}
+
+func TestReturningTheContextErrorAfterAStopExitsZero(t *testing.T) {
+	results := map[string]func(context.Context) error{
+		"ctx.Err":       func(ctx context.Context) error { return ctx.Err() },
+		"context.Cause": func(ctx context.Context) error { return context.Cause(ctx) },
+		"wrapped":       func(ctx context.Context) error { return fmt.Errorf("receive: %w", ctx.Err()) },
+	}
+	for name, result := range results {
+		signals := make(chan os.Signal, 1)
+		outcome := runAsync(Continuous{
+			StallAfter: time.Second,
+			Lookup:     env(nil),
+			Signals:    signals,
+		}, context.Background(), func(ctx context.Context, loop Loop) error {
+			<-ctx.Done()
+			return result(ctx)
+		})
+		signals <- syscall.SIGTERM
+		if got := waitOutcome(t, outcome); got.ExitCode != ExitSuccess || got.Reason != ReasonStopped {
+			t.Errorf("%s: got %+v", name, got)
+		}
+	}
 }
 
 func TestFreshProgressFeedsTheWatchdog(t *testing.T) {

@@ -18,6 +18,7 @@ const (
 	CredentialAWSAccessKeyID     = "aws-access-key-id"
 	CredentialAWSSecretAccessKey = "aws-secret-access-key"
 	CredentialInfluxDBToken      = "influxdb-token"
+	CredentialRedisPassword      = "redis-password"
 )
 
 var credentialName = regexp.MustCompile(`^[a-z0-9][a-z0-9-]*$`)
@@ -28,15 +29,32 @@ type Credentials struct {
 	dir string
 }
 
+// CredentialsFromEnv refuses to fall back to the default chain under systemd: a unit
+// without CREDENTIALS_DIRECTORY lost its LoadCredential= lines and is misconfigured.
 func CredentialsFromEnv(lookup LookupEnv) (Credentials, error) {
-	dir, _ := lookupOrOS(lookup)("CREDENTIALS_DIRECTORY")
+	get := lookupOrOS(lookup)
+	dir, _ := get("CREDENTIALS_DIRECTORY")
 	if dir == "" {
+		if supervised(get) {
+			return Credentials{}, Configuration(errors.New("CREDENTIALS_DIRECTORY is not set under systemd"))
+		}
 		return Credentials{}, nil
 	}
 	if !filepath.IsAbs(dir) {
 		return Credentials{}, Configuration(errors.New("CREDENTIALS_DIRECTORY must be absolute"))
 	}
 	return Credentials{dir: dir}, nil
+}
+
+// supervised reports whether systemd started this process: it sets INVOCATION_ID for
+// every unit and NOTIFY_SOCKET for Type=notify services.
+func supervised(get LookupEnv) bool {
+	for _, name := range []string{"INVOCATION_ID", "NOTIFY_SOCKET"} {
+		if value, _ := get(name); value != "" {
+			return true
+		}
+	}
+	return false
 }
 
 func (creds Credentials) Available() bool {

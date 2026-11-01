@@ -20,6 +20,9 @@ paths:
   state: /opt/limnopulse/workers/state
   config: /etc/limnopulse/workers
   credentials: /etc/limnopulse/workers/credentials
+  # LoadCredential=<name>:<credential_source>. Every role reads its own principal's keys
+  # from its own directory, even though the credential names repeat across roles.
+  credential_source: /etc/limnopulse/workers/credentials/{role}/{credential}
   units: /etc/systemd/system
 
 unit_health:
@@ -29,6 +32,9 @@ unit_health:
   # A one-shot role is unhealthy when its last successful run is older than this many
   # schedule intervals, or when its timer is not active.
   oneshot_stale_after_intervals: 3
+  # Only these exit codes count as a successful run. Exit 2 (partial) is unhealthy, and
+  # units never set SuccessExitStatus=2.
+  oneshot_success_exit_codes: [0]
   # Published only for roles whose service (continuous) or timer (one-shot) has
   # UnitFileState=enabled. A disabled role publishes nothing.
   published_when: unit_file_enabled
@@ -60,6 +66,11 @@ activation:
 deploy:
   forced_command: "^main-[0-9a-f]{40} [0-9a-f]{64}$"
   compose_profiles: [ingestion]
+
+# Set on every Go unit: an unrecovered panic then dies by SIGABRT instead of exiting 2,
+# so it cannot pass for a partial run.
+go_unit_environment:
+  GOTRACEBACK: crash
 
 shared_lifecycles: []
 
@@ -168,7 +179,8 @@ roles:
       service: limnopulse-telegram-worker.service
     binary: /opt/limnopulse/workers/current/bin/telegram-worker
     env_file: /etc/limnopulse/workers/telegram-worker.env
-    credentials: [aws-access-key-id, aws-secret-access-key]
+    # The Redis password reaches the unit through LoadCredential=, never the env file.
+    credentials: [aws-access-key-id, aws-secret-access-key, redis-password]
     iam_principal: telegram_worker
     enable_variable: telegram_worker_enabled
     unit_health: systemd
@@ -221,6 +233,13 @@ roles:
     work: SQS telemetry ingress → observations
     compose_service: telemetry-ingest-worker
     compose_profile: ingestion
+    restart: unless-stopped
+    # Written on every loop turn; the stall threshold is derived from the worker's deadlines
+    # and recorded in the stamp itself. A stall exits 1, a configuration error exits 78 and
+    # the Compose entrypoint guard then parks the container.
+    liveness_file: /tmp/limnopulse-telemetry-ingest.liveness
+    healthcheck: python -m limnopulse_api.workers.telemetry_ingest healthcheck
+    configuration_error: park
     iam_principal: telemetry_ingest
     enable_variable: telemetry_ingress
     unit_health: none

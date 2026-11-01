@@ -15,15 +15,29 @@ provisions a worker builds against both.
 | `78` | configuration error | `RestartPreventExitStatus=78`; never restarted |
 
 A timer starting a one-shot on its next tick is scheduling, not a restart. A failed run
-shows up as `UnitHealthy=0`.
+shows up as `UnitHealthy=0`. Only exit `0` is a successful run: units never set
+`SuccessExitStatus=2`, so a partial run stays visible as a failed run.
+
+Nothing else may exit `2`. Every Go unit sets `GOTRACEBACK=crash` (`go_unit_environment`
+in `roles.yaml`), so an unrecovered panic dies by `SIGABRT` instead of exiting `2`.
+Entrypoints parse flags with `workerproc.ParseFlags`, which switches the flag set to
+`flag.ContinueOnError` and returns a bad flag as a configuration error; the flag package's
+default `ExitOnError` would exit `2`.
 
 Go roles use `internal/workerproc`. `workerproc.Continuous` sends `READY=1` and
 `STOPPING=1`. It feeds `WATCHDOG=1` only while the loop reports progress, and it exits `1`
 once `stall_after_seconds` pass without any. That threshold stays below `watchdog_seconds`
 (the unit's `WatchdogSec`), so the clean exit wins and the systemd watchdog is only the
-backstop. `workerproc.Credentials` reads `LoadCredential=` files from
-`$CREDENTIALS_DIRECTORY`. Without that variable, as in local runs, the AWS default chain
-applies.
+backstop. After a stop signal, a loop that returns `nil` or its context's error exits `0`.
+
+`workerproc.Credentials` reads `LoadCredential=` files from `$CREDENTIALS_DIRECTORY`. Each
+unit loads every credential `<name>` from `paths.credential_source`,
+`/etc/limnopulse/workers/credentials/<role>/<name>`. The names repeat across roles, but
+each role's directory holds its own principal's keys. Under systemd (`INVOCATION_ID` or
+`NOTIFY_SOCKET` set), a missing `CREDENTIALS_DIRECTORY` is a configuration error, so a unit
+never falls back to the AWS default chain. Local runs have neither variable and use the
+default chain. Secrets never go in the env file: the Telegram worker's Redis password is
+the `redis-password` credential.
 
 ## Unit health
 
@@ -36,6 +50,11 @@ enabled, so a disabled role publishes nothing.
   `oneshot_stale_after_intervals` schedule intervals.
 - **worker-monitor:** reports itself too.
 - **Not covered:** the Compose ingest worker and the operator CLI publish no unit health.
+
+The Compose ingest worker restarts `unless-stopped`. It stamps `liveness_file` on every
+loop turn, and its Compose healthcheck runs the `healthcheck` subcommand against that
+stamp. A stall exits `1` and Compose restarts it. A configuration error exits `78`, and
+the entrypoint guard then parks the container idle instead of restarting it.
 
 Unit-health alarms treat missing data as breaching. They have
 `actions_enabled = var.<role>_enabled`, so they stay disabled while the role is disabled.
@@ -80,8 +99,10 @@ it only through the sudoers line in `roles.yaml`. The helper validates its own a
 Exit codes: `0` ok, `1` failure, `3` floor refused, `78` usage. It keeps two releases.
 
 **Rollback floor.** Activating a release whose `EPOCH_<ROLE>` is below the highest
-`FLOOR_<ROLE>` recorded on the host is refused with `3`. The deploy's automatic rollback
-never overrides it. An override exists only for root itself: the helper refuses it
+`FLOOR_<ROLE>` recorded on the host is refused with `3`. Only a successful `activate`
+records a release's floors; `stage` checks them but records nothing, so a staged release
+that never went live cannot block a rollback. The deploy's automatic rollback never
+overrides the floor. An override exists only for root itself: the helper refuses it
 whenever `SUDO_USER` is set.
 
 ## Deploy
