@@ -726,7 +726,7 @@ def test_runbook_production_environment_covers_the_worker_env_and_principal() ->
         r"`telemetry_ingest_iam_user_name`",
         r"access key",
         r"empty",
-        r"exit(s)? 2|exit code 2",
+        r"exit(s)? 78|exit code 78",
         r"`stop_grace_period`",
         r"(exceed|above|more than|greater)[^.]{0,60}drain.{0,40}wait.{0,40}5 ?s",
         r"`--env-file`",
