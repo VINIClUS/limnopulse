@@ -116,6 +116,7 @@ class _Loop:
     async def run(self, stop: asyncio.Event) -> None:
         if self.error is not None:
             raise self.error
+        stop.set()  # stands in for SIGTERM: only a stop exits 0 (ADR-020)
 
 
 def _run_worker(
@@ -166,8 +167,8 @@ def test_a_close_that_raises_never_changes_the_worker_exit_code(
     code: int,
     close_error: type[Exception],
 ) -> None:
-    """#116 audit finding 2: a stop stays exit 0 (no `restart: on-failure` restart of a worker
-    stopped on purpose), and the close failure is logged by category only, whatever its type."""
+    """#116 audit finding 2: a stop stays exit 0 (ADR-020: 0 only after a stop signal), and the
+    close failure is logged by category only, whatever its type."""
     caplog.set_level(logging.INFO)
 
     exit_code = _run_worker(monkeypatch, tmp_path, crash=crash, close_error=close_error(SENTINEL))

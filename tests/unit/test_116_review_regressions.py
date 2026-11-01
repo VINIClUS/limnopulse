@@ -1200,6 +1200,7 @@ def _still_open() -> None:
 class _StoppedLoop:
     async def run(self, stop: asyncio.Event) -> None:
         _still_open()
+        stop.set()  # stands in for SIGTERM: only a stop exits 0 (ADR-020)
 
 
 class _CrashedLoop:

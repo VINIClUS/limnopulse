@@ -67,8 +67,9 @@ Each step is a separate change. Verify each one before moving to the next.
    set `TELEMETRY_V2_WRITE_ENABLED` to `true` and `SQS_TELEMETRY_INGRESS_QUEUE_URL`, and start the
    `telemetry-ingest-worker` service with the `ingestion` profile. It runs as its own principal, the
    `telemetry_ingest` IAM user, never the API or the shared `workers` user. It refuses to start
-   (exit 2) without v2 writes and a queue, so it can never delete a message it did not write.
-   Confirm it logs `telemetry ingest worker started` and the queue-age alarm stays green.
+   (exit 78, a configuration error: the container parks) without v2 writes and a queue, so it can
+   never delete a message it did not write. Confirm it logs `telemetry ingest worker started`,
+   `docker compose ps` shows it `healthy`, and the queue-age alarm stays green.
 3. **Endpoint.** Set `INGEST_V2_ENABLED` to `true` (it requires `API_V2_ENABLED=true`,
    `TELEMETRY_V2_WRITE_ENABLED=true` and a non-empty `SQS_TELEMETRY_INGRESS_QUEUE_URL`; the API refuses
    to start otherwise) and recreate the API (see **Applying a change** below). Exactly `POST /ingest/v2/observations` and the five
@@ -131,8 +132,8 @@ the API-only secrets.
   write its `token` field straight into `.env` without printing it.
 - **Every interpolated name must be defined.** An empty interpolation is passed to the container as
   an empty string and overrides the Settings default. Outside `local`/`test` the worker refuses to
-  start with exit 2 when its AWS keys or InfluxDB token are empty, so a missing variable fails fast
-  instead of polling forever. Define each of these in the production `.env`, never in `.env.image`:
+  start with exit 78 when its AWS keys or InfluxDB token are empty, so a missing variable fails fast
+  (the container parks; see **Park on 78**) instead of polling forever. Define each of these in the production `.env`, never in `.env.image`:
   every promotion through the deploy script rewrites `.env.image` with `IMAGE_TAG` alone, so anything
   else there is gone after the next deploy:
 
@@ -167,19 +168,44 @@ the API-only secrets.
   drain + wait + 5 s (A47): `TELEMETRY_INGEST_DRAIN_SECONDS` 30 + `TELEMETRY_INGEST_WORKER_WAIT_SECONDS`
   20 + the 5 s poll grace, more than 55 s at the defaults. SIGTERM first finishes the in-flight long
   poll, then drains; a shorter grace lets Docker's SIGKILL cut the drain short. Keep some headroom for
-  a boto3 call still in flight (`SHUTDOWN_CALL_BUDGET_SECONDS` in `workers/telemetry_ingest.py`).
+  a boto3 call still in flight (`shutdown_call_budget_seconds(settings)` in
+  `workers/telemetry_ingest.py`, 28 s at the defaults).
   `TELEMETRY_INGEST_DRAIN_SECONDS` and `TELEMETRY_INGEST_WORKER_WAIT_SECONDS` are not interpolated
   into the worker's environment in either compose file (it has no `env_file`), so setting them in
   `.env` has no effect: changing either needs a compose change, made together with the grace.
-- **Restart policy.** `restart: on-failure:5` may leave the worker stopped after a reboot, and the
-  default deploy (without `--profile ingestion`) does not recreate it. Redeploy it with the profile
-  so producer and consumer run the same image; the queue-age alarm covers a stopped worker.
+- **Restart policy (ADR-020).** The worker restarts `unless-stopped`, so it comes back after a
+  crash, a stall, a Docker daemon restart or a host reboot. Every deploy passes
+  `--profile ingestion` and waits for the worker's health, so a promotion or a rollback moves the
+  API (producer) and the worker (consumer) to the same tag. This supersedes the P3 plan's bounded
+  `on-failure` restart (D7) and its opt-in start (D21).
+- **Until the ADR-020 deploy slice lands:** `ops/vps/limnopulse-deploy.sh` still runs `up -d`
+  without `--profile ingestion` and waits only for the API, so after every deploy recreate the
+  worker by hand with
+  `docker compose --env-file .env --env-file .env.image -f compose.production.yaml --profile ingestion up -d telemetry-ingest-worker`
+  and check it turns `healthy`.
+- **Liveness and healthcheck.** The loop marks a liveness stamp
+  (`/tmp/limnopulse-telemetry-ingest.liveness`) at the top of every turn and after every receive,
+  and every 5 s while all permits are busy. A watchdog thread exits 1 when no mark comes for the
+  stall threshold: the worst legitimate message lifetime, the processing deadline + one 10 s
+  InfluxDB write + an awaited heartbeat + the final action (45 + 10 + 28 + 28 = 111 s at the
+  defaults, `stall_after_seconds(settings)`). Once the oldest in-flight message has held its
+  permit past the threshold while all permits are busy, the busy marks stop too, so a worker whose
+  permits stay wedged exits 1 within up to 2 × the threshold (about 222 s at the defaults). The
+  compose healthcheck, `python -m limnopulse_api.workers.telemetry_ingest healthcheck`, exits 1
+  once the stamp is older than the threshold. SIGTERM disarms the watchdog, so the A47 drain and
+  the 90 s grace above are unchanged.
+- **Park on 78.** A configuration error exits 78: writes off, an empty queue URL, empty own
+  credentials or an invalid setting. Docker cannot skip a restart for one exit code, so the
+  entrypoint's shell guard keeps the container up but idle (`sleep infinity`) instead: Docker never
+  restarts it on 78, it parks again after a reboot, and with no stamp its healthcheck reports it
+  `unhealthy`, which fails the deploy health gate. Read the refusal in its log
+  (`refused to start: ...`), fix `.env`, and recreate it with the profile.
 
 ## Alarms and deadlines
 
 | Alarm | Fires when | First response |
 |---|---|---|
-| `<project>-<env>-telemetry-ingress-age` (queue age) | the oldest message is older than `telemetry_ingress_age_alarm_threshold_seconds` (default 300 s) | is the worker running? Check its logs and bring it back with `up -d` and the profile; a stopped worker is the usual cause |
+| `<project>-<env>-telemetry-ingress-age` (queue age) | the oldest message is older than `telemetry_ingress_age_alarm_threshold_seconds` (default 300 s) | is the worker running and `healthy`? A stopped or parked (exit 78) worker is the usual cause: read its log, fix the cause and bring it back with `up -d` and the profile |
 | `<project>-<env>-telemetry-ingress-depth` | more than `telemetry_ingress_depth_alarm_threshold` (default 1000) visible messages for 5 minutes | worker throughput or an outage; check `ingress_messages_total{outcome="retry"}` by category |
 | `<project>-<env>-telemetry-ingress-dlq` | the DLQ is not empty | run the [DLQ drill](#dlq-drill) |
 
@@ -367,7 +393,10 @@ stopping all telemetry intake is the intent.
 4. **Let the worker drain** the source queue (queue depth and age back to zero), unless the worker
    itself is the reason for the rollback.
 5. **Stop the worker:** stop the `ingestion` profile and set `TELEMETRY_V2_WRITE_ENABLED=false`.
-   Unprocessed messages simply stay on the queue or the DLQ.
+   Unprocessed messages simply stay on the queue or the DLQ. Since ADR-020 every deploy passes
+   `--profile ingestion` and waits for the worker's health: with writes off the worker refuses to
+   start (exit 78), parks and stays `unhealthy`, so a later deploy fails its health gate until the
+   worker can run again.
 6. **Retain the queues.** Never purge the source queue or the DLQ, and keep `telemetry_ingress = true`:
    accepted data stays recoverable for 4 days in the source queue and 14 days in the DLQ, and
    quarantine rows for 14 days. Turning the worker back on resumes processing.
@@ -457,6 +486,6 @@ and 2 are checks; steps 3 and 4 are separate changes. Record each step on #104.
 | G10 | sequence truth table, marks never pass the first receipt | `tests/ingestion/test_p3_acceptance_ingestion.py::test_gate10_truth_table_vectors_hold_end_to_end`, `tests/ingestion/test_p3_acceptance_ingestion.py::test_gate10_sequence_truth_table_end_to_end_and_marks_never_pass_the_first_receipt`; point-level flags DEFERRED → #17 |
 | G11 | limits | `tests/contracts/test_p3_acceptance_gate.py::test_gate11_limits_reject_before_any_queue_admission`, `tests/contracts/test_p3_acceptance_gate.py::test_gate11_envelope_size_guard_never_sends_an_oversized_message`; entitlement enforcement DEFERRED → #20 |
 | G12 | closed metrics, no secret anywhere | `tests/contracts/test_p3_acceptance_gate.py::test_gate12_metrics_use_the_closed_name_and_label_sets`, `tests/ingestion/test_p3_acceptance_ingestion.py::test_gate12_no_secret_or_raw_identifier_in_logs_bodies_receipts_or_rows` |
-| G13 | switch matrix, worker start guard | `tests/contracts/test_p3_acceptance_gate.py::test_gate13_switch_matrix_keeps_v1_and_mounts_exactly_the_switched_routes`, `tests/contracts/test_p3_acceptance_gate.py::test_gate13_worker_exits_2_unless_it_can_write` |
+| G13 | switch matrix, worker start guard | `tests/contracts/test_p3_acceptance_gate.py::test_gate13_switch_matrix_keeps_v1_and_mounts_exactly_the_switched_routes`, `tests/contracts/test_p3_acceptance_gate.py::test_gate13_worker_exits_78_unless_it_can_write` |
 | G14 | storage rules, optional cache | `tests/contracts/test_p3_acceptance_gate.py::test_gate14_no_scan_no_new_index_no_new_table_and_no_cache_dependency`, `tests/contracts/test_p3_acceptance_gate.py::test_gate14_the_composed_ingest_route_has_no_cache_dependency` |
 | G15 | zero divergence against the independent legacy writer | `tests/ingestion/test_p3_acceptance_ingestion.py::test_gate15_https_path_matches_the_independent_legacy_writer`; legacy devices: HTTPS only (#104), read switches behind the [D16 owner gate](#d16-owner-gate) |

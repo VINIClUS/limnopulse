@@ -187,3 +187,61 @@ def test_runbook_says_a_rerun_after_a_partial_mark_gets_a_new_replay_id() -> Non
     """#116 P3-09: already on main since P3-11; pinned so it cannot regress."""
     text = _section("Quarantine reconciliation drill")
     assert re.search(r"After a partial mark.{0,300}new replay id", text)
+
+
+# --- ADR-020 (S5): the ingest worker's restart policy, liveness and park-on-78 ---------------------
+
+PLAN = ROOT / "docs/superpowers/plans/2026-10-30-limnopulse-v4-p3-ingress-integration.md"
+
+
+def test_runbook_documents_the_adr_020_restart_liveness_and_park_rules() -> None:
+    text = _section("Production environment")
+    for pattern in (
+        r"restarts `unless-stopped`",
+        r"Every deploy passes `--profile ingestion`",
+        r"`python -m limnopulse_api\.workers\.telemetry_ingest healthcheck`",
+        r"45 \+ 10 \+ 28 \+ 28 = 111 s",
+        r"oldest in-flight message has held its permit past the threshold",
+        r"within up to 2 × the threshold \(about 222 s at the defaults\)",
+        r"SIGTERM disarms the watchdog",
+        r"\*\*Park on 78\.\*\*",
+        r"exits 78",
+        r"`sleep infinity`",
+        r"parks again after a reboot",
+        r"`shutdown_call_budget_seconds\(settings\)`",
+    ):
+        assert re.search(pattern, text), pattern
+    runbook = _runbook()
+    for stale in (
+        "SHUTDOWN_CALL_BUDGET_SECONDS",
+        "on-failure:5",
+        "(exit 2)",
+        "with exit 2",
+        "every permit wedged",
+    ):
+        assert stale not in runbook, stale
+    # A rollback that turns writes off leaves a parked worker, which a later deploy waits on.
+    assert re.search(r"fails its health gate", _section("Rollback"))
+
+
+def test_plan_marks_d7_and_d21_superseded_by_adr_020_and_keeps_their_text() -> None:
+    text = PLAN.read_text(encoding="utf-8")
+    (d7,) = [line for line in text.splitlines() if line.startswith("| D7 |")]
+    (d21,) = [line for line in text.splitlines() if line.startswith("| D21 |")]
+    assert "a bounded `on-failure` restart in production" in d7
+    assert "The default deploy does not start it." in d21
+    # Each superseded row points at its amendment where a reader meets it (like D16's `(A48)`).
+    assert "**Superseded by ADR-020 (A49).**" in d7
+    assert "**Superseded by ADR-020 (A49):** every deploy passes `--profile ingestion`." in d21
+    raw = markdown_section(text, "Audit amendments (r2)")
+    (a49,) = [line for line in raw.splitlines() if line.startswith("| A49 |")]
+    for pattern in (
+        r"Superseded by ADR-020",
+        r"D7's bounded `on-failure` restart",
+        r"D21's rule that the default deploy does not start the worker",
+        r"`unless-stopped`",
+        r"exits 78",
+        r"`127\.0\.0\.1:8086`",
+        r"A47 shutdown budget .{0,40}unchanged",
+    ):
+        assert re.search(pattern, a49), pattern

@@ -6,13 +6,16 @@ import os
 import re
 import shutil
 import subprocess
-from pathlib import Path
+import tempfile
+from pathlib import Path, PurePosixPath
 from typing import Any
 
 import pytest
 import yaml
 
 from limnopulse_api.core.config import Settings
+from limnopulse_api.workers.telemetry_ingest_liveness import LIVENESS_FILE_NAME, liveness_path
+from tests.support.worker_roles import load_roles, roles_by_name
 
 ROOT = Path(__file__).resolve().parents[2]
 COMPOSE = ROOT / "compose.yaml"
@@ -22,6 +25,8 @@ PRODUCTION_ENV_EXAMPLE = ROOT / ".env.production.example"
 WORKER = "telemetry-ingest-worker"
 PROFILE = "ingestion"
 ENTRYPOINT = ["python", "-m", "limnopulse_api.workers.telemetry_ingest"]
+# ADR-020: production runs the same command under the park-on-78 shell guard.
+GUARD_SHELL = ["/bin/sh", "-c"]
 IMAGE_TAG = "main-0000000000000000000000000000000000000000"
 API_IMAGE = "ghcr.io/viniclus/limnopulse/api:${IMAGE_TAG}"
 WORKER_CREDENTIALS = {
@@ -251,6 +256,13 @@ def test_local_compose_config_parses_with_and_without_the_ingestion_profile(
 # --- Production compose ----------------------------------------------------------------------
 
 
+def _guard_script(worker: dict[str, Any]) -> str:
+    """The guard as written in the file: compose turns each `$$` into a literal `$`."""
+    shell, flag, script = worker["entrypoint"]
+    assert [shell, flag] == GUARD_SHELL
+    return script
+
+
 def test_production_worker_is_profile_gated_and_reuses_the_api_image() -> None:
     services = _services(PRODUCTION_COMPOSE)
     worker = services[WORKER]
@@ -258,10 +270,73 @@ def test_production_worker_is_profile_gated_and_reuses_the_api_image() -> None:
     assert worker["profiles"] == [PROFILE]
     assert worker["image"] == API_IMAGE == services["api"]["image"]
     assert "build" not in worker
-    assert worker["entrypoint"] == ENTRYPOINT
-    assert worker["restart"] == "on-failure:5"
+    # ADR-020 supersedes D7's bounded `on-failure:5`: a crash or a stall always restarts.
+    assert worker["restart"] == "unless-stopped"
     assert "ports" not in worker
     assert "influxdb" in _depends_on(worker)
+
+
+def test_production_worker_runs_the_module_once_under_the_park_guard() -> None:
+    worker = _services(PRODUCTION_COMPOSE)[WORKER]
+    script = _guard_script(worker)
+
+    lines = [line.strip() for line in script.splitlines()]
+    assert lines.count(" ".join(ENTRYPOINT) + " &") == 1
+    assert lines.count("exec sleep infinity") == 1
+    assert worker["init"] is True  # tini reaps the worker and signals the guard shell
+    # Every shell `$` is escaped, so compose interpolates nothing from the guard.
+    assert "$" not in script.replace("$$", "")
+    assert not INTERPOLATION.search(script.replace("$$", ""))
+
+
+def test_production_worker_has_a_liveness_healthcheck() -> None:
+    healthcheck = _services(PRODUCTION_COMPOSE)[WORKER]["healthcheck"]
+
+    assert healthcheck["test"] == ["CMD", *ENTRYPOINT, "healthcheck"]
+    interval, timeout = _seconds(healthcheck["interval"]), _seconds(healthcheck["timeout"])
+    assert 0 < timeout < interval <= 60
+    assert healthcheck["retries"] >= 2
+    # Startup is the ~1.6 s import (slower under the 0.5-CPU limit) and the first loop turn,
+    # which marks at once; a parked worker never marks and turns unhealthy after it.
+    assert 20 <= _seconds(healthcheck["start_period"]) <= 120
+
+
+def test_production_worker_matches_its_adr_020_role(monkeypatch: pytest.MonkeyPatch) -> None:
+    """`ops/workers/roles.yaml` is normative (ADR-020): the service, its restart policy, its
+    healthcheck and the liveness file the worker writes match the `telemetry-ingest` role."""
+    role = roles_by_name(load_roles())["telemetry-ingest"]
+    worker = _services(PRODUCTION_COMPOSE)[role["compose_service"]]
+    script = _guard_script(worker)
+
+    assert role["compose_service"] == WORKER
+    assert worker["profiles"] == [role["compose_profile"]]
+    assert worker["restart"] == role["restart"] == "unless-stopped"
+    assert role["entrypoint"] == " ".join(ENTRYPOINT)
+    assert f"{role['entrypoint']} &" in script.splitlines()
+    assert worker["healthcheck"]["test"] == ["CMD", *role["healthcheck"].split()]
+    assert role["configuration_error"] == "park" and "exec sleep infinity" in script
+    # The worker writes the stamp under the temp directory: the container's /tmp tmpfs, since
+    # its environment sets no TMPDIR.
+    liveness_file = PurePosixPath(role["liveness_file"])
+    assert liveness_file.name == LIVENESS_FILE_NAME
+    assert liveness_file.parent == PurePosixPath("/tmp")
+    assert "/tmp" in worker["tmpfs"]
+    assert not {"TMPDIR", "TEMP", "TMP"} & set(_environment(worker))
+    for name in ("TMPDIR", "TEMP", "TMP"):
+        monkeypatch.delenv(name, raising=False)
+    monkeypatch.setattr(tempfile, "tempdir", None)
+    assert str(liveness_path()) == role["liveness_file"]
+
+
+def test_production_influxdb_is_published_on_host_loopback_only() -> None:
+    """ADR-020: the host-run Go evaluator reaches InfluxDB on loopback; nothing else is
+    published, and Redis stays internal."""
+    services = _services(PRODUCTION_COMPOSE)
+
+    assert services["influxdb"]["ports"] == ["127.0.0.1:8086:8086"]
+    for name, service in services.items():
+        if name != "influxdb":
+            assert "ports" not in service, name
 
 
 def test_production_compose_only_adds_the_worker() -> None:
@@ -433,7 +508,8 @@ def test_rendered_production_worker_never_receives_the_api_credentials(tmp_path:
         "sentinel-admin-token",
     ):
         assert api_secret not in rendered
-    assert worker["entrypoint"] == ENTRYPOINT
+    # The rendered config keeps compose's `$$` escape, so it equals the file's guard.
+    assert worker["entrypoint"] == _services(PRODUCTION_COMPOSE)[WORKER]["entrypoint"]
     assert worker["image"] == f"ghcr.io/viniclus/limnopulse/api:{IMAGE_TAG}"
 
 
@@ -624,7 +700,8 @@ def _assert_documents_p3_wiring(section: str) -> None:
     lowered = section.lower()
     assert "ships dark" in lowered
     assert "rollback" in lowered
-    assert "exit 2" in lowered or "exits 2" in lowered or "exit code 2" in lowered
+    assert "exit 78" in lowered or "exits 78" in lowered or "exit code 78" in lowered
+    assert "exits 2" not in lowered and "exit 2 " not in lowered
 
 
 def test_readme_documents_the_p3_wiring_and_links_the_runbook() -> None:
