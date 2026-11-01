@@ -24,16 +24,18 @@ from tests.unit.test_dynamodb_integration_resolver import DynamoIngestionSubject
 @pytest.fixture
 def dynamo_lifecycle(ingestion_tables: IngestionTables) -> DynamoIngestionSubject:
     client = dynamodb_client()
-    subject = DynamoIngestionSubject(
-        client, domain_table=ingestion_tables.domain, audit_table=ingestion_tables.audit
-    )
 
     def audit_items() -> list[dict[str, Any]]:
         response = client.scan(TableName=ingestion_tables.audit, ConsistentRead=True)
         assert "LastEvaluatedKey" not in response  # a throwaway table, one page
         return [subject.integrations.deserialize_item(item) for item in response["Items"]]
 
-    subject._audit_reader = audit_items
+    subject = DynamoIngestionSubject(
+        client,
+        domain_table=ingestion_tables.domain,
+        audit_table=ingestion_tables.audit,
+        audit_reader=audit_items,
+    )
     return subject
 
 

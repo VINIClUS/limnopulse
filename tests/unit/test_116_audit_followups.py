@@ -154,6 +154,7 @@ def _worker_lines(caplog: pytest.LogCaptureFixture) -> list[str]:
     ]
 
 
+@pytest.mark.parametrize("close_error", [OSError, RuntimeError], ids=["os_error", "runtime_error"])
 @pytest.mark.parametrize(
     ("crash", "code"),
     [(None, 0), (RuntimeError("crash"), 1)],
@@ -165,15 +166,17 @@ def test_a_close_that_raises_never_changes_the_worker_exit_code(
     caplog: pytest.LogCaptureFixture,
     crash: BaseException | None,
     code: int,
+    close_error: type[Exception],
 ) -> None:
     """#116 audit finding 2: a stop stays exit 0 (no `restart: on-failure` restart of a worker
-    stopped on purpose), and the close failure is logged by category only."""
+    stopped on purpose), and the close failure is logged by category only, whatever its type."""
     caplog.set_level(logging.INFO)
 
-    assert _run_worker(monkeypatch, tmp_path, crash=crash, close_error=OSError(SENTINEL)) == code
+    exit_code = _run_worker(monkeypatch, tmp_path, crash=crash, close_error=close_error(SENTINEL))
 
+    assert exit_code == code
     assert [client.close_calls for client in _Influx.instances] == [1]
-    assert "influx client close failed (OSError)" in _worker_lines(caplog)
+    assert f"influx client close failed ({close_error.__name__})" in _worker_lines(caplog)
     assert SENTINEL not in caplog.text
 
 
@@ -227,6 +230,24 @@ async def test_the_unavailable_warning_carries_the_category_never_the_text(
         await ingress.admit()
 
     assert f"ingest {step} failed: {type(error).__name__}" in caplog.text
+    assert SENTINEL not in caplog.text
+
+
+@pytest.mark.asyncio
+async def test_a_receipt_mark_failure_after_the_send_is_logged_by_category_only(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """The sibling of `_unavailable`: the message is durable, so the request is still accepted,
+    and the warning names the error's type only."""
+    caplog.set_level(logging.DEBUG)
+    ingress = Ingress()
+    await ingress.seed()
+    ingress.subject.fail_next("mark_ingress_receipt_enqueued", _sentinel_store_error("UpdateItem"))
+
+    accepted = await ingress.admit()
+
+    assert accepted.replayed is False
+    assert "ingest receipt mark failed after the send: ClientError" in caplog.text
     assert SENTINEL not in caplog.text
 
 
@@ -319,7 +340,9 @@ def test_the_p2_rollback_recreates_instead_of_restarting() -> None:
 def test_the_dlq_drill_says_a_dry_run_can_exit_3_with_an_error_category() -> None:
     """#116 audit finding 5: since #128 a redrive that stops midway exits 3 in both modes."""
     text = _section("docs/p3-ingestion-rollout-runbook.md", "DLQ drill")
-    assert re.search(r"dry run.{0,160}exits? 3|exit code 3.{0,240}dry run", text, re.IGNORECASE)
-    assert re.search(r"`error`", text)
+    step5 = text.split("**Verify.**", 1)[1]  # the last step of the section
+    assert re.search(r"\bA dry run also exits 3 when it stops midway\b", step5)
+    assert not re.search(r"dry run (?:never|does not|doesn't|cannot) exit", step5, re.IGNORECASE)
+    assert re.search(r"carries an `error` category", step5)
     for category in ("queue_unavailable", "unexpected", "interrupted"):
-        assert f"`{category}`" in text, category
+        assert f"`{category}`" in step5, category
