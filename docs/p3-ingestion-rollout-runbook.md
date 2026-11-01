@@ -347,8 +347,12 @@ Rollback follows §24: route pilots back, disable the endpoint, retain the queue
 
 If the [D16 owner gate](#d16-owner-gate) was completed, first return the read switches in reverse
 order: `V1_TELEMETRY_READ_SOURCE=legacy`, then `ALERT_EVALUATOR_TELEMETRY_SOURCE=legacy`, and
-recreate the API and the evaluator. Never stop legacy dual write or the worker while either read
-switch is `v2`: under HTTPS only they are the only producers of both measurements.
+recreate the API and the evaluator. Do this only while legacy dual write is still on, so
+`water_quality` holds both windows. If the P2 stop-dual-write criteria have already turned dual write
+off, follow the P2 [after-cutover rollback](p2-telemetry-rollout-runbook.md#rollback) instead:
+restore a `water_quality` producer and revert either read switch only once `water_quality` holds
+both windows again. During this rollback, never stop legacy dual write or the worker while either
+read switch is `v2`: under HTTPS only they are the only producers of both measurements.
 
 1. **Route pilots back** to their previous (legacy) path, so they stop calling the HTTPS endpoint.
 2. **Stop legacy dual write:** set `TELEMETRY_LEGACY_DUAL_WRITE_ENABLED=false` in the shared `.env`
