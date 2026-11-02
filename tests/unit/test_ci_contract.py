@@ -25,7 +25,18 @@ DYNAMODB_LOCAL_IMAGE = (
 )
 ELASTICMQ_JAR_SHA256 = "30a81f56a40b670fafc3f32b0f09f3baf59ad2645edaf17bc2e79170c75479f2"
 DYNAMODB_LOCAL_SHA256 = "7a94eb65f81aee270738751a4e5e3e6a7ad02a5d25194f55b83e08ec2ba6342b"
+REDIS_IMAGE = (
+    "redis:7.4.12-alpine@sha256:8da19c7399dca900c6822a1cf30f9d2285585e2c4b457ff4095b0f4500054d3f"
+)
+WIREMOCK_IMAGE = (
+    "wiremock/wiremock:3.13.1-alpine"
+    "@sha256:59b04800ed8099194243f3dd1da728fd498df3ea9692a126de3ef9bf1c4aa9a2"
+)
 INFLUX_BACKED_JOBS = ("influx", "ingestion")
+NOTIFICATIONS_RECIPE = [
+    "uv sync --locked --extra dev",
+    "RUN_NOTIFICATION_INTEGRATION=1 uv run --locked --no-sync python -m pytest -q tests/integration/test_notifications_local.py",
+]
 INGESTION_RECIPE = [
     "uv sync --locked --extra dev",
     "RUN_INGESTION_INTEGRATION=1 RUN_INFLUX_INTEGRATION=1 uv run --locked --no-sync python -m pytest -q tests/ingestion",
@@ -91,6 +102,7 @@ def test_verify_workflow_is_read_only_and_credential_free() -> None:
         "frontend",
         "influx",
         "ingestion",
+        "notifications",
     }
     expected_jobs = {
         "python": (
@@ -134,6 +146,7 @@ def test_verify_workflow_is_read_only_and_credential_free() -> None:
     assert [name for name, job in workflow["jobs"].items() if "services" in job] == [
         "influx",
         "ingestion",
+        "notifications",
     ]
 
 
@@ -469,3 +482,36 @@ def test_verification_docs_document_the_ingestion_gate() -> None:
     section = text.split("## Ingestion integration gate", 1)[1].split("\n## ", 1)[0]
     assert "not part of `make verify`" in section
     assert "ttl" in section.lower()
+
+
+def test_notifications_job_drains_the_role_executables_against_pinned_emulators() -> None:
+    text, workflow = _workflow()
+    job = workflow["jobs"]["notifications"]
+
+    services = {service["image"]: service for service in job["services"].values()}
+    assert set(services) == {ELASTICMQ_IMAGE, DYNAMODB_LOCAL_IMAGE, REDIS_IMAGE, WIREMOCK_IMAGE}
+    assert len(job["services"]) == 4
+    assert services[ELASTICMQ_IMAGE]["ports"] in (["9324:9324"], ["127.0.0.1:9324:9324"])
+    assert services[DYNAMODB_LOCAL_IMAGE]["ports"] in (["8001:8000"], ["127.0.0.1:8001:8000"])
+    assert services[REDIS_IMAGE]["ports"] in (["6379:6379"], ["127.0.0.1:6379:6379"])
+    # WireMock listens on 8080 in the container; the harness's Telegram fake is 8089.
+    assert services[WIREMOCK_IMAGE]["ports"] in (["8089:8080"], ["127.0.0.1:8089:8080"])
+    for service in services.values():
+        image, _, digest = service["image"].partition("@")
+        assert ":" in image and re.fullmatch(r"sha256:[0-9a-f]{64}", digest)
+        assert "credentials" not in service
+        assert "volumes" not in service
+        assert "env" not in service
+
+    steps = job["steps"]
+    actions = sorted(step["uses"].partition("@")[0] for step in steps if "uses" in step)
+    assert actions == sorted(
+        ["actions/checkout", "actions/setup-python", "astral-sh/setup-uv", "actions/setup-go"]
+    )
+    assert [step["run"] for step in steps if "run" in step] == NOTIFICATIONS_RECIPE
+    # The harness sets its own dummy credentials and strips any systemd supervision variables.
+    assert "env" not in job
+    for step in steps:
+        assert "env" not in step
+    for name in ("aws_access_key_id", "aws_secret_access_key", "aws_session_token"):
+        assert name not in text.lower()

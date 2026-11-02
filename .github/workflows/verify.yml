@@ -130,3 +130,41 @@ jobs:
           python-version: "3.12"
       - uses: astral-sh/setup-uv@d0cc045d04ccac9d8b7881df0226f9e82c39688e # v6.8.0
       - run: make verify-ingestion
+  notifications:
+    # ADR-020 S1: builds each notification role executable and drains it against emulators.
+    runs-on: ubuntu-latest
+    services:
+      elasticmq:
+        image: softwaremill/elasticmq-native:1.6.16@sha256:8383f29ad746c12981ca2128f689a4b4a93815235f1a7851d2f165316503d132
+        ports:
+          - 9324:9324
+      dynamodb:
+        # DynamoDB Local listens on 8000 in the container; the harness default is 8001.
+        image: amazon/dynamodb-local:3.3.2@sha256:6ada631ec7aa5fc83446855eb17233e3dad184fec47477e8140c6c569cfe0c86
+        ports:
+          - 8001:8000
+      redis:
+        image: redis:7.4.12-alpine@sha256:8da19c7399dca900c6822a1cf30f9d2285585e2c4b457ff4095b0f4500054d3f
+        ports:
+          - 6379:6379
+        options: >-
+          --health-cmd "redis-cli ping"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 30
+      telegram-fake:
+        # The Telegram Bot API fake; the test loads its mapping through the admin API.
+        image: wiremock/wiremock:3.13.1-alpine@sha256:59b04800ed8099194243f3dd1da728fd498df3ea9692a126de3ef9bf1c4aa9a2
+        ports:
+          - 8089:8080
+    steps:
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+      - uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6
+        with:
+          python-version: "3.12"
+      - uses: astral-sh/setup-uv@d0cc045d04ccac9d8b7881df0226f9e82c39688e # v6.8.0
+      - uses: actions/setup-go@924ae3a1cded613372ab5595356fb5720e22ba16 # v6
+        with:
+          go-version-file: go.mod
+      - run: uv sync --locked --extra dev
+      - run: RUN_NOTIFICATION_INTEGRATION=1 uv run --locked --no-sync python -m pytest -q tests/integration/test_notifications_local.py
