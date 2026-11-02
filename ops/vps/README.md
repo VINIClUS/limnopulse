@@ -267,6 +267,11 @@ own IAM principal, so the names repeat but the keys differ.
 | `telegram-worker` | `aws-access-key-id`, `aws-secret-access-key`, `redis-password` |
 | `worker-monitor` | `aws-access-key-id`, `aws-secret-access-key` |
 
+The AWS key pair is installed with `install_worker_key` (`infra/opentofu/README.md`,
+"Access keys") when a role is enabled, following "Enabling and disabling a role"
+there. The `read -rs` pattern below is for the other credentials (`influxdb-token`,
+`redis-password`).
+
 ```bash
 install -d -o root -g root -m 0755 /etc/limnopulse /etc/limnopulse/workers
 install -d -o root -g root -m 0700 /etc/limnopulse/workers/credentials

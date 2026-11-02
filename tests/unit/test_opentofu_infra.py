@@ -427,8 +427,9 @@ INGESTION_GATE = "var.telemetry_ingress ? 1 : 0"
 ALARM_EMAIL_GATE = 'var.telemetry_ingress && var.telemetry_ingress_alarm_email != "" ? 1 : 0'
 ALARM_TOPIC = "aws_sns_topic.telemetry_ingress_alarms[0]"
 UNCHANGED_FILE_SHA256 = {
-    # ADR-020 S6 changed only comments: the shared workers user is marked deprecated.
-    "iam_runtime.tf": "8e7502f3f948bb2016531ab72771d819be24f9ad73abeda03c95b6f288d93620",
+    # ADR-020 S6 and S7 changed only comments: the shared workers user is marked
+    # deprecated, and the header names the per-role principals instead of cmd/notifications.
+    "iam_runtime.tf": "5cea7356ab074f5c8eefdc738bb12c213ecac8db2110fa06e93d4c22c23b1cf2",
     "queues.tf": "d85972d656c951d6a728fecfe4f762f0e96dc1e4687ee39d068edbea74ad9425",
 }
 # Digest of every pre-P3 block in variables.tf and outputs.tf (see _pre_p3_digest): P3-02

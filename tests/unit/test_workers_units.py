@@ -511,6 +511,21 @@ def test_every_template_placeholder_names_an_opentofu_output():
     assert placeholders <= outputs, placeholders - outputs
 
 
+def test_the_email_sender_and_the_worker_keys_follow_the_opentofu_contract():
+    # workers.tf allows ses:SendEmail only from var.ses_from_address.
+    workers_tf = (ROOT / "infra/opentofu/workers.tf").read_text(encoding="utf-8")
+    assert "values   = [var.ses_from_address]" in workers_tf
+    template = (ENV_DIR / "email-worker.env.example").read_text(encoding="utf-8")
+    before_sender = template[: template.index("SES_FROM_EMAIL=")]
+    assert "ses_from_address" in before_sender.splitlines()[-3]
+    # Step 7.4 hands the AWS key pair to install_worker_key, defined in the OpenTofu README.
+    readme = (ROOT / "ops/vps/README.md").read_text(encoding="utf-8")
+    step = readme[readme.index("### 7.4 Per-role configuration") : readme.index("### 7.5")]
+    assert "`install_worker_key`" in step
+    opentofu_readme = (ROOT / "infra/opentofu/README.md").read_text(encoding="utf-8")
+    assert "install_worker_key() {" in opentofu_readme
+
+
 def test_the_secret_settings_have_credentials_instead():
     assert "influxdb-token" in role("alert-evaluator")["credentials"]
     assert "redis-password" in role("telegram-worker")["credentials"]

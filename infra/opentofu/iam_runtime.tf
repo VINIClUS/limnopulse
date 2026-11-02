@@ -1,19 +1,19 @@
-# Least-privilege runtime credentials for the two processes that talk to
-# AWS directly: the FastAPI API (src/limnopulse_api) and the Go workers
-# (cmd/notifications, cmd/alert-evaluator). Both are aws_iam_user, not
-# roles — see the design spec §15/§24 note: this repo's runtime is a VPS
-# container and a Proxmox LXC, neither of which can assume an IAM role
-# without either instance-profile-style metadata (VPS/LXC has none) or IAM
-# Roles Anywhere (deferred to Fase 3, needs a CA and cert renewal this repo
-# doesn't have yet). Long-lived access keys are the accepted interim
-# tradeoff.
+# Least-privilege runtime credentials for the FastAPI API (src/limnopulse_api)
+# and the deprecated shared Go workers user. Since ADR-020 every Go worker
+# role (cmd/<role>) has its own principal in workers.tf. All of them are
+# aws_iam_user, not roles — see the design spec §15/§24 note: this repo's
+# runtime is a VPS, which cannot assume an IAM role without either
+# instance-profile-style metadata (it has none) or IAM Roles Anywhere
+# (deferred to Fase 3, needs a CA and cert renewal this repo doesn't have
+# yet). Long-lived access keys are the accepted interim tradeoff.
 #
 # Deliberately NOT managed here: aws_iam_access_key. Generating one in
 # OpenTofu writes the secret access key into tfstate in plaintext; with no
 # S3 backend/state encryption configured yet (see backend.example.hcl),
 # that's a real credential sitting in a file on disk. Access keys are
 # created out of band with `aws iam create-access-key` after apply and
-# pasted directly into the VPS/.env and the LXC's env — same pattern
+# written straight onto the VPS (the API's .env, a worker role's
+# LoadCredential files; README.md, "Access keys") — same pattern
 # already used for the Telegram bot token and webhook secrets in
 # telegram.tf ("populated out of band").
 
@@ -56,7 +56,7 @@ resource "aws_iam_user" "workers" {
 # feature flag; these base grants no longer depend on that flag.
 #
 # The audit table is API-only — grep confirms every Go binary
-# (cmd/notifications, cmd/alert-evaluator, internal/notifications/**) reads
+# (cmd/<role>, internal/alertevaluator/**, internal/notifications/**) reads
 # DYNAMODB_DOMAIN_TABLE and never DYNAMODB_AUDIT_TABLE, so the workers
 # policy (below) omits it entirely. The API never reads, updates or deletes
 # an audit item: every audit write is a conditioned Put item inside the

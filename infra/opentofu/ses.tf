@@ -216,9 +216,10 @@ resource "aws_cloudwatch_event_target" "ses_events_reject" {
   ]
 }
 
-# Runtime access for the notification-worker's email path
-# (cmd/notifications/worker_command.go, internal/notifications/worker/ses).
-# Gated the same as the rest of this file: var.email_delivery.
+# Email-path grants of the deprecated shared "workers" user (iam_runtime.tf),
+# from before ADR-020 split the email and SES-feedback consumers into their
+# own processes and principals (workers.tf). Gated the same as the rest of
+# this file: var.email_delivery.
 data "aws_iam_policy_document" "email_worker" {
   count = var.email_delivery ? 1 : 0
 
