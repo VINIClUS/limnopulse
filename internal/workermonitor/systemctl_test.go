@@ -127,10 +127,10 @@ exit 1`)
 
 func TestExecSystemctlReportsOutputItCannotRead(t *testing.T) {
 	unit := "limnopulse-email-worker.service"
-	path := fakeSystemctlBinary(t, unit, `echo ExecMainCode=exited`)
+	path := fakeSystemctlBinary(t, unit, `printf '%s\n' LoadState=loaded ActiveState=failed ExecMainCode=exited`)
 	_, err := ExecSystemctl{Path: path}.Show(context.Background(), unit)
-	if err == nil || !strings.Contains(err.Error(), unit) {
-		t.Fatalf("Show error = %v, want a parse error naming the unit", err)
+	if err == nil || !strings.Contains(err.Error(), unit) || !strings.Contains(err.Error(), "ExecMainCode") {
+		t.Fatalf("Show error = %v, want an ExecMainCode parse error naming the unit", err)
 	}
 }
 

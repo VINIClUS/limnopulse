@@ -58,10 +58,55 @@ def test_go_test_table_is_the_monitor_projection_of_roles_yaml():
     )
 
 
+GO_STRUCT = re.compile(r"^type (\w+) struct \{\n(.*?)^\}", re.MULTILINE | re.DOTALL)
+GO_FIELD = re.compile(r"^\t(\w+)\s+[^\s`]+(?:\s+`([^`]*)`)?", re.MULTILINE)
+GO_JSON_KEY = re.compile(r'json:"([^",]*)')
+
+
+def go_json_keys(source: str) -> dict[str, set[str]]:
+    """Map each Go struct in source to the JSON keys encoding/json decodes into it.
+
+    A tag's key is the part before any option (json:"name,omitempty" decodes "name"). A
+    field without a json key decodes under its Go field name.
+    """
+    keys: dict[str, set[str]] = {}
+    for struct, body in GO_STRUCT.findall(source):
+        keys[struct] = set()
+        for field, tag in GO_FIELD.findall(body):
+            match = GO_JSON_KEY.search(tag)
+            keys[struct].add(match.group(1) if match and match.group(1) else field)
+    return keys
+
+
+def test_go_json_keys_reads_options_any_case_and_untagged_fields():
+    source = (
+        "type Sample struct {\n"
+        "\t// A comment line is not a field.\n"
+        '\tA int `json:"extra,omitempty"`\n'
+        '\tB int `json:"Extra2"`\n'
+        '\tC int `yaml:"c" json:"plain"`\n'
+        '\tD int `json:",string"`\n'
+        "\tE int\n"
+        "}\n"
+        "\n"
+        "type Other struct {\n"
+        '\tF []string `json:"f"`\n'
+        "}\n"
+    )
+    assert go_json_keys(source) == {
+        "Sample": {"extra", "Extra2", "plain", "D", "E"},
+        "Other": {"f"},
+    }
+
+
 def test_projection_covers_exactly_the_fields_the_go_table_decodes():
-    tags = set(re.findall(r'`json:"([a-z_]+)"`', GO_TABLE_SOURCE.read_text(encoding="utf-8")))
-    projected = {*TOP_LEVEL_FIELDS, *UNIT_HEALTH_FIELDS, *ROLE_FIELDS, *UNITS_FIELDS}
-    assert tags == projected
+    keys = go_json_keys(GO_TABLE_SOURCE.read_text(encoding="utf-8"))
+    assert keys == {
+        "Table": set(TOP_LEVEL_FIELDS),
+        "UnitHealth": set(UNIT_HEALTH_FIELDS),
+        "Role": set(ROLE_FIELDS),
+        "Units": set(UNITS_FIELDS),
+    }
 
 
 if __name__ == "__main__":
