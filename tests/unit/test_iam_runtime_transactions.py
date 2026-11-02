@@ -2462,14 +2462,64 @@ def _names_aws_operation(file: go_sources.GoFile, text: str) -> bool:
     return False
 
 
+def _go_embedded_files(files: Sequence[go_sources.GoFile]) -> dict[str, str]:
+    """Path -> text of every file a closure file embeds with `//go:embed`."""
+    embedded: dict[str, str] = {}
+    for file in files:
+        # The directive is a comment, so it is read from the source, not from file.code.
+        source = file.path.read_text(encoding="utf-8")
+        for patterns in re.findall(r"(?m)^//go:embed\s+(.+)$", source):
+            for pattern in patterns.split():
+                matches = sorted(file.path.parent.glob(pattern.strip('"`')))
+                assert matches, f"{file.relative}: //go:embed {pattern} matches nothing"
+                for match in matches:
+                    for path in sorted(match.rglob("*")) if match.is_dir() else [match]:
+                        if path.is_file():
+                            embedded[path.relative_to(ROOT).as_posix()] = path.read_text(
+                                encoding="utf-8"
+                            )
+    return embedded
+
+
+def _go_template_methods(
+    files: Sequence[go_sources.GoFile], templates: Mapping[str, str]
+) -> dict[str, set[str]]:
+    """Exported name -> where a template action names it as `.Name`.
+
+    The templates are the embedded files and every Go string literal holding an action.
+    """
+    texts = dict(templates)
+    for file in files:
+        literals = re.findall(r'"(?:[^"\\\n]|\\.)*"|`[^`]*`', file.code)
+        for index, literal in enumerate(text for text in literals if "{{" in text):
+            texts[f"{file.relative} template literal {index}"] = literal
+    named: dict[str, set[str]] = {}
+    for where, text in texts.items():
+        for action in re.findall(r"\{\{.*?\}\}", text, re.DOTALL):
+            for name in re.findall(r"\.([A-Z]\w*)", action):
+                named.setdefault(name, set()).add(where)
+    return named
+
+
 def _assert_never_run(
-    files: Sequence[go_sources.GoFile], main_package: str, unrun: frozenset[str]
+    files: Sequence[go_sources.GoFile],
+    main_package: str,
+    unrun: frozenset[str],
+    templates: Mapping[str, str],
 ) -> None:
-    """Fail unless each unrun file is linked, names an AWS operation and none of it is reached."""
+    """Fail unless each unrun file is linked, names an AWS operation and none of it is reached.
+
+    `templates` are the files the closure embeds (`_go_embedded_files`).
+    """
     if not unrun:
         return
     by_name = {file.relative: file for file in files}
     reached = _go_reachable(files, main_package)
+    # text/template and html/template call a method that a template names on whatever value
+    # the template is given, and that call appears nowhere in Go code. So no template action
+    # may name an exported method of an unrun file. internal/notifications/templates.go links
+    # both packages into every closure; its embedded templates name only view-model fields.
+    template_methods = _go_template_methods(files, templates)
     for relative in sorted(unrun):
         assert relative in by_name, f"{relative} is not in the closure any more"
         file = by_name[relative]
@@ -2486,6 +2536,16 @@ def _assert_never_run(
             for declaration in naming & reached.keys()
         )
         assert not ran, f"{relative} is not unrun: {main_package} reaches {'; '.join(ran)}"
+        exported = {
+            name
+            for kind, name, _ in _go_declarations(file)
+            if kind == "method" and name and name[0].isupper()
+        }
+        called = sorted(
+            f"{name} ({', '.join(sorted(template_methods[name]))})"
+            for name in exported & template_methods.keys()
+        )
+        assert not called, f"{relative} is not unrun: a template names {'; '.join(called)}"
 
 
 @functools.cache
@@ -2493,7 +2553,7 @@ def _go_role(name: str) -> _GoRole:
     entrypoint = roles_by_name(load_roles())[name]["entrypoint"]
     files = go_sources.closure_files(entrypoint)
     unrun = GO_ROLE_UNRUN_FILES.get(name, frozenset())
-    _assert_never_run(files, go_sources.MODULE + entrypoint, unrun)
+    _assert_never_run(files, go_sources.MODULE + entrypoint, unrun, _go_embedded_files(files))
     return _derive_go_role(files, go_sources.closure(entrypoint), unrun)
 
 
@@ -2979,20 +3039,31 @@ type loader interface{ Load() }
 func Run(l loader) { l.Load() }
 """,
 }
+# The embedded templates: like the real ones, they name view-model fields only.
+_UNRUN_TEMPLATES = {
+    "internal/store/templates/alert.tmpl": "{{.RuleName}} at {{utc .WindowStart}}\n"
+}
 _UNRUN_MAIN = go_sources.MODULE + "cmd/tool"
 _UNRUN_STORE = frozenset({"internal/store/store.go"})
+
+
+def _assert_fixture_never_run(sources: Mapping[str, str], unrun: frozenset[str]) -> None:
+    files = _fixture_package({path: text for path, text in sources.items() if path.endswith(".go")})
+    templates = {path: text for path, text in sources.items() if not path.endswith(".go")}
+    _assert_never_run(files, _UNRUN_MAIN, unrun, templates)
 
 
 def test_an_unrun_file_drops_out_of_the_scan_when_nothing_runs_it() -> None:
     files = _fixture_package(_UNRUN_FIXTURE)
 
-    _assert_never_run(files, _UNRUN_MAIN, _UNRUN_STORE)
+    _assert_fixture_never_run({**_UNRUN_FIXTURE, **_UNRUN_TEMPLATES}, _UNRUN_STORE)
     role = _derive_go_role(files, {"github.com/aws/aws-sdk-go-v2/service/dynamodb"}, _UNRUN_STORE)
     assert role.operations == {"dynamodb:Query"}
 
 
 _MAIN_GO = "cmd/tool/main.go"
 _STORE_GO = "internal/store/store.go"
+_TEMPLATE = "internal/store/templates/alert.tmpl"
 _MAIN_CALL = "store.Backfill(runner.Options{})"
 _MAIN_IMPORTS = "import (\n"
 
@@ -3107,18 +3178,37 @@ _MAIN_IMPORTS = "import (\n"
             "a func declared outside column 0",
             id="indented-func",
         ),
+        # A template calls a method it names on the value it is given, out of the scan's sight.
+        pytest.param(
+            ((_TEMPLATE, "{{.RuleName}}", "{{.RuleName}} {{.Store.Load}}"),),
+            _UNRUN_STORE,
+            re.escape(f"a template names Load ({_TEMPLATE})"),
+            id="embedded-template",
+        ),
+        pytest.param(
+            (
+                (
+                    _MAIN_GO,
+                    _MAIN_CALL,
+                    f'{_MAIN_CALL}; _ = template.Must(template.New("x").Parse("{{{{.Load}}}}"))',
+                ),
+            ),
+            _UNRUN_STORE,
+            re.escape(f"a template names Load ({_MAIN_GO} template literal 0)"),
+            id="template-literal",
+        ),
     ],
 )
 def test_an_unrun_file_fails_closed(
     edits: tuple[tuple[str, str, str], ...], unrun: set[str], message: str
 ) -> None:
-    sources = dict(_UNRUN_FIXTURE)
+    sources = {**_UNRUN_FIXTURE, **_UNRUN_TEMPLATES}
     for path, old, new in edits:
         assert sources[path].count(old) == 1, (path, old)
         sources[path] = sources[path].replace(old, new)
 
     with pytest.raises(AssertionError, match=message):
-        _assert_never_run(_fixture_package(sources), _UNRUN_MAIN, frozenset(unrun))
+        _assert_fixture_never_run(sources, frozenset(unrun))
 
 
 def test_func_literals_are_not_declarations_outside_column_0() -> None:
@@ -3129,7 +3219,7 @@ def test_func_literals_are_not_declarations_outside_column_0() -> None:
         "\tg := func(next func(int) error) func(int) error { return next }\n\t_, _ = f, g",
     )
 
-    _assert_never_run(_fixture_package(sources), _UNRUN_MAIN, _UNRUN_STORE)
+    _assert_fixture_never_run(sources, _UNRUN_STORE)
 
 
 _EMAIL_DOCUMENT = 'data "aws_iam_policy_document" "email_worker_runtime" {'

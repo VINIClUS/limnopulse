@@ -110,14 +110,37 @@ with their own credentials. They write it straight into the role's
 ([`ops/workers/README.md`](../../ops/workers/README.md)), so the secret never
 reaches a terminal, a shell history, an env file, a ticket or chat.
 
-The function below checks that the destination is writable before any key
-exists, and checks every step. It writes both files as `.new` and moves them
-into place only once both writes have succeeded. On any failure it deletes the
-new key, so no live key is left that nobody holds:
+The function below works in this order:
+
+1. It checks that the destination is writable before any key exists.
+2. It creates the key and writes both files as `.new`.
+3. It swaps both files in with one script on the host. That script backs up
+   the current pair as `.old` first, and if either move fails it puts both
+   back.
+4. It checks every step. On any failure it deletes the new key, so no live key
+   is left that nobody holds, and a running unit keeps a matching id and
+   secret.
+5. If the delete itself fails, it prints the new key's id, never the secret,
+   and the command to delete it.
 
 ```bash
 install_worker_key() {  # <role> <IAM user> <worker host>
   local dir="/etc/limnopulse/workers/credentials/$1" id secret
+  # Runs on the host as root, with the directory as $1: swaps both files in, or restores
+  # both (and removes a file that had no previous version).
+  local swap='cd "$1" || exit 1
+    for f in aws-access-key-id aws-secret-access-key; do
+      [ ! -e "$f" ] || cp -p "$f" "$f.old" || exit 1
+    done
+    if mv aws-access-key-id.new aws-access-key-id &&
+       mv aws-secret-access-key.new aws-secret-access-key; then
+      rm -f aws-access-key-id.old aws-secret-access-key.old
+    else
+      for f in aws-access-key-id aws-secret-access-key; do
+        if [ -e "$f.old" ]; then mv "$f.old" "$f"; else rm -f "$f"; fi
+      done
+      exit 1
+    fi'
   ssh "$3" "sudo -n test -d $dir -a -w $dir" \
     || { echo "cannot write $dir on $3; no key created" >&2; return 1; }
   read -r id secret < <(aws iam create-access-key --user-name "$2" \
@@ -125,17 +148,21 @@ install_worker_key() {  # <role> <IAM user> <worker host>
     || { echo "create-access-key failed" >&2; return 1; }
   if printf '%s' "$id" | ssh "$3" "sudo -n sh -c 'umask 077; cat > $dir/aws-access-key-id.new'" &&
      printf '%s' "$secret" | ssh "$3" "sudo -n sh -c 'umask 077; cat > $dir/aws-secret-access-key.new'" &&
-     ssh "$3" "sudo -n sh -c 'cd $dir && mv aws-access-key-id.new aws-access-key-id &&
-       mv aws-secret-access-key.new aws-secret-access-key'"; then
+     ssh "$3" "sudo -n sh -s $dir" <<<"$swap"; then
     echo "installed a new key for $1"
-  else
-    echo "writing the key failed; deleting the new key" >&2
-    ssh "$3" "sudo -n rm -f $dir/aws-access-key-id.new $dir/aws-secret-access-key.new"
-    aws iam delete-access-key --user-name "$2" --access-key-id "$id"
-    return 1
+    return 0
   fi
+  echo "installing the key failed; the previous files stay in place" >&2
+  ssh "$3" "sudo -n rm -f $dir/aws-access-key-id.new $dir/aws-secret-access-key.new"
+  aws iam delete-access-key --user-name "$2" --access-key-id "$id" && return 1
+  echo "deleting the new key failed; delete it with:" >&2
+  echo "  aws iam delete-access-key --user-name $2 --access-key-id $id" >&2
+  return 1
 }
 ```
+
+If `.old` files remain in the directory after a failure, the restore itself
+failed. Move them back by hand before restarting the unit.
 
 For example, for the email-worker, run this from this directory:
 
