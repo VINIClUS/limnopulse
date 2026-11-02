@@ -89,7 +89,7 @@ ensure_lab_go() {
   archive="$root/.lab-tools/go-$GO_VERSION.tar.gz"
   extract_dir="$root/.lab-tools/go-$GO_VERSION"
   install -d -m 755 "$root/.lab-tools"
-  curl --fail --location --silent --show-error \
+  curl --proto '=https' --tlsv1.2 --fail --location --silent --show-error \
     "https://go.dev/dl/go$GO_VERSION.linux-amd64.tar.gz" \
     --output "$archive"
   printf '%s  %s\n' "$GO_ARCHIVE_SHA256" "$archive" | sha256sum --check --status || \

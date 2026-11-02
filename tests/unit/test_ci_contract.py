@@ -42,12 +42,10 @@ WORKERS_RECIPES = {
     "workers-units": ["uv run --locked --no-sync python -m scripts.workers.units"],
     "workers-binaries": [
         "uv run --locked --no-sync python -m scripts.workers.build_bundle binaries"
-        " --out dist/workers/bin"
     ],
     "workers-bundle": [
         "uv run --locked --no-sync python -m scripts.workers.build_bundle bundle"
         " --tag main-0000000000000000000000000000000000000000"
-        " --binaries dist/workers/bin --out dist/workers"
     ],
 }
 INGESTION_RECIPE = [

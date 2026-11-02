@@ -114,9 +114,10 @@ jobs:
 
       - name: Build the workers bundle
         run: |
-          make workers-binaries WORKERS_DIR="$RUNNER_TEMP/workers-a"
-          make workers-bundle WORKERS_DIR="$RUNNER_TEMP/workers-a"
+          make workers-binaries
+          make workers-bundle
 
+      # build_bundle.py works only in the dist/workers of the checkout it runs from.
       - name: Rebuild it from a second checkout with an empty build cache
         run: |
           set -euo pipefail
@@ -125,29 +126,28 @@ jobs:
           git archive HEAD | tar -x -C "$source"
           cd "$source"
           GOCACHE="$RUNNER_TEMP/gocache-b" "$GITHUB_WORKSPACE/.venv/bin/python" \
-            -m scripts.workers.build_bundle binaries --out "$RUNNER_TEMP/workers-b/bin"
+            -m scripts.workers.build_bundle binaries
           "$GITHUB_WORKSPACE/.venv/bin/python" -m scripts.workers.build_bundle bundle \
-            --tag "$WORKERS_TAG" --binaries "$RUNNER_TEMP/workers-b/bin" \
-            --out "$RUNNER_TEMP/workers-b"
+            --tag "$WORKERS_TAG"
 
       - name: Require byte-identical bundles
         run: |
           set -euo pipefail
           file="limnopulse-workers-${WORKERS_TAG}.tar.gz"
-          sha256sum "$RUNNER_TEMP"/workers-a/bin/* "$RUNNER_TEMP"/workers-b/bin/*
-          sha256sum "$RUNNER_TEMP/workers-a/$file" "$RUNNER_TEMP/workers-b/$file"
-          cmp "$RUNNER_TEMP/workers-a/$file" "$RUNNER_TEMP/workers-b/$file"
+          second="$RUNNER_TEMP/source-b/dist/workers"
+          sha256sum dist/workers/bin/* "$second"/bin/*
+          sha256sum "dist/workers/$file" "$second/$file"
+          cmp "dist/workers/$file" "$second/$file"
 
       - name: Verify the bundle and its static executables
         run: |
           uv run --locked --no-sync python -m scripts.workers.build_bundle verify \
-            --tag "$WORKERS_TAG" --static-elf \
-            "$RUNNER_TEMP/workers-a/limnopulse-workers-${WORKERS_TAG}.tar.gz"
+            --tag "$WORKERS_TAG" --static-elf
 
       - name: Run each unit once on the runner's systemd
         run: |
           sudo --preserve-env=GITHUB_ACTIONS scripts/workers/smoke_units.sh \
-            "$RUNNER_TEMP/workers-a/limnopulse-workers-${WORKERS_TAG}.tar.gz" "$WORKERS_TAG"
+            "dist/workers/limnopulse-workers-${WORKERS_TAG}.tar.gz" "$WORKERS_TAG"
 
       - name: Install oras
         if: github.event_name == 'push' && github.ref == 'refs/heads/main'
@@ -168,7 +168,7 @@ jobs:
         if: github.event_name == 'push' && github.ref == 'refs/heads/main'
         uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2
         with:
-          subject-path: ${{ runner.temp }}/workers-a/limnopulse-workers-main-${{ github.sha }}.tar.gz
+          subject-path: ${{ github.workspace }}/dist/workers/limnopulse-workers-main-${{ github.sha }}.tar.gz
 
       - name: Log in to GHCR
         if: github.event_name == 'push' && github.ref == 'refs/heads/main'
@@ -182,7 +182,7 @@ jobs:
       # that file (ops/vps/limnopulse-workers-activate refuses anything else).
       - name: Push the bundle to GHCR
         if: github.event_name == 'push' && github.ref == 'refs/heads/main'
-        working-directory: ${{ runner.temp }}/workers-a
+        working-directory: dist/workers
         env:
           REPOSITORY: ${{ github.repository }}
         run: |

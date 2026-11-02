@@ -138,13 +138,13 @@ jobs:
       - name: Build the worker executables
         run: |
           uv sync --locked --extra dev
-          make workers-binaries WORKERS_DIR="$RUNNER_TEMP/workers"
+          make workers-binaries
 
       - name: Trivy rootfs scan (worker executables)
         uses: aquasecurity/trivy-action@ed142fd0673e97e23eac54620cfb913e5ce36c25 # v0.36.0
         with:
           scan-type: 'rootfs'
-          scan-ref: '${{ runner.temp }}/workers/bin'
+          scan-ref: 'dist/workers/bin'
           scanners: 'vuln'
           format: 'sarif'
           output: 'trivy-workers.sarif'

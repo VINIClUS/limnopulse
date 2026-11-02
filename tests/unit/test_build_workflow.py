@@ -103,16 +103,14 @@ def test_workers_bundle_is_built_twice_verified_and_smoked_on_pull_requests():
     runs = [step["run"] for step in job["steps"] if "run" in step]
     assert runs[0] == "uv sync --locked --extra dev"
     build = _step(job, "Build the workers bundle")["run"].split("\n")
-    assert build[:2] == [
-        'make workers-binaries WORKERS_DIR="$RUNNER_TEMP/workers-a"',
-        'make workers-bundle WORKERS_DIR="$RUNNER_TEMP/workers-a"',
-    ]
+    assert build[:2] == ["make workers-binaries", "make workers-bundle"]
     rebuild = _step(job, "Rebuild it from a second checkout with an empty build cache")["run"]
     assert "git archive HEAD" in rebuild
     assert 'GOCACHE="$RUNNER_TEMP/gocache-b"' in rebuild
     assert "build_bundle binaries" in rebuild and "build_bundle bundle" in rebuild
     compare = _step(job, "Require byte-identical bundles")["run"]
-    assert 'cmp "$RUNNER_TEMP/workers-a/$file" "$RUNNER_TEMP/workers-b/$file"' in compare
+    assert 'second="$RUNNER_TEMP/source-b/dist/workers"' in compare
+    assert 'cmp "dist/workers/$file" "$second/$file"' in compare
     verify = _step(job, "Verify the bundle and its static executables")["run"]
     assert "build_bundle verify" in verify and "--static-elf" in verify
     smoke = _step(job, "Run each unit once on the runner's systemd")["run"]
@@ -148,12 +146,12 @@ def test_workers_publisher_pushes_one_attested_file_layer_with_the_roles_yaml_ty
     assert attest["uses"].startswith("actions/attest-build-provenance@")
     # The tarball file itself is the subject; deploy.yml runs gh attestation verify on it.
     assert attest["with"] == {
-        "subject-path": "${{ runner.temp }}/workers-a/"
+        "subject-path": "${{ github.workspace }}/dist/workers/"
         + bundle["file"].format(tag="main-${{ github.sha }}")
     }
     push = _step(publisher, "Push the bundle to GHCR")
     # oras titles the layer with the path as given, so it runs next to the file.
-    assert push["working-directory"] == "${{ runner.temp }}/workers-a"
+    assert push["working-directory"] == "dist/workers"
     command = push["run"]
     assert f'file="{file}"' in command
     assert f"--artifact-type {bundle['artifact_type']}" in command
@@ -182,11 +180,11 @@ def test_no_go_image_is_built_or_scanned():
 def test_trivy_scans_the_worker_executables_as_a_rootfs():
     job = _workflow("trivy.yml")["jobs"]["workers"]
     build = _step(job, "Build the worker executables")["run"]
-    assert 'make workers-binaries WORKERS_DIR="$RUNNER_TEMP/workers"' in build
+    assert "make workers-binaries" in build
     scan = _step(job, "Trivy rootfs scan (worker executables)")
     assert scan["uses"].startswith("aquasecurity/trivy-action@")
     assert scan["with"]["scan-type"] == "rootfs"
-    assert scan["with"]["scan-ref"] == "${{ runner.temp }}/workers/bin"
+    assert scan["with"]["scan-ref"] == "dist/workers/bin"
     assert scan["with"]["exit-code"] == "1"
     assert scan["with"]["severity"] == "CRITICAL,HIGH"
 

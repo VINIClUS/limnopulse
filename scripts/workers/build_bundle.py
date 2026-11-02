@@ -1,13 +1,17 @@
 """Build and verify the ADR-020 workers bundle (`ops/workers/README.md`, "Workers bundle").
 
-    build_bundle.py binaries --out DIR
-        `go build` every Go role of roles.yaml into DIR as a static linux/amd64 executable.
-    build_bundle.py bundle --tag TAG --binaries DIR --out DIR
-        Write DIR/limnopulse-workers-TAG.tar.gz from those executables, roles.yaml and
-        ops/workers/systemd, then verify it. Prints the tarball path and its SHA-256.
-    build_bundle.py verify --tag TAG [--static-elf] TARBALL
-        Check a tarball against roles.yaml and the committed units, and that it is the
+    build_bundle.py binaries
+        `go build` every Go role of roles.yaml into dist/workers/bin as a static
+        linux/amd64 executable.
+    build_bundle.py bundle --tag TAG
+        Write dist/workers/limnopulse-workers-TAG.tar.gz from those executables, roles.yaml
+        and ops/workers/systemd, then verify it. Prints the tarball path and its SHA-256.
+    build_bundle.py verify --tag TAG [--static-elf]
+        Check that tarball against roles.yaml and the committed units, and that it is the
         canonical (byte-reproducible) packing of its own contents.
+
+The command line works only in dist/workers of the checkout it runs from, so no argument
+names a path; a second checkout builds into its own dist/workers.
 
 The tarball is deterministic: USTAR entries sorted by path, mtime 0, uid and gid 0 with no
 owner names, fixed modes, compressed with `gzip -9 -n`. Binaries are built with
@@ -35,6 +39,7 @@ from scripts.workers import units
 
 GO_LIFECYCLES = ("continuous", "oneshot", "cli")
 TAG_RE = re.compile(r"main-[0-9a-f]{40}")
+WORKSPACE = units.ROOT / "dist/workers"
 BINARY_MODE, FILE_MODE, DIRECTORY_MODE = 0o755, 0o644, 0o755
 GO_ENVIRONMENT = {
     "CGO_ENABLED": "0",
@@ -298,32 +303,29 @@ def verify_bundle(path: Path, tag: str, static_elf: bool = False) -> list[str]:
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     commands = parser.add_subparsers(dest="command", required=True)
-    binaries = commands.add_parser("binaries", help="go build every Go role")
-    binaries.add_argument("--out", type=Path, required=True)
+    commands.add_parser("binaries", help="go build every Go role into dist/workers/bin")
     bundle = commands.add_parser("bundle", help="pack and verify the bundle tarball")
     bundle.add_argument("--tag", required=True)
-    bundle.add_argument("--binaries", type=Path, required=True)
-    bundle.add_argument("--out", type=Path, required=True)
-    verify = commands.add_parser("verify", help="verify a bundle tarball")
+    verify = commands.add_parser("verify", help="verify the bundle tarball")
     verify.add_argument("--tag", required=True)
     verify.add_argument("--static-elf", action="store_true")
-    verify.add_argument("tarball", type=Path)
     args = parser.parse_args(argv)
     try:
         if args.command == "binaries":
-            for path in build_binaries(args.out):
+            for path in build_binaries(WORKSPACE / "bin"):
                 print(path)
         elif args.command == "bundle":
-            path = build_bundle(args.tag, args.binaries, args.out)
+            path = build_bundle(check_tag(args.tag), WORKSPACE / "bin", WORKSPACE)
             print(f"{path} {hashlib.sha256(path.read_bytes()).hexdigest()}")
         else:
-            for name in verify_bundle(args.tarball, args.tag, args.static_elf):
+            tag = check_tag(args.tag)
+            tarball = WORKSPACE / bundle_file(table(), tag)
+            for name in verify_bundle(tarball, tag, args.static_elf):
                 print(name)
     except (BundleError, subprocess.CalledProcessError, OSError) as error:
         print(f"build_bundle: {error}", file=sys.stderr)
         return 1
     return 0
-
 
 if __name__ == "__main__":
     sys.exit(main())

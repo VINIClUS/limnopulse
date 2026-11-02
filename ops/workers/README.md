@@ -105,18 +105,20 @@ CI pushes the bundle to GHCR as an OCI artifact,
 attaches a build-provenance attestation for the tarball.
 
 **Building it.** `scripts/workers/build_bundle.py` builds and checks the bundle
-(`make workers-binaries`, then `make workers-bundle`):
+(`make workers-binaries`, then `make workers-bundle`). It works only in `dist/workers` of
+the checkout it runs from, and no argument names a path:
 
-- `binaries` builds every Go role with `CGO_ENABLED=0`, `GOOS=linux`, `GOARCH=amd64`,
-  `GOAMD64=v1`, `-trimpath`, `-buildvcs=false` and `-ldflags='-s -w -buildid='`. Two
-  builds of one commit with one Go toolchain produce the same bytes.
-- `bundle` packs USTAR entries sorted by path, mtime 0, uid and gid 0 with no owner
-  names, `bin/*` 0755 and the rest 0644, through `gzip -9 -n`. It refuses a `bin/`
-  directory that is not exactly one file per Go role, and units that drifted from
-  `roles.yaml`.
-- `verify` checks a tarball against `roles.yaml` and the committed units, and that it is
-  the canonical packing of its own contents. `--static-elf` also requires each binary to
-  be a static x86-64 executable with no dynamic loader.
+- `binaries` builds every Go role into `dist/workers/bin` with `CGO_ENABLED=0`,
+  `GOOS=linux`, `GOARCH=amd64`, `GOAMD64=v1`, `-trimpath`, `-buildvcs=false` and
+  `-ldflags='-s -w -buildid='`. Two builds of one commit with one Go toolchain produce
+  the same bytes.
+- `bundle --tag <tag>` writes `dist/workers/limnopulse-workers-<tag>.tar.gz`. It packs
+  USTAR entries sorted by path, mtime 0, uid and gid 0 with no owner names, `bin/*` 0755
+  and the rest 0644, through `gzip -9 -n`. It refuses a `bin/` directory that is not
+  exactly one file per Go role, and units that drifted from `roles.yaml`.
+- `verify --tag <tag>` checks that tarball against `roles.yaml` and the committed units,
+  and that it is the canonical packing of its own contents. `--static-elf` also requires
+  each binary to be a static x86-64 executable with no dynamic loader.
 
 The `workers-bundle` job in `.github/workflows/build.yml` runs on pull requests. It builds
 the bundle twice, from two checkouts with separate Go build caches, and requires the two

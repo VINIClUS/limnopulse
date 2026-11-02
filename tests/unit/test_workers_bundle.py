@@ -310,17 +310,37 @@ def test_binaries_builds_every_go_role_static_trimmed_and_without_a_build_id(tmp
         build_bundle.build_binaries(out, go=str(go))
 
 
-def test_the_command_line_builds_and_verifies(tmp_path, capsys):
-    directory = fake_binaries(tmp_path / "bin")
-    out = tmp_path / "out"
-    args = ["bundle", "--tag", TAG, "--binaries", str(directory), "--out", str(out)]
-    assert build_bundle.main(args) == 0
+def test_the_command_line_works_only_in_dist_workers(tmp_path, capsys, monkeypatch):
+    workspace = tmp_path / "dist/workers"
+    monkeypatch.setattr(build_bundle, "WORKSPACE", workspace)
+    fake_binaries(workspace / "bin")
+    assert build_bundle.main(["bundle", "--tag", TAG]) == 0
     path, digest = capsys.readouterr().out.split()
+    assert Path(path) == workspace / f"limnopulse-workers-{TAG}.tar.gz"
     assert digest == sha256(Path(path).read_bytes())
-    assert build_bundle.main(["verify", "--tag", TAG, path]) == 0
+    assert build_bundle.main(["verify", "--tag", TAG]) == 0
     assert "SHA256SUMS" in capsys.readouterr().out.split()
-    assert build_bundle.main(["verify", "--tag", TAG, "--static-elf", path]) == 1
+    assert build_bundle.main(["verify", "--tag", TAG, "--static-elf"]) == 1
     assert "not an ELF file" in capsys.readouterr().err
+    assert build_bundle.main(["verify", "--tag", "main-" + "1" * 40]) == 1
+    assert "No such file" in capsys.readouterr().err
+    assert build_bundle.main(["verify", "--tag", "../" + TAG]) == 1
+    assert "the tag must be" in capsys.readouterr().err
+    # Nothing names a path: the subcommands take no file or directory argument.
+    for extra in (["binaries", "--out", "x"], ["bundle", "--tag", TAG, "--out", "x"]):
+        with pytest.raises(SystemExit):
+            build_bundle.main(extra)
+
+
+def test_the_binaries_command_builds_into_dist_workers_bin(tmp_path, capsys, monkeypatch):
+    calls = []
+    monkeypatch.setattr(build_bundle, "WORKSPACE", tmp_path / "dist/workers")
+    monkeypatch.setattr(
+        build_bundle, "build_binaries", lambda out: calls.append(out) or [out / "alert-evaluator"]
+    )
+    assert build_bundle.main(["binaries"]) == 0
+    assert calls == [tmp_path / "dist/workers/bin"]
+    assert capsys.readouterr().out == f"{tmp_path / 'dist/workers/bin/alert-evaluator'}\n"
 
 
 # --- the S4 activation helper accepts it ---------------------------------------------------
