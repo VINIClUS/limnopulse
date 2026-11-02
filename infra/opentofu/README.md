@@ -209,7 +209,17 @@ account, from this directory:
    A `MessageId` means SES authorized the identity and the From condition.
    Leave the configuration set out: its events carry no delivery, so the
    SES-feedback worker would retry them into its DLQ. Step 1 covers the
-   configuration set.
+   configuration set. OpenTofu does not manage the identities, and SES applies
+   an identity's default configuration set even to this send. So first check
+   the mailbox and the domain. Each must print `None` or report that the
+   identity does not exist; otherwise skip the send.
+
+   ```bash
+   for identity in <ses_from_address> <ses_from_domain>; do
+     aws sesv2 get-email-identity --email-identity "$identity" \
+       --query ConfigurationSetName --output text
+   done
+   ```
 
    ```bash
    dir=/etc/limnopulse/workers/credentials/email-worker
