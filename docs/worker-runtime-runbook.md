@@ -162,20 +162,30 @@ evaluator stays stopped. An evaluator run with Telegram off marks each new Teleg
 `deferred_unsupported_channel`, and only `backfill-telegram` makes those outboxes
 deliverable.
 
-Stopping the timer does not stop a run that is already in progress. So stop both units,
-and start the final backfill only once the service reads `inactive` (*host*):
+In a first rollout the evaluator is held and was never enabled, so nothing needs pausing.
+To pause an evaluator that is already enabled:
 
-```bash
-systemctl stop limnopulse-alert-evaluator.timer limnopulse-alert-evaluator.service
-systemctl is-active limnopulse-alert-evaluator.service   # must print inactive (or failed)
-```
+1. *Workstation:* set `alert_evaluator_enabled = false` and apply it. The pause stops its
+   `UnitHealthy` data, and with actions on its alarm would page.
+2. *Host:* disable the timer and stop any run already in progress. Stopping the timer alone
+   leaves an in-progress run going, and `disable` keeps it off across a reboot. Start the
+   final backfill only once the service reads `inactive`:
 
-If the evaluator ran in that window anyway:
+   ```bash
+   systemctl disable --now limnopulse-alert-evaluator.timer
+   systemctl stop limnopulse-alert-evaluator.service
+   systemctl is-active limnopulse-alert-evaluator.service   # must print inactive (or failed)
+   ```
 
-1. Stop both units as above.
-2. Repeat the `backfill-telegram` dry run, `--apply` and dry run until it reports nothing
-   to update.
-3. Turn on the flags.
+3. Run the final `backfill-telegram`, then turn Telegram on in the relay's env file and
+   then the evaluator's.
+4. *Host:* `systemctl enable --now limnopulse-alert-evaluator.timer`.
+5. *Workstation:* once its unit-health alarm reads `OK`, set `alert_evaluator_enabled = true`
+   and apply it.
+
+If the evaluator ran in that window anyway, pause it as in steps 1 and 2. Repeat the
+`backfill-telegram` dry run, `--apply` and dry run until it reports nothing to update.
+Then continue with step 3.
 
 ## Disable a Go role
 
