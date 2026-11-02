@@ -21,7 +21,7 @@ Limnopulse is the successor to the AquaFarm prototype. AquaFarm names in histori
 | Phase 2D | Current scaffold | OpenTofu for DynamoDB, Cognito and base cloud resources |
 | Phase 3A | Current | Alert Rule configuration, optimistic updates, replacement idempotency, transactional audit, TTL |
 | Phase 3B | Current | one-shot Go evaluator, 64-bucket due index, InfluxDB windows, durable Alert Events and notification outboxes |
-| Phase 3C-A | Current | one-shot outbox relay, SQS email jobs, continuous SES worker/feedback, durable deliveries and attempts |
+| Phase 3C-A | Current | one-shot outbox relay, SQS email jobs, continuous email and SES-feedback workers, durable deliveries and attempts |
 | Phase 3C-B | Current | FastAPI Telegram binding/webhook, isolated queue/worker, durable snapshots/attempts, Redis rate limit |
 
 “Current” means implemented in this repository. “Target” is architectural direction and must not be interpreted as a deployed capability.

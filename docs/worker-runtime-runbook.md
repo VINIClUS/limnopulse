@@ -1,9 +1,9 @@
 # Worker runtime runbook (ADR-020)
 
-This page covers operating the workers on the VPS after the host bootstrap. Each role runs
+This runbook covers operating the workers on the VPS after the host bootstrap. Each role runs
 as its own supervised process
 ([ADR-020](adr/ADR-020-each-worker-role-is-a-supervised-process.md)). The Go roles are
-systemd units from the workers bundle, and the telemetry ingest worker is a Compose service.
+systemd units from the workers bundle. The telemetry ingest worker is a Compose service.
 The rules live elsewhere, and this page links to them instead of repeating them:
 
 | Topic | Source |
@@ -11,24 +11,34 @@ The rules live elsewhere, and this page links to them instead of repeating them:
 | Role table: units, paths, credentials, principals, alarms | [`ops/workers/roles.yaml`](../ops/workers/roles.yaml) |
 | Exit codes, unit health, bundle, units, activation helper, deploy | [`ops/workers/README.md`](../ops/workers/README.md) |
 | One-time host bootstrap | [`ops/vps/README.md`](../ops/vps/README.md), section 7 |
-| Principals, access keys, enabling a role's alarms, the SES check | [`infra/opentofu/README.md`](../infra/opentofu/README.md), "Worker roles (ADR-020)" |
-| Ingest worker rollout and rollback | [`docs/p3-ingestion-rollout-runbook.md`](p3-ingestion-rollout-runbook.md) |
+| Principals, access keys, alarm actions, the SES check, `limnopulse-admin` | [`infra/opentofu/README.md`](../infra/opentofu/README.md), "Worker roles (ADR-020)" |
+| Email and Telegram rollouts | [`docs/notifications-phase-3c-a.md`](notifications-phase-3c-a.md) and [`docs/notifications-phase-3c-b.md`](notifications-phase-3c-b.md), "Cloud rollout" |
+| Ingest worker rollout, keys and rollback | [`docs/p3-ingestion-rollout-runbook.md`](p3-ingestion-rollout-runbook.md) |
 
-Run the host commands below as root on the VPS, unless a command says otherwise.
+**Where commands run.**
+
+- **Host:** commands marked *host* run as root on the VPS.
+- **Workstation:** commands marked *workstation* run on the operator's workstation, from
+  `infra/opentofu` in a checkout, with the operator's own AWS credentials. That covers
+  `tofu`, `aws`, `install_worker_key` and `limnopulse-admin`. Operator credentials never
+  go onto the VPS. The one exception is the fallback that "Access keys" describes for a
+  host whose `sudo` needs a password.
 
 ## Starting state
 
-The first bundled promotion installs every unit and enables none. Every Go role starts out
+The first bundled promotion installs every unit and enables none. Each Go role starts out
 like this:
 
 - its unit or timer is installed and disabled, and it publishes no `UnitHealthy` datapoint;
 - its principal exists or not, as its delivery flag decides, and holds no access key;
-- its alarms have `actions_enabled = false`, so a breaching alarm notifies nobody.
+- its alarms have `actions_enabled = false`.
 
-The ingest worker runs whenever its host switch, `TELEMETRY_V2_WRITE_ENABLED`, is on. The
+The ingest worker runs while its host switch, `TELEMETRY_V2_WRITE_ENABLED`, is on. The
 deploy removes it while the switch is off.
 
 ## Look at the workers
+
+*Host:*
 
 ```bash
 /usr/local/sbin/limnopulse-workers-activate status   # current tag, staged releases, floors
@@ -42,7 +52,7 @@ systemctl show limnopulse-<role>.service -p Result -p ExecMainStatus -p NRestart
 The deploy logs to `/var/log/limnopulse-deploy.log`. `/opt/limnopulse/.env.image`
 records the live `IMAGE_TAG` and `WORKERS_BUNDLE_SHA256`.
 
-For the ingest worker, run these as the deploy user from `/opt/limnopulse`:
+For the ingest worker, run these as the deploy user from `/opt/limnopulse` (*host*):
 
 ```bash
 sudo -u limnopulse-deploy docker compose --env-file .env --env-file .env.image \
@@ -57,7 +67,7 @@ sudo -u limnopulse-deploy docker compose --env-file .env --env-file .env.image \
 |---|---|---|---|
 | `1` | runtime failure, or a loop that stopped making progress | a continuous unit restarts, backing off from 5 s to 60 s; a one-shot runs again at the next tick | read the journal |
 | `2` | partial one-shot run | the next tick picks up the rest; `UnitHealthy` reads `0` until a run exits `0` | nothing, unless it repeats; then read the journal |
-| `78` | configuration error: an env file setting, a credential or a flag | never restarted; a one-shot fails again at every tick | fix the env file or the credential, then `systemctl reset-failed limnopulse-<role>.service` and `systemctl start` it (one-shots: let the timer start it) |
+| `78` | configuration error: an env file setting, a credential or a flag | never restarted; a one-shot fails again at every tick | fix the env file or the credential, then `systemctl reset-failed limnopulse-<role>.service` and `systemctl start` it (for a one-shot, let the timer start it) |
 | `SIGABRT` | an unrecovered panic (`GOTRACEBACK=crash`), or the systemd watchdog | treated like `1` | the journal holds the goroutine dump |
 
 A continuous worker exits `1` by itself once its loop stops making progress, before the
@@ -65,62 +75,107 @@ watchdog fires. A watchdog kill therefore means the process could not even exit.
 
 ## Enable a Go role
 
-The AWS side, keys and alarms included, follows "Enabling and disabling a role" in
-[`infra/opentofu/README.md`](../infra/opentofu/README.md). Enable `worker-monitor` first,
-because every other unit-health alarm reads its datapoints. Enable consumers before their
-producers: the email-worker and the SES-feedback worker, then the Telegram worker, then the
-relay, then the evaluator. A producer started first leaves its jobs aging in a queue that
-nothing reads.
+Enable one role at a time, and finish each before starting the next. Each role's alarm
+actions follow "Enabling and disabling a role" in
+[`infra/opentofu/README.md`](../infra/opentofu/README.md). The order is:
 
-On the host, for each role:
+1. `worker-monitor`. Every other unit-health alarm reads its datapoints.
+2. `ses-feedback-worker`.
+3. `email-worker`.
+4. `telegram-worker`, with Telegram still off on the relay and the evaluator.
+5. `notification-relay`.
+6. `alert-evaluator`.
 
-1. Write `/etc/limnopulse/workers/<role>.env` (root, 0600) from
-   [`ops/workers/env/<role>.env.example`](../ops/workers/env/). Take every placeholder
-   from the OpenTofu outputs. An env file holds no secret and never sets `GOTRACEBACK`,
-   `LIMNOPULSE_SUPERVISOR` or an `*_ENDPOINT_URL`.
-2. Install the access key with `install_worker_key`
-   ([`infra/opentofu/README.md`](../infra/opentofu/README.md), "Access keys"). Write any
-   other credential the role lists with the `read -rs` pattern in `ops/vps/README.md`,
-   step 7.4.
+Consumers come before producers. A producer started first leaves its jobs aging in a queue
+that nothing reads.
+
+For each role:
+
+1. *Workstation:* copy `ops/workers/env/<role>.env.example` from a checkout to the host's
+   `/etc/limnopulse/workers/<role>.env` (root, 0600). The VPS has no clone. Fill each
+   placeholder from the OpenTofu outputs. Two are not outputs:
+   - `SES_FROM_EMAIL` is the verified SES sender, and its mailbox must equal
+     `ses_from_address`.
+   - `LIMNOPULSE_WEB_URL` is the public web URL.
+
+   An env file holds no secret and never sets `GOTRACEBACK`, `LIMNOPULSE_SUPERVISOR` or an
+   `*_ENDPOINT_URL`.
+2. *Workstation:* define `install_worker_key` from "Access keys" in
+   [`infra/opentofu/README.md`](../infra/opentofu/README.md), then install the role's key
+   with it. *Host:* write any other credential the role lists (`influxdb-token`,
+   `redis-password`) with the `read -rs` pattern in `ops/vps/README.md`, step 7.4.
 3. Pass the role's gate below.
-4. Run `systemctl enable --now limnopulse-<role>.timer` for a one-shot, or
+4. *Host:* run `systemctl enable --now limnopulse-<role>.timer` for a one-shot, or
    `systemctl enable --now limnopulse-<role>.service` for a continuous role. The enable
-   must be persistent: a `--runtime` or linked unit publishes nothing.
-5. Check `journalctl -u limnopulse-<role>.service` for the first run, then wait for the
-   role's alarms to reach `OK` before you set `<role>_enabled`.
+   must be persistent: a unit enabled with `--runtime`, or only linked, publishes nothing.
+5. *Host:* check `journalctl -u limnopulse-<role>.service` for the first run.
+   *Workstation:* wait until every alarm of the role reads `OK` ([Alarms](#alarms)), then
+   set `<role>_enabled = true` and apply it.
 
 | Role | Gate before step 4 |
 |---|---|
 | `worker-monitor` | The static user exists: `getent passwd limnopulse-worker-monitor` shows a uid below 61184 (`ops/vps/README.md`, step 7.5). |
-| `email-worker`, `ses-feedback-worker` | `email_delivery` is applied, the SES identity is verified, and the SES check passes (`infra/opentofu/README.md`, "The email-worker's SES check"). Enable the two together. |
-| `telegram-worker` | `telegram_delivery` is applied and the bot-token secret has a version. Redis is published on the host loopback with a password, and that password is the `redis-password` credential: `compose.production.yaml` does not publish Redis yet, so this needs its own change first. Set `TELEGRAM_DELIVERY_ENABLED=true` in the evaluator's and the relay's env files in the same change. |
-| `notification-relay` | `NotificationRelayByAvailableAt` is `ACTIVE`, and the `limnopulse-admin backfill-relay` migration has run (`infra/opentofu/README.md`, "Notification rollout boundary"). |
-| `alert-evaluator` | The `influxdb-token` credential can read `INFLUXDB_BUCKET_RAW`. The data-quality settings in the env file match the devices. The `limnopulse-admin backfill-schedule` migration has run ([`docs/alert-evaluator-phase-3b.md`](alert-evaluator-phase-3b.md), "Initial schedule backfill"). |
+| `ses-feedback-worker` | `email_delivery` is applied. The 3C-A "Cloud rollout" steps 1 to 6 are done: the relay index is `ACTIVE`, the email outboxes are backfilled and SES is validated. No older feedback worker is running. |
+| `email-worker` | The SES-feedback worker is enabled and its alarms are `OK`. The SES check passes (`infra/opentofu/README.md`, "The email-worker's SES check"). The apply that first created `NotificationRelayByAvailableAt` is not the one that enables it ("Notification rollout boundary"). |
+| `telegram-worker` | The 3C-B "Cloud rollout" steps 1 to 6 are done: queue, secrets, webhook and binding, binaries with every Telegram flag `false`, and the final `limnopulse-admin backfill-telegram` with the evaluator timer stopped. Redis is published on the host loopback with a password, and in the same change the API's `REDIS_URL` gets that password. `compose.production.yaml` publishes no Redis port and hard-codes a password-less `REDIS_URL`, so that change comes first. The password is the worker's `redis-password` credential. Only the worker's env file sets `TELEGRAM_DELIVERY_ENABLED=true` (3C-B step 7). |
+| `notification-relay` | `NotificationRelayByAvailableAt` is `ACTIVE`, and `limnopulse-admin backfill-relay` reports zero rows needing update. The apply that first created the index is not the one that enables it. With Telegram on, the env file also sets `SQS_TELEGRAM_JOBS_URL` and `LIMNOPULSE_WEB_URL`. |
+| `alert-evaluator` | The `influxdb-token` credential can read `INFLUXDB_BUCKET_RAW`. The data-quality settings in the env file match the devices. `limnopulse-admin backfill-schedule` has been applied ([`docs/alert-evaluator-phase-3b.md`](alert-evaluator-phase-3b.md), "Initial schedule backfill"). |
+
+**Backfills.** *Workstation:* run each backfill under the assumed `limnopulse_admin` role,
+as "limnopulse-admin" in [`infra/opentofu/README.md`](../infra/opentofu/README.md)
+describes. Name the tenants explicitly. Do a dry run, review it, run with `--apply`, then
+dry-run again until it reports nothing left to update.
+
+**Telegram on the producers.** Turn Telegram on later, as 3C-B step 8 describes: first the
+relay, then the evaluator, for a controlled tenant cohort. Then confirm one opening and one
+recovery. If the evaluator timer was stopped for the final Telegram backfill, start it
+again only once its env file has Telegram on.
 
 ## Disable a Go role
 
-Reverse the order, as "Enabling and disabling a role" says. Turn the alarm actions off
-first (`<role>_enabled = false`, apply), then disable the unit:
+Within a role, reverse the enable steps (*workstation*, then *host*):
 
-```bash
-systemctl disable --now limnopulse-<role>.timer     # one-shot
-systemctl disable --now limnopulse-<role>.service   # continuous
-```
+1. Set `<role>_enabled = false` and apply it, so its alarms notify nobody.
+2. Disable the unit:
 
-Then delete the role's access key and its credential files. With the unit stopped, its
-unit-health alarm reads missing data as breaching, but its actions are already off.
+   ```bash
+   systemctl disable --now limnopulse-<role>.timer     # one-shot
+   systemctl disable --now limnopulse-<role>.service   # continuous
+   ```
 
-## Rotate a credential
+3. Delete the role's access key and its credential files.
 
-Run `install_worker_key` again; IAM allows two keys per user. Then make the unit read the
-new files: `LoadCredential=` copies them when a unit starts.
+Across roles, disable in the reverse of the enable order, and `worker-monitor` last. Every
+other unit-health alarm treats missing data as breaching. So stopping the monitor while
+another role's alarm actions are on pages for that role within minutes.
 
-- **Continuous role:** `systemctl restart limnopulse-<role>.service`.
-- **One-shot role:** the next tick reads the new files.
+## Rotate a Go role's credentials
 
-Delete the old key last (`aws iam list-access-keys`, then `aws iam delete-access-key`).
-For the InfluxDB token or the Redis password, write the new value over the credential file
-and restart the same way.
+**AWS key pair.**
+
+1. *Workstation:* run `install_worker_key` again. IAM allows two keys per user.
+2. *Host:* make the unit read the new files. `LoadCredential=` copies them when the unit
+   starts:
+   - continuous role: `systemctl restart limnopulse-<role>.service`;
+   - one-shot role: the next tick reads them.
+3. *Host:* `cat /etc/limnopulse/workers/credentials/<role>/aws-access-key-id` shows the new
+   key's id. It is an id, not a secret.
+4. *Workstation:* wait for a healthy run on the new key. Then run
+   `aws iam list-access-keys --user-name <user>` and delete the other key with
+   `aws iam delete-access-key`.
+
+**InfluxDB token.**
+
+1. Create a new token with the same read scope.
+2. *Host:* write it over `influxdb-token` with the `read -rs` pattern.
+3. Restart the unit, or wait for the next tick.
+4. Delete the old token in InfluxDB once a run succeeds.
+
+**Redis password.** It changes the Redis server, the API's `REDIS_URL` and the
+`redis-password` credential together, as one change.
+
+The ingest worker's keys live in `/opt/limnopulse/.env`; see the P3 runbook's
+"Production environment" section.
 
 ## Releases
 
@@ -129,22 +184,36 @@ images and its workers bundle must already be in GHCR. One tag moves the API, th
 Compose workers and the bundle together. The deploy order and its rollback are in
 `ops/workers/README.md`, "Deploy".
 
-- **Automatic rollback.** A failed health check or activation moves the API, the ingest
-  worker and the bundle back to the release that `.env.image` records. Activation then
-  restarts the workers the failed activation stopped.
-- **Manual rollback.** Run `deploy.yml` again with the previous tag. The helper keeps two
-  releases, but the deploy pulls and verifies the bundle again, so the older tag's bundle
-  must still be in GHCR.
-- **Rollback floor.** A release whose role epoch is below a recorded floor is refused with
-  exit `3`, and the deploy logs that it needs a manual decision. Only root, from a real root
-  login, can override it (`ops/vps/README.md`, "Rollback floor override").
-- **No bundle.** The deploy refuses a tag without a bundle. It returns to the no-bundle
-  state only on its own automatic rollback, and only when the previous release had no
-  bundle.
+**Automatic rollback.** Any failure after the bundle is staged rolls back to the release
+that `.env.image` records: a pull, a Compose update, a health check or the activation.
 
-The first `main` push after the bundle job landed fails `workers-publish` at "Pull the
-bundle back": the `workers` package is private until someone makes it public. Make it
-public (`ops/vps/README.md`, section 4), then re-run the failed job.
+- The API goes back to the previous tag. If the registry fails that pull, the API starts
+  from the cached images and the failure is reported.
+- The ingest worker follows the host switch as it is at rollback time. With the switch on,
+  it goes back to the previous tag; with it off, it is removed.
+- The bundle moves back only if activation started. If it never moved, the log says so.
+  The helper then re-activates the previous release, which restarts the workers the failed
+  activation stopped. If the previous release had no bundle, the helper deactivates
+  instead.
+
+**Manual rollback.** Run `deploy.yml` again with the previous tag. The helper keeps two
+releases, but the deploy pulls and verifies the bundle again, so the older tag's bundle
+must still be in GHCR.
+
+**Rollback floor.** A release whose role epoch is below a recorded floor is refused with
+exit `3`.
+
+- A manual promotion stops at `stage refused ... status=3`, and nothing changes.
+- An automatic rollback logs that the refused bundle needs a manual decision.
+- Only root, from a real root login, can override the floor (`ops/vps/README.md`,
+  "Rollback floor override").
+
+**No bundle.** The deploy refuses a tag without a bundle. It returns to the no-bundle state
+only during its own automatic rollback, and only when the previous release had no bundle.
+
+The first `main` push that publishes a bundle can fail `workers-publish` at "Pull the
+bundle back", while the `workers` package is still private. Make the package public
+(`ops/vps/README.md`, section 4), then re-run the failed job.
 
 ## The ingest worker
 
@@ -156,8 +225,8 @@ The ingest worker is the `telemetry-ingest-worker` Compose service, in profile `
 - **Health.** Its healthcheck reads the liveness stamp that the loop writes every turn.
   A stalled loop exits `1`, and Docker restarts it.
 - **Parked.** A configuration error exits `78`. The entrypoint guard then keeps the
-  container up but idle, logs "parked, not restarted", and the container turns unhealthy.
-  Fix `.env`, then recreate it (the deploy user, from `/opt/limnopulse`):
+  container up but idle and logs "parked, not restarted", and the container turns
+  unhealthy. Fix `.env`, then recreate the container (*host*, from `/opt/limnopulse`):
 
   ```bash
   sudo -u limnopulse-deploy env COMPOSE_PROFILES= docker compose --env-file .env \
@@ -165,17 +234,44 @@ The ingest worker is the `telemetry-ingest-worker` Compose service, in profile `
     up -d --force-recreate telemetry-ingest-worker
   ```
 
-- **Turning it off.** Follow the rollback order of the P3 runbook: `INGEST_V2_ENABLED`
-  goes off before `TELEMETRY_V2_WRITE_ENABLED`. The next deploy then removes the worker.
+- **Turning it off.** Follow the P3 runbook's
+  [Rollback](p3-ingestion-rollout-runbook.md#rollback) in full:
+  1. Route pilots back and stop dual write.
+  2. Set `INGEST_V2_ENABLED=false` and recreate the API.
+  3. Let the worker drain the queue.
+  4. Stop the worker:
 
-The ingest worker publishes no `UnitHealthy`. Its Compose healthcheck and the
-telemetry-ingress queue age, depth and DLQ alarms observe it.
+     ```bash
+     sudo -u limnopulse-deploy env COMPOSE_PROFILES= docker compose --env-file .env \
+       --env-file .env.image -f compose.production.yaml --profile ingestion \
+       stop telemetry-ingest-worker
+     ```
+
+  5. Set `TELEMETRY_V2_WRITE_ENABLED=false`. Later deploys then remove the worker instead
+     of starting it.
+
+  Never stop the worker or dual write while either read switch is `v2`. Changing the
+  switch alone does nothing until the next deploy.
+
+The ingest worker publishes no `UnitHealthy`. Its Compose healthcheck and its own queue
+alarms observe it.
 
 ## Alarms
 
-All worker alarms publish to the `worker-alarms` topic. Their names are
-`<project_name>-<environment>-<role>-<alarm>`, where `<alarm>` is `unit-health` or, for a
-consumer, `queue-age`, `queue-depth` or `queue-dlq`. While a role is disabled, its
-alarms sit in `INSUFFICIENT_DATA` or `ALARM` with actions off. That is expected, and it is
-why actions go on only after every alarm of the role reads `OK`. The thresholds and the
-SES routing DLQ alarm are in `infra/opentofu/README.md`, "Alarms".
+| Alarms | Names | Topic | Actions |
+|---|---|---|---|
+| Go role unit health | `<project>-<env>-<role>-unit-health` | `worker-alarms` | `<role>_enabled` |
+| Go consumer queues | `<project>-<env>-<role>-queue-age`, `-queue-depth`, `-queue-dlq` | `worker-alarms` | `<role>_enabled` |
+| SES routing DLQ | `<project>-<env>-ses-events-routing-dlq` | `worker-alarms` | on as soon as `email_delivery` is applied |
+| Ingest worker queues | `<project>-<env>-telemetry-ingress-age`, `-depth`, `-dlq` | its own ([P3 "Alarms and deadlines"](p3-ingestion-rollout-runbook.md#alarms-and-deadlines)) | on |
+
+While a Go role is disabled:
+
+- its unit-health alarm treats missing data as breaching, and sits in
+  `INSUFFICIENT_DATA` or `ALARM`;
+- its queue alarms treat missing data as not breaching, and sit in `OK`.
+
+CloudWatch acts only on state changes. An alarm that is already in `ALARM` when its
+actions turn on never notifies for that breach. So drain a backlog or a DLQ first, and
+turn a role's actions on only once every one of its alarms reads `OK`. The thresholds are
+in `infra/opentofu/README.md`, "Alarms".
