@@ -188,8 +188,8 @@ services:
     restart: unless-stopped
 
   # V4 P3 telemetry ingest worker (D7, D21): `docker compose --profile ingestion up`.
-  # The API image with an entrypoint override; it refuses to start (exit 2) unless
-  # TELEMETRY_V2_WRITE_ENABLED=true and the ingress queue URL is set.
+  # The API image with an entrypoint override; it refuses to start (exit 78, a configuration
+  # error) unless TELEMETRY_V2_WRITE_ENABLED=true and the ingress queue URL is set.
   telemetry-ingest-worker:
     profiles: ["ingestion"]
     build:
