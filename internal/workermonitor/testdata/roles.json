@@ -1,0 +1,79 @@
+{
+  "schema_version": 1,
+  "unit_health": {
+    "namespace": "Limnopulse/Workers",
+    "metric": "UnitHealthy",
+    "dimension": "Role",
+    "oneshot_stale_after_intervals": 3,
+    "oneshot_success_exit_codes": [
+      0
+    ],
+    "published_when": "unit_file_enabled"
+  },
+  "roles": [
+    {
+      "name": "alert-evaluator",
+      "lifecycle": "oneshot",
+      "schedule_seconds": 60,
+      "units": {
+        "service": "limnopulse-alert-evaluator.service",
+        "timer": "limnopulse-alert-evaluator.timer"
+      },
+      "unit_health": "systemd"
+    },
+    {
+      "name": "notification-relay",
+      "lifecycle": "oneshot",
+      "schedule_seconds": 60,
+      "units": {
+        "service": "limnopulse-notification-relay.service",
+        "timer": "limnopulse-notification-relay.timer"
+      },
+      "unit_health": "systemd"
+    },
+    {
+      "name": "email-worker",
+      "lifecycle": "continuous",
+      "units": {
+        "service": "limnopulse-email-worker.service"
+      },
+      "unit_health": "systemd"
+    },
+    {
+      "name": "ses-feedback-worker",
+      "lifecycle": "continuous",
+      "units": {
+        "service": "limnopulse-ses-feedback-worker.service"
+      },
+      "unit_health": "systemd"
+    },
+    {
+      "name": "telegram-worker",
+      "lifecycle": "continuous",
+      "units": {
+        "service": "limnopulse-telegram-worker.service"
+      },
+      "unit_health": "systemd"
+    },
+    {
+      "name": "worker-monitor",
+      "lifecycle": "oneshot",
+      "schedule_seconds": 60,
+      "units": {
+        "service": "limnopulse-worker-monitor.service",
+        "timer": "limnopulse-worker-monitor.timer"
+      },
+      "unit_health": "systemd"
+    },
+    {
+      "name": "limnopulse-admin",
+      "lifecycle": "cli",
+      "unit_health": "none"
+    },
+    {
+      "name": "telemetry-ingest",
+      "lifecycle": "compose",
+      "unit_health": "none"
+    }
+  ]
+}
