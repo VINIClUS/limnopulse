@@ -108,27 +108,49 @@ with their own credentials. They write it straight into the role's
 `aws-access-key-id` and `aws-secret-access-key` credentials under
 `/etc/limnopulse/workers/credentials/<role>/`
 ([`ops/workers/README.md`](../../ops/workers/README.md)), so the secret never
-reaches a terminal, a shell history, an env file, a ticket or chat. For example,
-for the email-worker, from this directory:
+reaches a terminal, a shell history, an env file, a ticket or chat.
+
+The function below checks that the destination is writable before any key
+exists, and checks every step. It writes both files as `.new` and moves them
+into place only once both writes have succeeded. On any failure it deletes the
+new key, so no live key is left that nobody holds:
 
 ```bash
-role=email-worker
-user="$(tofu output -raw email_worker_iam_user_name)"
-dir="/etc/limnopulse/workers/credentials/$role"
-read -r id secret < <(aws iam create-access-key --user-name "$user" \
-  --query 'AccessKey.[AccessKeyId,SecretAccessKey]' --output text)
-if [ -n "$secret" ]; then
-  printf '%s' "$id" | ssh <worker-host> "sudo sh -c 'umask 077; cat > $dir/aws-access-key-id'"
-  printf '%s' "$secret" | ssh <worker-host> "sudo sh -c 'umask 077; cat > $dir/aws-secret-access-key'"
-fi
-unset id secret
+install_worker_key() {  # <role> <IAM user> <worker host>
+  local dir="/etc/limnopulse/workers/credentials/$1" id secret
+  ssh "$3" "sudo -n test -d $dir -a -w $dir" \
+    || { echo "cannot write $dir on $3; no key created" >&2; return 1; }
+  read -r id secret < <(aws iam create-access-key --user-name "$2" \
+      --query 'AccessKey.[AccessKeyId,SecretAccessKey]' --output text) && [ -n "$secret" ] \
+    || { echo "create-access-key failed" >&2; return 1; }
+  if printf '%s' "$id" | ssh "$3" "sudo -n sh -c 'umask 077; cat > $dir/aws-access-key-id.new'" &&
+     printf '%s' "$secret" | ssh "$3" "sudo -n sh -c 'umask 077; cat > $dir/aws-secret-access-key.new'" &&
+     ssh "$3" "sudo -n sh -c 'cd $dir && mv aws-access-key-id.new aws-access-key-id &&
+       mv aws-secret-access-key.new aws-secret-access-key'"; then
+    echo "installed a new key for $1"
+  else
+    echo "writing the key failed; deleting the new key" >&2
+    ssh "$3" "sudo -n rm -f $dir/aws-access-key-id.new $dir/aws-secret-access-key.new"
+    aws iam delete-access-key --user-name "$2" --access-key-id "$id"
+    return 1
+  fi
+}
 ```
 
-The key travels on stdin, so `sudo` on the host must not prompt. Otherwise run
-the same lines in a root shell on the host, with the operator's AWS
-credentials there and the two `printf` lines writing to `$dir` directly. To
-rotate a key, create the second one the same way (IAM allows two per user),
-restart the unit, then delete the first with `aws iam delete-access-key`.
+For example, for the email-worker, run this from this directory:
+
+```bash
+install_worker_key email-worker "$(tofu output -raw email_worker_iam_user_name)" <worker-host>
+```
+
+The key travels on stdin, so the host's `sudo` runs with `-n` and fails rather
+than prompting. That makes the first check fail before any key exists. On such
+a host, run the same steps in a root shell on the host itself, with the
+operator's AWS credentials there and without the `ssh "$3" "sudo -n …"`
+wrapper. To rotate a key, run the
+function again (IAM allows two keys per user), restart the unit, then delete the
+old key with `aws iam delete-access-key`. Check its id first with
+`aws iam list-access-keys`.
 
 ### Enabling and disabling a role
 
@@ -241,7 +263,10 @@ Its trust names this account, narrowed on `aws:PrincipalArn` by
 `limnopulse_admin_trusted_principal_arns`. Set that list in the untracked
 tfvars to the operators' IAM role or user ARNs. `ArnLike` patterns are allowed,
 and for an IAM Identity Center permission set you give its role ARN, for example
-`arn:aws:iam::<account>:role/aws-reserved/sso.amazonaws.com/*/AWSReservedSSO_<permission-set>_*`.
+`arn:aws:iam::<account>:role/aws-reserved/sso.amazonaws.com/*AWSReservedSSO_<permission-set>_*`.
+The `*` comes right after `sso.amazonaws.com/` because the role path has a
+Region segment for some Identity Center instances and none for others. A `*` in
+`ArnLike` also matches `/`, so this one pattern covers both.
 `aws:PrincipalArn` holds a role's ARN, never a session's. While the list is
 empty, any identity in the account whose own policy allows `sts:AssumeRole` on
 the role can assume it.

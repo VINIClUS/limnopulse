@@ -36,6 +36,7 @@ the unit-health namespace). Nothing more, nothing less, and nothing the scan can
 """
 
 import ast
+import collections
 import copy
 import functools
 import itertools
@@ -2360,25 +2361,44 @@ def _go_declarations(file: go_sources.GoFile) -> Iterator[tuple[str, str | None,
             yield ("var", None, text)
 
 
+# A named func or method declaration. A func literal has no name before its parameters, and
+# what follows them is a result type, never `name(`; methods take no type parameters.
+_GO_NAMED_FUNC = re.compile(
+    r"\bfunc\s+[A-Za-z_]\w*\s*[\[(]|\bfunc\s*\([^)]*\)\s*(?!func\b)[A-Za-z_]\w*\s*\("
+)
+_GoDeclaration = tuple[str, str | None, str]
+
+
 def _go_reachable(
     files: Sequence[go_sources.GoFile], main_package: str
-) -> set[tuple[str, str | None, str]]:
-    """(file, name, text) of every declaration that code reachable from `main` may run.
+) -> dict[_GoDeclaration, _GoDeclaration | None]:
+    """Every declaration that code reachable from `main` may run, mapped to its first caller.
 
-    The roots are `main`, every `init`, every package variable and every GO_IMPLICIT_METHODS
-    method. A bare `name` reaches that package function, `alias.name` the function in the
-    imported package, and any `.name` every method of that name in the closure, so a name
-    collision can only add reach.
+    A declaration is (file, name, text). The roots, with no caller, are `main`, every `init`,
+    every package variable and every GO_IMPLICIT_METHODS method. A bare `name` reaches that
+    package function, `alias.name` the function in the imported package, and any `.name`
+    every method of that name in the closure, so a name collision can only add reach. The
+    search is breadth first, so the callers trace a shortest chain from a root.
     """
-    functions: dict[tuple[str, str], list[tuple[str, str | None, str]]] = {}
-    methods: dict[str, list[tuple[str, str | None, str]]] = {}
+    functions: dict[tuple[str, str], list[_GoDeclaration]] = {}
+    methods: dict[str, list[_GoDeclaration]] = {}
     files_by_name = {file.relative: file for file in files}
-    roots: list[tuple[str, str | None, str]] = []
+    roots: list[_GoDeclaration] = []
     for file in files:
+        # Calls the name-based search cannot follow fail the scan instead.
+        for path, names in file.imports.items():
+            assert path not in {"reflect", "plugin"}, (
+                f"{file.relative}: imports {path}, which can call code the scan cannot see"
+            )
+            assert "." not in names or not path.startswith(go_sources.MODULE), (
+                f"{file.relative}: dot import of {path} hides which package a call reaches"
+            )
         blank = _blank_go_literals(file.code)
-        assert re.search(r"\bMethodByName\b", blank) is None, (
-            f"{file.relative}: a method called by a name the scan cannot see"
-        )
+        for match in _GO_NAMED_FUNC.finditer(blank):
+            assert match.start() == 0 or blank[match.start() - 1] == "\n", (
+                f"{file.relative}: a func declared outside column 0, which the scan cannot see;"
+                " run gofmt"
+            )
         for kind, name, text in _go_declarations(file):
             declaration = (file.relative, name, text)
             if kind == "func":
@@ -2392,25 +2412,41 @@ def _go_reachable(
                 or (kind == "method" and name in GO_IMPLICIT_METHODS)
             ):
                 roots.append(declaration)
-    reached: set[tuple[str, str | None, str]] = set()
-    pending = roots
+    reached: dict[_GoDeclaration, _GoDeclaration | None] = {}
+    pending: collections.deque[tuple[_GoDeclaration, _GoDeclaration | None]] = collections.deque(
+        (root, None) for root in roots
+    )
     while pending:
-        declaration = pending.pop()
+        declaration, caller = pending.popleft()
         if declaration in reached:
             continue
-        reached.add(declaration)
+        reached[declaration] = caller
         file = files_by_name[declaration[0]]
         aliases = {alias: path for path, names in file.imports.items() for alias in names}
         text = declaration[2]
+        callees: list[_GoDeclaration] = []
         for match in re.finditer(r"(?<![\w.])([A-Za-z_]\w*)(?:\s*\.\s*([A-Za-z_]\w*))?", text):
             first, second = match.groups()
             if second and first in aliases:
-                pending += functions.get((aliases[first], second), [])
+                callees += functions.get((aliases[first], second), [])
             else:
-                pending += functions.get((file.package, first), [])
+                callees += functions.get((file.package, first), [])
         for name in re.findall(r"\.\s*([A-Za-z_]\w*)", text):
-            pending += methods.get(name, [])
+            callees += methods.get(name, [])
+        pending.extend((callee, declaration) for callee in callees)
     return reached
+
+
+def _go_chain(
+    reached: Mapping[_GoDeclaration, _GoDeclaration | None], declaration: _GoDeclaration
+) -> str:
+    """`root (file) -> ... -> declaration (file)`, the path the search took to it."""
+    links: list[str] = []
+    current: _GoDeclaration | None = declaration
+    while current is not None:
+        links.append(f"{current[1] or 'a package variable'} ({current[0]})")
+        current = reached[current]
+    return " -> ".join(reversed(links))
 
 
 def _names_aws_operation(file: go_sources.GoFile, text: str) -> bool:
@@ -2443,8 +2479,13 @@ def _assert_never_run(
             if _names_aws_operation(file, text)
         }
         assert naming, f"{relative} names no AWS operation, so excluding it changes nothing"
-        ran = sorted(name or "a package variable" for _, name, _ in naming & reached)
-        assert not ran, f"{relative} is not unrun: {main_package} reaches {', '.join(ran)}"
+        # Method edges match on the name alone, so a call on an unrelated type with the same
+        # method name fails here too; the chain shows which call the search followed.
+        ran = sorted(
+            f"{declaration[1] or 'a package variable'} via {_go_chain(reached, declaration)}"
+            for declaration in naming & reached.keys()
+        )
+        assert not ran, f"{relative} is not unrun: {main_package} reaches {'; '.join(ran)}"
 
 
 @functools.cache
@@ -2950,80 +2991,145 @@ def test_an_unrun_file_drops_out_of_the_scan_when_nothing_runs_it() -> None:
     assert role.operations == {"dynamodb:Query"}
 
 
+_MAIN_GO = "cmd/tool/main.go"
+_STORE_GO = "internal/store/store.go"
+_MAIN_CALL = "store.Backfill(runner.Options{})"
+_MAIN_IMPORTS = "import (\n"
+
+
 @pytest.mark.parametrize(
-    ("path", "old", "new", "unrun", "message"),
+    ("edits", "unrun", "message"),
     [
+        pytest.param((), {"internal/store/gone.go"}, "not in the closure any more", id="gone"),
         pytest.param(
-            None, "", "", {"internal/store/gone.go"}, "not in the closure any more", id="gone"
+            (), {"internal/runner/runner.go"}, "names no AWS operation", id="nothing-to-exclude"
         ),
         pytest.param(
-            None,
-            "",
-            "",
-            {"internal/runner/runner.go"},
-            "names no AWS operation",
-            id="nothing-to-exclude",
-        ),
-        pytest.param(
-            "cmd/tool/main.go",
-            "store.Backfill(runner.Options{})",
-            "store.Store{}.Load()",
+            ((_MAIN_GO, _MAIN_CALL, "store.Store{}.Load()"),),
             _UNRUN_STORE,
-            "reaches Load",
+            re.escape("reaches Load via main (cmd/tool/main.go) -> Load (internal/store/store.go)"),
             id="called",
         ),
         pytest.param(
-            "cmd/tool/main.go",
-            "store.Backfill(runner.Options{})",
-            "runner.Run(store.Store{})",
+            ((_MAIN_GO, _MAIN_CALL, "runner.Run(store.Store{})"),),
             _UNRUN_STORE,
-            "reaches Load",
+            re.escape(
+                "reaches Load via main (cmd/tool/main.go) -> Run (internal/runner/runner.go)"
+                " -> Load (internal/store/store.go)"
+            ),
             id="through-an-interface",
         ),
+        # Method edges match on the name alone: a Load on any other type counts as this one.
         pytest.param(
-            "internal/store/store.go",
-            "func helper() {}",
-            "func helper() {}\n\nfunc init() { Store{}.Load() }",
+            ((_MAIN_GO, _MAIN_CALL, f"{_MAIN_CALL}; var c conn; c.Load()"),),
             _UNRUN_STORE,
-            "reaches Load",
+            re.escape("reaches Load via main (cmd/tool/main.go) -> Load (internal/store/store.go)"),
+            id="name-collision",
+        ),
+        pytest.param(
+            (
+                (
+                    _STORE_GO,
+                    "func helper() {}",
+                    "func helper() {}\n\nfunc init() { Store{}.Load() }",
+                ),
+            ),
+            _UNRUN_STORE,
+            "reaches Load via init",
             id="init",
         ),
         pytest.param(
-            "internal/store/store.go",
-            "func helper() {}",
-            "func helper() {}\n\nvar probe = ddb.GetItemInput{}",
+            (
+                (
+                    _STORE_GO,
+                    "func helper() {}",
+                    "func helper() {}\n\nvar probe = ddb.GetItemInput{}",
+                ),
+            ),
             _UNRUN_STORE,
             "reaches a package variable",
             id="package-variable",
         ),
         pytest.param(
-            "internal/store/store.go",
-            "func helper() {}",
-            'func helper() {}\n\nfunc (s Store) String() string { _ = ddb.GetItemInput{}; return "" }',
+            (
+                (
+                    _STORE_GO,
+                    "func helper() {}",
+                    (
+                        "func helper() {}\n\n"
+                        'func (s Store) String() string { _ = ddb.GetItemInput{}; return "" }'
+                    ),
+                ),
+            ),
             _UNRUN_STORE,
             "reaches String",
             id="implicit-method",
         ),
         pytest.param(
-            "cmd/tool/main.go",
-            "store.Backfill(runner.Options{})",
-            '_ = reflect.ValueOf(store.Store{}).MethodByName("Load")',
+            (
+                (_MAIN_GO, _MAIN_IMPORTS, _MAIN_IMPORTS + '\t"reflect"\n'),
+                (_MAIN_GO, _MAIN_CALL, f"{_MAIN_CALL}; reflect.ValueOf(store.Store{{}}).Method(0)"),
+            ),
             _UNRUN_STORE,
-            "a method called by a name the scan cannot see",
-            id="reflection",
+            "imports reflect, which can call code the scan cannot see",
+            id="reflect",
+        ),
+        pytest.param(
+            ((_MAIN_GO, _MAIN_IMPORTS, _MAIN_IMPORTS + '\t"plugin"\n'),),
+            _UNRUN_STORE,
+            "imports plugin, which can call code the scan cannot see",
+            id="plugin",
+        ),
+        pytest.param(
+            (
+                (
+                    _MAIN_GO,
+                    '\t"github.com/VINIClUS/limnopulse/internal/store"',
+                    '\t. "github.com/VINIClUS/limnopulse/internal/store"',
+                ),
+                (_MAIN_GO, _MAIN_CALL, "LoadAll()"),
+                (
+                    _STORE_GO,
+                    "func helper() {}",
+                    "func helper() {}\n\nfunc LoadAll() { Store{}.Load() }",
+                ),
+            ),
+            _UNRUN_STORE,
+            "dot import of github.com/VINIClUS/limnopulse/internal/store",
+            id="dot-import",
+        ),
+        pytest.param(
+            (
+                (_STORE_GO, "func (s Store) Load()", "  func (s Store) Load()"),
+                (_MAIN_GO, _MAIN_CALL, "store.Store{}.Load()"),
+            ),
+            _UNRUN_STORE,
+            "a func declared outside column 0",
+            id="indented-func",
         ),
     ],
 )
 def test_an_unrun_file_fails_closed(
-    path: str | None, old: str, new: str, unrun: set[str], message: str
+    edits: tuple[tuple[str, str, str], ...], unrun: set[str], message: str
 ) -> None:
     sources = dict(_UNRUN_FIXTURE)
-    if path is not None:
+    for path, old, new in edits:
         assert sources[path].count(old) == 1, (path, old)
         sources[path] = sources[path].replace(old, new)
 
     with pytest.raises(AssertionError, match=message):
         _assert_never_run(_fixture_package(sources), _UNRUN_MAIN, frozenset(unrun))
+
+
+def test_func_literals_are_not_declarations_outside_column_0() -> None:
+    sources = dict(_UNRUN_FIXTURE)
+    sources[_MAIN_GO] = sources[_MAIN_GO].replace(
+        _MAIN_CALL,
+        f"{_MAIN_CALL}\n\tf := func(n int) error {{ return nil }}\n"
+        "\tg := func(next func(int) error) func(int) error { return next }\n\t_, _ = f, g",
+    )
+
+    _assert_never_run(_fixture_package(sources), _UNRUN_MAIN, _UNRUN_STORE)
 
 
 _EMAIL_DOCUMENT = 'data "aws_iam_policy_document" "email_worker_runtime" {'
