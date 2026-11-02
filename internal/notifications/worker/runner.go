@@ -2,8 +2,11 @@ package worker
 
 import (
 	"context"
+	"errors"
 	"sync"
 	"time"
+
+	"github.com/VINIClUS/limnopulse/internal/workerproc"
 )
 
 type Handler interface {
@@ -189,6 +192,11 @@ receiveLoop:
 		}
 	}
 	cancelReceive()
+	// After a stall the process exits within workerproc's short grace, not the drain budget.
+	// Abort in-flight work now, so no limiter waiter starts a send the exit would cut off.
+	if errors.Is(context.Cause(ctx), workerproc.ErrStalled) {
+		cancelProcess()
+	}
 	drained := make(chan struct{})
 	go func() { inflight.Wait(); close(drained) }()
 	select {

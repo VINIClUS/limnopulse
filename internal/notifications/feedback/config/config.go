@@ -12,7 +12,7 @@ import (
 	"time"
 
 	workerconfig "github.com/VINIClUS/limnopulse/internal/notifications/worker/config"
-	"github.com/VINIClUS/limnopulse/internal/workerproc"
+	"github.com/VINIClUS/limnopulse/internal/workerflag"
 )
 
 const DefaultConcurrency = workerconfig.DefaultFeedbackConcurrency
@@ -69,7 +69,7 @@ func Load(args []string, lookup LookupEnv) (RunConfig, error) {
 	fs.IntVar(&config.Concurrency, "feedback-concurrency", config.Concurrency, "concurrent SES feedback messages")
 	fs.DurationVar(&config.ReceiveWait, "receive-wait", config.ReceiveWait, "SQS long-poll wait (0s disables only in local/test)")
 	fs.DurationVar(&config.InvalidVisibility, "invalid-visibility", config.InvalidVisibility, "visibility delay for invalid messages (short overrides only in local/test)")
-	if err := workerproc.ParseFlags(fs, args); err != nil {
+	if err := workerflag.Parse(fs, args); err != nil {
 		return RunConfig{}, err
 	}
 	if len(fs.Args()) != 0 {

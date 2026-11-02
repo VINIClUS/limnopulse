@@ -80,6 +80,10 @@ func TestEmailWorkerExits78OnConfigurationErrors(t *testing.T) {
 		"missing sender":  {lookup: environment(map[string]string{"SES_FROM_EMAIL": ""})},
 		"no credentials":  {lookup: environment(map[string]string{workerproc.SupervisorEnv: "systemd"})},
 		"unknown APP_ENV": {lookup: environment(map[string]string{"APP_ENV": "dev"})},
+		"malformed SES source": {lookup: environment(map[string]string{
+			"NOTIFICATION_EMAIL_SENDER_MODE": "aws", "SES_FROM_EMAIL": "Alerts alerts@example.com",
+		})},
+		"rate below the stall limit": {lookup: environment(map[string]string{"NOTIFICATION_MAX_SEND_RATE": "0.0125"})},
 	} {
 		t.Run(name, func(t *testing.T) {
 			runs := 0
@@ -108,5 +112,39 @@ func TestEmailWorkerExitsOneWhenTheConsumerFails(t *testing.T) {
 	})
 	if code != workerproc.ExitFailure {
 		t.Fatalf("exit=%d output=%s", code, output.String())
+	}
+}
+
+func TestEmailWorkerChecksTheSESSourceOnlyForTheAWSSender(t *testing.T) {
+	for _, test := range []struct {
+		mode, source string
+		wantErr      bool
+	}{
+		{mode: "aws", source: "alerts@example.com"},
+		{mode: "aws", source: "Limnopulse <alerts@example.com>"},
+		{mode: "aws", source: " alerts@example.com", wantErr: true},
+		{mode: "aws", source: "alerts@example", wantErr: true},
+		{mode: "success", source: "not checked by the fake sender"},
+	} {
+		err := checkRole(workerconfig.RunConfig{
+			EmailSenderMode: test.mode, SESFromEmail: test.source, MaxSendRate: 1, ProviderTimeout: 15 * time.Second,
+		})
+		if (err != nil) != test.wantErr || (err != nil && strings.Contains(err.Error(), test.source)) {
+			t.Fatalf("mode %s source %q: err=%v", test.mode, test.source, err)
+		}
+	}
+}
+
+func TestEmailWorkerRejectsASendRateWhoseWaitOutlastsTheStallLimit(t *testing.T) {
+	for _, test := range []struct {
+		rate    float64
+		wantErr bool
+	}{
+		{rate: 1}, {rate: 0.02}, {rate: 1.0 / 74}, {rate: 1.0 / 76, wantErr: true}, {rate: 1e-12, wantErr: true},
+	} {
+		err := checkRole(workerconfig.RunConfig{EmailSenderMode: "success", MaxSendRate: test.rate, ProviderTimeout: 15 * time.Second})
+		if (err != nil) != test.wantErr {
+			t.Fatalf("rate %v: err=%v", test.rate, err)
+		}
 	}
 }

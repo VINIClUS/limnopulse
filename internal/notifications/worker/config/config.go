@@ -10,7 +10,7 @@ import (
 	"time"
 
 	"github.com/VINIClUS/limnopulse/internal/notifications/worker"
-	"github.com/VINIClUS/limnopulse/internal/workerproc"
+	"github.com/VINIClUS/limnopulse/internal/workerflag"
 )
 
 const (
@@ -149,7 +149,7 @@ func load(name string, args []string, lookup LookupEnv, withFeedback bool) (RunC
 	fs.IntVar(&config.SendBurst, "send-burst", config.SendBurst, "send rate limiter burst")
 	fs.DurationVar(&config.ReceiveWait, "receive-wait", config.ReceiveWait, "SQS long-poll wait (0s disables only in local/test)")
 	fs.DurationVar(&config.InvalidVisibility, "invalid-visibility", config.InvalidVisibility, "visibility delay for invalid messages (short overrides only in local/test)")
-	if err := workerproc.ParseFlags(fs, args); err != nil {
+	if err := workerflag.Parse(fs, args); err != nil {
 		return RunConfig{}, err
 	}
 	if len(fs.Args()) != 0 {

@@ -9,7 +9,7 @@ import (
 	"time"
 
 	"github.com/VINIClUS/limnopulse/internal/notifications"
-	"github.com/VINIClUS/limnopulse/internal/workerproc"
+	"github.com/VINIClUS/limnopulse/internal/workerflag"
 )
 
 const (
@@ -127,7 +127,7 @@ func Load(args []string, lookup LookupEnv) (RunConfig, error) {
 	fs.IntVar(&config.WorkParallelism, "work-parallelism", config.WorkParallelism, "parallel relay work")
 	fs.IntVar(&config.MaxWork, "max-work", config.MaxWork, "maximum work items per run")
 	fs.IntVar(&config.FanoutPageSize, "fanout-page-size", config.FanoutPageSize, "fanout transaction page size")
-	if err = workerproc.ParseFlags(fs, args); err != nil {
+	if err = workerflag.Parse(fs, args); err != nil {
 		return RunConfig{}, err
 	}
 	if len(fs.Args()) != 0 {
@@ -136,7 +136,7 @@ func Load(args []string, lookup LookupEnv) (RunConfig, error) {
 	if relayTime != "" {
 		parsed, parseErr := time.Parse(time.RFC3339Nano, relayTime)
 		if parseErr != nil {
-			return RunConfig{}, fmt.Errorf("relay-time: %w", parseErr)
+			return RunConfig{}, fmt.Errorf("--relay-time: %w", parseErr)
 		}
 		parsed = parsed.UTC()
 		config.RelayTime = &parsed

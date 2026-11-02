@@ -3,7 +3,6 @@ package main
 import (
 	"context"
 	"flag"
-	"io"
 	"time"
 
 	"github.com/VINIClUS/limnopulse/internal/notifications"
@@ -29,7 +28,6 @@ func backfillRelay(
 	load workercmd.AWSLoader,
 ) int {
 	fs := flag.NewFlagSet("limnopulse-admin "+name, flag.ContinueOnError)
-	fs.SetOutput(io.Discard)
 	var sources []tenantSource
 	fs.Var(tenantSourceFlagValue{Kind: tenantSourceFlag, Sources: &sources}, "tenant", "explicit tenant ID; repeatable")
 	fs.Var(tenantSourceFlagValue{Kind: tenantSourceFile, Sources: &sources}, "tenant-file", "file containing tenant IDs; repeatable")
@@ -37,13 +35,19 @@ func backfillRelay(
 	pageSize := fs.Int("page-size", 25, "DynamoDB query page size")
 	maxRows := fs.Int("max-rows", notificationdynamo.DefaultBackfillMaxRows, "maximum migration candidates per run")
 	timeout := fs.Duration("timeout", defaultBackfillTimeout, "total backfill deadline")
-	if err := workerproc.ParseFlags(fs, args); err != nil || len(fs.Args()) != 0 || *pageSize < 1 || *pageSize > maxPageSize ||
-		*maxRows < 1 || *timeout <= 0 || *timeout > maxBackfillTimeout {
-		return writeFailure(deps.Output, "configuration", workerproc.ExitConfiguration)
+	if err := parse(fs, args); err != nil {
+		return workercmd.Fail(deps.Output, err, "configuration")
+	}
+	if err := checkBounds(
+		bound{*pageSize >= 1 && *pageSize <= maxPageSize, "page-size"},
+		bound{*maxRows >= 1, "max-rows"},
+		bound{*timeout > 0 && *timeout <= maxBackfillTimeout, "timeout"},
+	); err != nil {
+		return workercmd.Fail(deps.Output, err, "configuration")
 	}
 	tenants, err := resolveTenants(sources)
 	if err != nil {
-		return writeFailure(deps.Output, "tenant_scope", workerproc.ExitConfiguration)
+		return workercmd.Fail(deps.Output, workerproc.Configuration(err), "tenant_scope")
 	}
 	runCtx, cancel := context.WithTimeout(ctx, *timeout)
 	defer cancel()

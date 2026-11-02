@@ -10,7 +10,7 @@ import (
 	"strings"
 	"time"
 
-	"github.com/VINIClUS/limnopulse/internal/workerproc"
+	"github.com/VINIClUS/limnopulse/internal/workerflag"
 )
 
 const (
@@ -148,7 +148,7 @@ func Load(args []string, lookup LookupEnv) (RunConfig, error) {
 	fs.IntVar(&config.SendConcurrency, "send-concurrency", config.SendConcurrency, "concurrent Telegram sends")
 	fs.DurationVar(&config.ReceiveWait, "receive-wait", config.ReceiveWait, "SQS long-poll wait")
 	fs.DurationVar(&config.InvalidVisibility, "invalid-visibility", config.InvalidVisibility, "visibility for invalid messages")
-	if err := workerproc.ParseFlags(fs, args); err != nil {
+	if err := workerflag.Parse(fs, args); err != nil {
 		return RunConfig{}, err
 	}
 	if len(fs.Args()) != 0 {

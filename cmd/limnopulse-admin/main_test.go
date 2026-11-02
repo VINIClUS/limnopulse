@@ -93,6 +93,7 @@ type decodedResult[S any] struct {
 	ScopeCompleted   bool           `json:"scope_completed"`
 	RetryRecommended bool           `json:"retry_recommended"`
 	ErrorCategories  map[string]int `json:"error_categories"`
+	Settings         []string       `json:"settings"`
 	Summary          *S             `json:"summary"`
 }
 
@@ -253,22 +254,22 @@ func TestBackfillRelayExits78OnInvalidScopeOrFlagsBeforeAWS(t *testing.T) {
 		args      []string
 		category  string
 		sensitive string
+		setting   string
 	}{
 		{name: "no tenant", args: []string{"backfill-relay"}, category: "tenant_scope"},
 		{name: "empty effective file", args: []string{"backfill-relay", "--tenant-file", emptyFile}, category: "tenant_scope", sensitive: emptyFile},
-		{name: "missing file", args: []string{"backfill-relay", "--tenant-file", missingFile}, category: "tenant_scope", sensitive: missingFile},
+		{name: "missing file", args: []string{"backfill-relay", "--tenant-file", missingFile}, category: "tenant_scope", sensitive: missingFile, setting: "tenant-file"},
 		{name: "NUL file", args: []string{"backfill-relay", "--tenant-file", nulFile}, category: "tenant_scope", sensitive: nulFile},
 		{name: "blank file path", args: []string{"backfill-relay", "--tenant-file", " "}, category: "tenant_scope"},
 		{name: "empty flag", args: []string{"backfill-relay", "--tenant", "  "}, category: "tenant_scope"},
 		{name: "NUL flag", args: []string{"backfill-telegram", "--tenant", "private\x00tenant"}, category: "tenant_scope", sensitive: "private"},
-		{name: "zero page size", args: []string{"backfill-relay", "--tenant", "private_tenant", "--page-size", "0"}, category: "configuration", sensitive: "private_tenant"},
+		{name: "zero page size", args: []string{"backfill-relay", "--tenant", "private_tenant", "--page-size", "0"}, category: "configuration", sensitive: "private_tenant", setting: "page-size"},
 		{name: "oversized page", args: []string{"backfill-relay", "--tenant", "private_tenant", "--page-size", "2147483648"}, category: "configuration", sensitive: "private_tenant"},
 		{name: "zero max rows", args: []string{"backfill-relay", "--tenant", "private_tenant", "--max-rows", "0"}, category: "configuration", sensitive: "private_tenant"},
 		{name: "zero timeout", args: []string{"backfill-relay", "--tenant", "private_tenant", "--timeout", "0s"}, category: "configuration", sensitive: "private_tenant"},
 		{name: "long timeout", args: []string{"backfill-relay", "--tenant", "private_tenant", "--timeout", "25h"}, category: "configuration", sensitive: "private_tenant"},
 		{name: "positional argument", args: []string{"backfill-relay", "--tenant", "private_tenant", "extra"}, category: "configuration", sensitive: "private_tenant"},
-		{name: "unknown flag", args: []string{"backfill-relay", "--tenant", "private_tenant", "--tenants=x"}, category: "configuration", sensitive: "private_tenant"},
-		{name: "help", args: []string{"backfill-relay", "-h"}, category: "configuration"},
+		{name: "unknown flag", args: []string{"backfill-relay", "--tenant", "private_tenant", "--tenants=x"}, category: "configuration", sensitive: "private_tenant", setting: "tenants"},
 	}
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
@@ -283,7 +284,8 @@ func TestBackfillRelayExits78OnInvalidScopeOrFlagsBeforeAWS(t *testing.T) {
 			}
 			result := decode[notificationdynamo.BackfillSummary](t, &output)
 			if result.Result != "fatal_failure" || result.ExitCode != workerproc.ExitConfiguration || result.ScopeCompleted ||
-				result.RetryRecommended || result.ErrorCategories[test.category] != 1 {
+				result.RetryRecommended || result.ErrorCategories[test.category] != 1 ||
+				(test.setting != "" && !reflect.DeepEqual(result.Settings, []string{test.setting})) {
 				t.Fatalf("result = %#v", result)
 			}
 		})
@@ -549,5 +551,22 @@ func TestBackfillActiveAlertIndexReportsALimitedBatchAsNotCompleted(t *testing.T
 	if code != 0 || result.Result != "success" || result.ScopeCompleted || result.Summary == nil ||
 		result.Summary.AlertEventsEligible != 1 || len(client.updateInputs) != 0 {
 		t.Fatalf("exit=%d result=%+v", code, result)
+	}
+}
+
+func TestAdminPrintsACommandsUsageAndExits0OnHelp(t *testing.T) {
+	for _, test := range []struct{ command, flag string }{
+		{"backfill-relay", "-tenant-file"},
+		{"backfill-telegram", "-max-rows"},
+		{"backfill-schedule", "-evaluation-time"},
+		{"backfill-active-alert-index", "-tenant-id"},
+	} {
+		var output bytes.Buffer
+		loadCalls := 0
+		code := runMain(context.Background(), []string{test.command, "-h"}, fakeDependencies(&output, &fakeDynamo{}, &loadCalls))
+		if code != 0 || loadCalls != 0 || !strings.Contains(output.String(), test.flag) ||
+			!strings.HasPrefix(output.String(), "Usage of limnopulse-admin "+test.command+":") {
+			t.Fatalf("%s: exit=%d loads=%d output=%s", test.command, code, loadCalls, output.String())
+		}
 	}
 }

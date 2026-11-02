@@ -8,12 +8,14 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"strings"
 	"syscall"
 	"testing"
 	"time"
 
 	"github.com/VINIClUS/limnopulse/internal/notifications/worker"
 	"github.com/VINIClUS/limnopulse/internal/workercmd"
+	"github.com/VINIClUS/limnopulse/internal/workerflag"
 	"github.com/VINIClUS/limnopulse/internal/workerproc"
 )
 
@@ -198,6 +200,9 @@ func testRole(loads, runs *int) Role[roleConfig] {
 			*loads++
 			setting, _ := lookup("SETTING")
 			secret, _ := lookup("SECRET")
+			if len(args) == 1 && args[0] == "-h" {
+				return roleConfig{}, &workerflag.Help{Usage: "Usage of role:\n"}
+			}
 			if setting == "" || len(args) != 0 {
 				return roleConfig{}, errors.New("SETTING is required")
 			}
@@ -290,5 +295,25 @@ func TestRoleMainServesTheSecretFromItsCredentialOnly(t *testing.T) {
 		newSupervisor(time.Second, make(chan os.Signal)))
 	if code != workerproc.ExitConfiguration || loaded.secret != "" || bytes.Contains(output.Bytes(), []byte("password")) {
 		t.Fatalf("exit=%d secret=%q output=%s", code, loaded.secret, output.String())
+	}
+}
+
+func TestRoleMainPrintsTheUsageAndExits0OnHelp(t *testing.T) {
+	loads, runs := 0, 0
+	var output bytes.Buffer
+	code := testRole(&loads, &runs).Main(context.Background(), []string{"-h"}, &output,
+		roleEnv(map[string]string{"SETTING": "on"}), newSupervisor(time.Second, make(chan os.Signal)))
+	if code != workerproc.ExitSuccess || runs != 0 || output.String() != "Usage of role:\n" {
+		t.Fatalf("exit=%d runs=%d output=%q", code, runs, output.String())
+	}
+}
+
+func TestRoleMainNamesTheFailingSetting(t *testing.T) {
+	loads, runs := 0, 0
+	var output bytes.Buffer
+	testRole(&loads, &runs).Main(context.Background(), nil, &output, roleEnv(map[string]string{}),
+		newSupervisor(time.Second, make(chan os.Signal)))
+	if !strings.Contains(output.String(), `"settings":["SETTING"]`) {
+		t.Fatalf("output = %s", output.String())
 	}
 }

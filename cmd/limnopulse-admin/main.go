@@ -12,6 +12,8 @@ package main
 import (
 	"bytes"
 	"context"
+	"errors"
+	"flag"
 	"fmt"
 	"io"
 	"os"
@@ -23,6 +25,7 @@ import (
 	"github.com/VINIClUS/limnopulse/internal/notifications"
 	notificationdynamo "github.com/VINIClUS/limnopulse/internal/notifications/dynamo"
 	"github.com/VINIClUS/limnopulse/internal/workercmd"
+	"github.com/VINIClUS/limnopulse/internal/workerflag"
 	"github.com/VINIClUS/limnopulse/internal/workerproc"
 	"github.com/aws/aws-sdk-go-v2/service/dynamodb"
 )
@@ -58,7 +61,7 @@ func main() {
 
 func runMain(ctx context.Context, args []string, deps dependencies) int {
 	if len(args) == 0 {
-		return writeFailure(deps.Output, "usage", workerproc.ExitConfiguration)
+		return workercmd.Fail(deps.Output, errUsage, "usage")
 	}
 	var run func(context.Context, []string, dependencies, workercmd.AWSLoader) int
 	switch args[0] {
@@ -75,11 +78,11 @@ func runMain(ctx context.Context, args []string, deps dependencies) int {
 	case "backfill-active-alert-index":
 		run = backfillActiveAlertIndex
 	default:
-		return writeFailure(deps.Output, "usage", workerproc.ExitConfiguration)
+		return workercmd.Fail(deps.Output, errUsage, "usage")
 	}
 	load, _, err := workercmd.AWSLoaderFromEnv(deps.LookupEnv)
 	if err != nil {
-		return writeFailure(deps.Output, "credentials", workerproc.ExitCode(err))
+		return workercmd.Fail(deps.Output, err, "credentials")
 	}
 	return run(ctx, args[1:], deps, load)
 }
@@ -91,11 +94,12 @@ func connect(ctx context.Context, deps dependencies, load workercmd.AWSLoader) (
 	endpoint := envOr(deps.LookupEnv, "DYNAMODB_ENDPOINT_URL", "")
 	table := envOr(deps.LookupEnv, "DYNAMODB_DOMAIN_TABLE", "LimnopulseDomain")
 	if strings.TrimSpace(region) == "" || strings.TrimSpace(table) == "" {
-		return nil, "", writeFailure(deps.Output, "configuration", workerproc.ExitConfiguration)
+		err := errors.New("AWS_REGION and DYNAMODB_DOMAIN_TABLE must not be empty")
+		return nil, "", workercmd.Fail(deps.Output, workerproc.Configuration(err), "configuration")
 	}
 	client, err := deps.LoadDynamo(ctx, load, region, endpoint)
 	if err != nil {
-		return nil, "", writeFailure(deps.Output, "aws_configuration", workerproc.ExitCode(err))
+		return nil, "", workercmd.Fail(deps.Output, err, "aws_configuration")
 	}
 	return client, table, workerproc.ExitSuccess
 }
@@ -139,7 +143,7 @@ func resolveTenants(sources []tenantSource) ([]string, error) {
 	add := func(raw string) error {
 		tenantID := strings.TrimSpace(raw)
 		if tenantID == "" || strings.ContainsRune(tenantID, '\x00') {
-			return fmt.Errorf("tenant ID is invalid")
+			return errors.New("--tenant is invalid")
 		}
 		if _, exists := seen[tenantID]; !exists {
 			seen[tenantID] = struct{}{}
@@ -165,22 +169,23 @@ func resolveTenants(sources []tenantSource) ([]string, error) {
 		}
 	}
 	if len(tenants) == 0 {
-		return nil, fmt.Errorf("at least one explicit tenant is required")
+		return nil, errors.New("at least one --tenant is required")
 	}
 	return tenants, nil
 }
 
 func readTenantFile(raw string) ([]string, error) {
+	// The errors name the flag only: a path or a tenant ID never reaches the result line.
 	path := strings.TrimSpace(raw)
 	if path == "" || strings.ContainsRune(path, '\x00') {
-		return nil, fmt.Errorf("tenant file path is invalid")
+		return nil, errors.New("--tenant-file is invalid")
 	}
 	contents, err := os.ReadFile(path)
 	if err != nil {
-		return nil, fmt.Errorf("read tenant file: %w", err)
+		return nil, errors.New("--tenant-file is not readable")
 	}
 	if bytes.IndexByte(contents, 0) >= 0 {
-		return nil, fmt.Errorf("tenant file contains NUL")
+		return nil, errors.New("--tenant-file contains NUL")
 	}
 	var lines []string
 	for _, line := range strings.Split(string(contents), "\n") {
@@ -191,15 +196,36 @@ func readTenantFile(raw string) ([]string, error) {
 	return lines, nil
 }
 
-// writeFailure writes a failure line without the error text, which can name a tenant or a
-// table, and returns code. A configuration error (78) is not worth retrying.
-func writeFailure(output io.Writer, category string, code int) int {
-	workercmd.WriteJSON(output, commandResult{
-		Result: "fatal_failure", ExitCode: code,
-		RetryRecommended: code != workerproc.ExitConfiguration,
-		ErrorCategories:  map[string]int{category: 1},
-	})
-	return code
+var errUsage = workerproc.Configuration(errors.New(
+	"expected a command: backfill-relay, backfill-telegram, backfill-schedule or backfill-active-alert-index",
+))
+
+// parse parses a command's flags. A help request prints the usage through workercmd.Fail;
+// a bad flag or a positional argument is a configuration error.
+func parse(fs *flag.FlagSet, args []string) error {
+	fs.SetOutput(io.Discard)
+	if err := workerflag.Parse(fs, args); err != nil {
+		return err
+	}
+	if len(fs.Args()) != 0 {
+		return workerproc.Configuration(errors.New("positional arguments are not accepted"))
+	}
+	return nil
+}
+
+// bound is a flag's range check.
+type bound struct {
+	ok   bool
+	flag string
+}
+
+func checkBounds(bounds ...bound) error {
+	for _, check := range bounds {
+		if !check.ok {
+			return workerproc.Configuration(fmt.Errorf("--%s is out of range", check.flag))
+		}
+	}
+	return nil
 }
 
 func envOr(lookup func(string) (string, bool), key, fallback string) string {

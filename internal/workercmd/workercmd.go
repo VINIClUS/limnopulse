@@ -6,13 +6,17 @@ package workercmd
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
+	"regexp"
+	"strings"
 
 	"github.com/aws/aws-sdk-go-v2/aws"
 	awsconfig "github.com/aws/aws-sdk-go-v2/config"
 	"github.com/aws/aws-sdk-go-v2/credentials"
 
+	"github.com/VINIClUS/limnopulse/internal/workerflag"
 	"github.com/VINIClUS/limnopulse/internal/workerproc"
 )
 
@@ -96,22 +100,78 @@ type Failure struct {
 	ScopeCompleted   bool           `json:"scope_completed"`
 	RetryRecommended bool           `json:"retry_recommended"`
 	ErrorCategories  map[string]int `json:"error_categories"`
+	// Settings names what a configuration error is about: env keys, flags and credentials.
+	Settings []string `json:"settings,omitempty"`
 }
 
 // Fail writes the failure line for err under category and returns its exit code: 78 for a
 // configuration error, which no restart can fix, and 1 otherwise. The error text is never
-// written; it can name a queue, a table or a secret.
+// written; it can name a queue, a table or a secret. A configuration failure lists the
+// settings it names instead. A help request (workerflag.Help) is no failure: Fail prints
+// the usage and returns 0.
 func Fail(output io.Writer, err error, category string) int {
+	var help *workerflag.Help
+	if errors.As(err, &help) {
+		_, _ = io.WriteString(output, help.Usage)
+		return workerproc.ExitSuccess
+	}
 	code := workerproc.ExitCode(err)
 	if code == workerproc.ExitSuccess {
 		code = workerproc.ExitFailure
 	}
-	WriteJSON(output, Failure{
+	failure := Failure{
 		Result: "fatal_failure", ExitCode: code,
 		RetryRecommended: code != workerproc.ExitConfiguration,
 		ErrorCategories:  map[string]int{category: 1},
-	})
+	}
+	if code == workerproc.ExitConfiguration {
+		failure.Settings = Settings(err)
+	}
+	WriteJSON(output, failure)
 	return code
+}
+
+var (
+	// Flag, strconv, time and url errors quote the offending value; it is dropped first.
+	quotedText   = regexp.MustCompile(`"(?:[^"\\]|\\.)*"`)
+	envSetting   = regexp.MustCompile(`\b[A-Z][A-Z0-9]*(?:_[A-Z0-9]+)+\b`)
+	dashedFlag   = regexp.MustCompile(`(?:^|[\s(])--?([a-z][a-z0-9]*(?:-[a-z0-9]+)*)\b`)
+	leadingFlag  = regexp.MustCompile(`^([a-z][a-z0-9]*(?:-[a-z0-9]+)+) must\b`)
+	credentialIn = regexp.MustCompile(`\bcredential ([a-z][a-z0-9-]*)|\b([a-z][a-z0-9-]*) credential\b`)
+)
+
+// Settings returns the setting names in err's text, in order and without repeats: env keys
+// (SES_FROM_EMAIL), flags (--send-concurrency, or "<flag> must ..." as in "global-deadline
+// must be positive") and credentials (influxdb-token). Quoted text is removed first,
+// so an offending value never comes back.
+func Settings(err error) []string {
+	if err == nil {
+		return nil
+	}
+	text := quotedText.ReplaceAllString(err.Error(), `""`)
+	var names []string
+	seen := map[string]bool{}
+	add := func(name string) {
+		if name != "" && !seen[name] {
+			seen[name] = true
+			names = append(names, name)
+		}
+	}
+	for _, part := range strings.Split(text, ": ") {
+		if match := leadingFlag.FindStringSubmatch(part); match != nil {
+			add(match[1])
+		}
+		for _, match := range envSetting.FindAllString(part, -1) {
+			add(match)
+		}
+		for _, match := range dashedFlag.FindAllStringSubmatch(part, -1) {
+			add(match[1])
+		}
+		for _, match := range credentialIn.FindAllStringSubmatch(part, -1) {
+			add(match[1] + match[2])
+		}
+	}
+	return names
 }
 
 // WriteJSON writes value as one JSON line.

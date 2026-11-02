@@ -3,7 +3,6 @@ package main
 import (
 	"context"
 	"flag"
-	"io"
 	"time"
 
 	alertdynamo "github.com/VINIClUS/limnopulse/internal/alertevaluator/dynamo"
@@ -14,26 +13,30 @@ import (
 // backfillSchedule writes the AlertEvaluationByDue attributes of rules that predate them.
 func backfillSchedule(ctx context.Context, args []string, deps dependencies, load workercmd.AWSLoader) int {
 	fs := flag.NewFlagSet("limnopulse-admin backfill-schedule", flag.ContinueOnError)
-	fs.SetOutput(io.Discard)
 	var sources []tenantSource
 	fs.Var(tenantSourceFlagValue{Kind: tenantSourceFlag, Sources: &sources}, "tenant", "explicit tenant ID; repeatable")
 	evaluationTime := fs.String("evaluation-time", "", "stable RFC3339 schedule time; default now")
 	apply := fs.Bool("apply", false, "write schedules; default is dry-run")
 	pageSize := fs.Int("page-size", 25, "DynamoDB query page size")
-	if err := workerproc.ParseFlags(fs, args); err != nil || len(fs.Args()) != 0 || *pageSize < 1 || *pageSize > maxPageSize {
-		return writeFailure(deps.Output, "configuration", workerproc.ExitConfiguration)
+	if err := parse(fs, args); err != nil {
+		return workercmd.Fail(deps.Output, err, "configuration")
 	}
+	// A zero time lets the store schedule from now.
 	var at time.Time
+	var timeErr error
 	if *evaluationTime != "" {
-		parsed, err := time.Parse(time.RFC3339Nano, *evaluationTime)
-		if err != nil {
-			return writeFailure(deps.Output, "configuration", workerproc.ExitConfiguration)
-		}
-		at = parsed.UTC()
+		at, timeErr = time.Parse(time.RFC3339Nano, *evaluationTime)
+		at = at.UTC()
+	}
+	if err := checkBounds(
+		bound{*pageSize >= 1 && *pageSize <= maxPageSize, "page-size"},
+		bound{timeErr == nil, "evaluation-time"},
+	); err != nil {
+		return workercmd.Fail(deps.Output, err, "configuration")
 	}
 	tenants, err := resolveTenants(sources)
 	if err != nil {
-		return writeFailure(deps.Output, "tenant_scope", workerproc.ExitConfiguration)
+		return workercmd.Fail(deps.Output, workerproc.Configuration(err), "tenant_scope")
 	}
 	client, table, code := connect(ctx, deps, load)
 	if code != workerproc.ExitSuccess {
@@ -49,7 +52,6 @@ func backfillSchedule(ctx context.Context, args []string, deps dependencies, loa
 // alert events.
 func backfillActiveAlertIndex(ctx context.Context, args []string, deps dependencies, load workercmd.AWSLoader) int {
 	fs := flag.NewFlagSet("limnopulse-admin backfill-active-alert-index", flag.ContinueOnError)
-	fs.SetOutput(io.Discard)
 	var sources []tenantSource
 	for _, name := range []string{"tenant", "tenant-id"} {
 		fs.Var(tenantSourceFlagValue{Kind: tenantSourceFlag, Sources: &sources}, name, "explicit tenant ID; repeatable")
@@ -57,12 +59,18 @@ func backfillActiveAlertIndex(ctx context.Context, args []string, deps dependenc
 	apply := fs.Bool("apply", false, "write the active-alert projection; default is dry-run")
 	pageSize := fs.Int("page-size", 25, "DynamoDB query page size")
 	limit := fs.Int("limit", 0, "maximum pending projections; zero means unlimited")
-	if err := workerproc.ParseFlags(fs, args); err != nil || len(fs.Args()) != 0 || *pageSize < 1 || *pageSize > maxPageSize || *limit < 0 {
-		return writeFailure(deps.Output, "configuration", workerproc.ExitConfiguration)
+	if err := parse(fs, args); err != nil {
+		return workercmd.Fail(deps.Output, err, "configuration")
+	}
+	if err := checkBounds(
+		bound{*pageSize >= 1 && *pageSize <= maxPageSize, "page-size"},
+		bound{*limit >= 0, "limit"},
+	); err != nil {
+		return workercmd.Fail(deps.Output, err, "configuration")
 	}
 	tenants, err := resolveTenants(sources)
 	if err != nil {
-		return writeFailure(deps.Output, "tenant_scope", workerproc.ExitConfiguration)
+		return workercmd.Fail(deps.Output, workerproc.Configuration(err), "tenant_scope")
 	}
 	client, table, code := connect(ctx, deps, load)
 	if code != workerproc.ExitSuccess {

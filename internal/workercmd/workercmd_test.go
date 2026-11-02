@@ -7,9 +7,11 @@ import (
 	"errors"
 	"os"
 	"path/filepath"
+	"reflect"
 	"strings"
 	"testing"
 
+	"github.com/VINIClUS/limnopulse/internal/workerflag"
 	"github.com/VINIClUS/limnopulse/internal/workerproc"
 )
 
@@ -161,6 +163,61 @@ func TestFailMapsConfigurationTo78AndNeverWritesTheError(t *testing.T) {
 			failure.RetryRecommended != test.wantRetry || failure.ErrorCategories["startup"] != 1 ||
 			strings.Contains(output.String(), "private-queue") {
 			t.Fatalf("line = %s", output.String())
+		}
+	}
+}
+
+func TestFailNamesTheSettingsOfAConfigurationErrorButNeverItsValue(t *testing.T) {
+	for _, test := range []struct {
+		err  error
+		want []string
+	}{
+		{err: errors.New("SES_FROM_EMAIL is invalid"), want: []string{"SES_FROM_EMAIL"}},
+		{err: errors.New(`invalid value "private-x" for flag -send-concurrency: parse error`), want: []string{"send-concurrency"}},
+		{err: errors.New("flag provided but not defined: -tenants"), want: []string{"tenants"}},
+		{err: errors.New(`--relay-time: parsing time "PRIVATE_VALUE" as "2006": cannot parse`), want: []string{"relay-time"}},
+		{err: errors.New(`NOTIFICATION_SEND_CONCURRENCY: strconv.Atoi: parsing "SECRET_TOKEN": invalid syntax`), want: []string{"NOTIFICATION_SEND_CONCURRENCY"}},
+		{err: errors.New("INFLUXDB_TOKEN must not be set when the influxdb-token credential is loaded"), want: []string{"INFLUXDB_TOKEN", "influxdb-token"}},
+		{err: errors.New("credential redis-password is empty"), want: []string{"redis-password"}},
+		{err: errors.New("global-deadline must be positive and less than the cadence"), want: []string{"global-deadline"}},
+		{err: errors.New("--page-size is out of range; --page-size again"), want: []string{"page-size"}},
+		{err: errors.New("queue private-queue is missing")},
+		{err: errors.New("private-queue: unreachable")},
+	} {
+		var output bytes.Buffer
+		if code := Fail(&output, workerproc.Configuration(test.err), "configuration"); code != workerproc.ExitConfiguration {
+			t.Fatalf("%v: exit %d", test.err, code)
+		}
+		var failure Failure
+		if err := json.Unmarshal(output.Bytes(), &failure); err != nil {
+			t.Fatal(err)
+		}
+		if !reflect.DeepEqual(failure.Settings, test.want) {
+			t.Fatalf("%v: settings = %#v, want %#v", test.err, failure.Settings, test.want)
+		}
+		for _, private := range []string{"private", "PRIVATE_VALUE", "SECRET_TOKEN"} {
+			if strings.Contains(output.String(), private) {
+				t.Fatalf("%v: line leaked %q: %s", test.err, private, output.String())
+			}
+		}
+	}
+	// A runtime failure names nothing: its text is not a setting.
+	var output bytes.Buffer
+	Fail(&output, errors.New("SQS_NOTIFICATION_JOBS_URL unreachable"), "startup")
+	if strings.Contains(output.String(), "settings") {
+		t.Fatalf("line = %s", output.String())
+	}
+	if Settings(nil) != nil {
+		t.Fatal("nil error has settings")
+	}
+}
+
+func TestFailPrintsTheUsageForAHelpRequestAndExits0(t *testing.T) {
+	help := &workerflag.Help{Usage: "Usage of email-worker:\n  -send-concurrency int\n"}
+	for _, err := range []error{help, workerproc.Configuration(help)} {
+		var output bytes.Buffer
+		if code := Fail(&output, err, "configuration"); code != workerproc.ExitSuccess || output.String() != help.Usage {
+			t.Fatalf("%v: exit %d output %q", err, code, output.String())
 		}
 	}
 }

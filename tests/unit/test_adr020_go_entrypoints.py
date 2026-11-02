@@ -162,15 +162,27 @@ def test_secrets_come_from_their_credentials_when_loaded() -> None:
         "internal/notifications/worker/config/config.go",
         "internal/notifications/feedback/config/config.go",
         "internal/notifications/telegramworker/config/config.go",
-        "cmd/limnopulse-admin/notifications.go",
-        "cmd/limnopulse-admin/alerts.go",
+        "cmd/limnopulse-admin/main.go",
     ),
 )
-def test_flag_errors_are_configuration_errors(loader: str) -> None:
+def test_flag_errors_are_configuration_errors_and_help_is_not(loader: str) -> None:
     source = (ROOT / loader).read_text(encoding="utf-8")
-    assert "workerproc.ParseFlags(fs, " in source
+    assert "workerflag.Parse(fs, " in source
     assert "fs.Parse(" not in source
     assert "flag.ExitOnError" not in source
+    workerflag = _production_source(ROOT / "internal/workerflag")
+    assert "workerproc.ParseFlags(fs, args)" in workerflag
+    assert "return &Help{Usage: usage.String()}" in workerflag
+    # A help request prints the usage and exits 0; everything else fails through workercmd.
+    assert "errors.As(err, &help)" in _production_source(ROOT / "internal/workercmd")
+
+
+def test_admin_commands_parse_through_the_shared_helper() -> None:
+    for name in ("notifications.go", "alerts.go"):
+        source = (ROOT / "cmd/limnopulse-admin" / name).read_text(encoding="utf-8")
+        assert "if err := parse(fs, args); err != nil {" in source
+        assert "ParseFlags" not in source
+        assert "fs.Parse(" not in source
 
 
 def test_email_and_ses_feedback_are_separate_processes_with_separate_loaders() -> None:

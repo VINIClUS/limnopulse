@@ -86,7 +86,6 @@ func TestRelayConfigurationErrorsExit78BeforeAnyWork(t *testing.T) {
 		"missing environment": {lookup: func(string) (string, bool) { return "", false }},
 		"invalid flag value":  {args: []string{"--max-work=0"}, lookup: relayEnvironment(nil)},
 		"unknown flag":        {args: []string{"--bogus"}, lookup: relayEnvironment(nil)},
-		"help":                {args: []string{"-h"}, lookup: relayEnvironment(nil)},
 		"positional":          {args: []string{"relay"}, lookup: relayEnvironment(nil)},
 		"credentials":         {lookup: relayEnvironment(map[string]string{"LIMNOPULSE_SUPERVISOR": "systemd"})},
 	} {
@@ -107,6 +106,21 @@ func TestRelayConfigurationErrorsExit78BeforeAnyWork(t *testing.T) {
 				t.Fatalf("line = %v", line)
 			}
 		})
+	}
+}
+
+func TestRelayPrintsItsUsageAndExits0OnHelp(t *testing.T) {
+	runs := 0
+	var output bytes.Buffer
+	exitCode := runMain(context.Background(), []string{"-h"}, dependencies{
+		Output: &output, LookupEnv: relayEnvironment(nil),
+		RunRelay: func(context.Context, relayconfig.RunConfig, workercmd.AWSLoader) (relay.RunSummary, error) {
+			runs++
+			return relay.RunSummary{}, nil
+		},
+	})
+	if exitCode != 0 || runs != 0 || !strings.Contains(output.String(), "-relay-time") {
+		t.Fatalf("exit=%d runs=%d output=%s", exitCode, runs, output.String())
 	}
 }
 

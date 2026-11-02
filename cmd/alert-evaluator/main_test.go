@@ -110,7 +110,7 @@ type failureLine struct {
 	ExitCode         int            `json:"exit_code"`
 	RetryRecommended bool           `json:"retry_recommended"`
 	ErrorCategories  map[string]int `json:"error_categories"`
-	Error            string         `json:"error"`
+	Settings         []string       `json:"settings"`
 }
 
 func environment(extra map[string]string) func(string) (string, bool) {
@@ -171,7 +171,7 @@ func TestEvaluatorAcceptsOnlyTheRunCommand(t *testing.T) {
 		code, captured, output := evaluateWith(t, args, environment(nil), alertevaluator.RunSummary{}, nil)
 		line := decodeFailure(t, output)
 		if code != workerproc.ExitConfiguration || captured != nil || line.ExitCode != code ||
-			line.RetryRecommended || line.ErrorCategories["usage"] != 1 || !strings.Contains(line.Error, "limnopulse-admin") {
+			line.RetryRecommended || line.ErrorCategories["usage"] != 1 || len(line.Settings) != 0 {
 			t.Fatalf("args %v: exit=%d started=%t line=%+v", args, code, captured != nil, line)
 		}
 	}
@@ -204,13 +204,13 @@ func TestRunRejectsInvalidSettingsAsConfigurationErrors(t *testing.T) {
 		{env: "bogus", args: []string{"run"}},
 		{env: "legacy", args: []string{"run", "--telemetry-source=V2"}},
 		{env: "legacy", args: []string{"run", "--no-such-flag"}},
-		{env: "legacy", args: []string{"run", "-h"}},
+		{env: "legacy", args: []string{"run", "--evaluation-time=yesterday"}},
 	} {
 		code, captured, output := evaluateWith(t, test.args,
 			environment(map[string]string{"ALERT_EVALUATOR_TELEMETRY_SOURCE": test.env}), alertevaluator.RunSummary{}, nil)
 		line := decodeFailure(t, output)
 		if code != workerproc.ExitConfiguration || captured != nil || line.Result != "fatal_failure" || line.RetryRecommended ||
-			len(line.ErrorCategories) != 1 || line.ErrorCategories["configuration"] != 1 {
+			len(line.ErrorCategories) != 1 || line.ErrorCategories["configuration"] != 1 || len(line.Settings) != 1 {
 			t.Fatalf("env %q args %v: exit %d, line %+v; want a configuration failure", test.env, test.args, code, line)
 		}
 	}
@@ -287,5 +287,12 @@ func TestEvaluateReportsAnAWSLoadError(t *testing.T) {
 		return aws.Config{}, errors.New("no profile")
 	}); err == nil {
 		t.Fatal("expected the AWS load error")
+	}
+}
+
+func TestEvaluatorPrintsItsUsageAndExits0OnHelp(t *testing.T) {
+	code, captured, output := evaluateWith(t, []string{"run", "-h"}, environment(nil), alertevaluator.RunSummary{}, nil)
+	if code != 0 || captured != nil || !strings.Contains(output, "-evaluation-time") || strings.Contains(output, "{") {
+		t.Fatalf("exit=%d started=%t output=%s", code, captured != nil, output)
 	}
 }

@@ -39,26 +39,26 @@ func main() {
 
 func runMain(ctx context.Context, args []string, deps dependencies) int {
 	if len(args) == 0 || args[0] != "run" {
-		return writeFailure(deps.Output, "usage", workerproc.Configuration(
+		return workercmd.Fail(deps.Output, workerproc.Configuration(
 			fmt.Errorf("expected run; the backfills are limnopulse-admin commands"),
-		))
+		), "usage")
 	}
 	load, creds, err := workercmd.AWSLoaderFromEnv(deps.LookupEnv)
 	if err != nil {
-		return writeFailure(deps.Output, "credentials", err)
+		return workercmd.Fail(deps.Output, err, "credentials")
 	}
 	// Under systemd the token is the influxdb-token credential, never an env-file value.
 	lookup, err := workercmd.SecretLookup(deps.LookupEnv, creds, workerproc.CredentialInfluxDBToken, "INFLUXDB_TOKEN")
 	if err != nil {
-		return writeFailure(deps.Output, "credentials", err)
+		return workercmd.Fail(deps.Output, err, "credentials")
 	}
 	config, err := alertevaluator.LoadRunConfig(args[1:], lookup)
 	if err != nil {
-		return writeFailure(deps.Output, "configuration", workerproc.Configuration(err))
+		return workercmd.Fail(deps.Output, workerproc.Configuration(err), "configuration")
 	}
 	summary, err := deps.Evaluate(ctx, config, load)
 	if err != nil {
-		return writeFailure(deps.Output, "aws_configuration", err)
+		return workercmd.Fail(deps.Output, err, "aws_configuration")
 	}
 	workercmd.WriteJSON(deps.Output, summary)
 	return summary.ExitCode
@@ -104,22 +104,4 @@ func windowReaderFor(config alertevaluator.RunConfig, queryAPI influxapi.QueryAP
 		return influxadapter.V2WindowReader{Bucket: config.InfluxDBBucket, Querier: influxadapter.ClientV2Querier{API: queryAPI}}
 	}
 	return influxadapter.WindowReader{Bucket: config.InfluxDBBucket, Querier: influxadapter.ClientQuerier{API: queryAPI}}
-}
-
-// writeFailure writes the failure line and returns its exit code: 78 for a configuration
-// error, which no rerun can fix, and 1 otherwise. No error here carries a secret value.
-func writeFailure(output io.Writer, category string, err error) int {
-	code := workerproc.ExitCode(err)
-	workercmd.WriteJSON(output, struct {
-		workercmd.Failure
-		Error string `json:"error"`
-	}{
-		Failure: workercmd.Failure{
-			Result: "fatal_failure", ExitCode: code,
-			RetryRecommended: code != workerproc.ExitConfiguration,
-			ErrorCategories:  map[string]int{category: 1},
-		},
-		Error: err.Error(),
-	})
-	return code
 }

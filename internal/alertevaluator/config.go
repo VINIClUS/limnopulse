@@ -7,7 +7,7 @@ import (
 	"strconv"
 	"time"
 
-	"github.com/VINIClUS/limnopulse/internal/workerproc"
+	"github.com/VINIClUS/limnopulse/internal/workerflag"
 )
 
 type LookupEnv func(string) (string, bool)
@@ -112,7 +112,7 @@ func LoadRunConfig(args []string, lookup LookupEnv) (RunConfig, error) {
 	fs.DurationVar(&config.AllowedLateness, "allowed-lateness", config.AllowedLateness, "telemetry lateness allowance")
 	fs.DurationVar(&config.MaximumSampleAge, "max-sample-age", config.MaximumSampleAge, "maximum sample age")
 	fs.StringVar(&config.TelemetrySource, "telemetry-source", config.TelemetrySource, "window reader source: legacy or v2")
-	if err := workerproc.ParseFlags(fs, args); err != nil {
+	if err := workerflag.Parse(fs, args); err != nil {
 		return RunConfig{}, err
 	}
 	fs.Visit(func(item *flag.Flag) {
@@ -123,7 +123,7 @@ func LoadRunConfig(args []string, lookup LookupEnv) (RunConfig, error) {
 	if evaluationTime != "" {
 		parsed, err := time.Parse(time.RFC3339Nano, evaluationTime)
 		if err != nil {
-			return RunConfig{}, fmt.Errorf("evaluation-time: %w", err)
+			return RunConfig{}, fmt.Errorf("--evaluation-time: %w", err)
 		}
 		parsed = parsed.UTC()
 		config.EvaluationTime = &parsed

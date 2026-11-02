@@ -7,6 +7,8 @@ import (
 	"sync/atomic"
 	"testing"
 	"time"
+
+	"github.com/VINIClUS/limnopulse/internal/workerproc"
 )
 
 func TestRunnerStopsReceivingAndGracefullyDrainsInflightWork(t *testing.T) {
@@ -529,4 +531,51 @@ func (*emptyQueue) Receive(ctx context.Context, _ int, _ time.Duration, _ time.D
 func (*emptyQueue) Delete(context.Context, QueueMessage) error { return nil }
 func (*emptyQueue) ChangeVisibility(context.Context, QueueMessage, time.Duration) error {
 	return nil
+}
+
+// waitingHandler stands for a send waiting on the rate limiter: it returns only when its
+// context ends.
+type waitingHandler struct{ started, aborted chan struct{} }
+
+func (handler waitingHandler) Handle(ctx context.Context, _ QueueMessage) Decision {
+	close(handler.started)
+	<-ctx.Done()
+	close(handler.aborted)
+	return Decision{Action: ActionChangeVisibility, Visibility: time.Second}
+}
+
+func TestRunnerAbortsInflightWorkAtOnceWhenTheLoopStalls(t *testing.T) {
+	for _, test := range []struct {
+		cause       error
+		wantAborted bool
+	}{
+		{cause: workerproc.ErrStalled, wantAborted: true},
+		// A stop signal keeps the drain budget, so the waiter is still running before it ends.
+		{cause: workerproc.ErrStopSignal},
+	} {
+		queue := newRunnerQueue([]QueueMessage{{MessageID: "m1", ReceiptHandle: "r1"}})
+		handler := waitingHandler{started: make(chan struct{}), aborted: make(chan struct{})}
+		runner := Runner{Queue: queue, Handler: handler, Concurrency: 1, ReceiveBatch: 1,
+			ReceiveWait: time.Second, Visibility: time.Minute, DrainTimeout: 2 * time.Second}
+		ctx, cancel := context.WithCancelCause(context.Background())
+		done := make(chan RunSummary, 1)
+		go func() { done <- runner.Run(ctx) }()
+		<-handler.started
+		cancel(test.cause)
+		select {
+		case <-handler.aborted:
+			if !test.wantAborted {
+				t.Fatalf("cause %v: in-flight work was aborted before the drain budget", test.cause)
+			}
+			<-done
+		case <-time.After(500 * time.Millisecond):
+			if test.wantAborted {
+				t.Fatalf("cause %v: in-flight work kept running after a stall", test.cause)
+			}
+			// The drain budget ends it instead.
+			if summary := <-done; !summary.DrainTimedOut {
+				t.Fatalf("cause %v: summary = %#v", test.cause, summary)
+			}
+		}
+	}
 }
