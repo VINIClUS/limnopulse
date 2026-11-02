@@ -1,0 +1,13 @@
+# Rendered from ops/workers/roles.yaml by scripts/workers/units.py; do not edit by hand.
+
+[Unit]
+Description=Run limnopulse-worker-monitor.service every 60 s
+Documentation=https://github.com/VINIClUS/limnopulse/blob/main/ops/workers/README.md
+
+[Timer]
+OnCalendar=*-*-* *:*:30
+AccuracySec=1s
+Unit=limnopulse-worker-monitor.service
+
+[Install]
+WantedBy=timers.target

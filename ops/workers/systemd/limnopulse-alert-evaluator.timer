@@ -1,0 +1,13 @@
+# Rendered from ops/workers/roles.yaml by scripts/workers/units.py; do not edit by hand.
+
+[Unit]
+Description=Run limnopulse-alert-evaluator.service every 60 s
+Documentation=https://github.com/VINIClUS/limnopulse/blob/main/ops/workers/README.md
+
+[Timer]
+OnCalendar=*-*-* *:*:00
+AccuracySec=1s
+Unit=limnopulse-alert-evaluator.service
+
+[Install]
+WantedBy=timers.target
