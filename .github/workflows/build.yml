@@ -32,8 +32,6 @@ jobs:
         app:
           - api
           - frontend
-          - alert-evaluator
-          - notifications
     steps: &image-steps
       - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
         with:
@@ -79,3 +77,134 @@ jobs:
       packages: write
     strategy: *image-strategy
     steps: *image-steps
+
+  # ADR-020: the Go workers ship as one bundle per release, never as images. The PR job
+  # builds every role twice, from two checkouts with separate build caches, and requires
+  # byte-identical bundles before it verifies one and runs its units on the runner's
+  # systemd. It never receives a publishing token.
+  workers-bundle:
+    if: github.event_name == 'pull_request'
+    needs: compose-production-config
+    runs-on: ubuntu-latest
+    env: &workers-env
+      WORKERS_TAG: main-${{ github.sha }}
+      # Pinned and checksum-verified, the same release deploy.yml pulls the bundle with.
+      ORAS_VERSION: "1.3.6"
+      ORAS_SHA256: 66fb0ad7206f3f6fa77ed5b552049d364ccf4b50b1684554f731f76302b52ca0
+    steps: &workers-steps
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+        with:
+          persist-credentials: false
+
+      # The latest patch of go.mod's Go minor, as the retired golang:1.26 images had: go.mod
+      # names the oldest toolchain it accepts, and a release ships the newest stdlib fixes.
+      # Each binary records the toolchain it was built with (go version -m).
+      - uses: actions/setup-go@924ae3a1cded613372ab5595356fb5720e22ba16 # v6
+        with:
+          go-version: "1.26"
+          check-latest: true
+
+      - uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6
+        with:
+          python-version: "3.12"
+
+      - uses: astral-sh/setup-uv@d0cc045d04ccac9d8b7881df0226f9e82c39688e # v6.8.0
+
+      - run: uv sync --locked --extra dev
+
+      - name: Build the workers bundle
+        run: |
+          make workers-binaries WORKERS_DIR="$RUNNER_TEMP/workers-a"
+          make workers-bundle WORKERS_DIR="$RUNNER_TEMP/workers-a"
+
+      - name: Rebuild it from a second checkout with an empty build cache
+        run: |
+          set -euo pipefail
+          source="$RUNNER_TEMP/source-b"
+          mkdir "$source"
+          git archive HEAD | tar -x -C "$source"
+          cd "$source"
+          GOCACHE="$RUNNER_TEMP/gocache-b" "$GITHUB_WORKSPACE/.venv/bin/python" \
+            -m scripts.workers.build_bundle binaries --out "$RUNNER_TEMP/workers-b/bin"
+          "$GITHUB_WORKSPACE/.venv/bin/python" -m scripts.workers.build_bundle bundle \
+            --tag "$WORKERS_TAG" --binaries "$RUNNER_TEMP/workers-b/bin" \
+            --out "$RUNNER_TEMP/workers-b"
+
+      - name: Require byte-identical bundles
+        run: |
+          set -euo pipefail
+          file="limnopulse-workers-${WORKERS_TAG}.tar.gz"
+          sha256sum "$RUNNER_TEMP"/workers-a/bin/* "$RUNNER_TEMP"/workers-b/bin/*
+          sha256sum "$RUNNER_TEMP/workers-a/$file" "$RUNNER_TEMP/workers-b/$file"
+          cmp "$RUNNER_TEMP/workers-a/$file" "$RUNNER_TEMP/workers-b/$file"
+
+      - name: Verify the bundle and its static executables
+        run: |
+          uv run --locked --no-sync python -m scripts.workers.build_bundle verify \
+            --tag "$WORKERS_TAG" --static-elf \
+            "$RUNNER_TEMP/workers-a/limnopulse-workers-${WORKERS_TAG}.tar.gz"
+
+      - name: Run each unit once on the runner's systemd
+        run: |
+          sudo --preserve-env=GITHUB_ACTIONS scripts/workers/smoke_units.sh \
+            "$RUNNER_TEMP/workers-a/limnopulse-workers-${WORKERS_TAG}.tar.gz" "$WORKERS_TAG"
+
+      - name: Install oras
+        if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+        run: |
+          set -euo pipefail
+          dir="$RUNNER_TEMP/oras"
+          mkdir -p "$dir"
+          curl -fsSL --retry 3 -o "$dir/oras.tar.gz" \
+            "https://github.com/oras-project/oras/releases/download/v${ORAS_VERSION}/oras_${ORAS_VERSION}_linux_amd64.tar.gz"
+          printf '%s  %s\n' "$ORAS_SHA256" "$dir/oras.tar.gz" | sha256sum --check --strict -
+          tar -xzf "$dir/oras.tar.gz" -C "$dir" oras
+          rm -f "$dir/oras.tar.gz"
+          echo "$dir" >> "$GITHUB_PATH"
+
+      # deploy.yml verifies this attestation of the tarball file: signer build.yml, source
+      # ref main, source digest the commit in the tag.
+      - name: Attest the bundle
+        if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+        uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2
+        with:
+          subject-path: ${{ runner.temp }}/workers-a/limnopulse-workers-main-${{ github.sha }}.tar.gz
+
+      - name: Log in to GHCR
+        if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+        uses: docker/login-action@c94ce9fb468520275223c153574b00df6fe4bcc9 # v3.7.0
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      # One file layer titled with the bare file name, so `oras pull -o <dir>` writes exactly
+      # that file (ops/vps/limnopulse-workers-activate refuses anything else).
+      - name: Push the bundle to GHCR
+        if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+        working-directory: ${{ runner.temp }}/workers-a
+        env:
+          REPOSITORY: ${{ github.repository }}
+        run: |
+          set -euo pipefail
+          file="limnopulse-workers-${WORKERS_TAG}.tar.gz"
+          oras push --no-tty \
+            --artifact-type application/vnd.limnopulse.workers.bundle.v1 \
+            --annotation "org.opencontainers.image.source=https://github.com/${REPOSITORY}" \
+            --annotation "org.opencontainers.image.revision=${GITHUB_SHA}" \
+            "ghcr.io/viniclus/limnopulse/workers:${WORKERS_TAG}" \
+            "${file}:application/vnd.limnopulse.workers.bundle.v1.tar+gzip"
+
+  workers-publish:
+    # Only a main-branch push can publish and attest the workers bundle.
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    needs: compose-production-config
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+      # actions/attest-build-provenance signs with the workflow's OIDC identity.
+      id-token: write
+      attestations: write
+    env: *workers-env
+    steps: *workers-steps

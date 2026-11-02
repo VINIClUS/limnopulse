@@ -75,8 +75,6 @@ jobs:
     strategy:
       matrix:
         app:
-          - alert-evaluator
-          - notifications
           - api
           - frontend
     steps:
@@ -115,3 +113,50 @@ jobs:
         with:
           sarif_file: 'trivy-image-${{ matrix.app }}.sarif'
           category: 'trivy-image-${{ matrix.app }}'
+
+  # ADR-020: the Go workers ship as static executables in the workers bundle, not as
+  # images. A rootfs scan reads each binary's embedded module list.
+  workers:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+
+      # The latest patch of go.mod's Go minor, as the retired golang:1.26 images had: go.mod
+      # names the oldest toolchain it accepts, and a release ships the newest stdlib fixes.
+      # Each binary records the toolchain it was built with (go version -m).
+      - uses: actions/setup-go@924ae3a1cded613372ab5595356fb5720e22ba16 # v6
+        with:
+          go-version: "1.26"
+          check-latest: true
+
+      - uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6
+        with:
+          python-version: "3.12"
+
+      - uses: astral-sh/setup-uv@d0cc045d04ccac9d8b7881df0226f9e82c39688e # v6.8.0
+
+      - name: Build the worker executables
+        run: |
+          uv sync --locked --extra dev
+          make workers-binaries WORKERS_DIR="$RUNNER_TEMP/workers"
+
+      - name: Trivy rootfs scan (worker executables)
+        uses: aquasecurity/trivy-action@ed142fd0673e97e23eac54620cfb913e5ce36c25 # v0.36.0
+        with:
+          scan-type: 'rootfs'
+          scan-ref: '${{ runner.temp }}/workers/bin'
+          scanners: 'vuln'
+          format: 'sarif'
+          output: 'trivy-workers.sarif'
+          severity: 'CRITICAL,HIGH'
+          ignore-unfixed: true
+          exit-code: '1'
+          trivyignores: '.trivyignore'
+          limit-severities-for-sarif: true
+
+      - name: Upload SARIF
+        if: always()
+        uses: github/codeql-action/upload-sarif@b96794f015dfd88f77b49b1c93e0fa7110f94c63 # v4
+        with:
+          sarif_file: 'trivy-workers.sarif'
+          category: 'trivy-workers'
