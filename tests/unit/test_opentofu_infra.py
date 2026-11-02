@@ -429,7 +429,7 @@ ALARM_TOPIC = "aws_sns_topic.telemetry_ingress_alarms[0]"
 UNCHANGED_FILE_SHA256 = {
     # ADR-020 S6 and S7 changed only comments: the shared workers user is marked
     # deprecated, and the header names the per-role principals instead of cmd/notifications.
-    "iam_runtime.tf": "5cea7356ab074f5c8eefdc738bb12c213ecac8db2110fa06e93d4c22c23b1cf2",
+    "iam_runtime.tf": "ff12468a6f02cacb5019b0862cb86c46e619befe6ae121188e9b9b9e7b9ba4b7",
     "queues.tf": "d85972d656c951d6a728fecfe4f762f0e96dc1e4687ee39d068edbea74ad9425",
 }
 # Digest of every pre-P3 block in variables.tf and outputs.tf (see _pre_p3_digest): P3-02

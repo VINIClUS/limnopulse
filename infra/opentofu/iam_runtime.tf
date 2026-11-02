@@ -1,9 +1,10 @@
 # Least-privilege runtime credentials for the FastAPI API (src/limnopulse_api)
 # and the deprecated shared Go workers user. Since ADR-020 every Go worker
-# role (cmd/<role>) has its own principal in workers.tf. All of them are
-# aws_iam_user, not roles — see the design spec §15/§24 note: this repo's
-# runtime is a VPS, which cannot assume an IAM role without either
-# instance-profile-style metadata (it has none) or IAM Roles Anywhere
+# role (cmd/<role>) has its own principal in workers.tf. Every runtime
+# principal is an aws_iam_user, not a role; the one role, limnopulse_admin,
+# is assumed by an operator for a backfill. See the design spec §15/§24
+# note: this repo's runtime is a VPS, which cannot assume an IAM role without
+# either instance-profile-style metadata (it has none) or IAM Roles Anywhere
 # (deferred to Fase 3, needs a CA and cert renewal this repo doesn't have
 # yet). Long-lived access keys are the accepted interim tradeoff.
 #
