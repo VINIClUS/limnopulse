@@ -245,6 +245,9 @@ roles:
     configuration_error: park
     iam_principal: telemetry_ingest
     enable_variable: telemetry_ingress
+    # The VPS-side switch, distinct from enable_variable (the OpenTofu/AWS gate). The deploy
+    # starts and waits for this worker only when Compose resolves it to true, else removes it.
+    host_enable_env: TELEMETRY_V2_WRITE_ENABLED
     unit_health: none
     unit_health_reason: >-
       worker-monitor gets no Docker socket; the Compose healthcheck and the

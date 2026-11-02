@@ -175,14 +175,11 @@ the API-only secrets.
   `.env` has no effect: changing either needs a compose change, made together with the grace.
 - **Restart policy (ADR-020).** The worker restarts `unless-stopped`, so it comes back after a
   crash, a stall, a Docker daemon restart or a host reboot. Every deploy passes
-  `--profile ingestion` and waits for the worker's health, so a promotion or a rollback moves the
-  API (producer) and the worker (consumer) to the same tag. This supersedes the P3 plan's bounded
-  `on-failure` restart (D7) and its opt-in start (D21).
-- **Until the ADR-020 deploy slice lands:** `ops/vps/limnopulse-deploy.sh` still runs `up -d`
-  without `--profile ingestion` and waits only for the API, so after every deploy recreate the
-  worker by hand with
-  `docker compose --env-file .env --env-file .env.image -f compose.production.yaml --profile ingestion up -d telemetry-ingest-worker`
-  and check it turns `healthy`.
+  `--profile ingestion` and waits for the worker's health while `TELEMETRY_V2_WRITE_ENABLED=true`,
+  so a promotion or a rollback moves the API (producer) and the worker (consumer) to the same tag.
+  While the switch is off, the deploy stops and removes the worker instead of starting it or
+  waiting for it. This supersedes the P3 plan's bounded `on-failure` restart (D7) and its opt-in
+  start (D21).
 - **Liveness and healthcheck.** The loop marks a liveness stamp
   (`/tmp/limnopulse-telemetry-ingest.liveness`) at the top of every turn and after every receive,
   and every 5 s while all permits are busy. A watchdog thread exits 1 when no mark comes for the
@@ -393,10 +390,10 @@ stopping all telemetry intake is the intent.
 4. **Let the worker drain** the source queue (queue depth and age back to zero), unless the worker
    itself is the reason for the rollback.
 5. **Stop the worker:** stop the `ingestion` profile and set `TELEMETRY_V2_WRITE_ENABLED=false`.
-   Unprocessed messages simply stay on the queue or the DLQ. Since ADR-020 every deploy passes
-   `--profile ingestion` and waits for the worker's health: with writes off the worker refuses to
-   start (exit 78), parks and stays `unhealthy`, so a later deploy fails its health gate until the
-   worker can run again.
+   Unprocessed messages simply stay on the queue or the DLQ. Since ADR-020 a deploy removes the
+   worker while `TELEMETRY_V2_WRITE_ENABLED` is off, so later deploys neither start nor wait for
+   it. Turn the switch back on only once the worker can run: an enabled worker that refuses its
+   configuration (exit 78) parks and stays `unhealthy`, so a deploy fails its health gate.
 6. **Retain the queues.** Never purge the source queue or the DLQ, and keep `telemetry_ingress = true`:
    accepted data stays recoverable for 4 days in the source queue and 14 days in the DLQ, and
    quarantine rows for 14 days. Turning the worker back on resumes processing.

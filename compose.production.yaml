@@ -149,9 +149,11 @@ services:
       start_period: 20s
     logging: *default-logging
 
-  # V4 P3 telemetry ingest worker (D7; ADR-020). Every deploy passes the profile, so a promotion
-  # or rollback moves the API (producer) and this worker (consumer) to the same tag:
+  # V4 P3 telemetry ingest worker (D7; ADR-020). While TELEMETRY_V2_WRITE_ENABLED is on, every
+  # deploy passes the profile, so a promotion or rollback moves the API (producer) and this
+  # worker (consumer) to the same tag:
   #   docker compose ... -f compose.production.yaml --profile ingestion up -d
+  # While it is off, the deploy removes this worker instead (ops/workers/README.md, "Deploy").
   # It runs as the dedicated `telemetry_ingest` IAM user (infra/opentofu/ingestion_queues.tf), so
   # it deliberately has no env_file: the shared .env carries the API principal's AWS keys. Its
   # settings are interpolated from the --env-file sources instead. It restarts unless-stopped,
