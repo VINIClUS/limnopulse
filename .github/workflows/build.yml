@@ -197,6 +197,8 @@ jobs:
 
       # No pull request exercises oras push or the attestation. Repeat deploy.yml's checks on
       # what was just published, so a broken publish fails on main, not at the next deploy.
+      # The pull is anonymous like deploy.yml's and the VPS helper's: an empty DOCKER_CONFIG
+      # hides the GHCR login above, so a private package fails here too.
       - name: Pull the bundle back and verify it as deploy.yml does
         if: github.event_name == 'push' && github.ref == 'refs/heads/main'
         env:
@@ -207,18 +209,34 @@ jobs:
           tag="$WORKERS_TAG"
           file="limnopulse-workers-${tag}.tar.gz"
           bundle_dir="$(mktemp -d)"
-          oras pull --no-tty -o "$bundle_dir" "ghcr.io/viniclus/limnopulse/workers:${tag}"
+          DOCKER_CONFIG="$(mktemp -d)"
+          export DOCKER_CONFIG
+          if ! oras pull --no-tty -o "$bundle_dir" "ghcr.io/viniclus/limnopulse/workers:${tag}"; then
+            echo "::error::an anonymous pull of the bundle failed. deploy.yml and the VPS pull without credentials, so the GHCR workers package must be public (ops/vps/README.md, section 4)"
+            exit 1
+          fi
           if [ "$(ls -A "$bundle_dir")" != "$file" ]; then
             echo "::error::the pushed bundle must contain exactly ${file}"
             exit 1
           fi
           cmp "dist/workers/$file" "$bundle_dir/$file"
-          gh attestation verify "$bundle_dir/$file" \
-            --repo "$REPOSITORY" \
-            --signer-workflow "$REPOSITORY/.github/workflows/build.yml" \
-            --source-ref refs/heads/main \
-            --source-digest "${tag#main-}" \
-            --deny-self-hosted-runners
+          verify() {
+            gh attestation verify "$bundle_dir/$file" \
+              --repo "$REPOSITORY" \
+              --signer-workflow "$REPOSITORY/.github/workflows/build.yml" \
+              --source-ref refs/heads/main \
+              --source-digest "${tag#main-}" \
+              --deny-self-hosted-runners
+          }
+          # The attestation was just written; allow the store about 30 s to serve it.
+          for attempt in 1 2 3 4 5 6; do
+            verify && break
+            if [ "$attempt" -eq 6 ]; then
+              echo "::error::the bundle's attestation did not verify"
+              exit 1
+            fi
+            sleep 5
+          done
           sha256sum "$bundle_dir/$file"
 
   workers-publish:

@@ -195,6 +195,12 @@ def test_workers_publisher_pulls_and_verifies_what_it_pushed_as_deploy_does():
     assert _attestation_verify(check["run"]) == _attestation_verify(deploy["run"])
     assert check["env"]["REPOSITORY"] == deploy["env"]["REPOSITORY"]
     assert check["env"]["GH_TOKEN"] == deploy["env"]["GH_TOKEN"]
+    # Anonymous, like deploy.yml and the VPS: the job's GHCR login must not reach the pull.
+    run = check["run"]
+    assert run.index('DOCKER_CONFIG="$(mktemp -d)"') < run.index("export DOCKER_CONFIG")
+    assert run.index("export DOCKER_CONFIG") < run.index("oras pull")
+    assert "DOCKER_CONFIG" not in check["env"]
+    assert "the GHCR workers package must be public (ops/vps/README.md, section 4)" in run
     # And the bytes in GHCR are the bytes CI built and attested.
     assert 'cmp "dist/workers/$file" "$bundle_dir/$file"' in check["run"]
     assert 'tag="$WORKERS_TAG"' in check["run"]

@@ -404,7 +404,10 @@ def test_the_host_bootstrap_creates_the_static_user_before_the_monitor_runs():
     step = readme[readme.index("### 7.5 worker-monitor's static user") :]
     step = step[: step.index("\n### ")]
     assert copy in readme
-    assert install in step
+    # Stock Ubuntu has no /etc/sysusers.d, and install does not create it.
+    directory = "install -d -o root -g root -m 0755 /etc/sysusers.d"
+    assert directory in step and install in step
+    assert step.index(directory) < step.index(install)
     assert "systemd-sysusers /etc/sysusers.d/limnopulse-workers.conf" in step
     # The same static-uid post-condition the CI smoke checks.
     assert '[ "$uid" -lt 61184 ]' in step

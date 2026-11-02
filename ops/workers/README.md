@@ -129,8 +129,10 @@ credentials there and must exit `78` without a restart; worker-monitor reads eve
 over D-Bus and exits `0`. On a push to `main`, `workers-publish` runs the same steps,
 attests the tarball file with `actions/attest-build-provenance`, and pushes it with
 `oras push` as one file layer titled with its bare file name. It then pulls the bundle
-back, requires the bytes it built, and runs the same `gh attestation verify` as
-`deploy.yml`, so a broken publish fails on `main` rather than at the next deploy.
+back anonymously, as `deploy.yml` and the VPS helper do, requires the bytes it built, and
+runs the same `gh attestation verify` as `deploy.yml`. A broken publish therefore fails on
+`main` rather than at the next deploy. So does a private package: the GHCR `workers`
+package must be public (`ops/vps/README.md`, section 4).
 
 ## Units
 

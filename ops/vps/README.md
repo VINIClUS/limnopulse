@@ -298,6 +298,7 @@ every minute with "Transport endpoint is not connected" and every unit-health
 alarm breaches.
 
 ```bash
+install -d -o root -g root -m 0755 /etc/sysusers.d
 install -o root -g root -m 0644 /tmp/limnopulse-workers.sysusers /etc/sysusers.d/limnopulse-workers.conf
 systemd-sysusers /etc/sysusers.d/limnopulse-workers.conf
 uid="$(getent passwd limnopulse-worker-monitor | cut -d: -f3)"
