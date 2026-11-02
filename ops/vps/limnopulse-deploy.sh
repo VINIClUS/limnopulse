@@ -14,8 +14,9 @@
 # One release tag moves the API image, the profiled Compose workers and the
 # workers bundle together (ops/workers/README.md, "Deploy"):
 #   1. stage the bundle through the root-owned activation helper;
-#   2. pull and start Compose with every profile in deploy.compose_profiles;
-#   3. wait for api and each profiled worker to be healthy;
+#   2. pull and start Compose with each profile in deploy.compose_profiles whose worker
+#      is enabled on the host, after stopping and removing each disabled worker;
+#   3. wait for api and each enabled profiled worker to be healthy;
 #   4. activate the bundle;
 #   5. record IMAGE_TAG and WORKERS_BUNDLE_SHA256 in .env.image.
 # A failure after step 1 rolls all three back to the release .env.image records.
@@ -27,11 +28,29 @@ STACK_DIR="${LIMNOPULSE_STACK_DIR:-/opt/limnopulse}"
 LOG="${LIMNOPULSE_DEPLOY_LOG:-/var/log/limnopulse-deploy.log}"
 HEALTH_TIMEOUT_SECONDS="${LIMNOPULSE_HEALTH_TIMEOUT_SECONDS:-120}"
 # activation.helper, deploy.forced_command and deploy.compose_profiles in
-# ops/workers/roles.yaml, and the Compose service of each role in those profiles.
+# ops/workers/roles.yaml. PROFILED_WORKERS has one "compose_service compose_profile
+# host_enable_env" entry per Compose role in those profiles.
 ACTIVATE=/usr/local/sbin/limnopulse-workers-activate
 FORCED_COMMAND='^main-[0-9a-f]{40} [0-9a-f]{64}$'
 PROFILES=(ingestion)
-PROFILED_WORKERS=(telemetry-ingest-worker)
+PROFILED_WORKERS=("telemetry-ingest-worker ingestion TELEMETRY_V2_WRITE_ENABLED")
+
+# Reads `docker compose config --format json` and prints "<service> enabled|disabled" for
+# each PROFILED_WORKERS entry. A host switch is on or off exactly as the worker's settings
+# parse a boolean (pydantic); any other value, or a missing one, is refused.
+SWITCHES_PY='
+import json, sys
+ON = {"1", "on", "t", "true", "y", "yes"}
+OFF = {"0", "off", "f", "false", "n", "no"}
+services = json.load(sys.stdin)["services"]
+for entry in sys.argv[1:]:
+    service, _profile, variable = entry.split()
+    value = (services.get(service, {}).get("environment") or {}).get(variable)
+    word = value.lower() if isinstance(value, str) else None
+    if word not in ON | OFF:
+        sys.exit(f"{service}: {variable} must be a boolean, got {value!r}")
+    print(service, "enabled" if word in ON else "disabled")
+'
 
 log() {
   echo "$(date -u +%Y-%m-%dT%H:%M:%SZ) $*" | tee -a "$LOG"
@@ -43,14 +62,65 @@ activation() {
   sudo -n "$ACTIVATE" "$@"
 }
 
-profile_args=()
+all_profile_args=()
 for profile in "${PROFILES[@]}"; do
-  profile_args+=(--profile "$profile")
+  all_profile_args+=(--profile "$profile")
 done
 # .env.image records the last release that finished all five steps. The candidate tag
 # reaches Compose through its own env file until step 5 records it.
-COMPOSE=(docker compose --env-file .env --env-file .env.image -f compose.production.yaml "${profile_args[@]}")
-CANDIDATE_COMPOSE=(docker compose --env-file .env --env-file .env.image.candidate -f compose.production.yaml "${profile_args[@]}")
+COMPOSE=(docker compose --env-file .env --env-file .env.image -f compose.production.yaml)
+CANDIDATE_COMPOSE=(docker compose --env-file .env --env-file .env.image.candidate -f compose.production.yaml)
+
+contains() {
+  local needle="$1" item
+  shift
+  for item in "$@"; do
+    [ "$item" = "$needle" ] && return 0
+  done
+  return 1
+}
+
+# resolve_workers <compose command...>: set ENABLED_WORKERS and DISABLED_WORKERS from the
+# host switches as Compose resolves them. Every deploy profile is active for the read, so
+# each worker appears in the config. On failure both lists stay as they were.
+ENABLED_WORKERS=()
+DISABLED_WORKERS=()
+resolve_workers() {
+  local resolved service state
+  resolved="$("$@" "${all_profile_args[@]}" config --format json 2>>"$LOG" |
+    python3 -I -c "$SWITCHES_PY" "${PROFILED_WORKERS[@]}" 2>>"$LOG")" || return 1
+  ENABLED_WORKERS=()
+  DISABLED_WORKERS=()
+  while read -r service state; do
+    [ -n "$service" ] || continue
+    if [ "$state" = enabled ]; then
+      ENABLED_WORKERS+=("$service")
+    else
+      DISABLED_WORKERS+=("$service")
+    fi
+  done <<<"$resolved"
+}
+
+# start_release <compose command...>: pull, stop and remove each disabled worker, then start
+# the stack with the profiles of the enabled ones. Plain `up` without a profile would leave
+# a disabled worker's old container running.
+start_release() {
+  local entry service profile enabled_profiles=()
+  for entry in "${PROFILED_WORKERS[@]}"; do
+    read -r service profile _ <<<"$entry"
+    if contains "$service" "${ENABLED_WORKERS[@]}"; then
+      enabled_profiles+=(--profile "$profile")
+    fi
+  done
+  "$@" "${enabled_profiles[@]}" pull >>"$LOG" 2>&1 || return 1
+  for entry in "${PROFILED_WORKERS[@]}"; do
+    read -r service profile _ <<<"$entry"
+    if contains "$service" "${DISABLED_WORKERS[@]}"; then
+      "$@" --profile "$profile" rm --stop --force "$service" >>"$LOG" 2>&1 || return 1
+    fi
+  done
+  "$@" "${enabled_profiles[@]}" up -d --remove-orphans >>"$LOG" 2>&1 || return 1
+}
 
 # --- request validation; nothing above this line does deploy I/O ---
 REQUEST="${SSH_ORIGINAL_COMMAND:-}"
@@ -80,11 +150,21 @@ if [ -f .env.image ]; then
   PREV_BUNDLE_SHA256="$(sed -n 's/^WORKERS_BUNDLE_SHA256=//p' .env.image | tail -n 1)"
 fi
 
+# The host switches decide which profiled workers this release starts and waits for.
+printf 'IMAGE_TAG=%s\n' "$TAG" > .env.image.candidate
+if ! resolve_workers "${CANDIDATE_COMPOSE[@]}"; then
+  rm -f -- .env.image.candidate
+  log "rejected tag=$TAG: cannot resolve the profiled workers' host switches; nothing changed"
+  exit 1
+fi
+log "profiled workers enabled: ${ENABLED_WORKERS[*]:-none}; disabled: ${DISABLED_WORKERS[*]:-none}"
+
 # 1. Stage. Nothing has changed yet, so a refusal (a missing or tampered bundle, a bad
 # SHA256SUMS or a rollback floor) stops the deploy with the helper's exit code.
 stage_status=0
 activation stage "$TAG" "$BUNDLE_SHA256" >>"$LOG" 2>&1 || stage_status=$?
 if [ "$stage_status" -ne 0 ]; then
+  rm -f -- .env.image.candidate
   log "stage refused tag=$TAG status=$stage_status; nothing changed"
   exit "$stage_status"
 fi
@@ -95,12 +175,15 @@ rollback() {
   local rollback_failed=0 bundle_status=0
   log "deploy failed tag=$TAG, rolling back to prev=${PREV_TAG:-none}" || true
   if [ -n "$PREV_TAG" ]; then
-    "${COMPOSE[@]}" pull >>"$LOG" 2>&1 || rollback_failed=1
-    "${COMPOSE[@]}" up -d --remove-orphans >>"$LOG" 2>&1 || rollback_failed=1
+    # The same rule as the promotion, with the host switches as they are now.
+    if ! resolve_workers "${COMPOSE[@]}"; then
+      log "cannot re-read the host switches; rolling back with the values read at promotion" || true
+    fi
+    start_release "${COMPOSE[@]}" || rollback_failed=1
   else
     # Compose still needs the candidate env file while stopping its services.
     # Stop preserves the volumes and network; this is not a stack reset.
-    "${CANDIDATE_COMPOSE[@]}" stop >>"$LOG" 2>&1 || rollback_failed=1
+    "${CANDIDATE_COMPOSE[@]}" "${all_profile_args[@]}" stop >>"$LOG" 2>&1 || rollback_failed=1
   fi
   rm -f -- .env.image.candidate .env.image.next || rollback_failed=1
   # Re-activate the previous release from its verified directory, or return to the
@@ -124,24 +207,22 @@ rollback() {
 }
 trap rollback ERR
 
-# 2. Compose, with every deploy profile, on the candidate tag.
-printf 'IMAGE_TAG=%s\n' "$TAG" > .env.image.candidate
-"${CANDIDATE_COMPOSE[@]}" pull >>"$LOG" 2>&1
-"${CANDIDATE_COMPOSE[@]}" up -d --remove-orphans >>"$LOG" 2>&1
+# 2. Compose on the candidate tag, with the profiles of the enabled workers.
+start_release "${CANDIDATE_COMPOSE[@]}"
 
-# 3. api and each profiled worker must report healthy.
+# 3. api and each enabled profiled worker must report healthy. A parked worker never does.
 unhealthy=""
 all_healthy() {
   local service status
-  for service in api "${PROFILED_WORKERS[@]}"; do
-    status="$("${CANDIDATE_COMPOSE[@]}" ps -q "$service" | xargs -r docker inspect -f '{{.State.Health.Status}}' 2>/dev/null)" || status=""
+  for service in api "${ENABLED_WORKERS[@]}"; do
+    status="$("${CANDIDATE_COMPOSE[@]}" "${all_profile_args[@]}" ps -q "$service" | xargs -r docker inspect -f '{{.State.Health.Status}}' 2>/dev/null)" || status=""
     if [ "$status" != "healthy" ]; then
       unhealthy="$service"
       return 1
     fi
   done
 }
-log "waiting for api and ${PROFILED_WORKERS[*]} health"
+log "waiting for the health of api ${ENABLED_WORKERS[*]}"
 deadline=$((SECONDS + 10#$HEALTH_TIMEOUT_SECONDS))
 until all_healthy; do
   if [ "$SECONDS" -ge "$deadline" ]; then

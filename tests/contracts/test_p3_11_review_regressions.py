@@ -220,7 +220,7 @@ def test_runbook_documents_the_adr_020_restart_liveness_and_park_rules() -> None
         "every permit wedged",
     ):
         assert stale not in runbook, stale
-    # A rollback that turns writes off leaves a parked worker, which a later deploy waits on.
+    # An enabled worker that cannot run parks, and a deploy that waits on it fails.
     assert re.search(r"fails its health gate", _section("Rollback"))
 
 

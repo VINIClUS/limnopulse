@@ -103,12 +103,14 @@ LIFECYCLE_FIELDS = {
         "healthcheck",
         "configuration_error",
         "enable_variable",
+        "host_enable_env",
         "unit_health_reason",
     ),
 }
 UNIT_ONLY_FIELDS = ("units", "env_file", "credentials")
 QUEUE_ALARMS = ("queue-age", "queue-depth", "queue-dlq")
 SNAKE = re.compile(r"^[a-z][a-z0-9_]*$")
+ENV_NAME = re.compile(r"^[A-Z][A-Z0-9_]*$")
 KEBAB = re.compile(r"^[a-z][a-z0-9-]*$")
 
 
@@ -319,6 +321,8 @@ def _validate_role(
             problems.append(f"{name}: healthcheck must be {role['entrypoint']} healthcheck")
         if not str(role["liveness_file"]).startswith("/tmp/"):
             problems.append(f"{name}: liveness_file lives under the container's /tmp")
+        if not ENV_NAME.match(str(role["host_enable_env"])):
+            problems.append(f"{name}: host_enable_env must be an environment variable name")
     if name == "ses-feedback-worker" and role.get("single_instance") is not True:
         problems.append("ses-feedback-worker runs as a single instance")
     return problems
@@ -438,5 +442,12 @@ def _validate_compose(roles: list[dict[str, Any]]) -> list[str]:
         elif role.get("compose_profile") not in service.get("profiles", []):
             problems.append(
                 f"{name}: compose.production.yaml does not put it in profile {role.get('compose_profile')}"
+            )
+        if service is not None and role.get("host_enable_env") not in (
+            service.get("environment") or {}
+        ):
+            problems.append(
+                f"{name}: host_enable_env {role.get('host_enable_env')} is not in its "
+                "compose.production.yaml environment"
             )
     return problems

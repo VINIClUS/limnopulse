@@ -114,11 +114,22 @@ its attestation.
 
 1. Stage the bundle. A missing or tampered bundle stops the deploy before anything
    changes.
-2. Pull and start Compose with every profile in `deploy.compose_profiles`.
-3. Wait for `api` and each profiled worker to be healthy.
+2. Pull and start Compose with each profile in `deploy.compose_profiles` whose role is
+   enabled on the host. Stop and remove each disabled role's service explicitly: a plain
+   `up -d` without its profile would leave an old-tag container running.
+3. Wait for `api` and each enabled profiled worker to be healthy.
 4. Activate the bundle.
 5. Record `IMAGE_TAG` and `WORKERS_BUNDLE_SHA256` in `.env.image`.
 
+**Host switch.** A Compose role is enabled on the host when its `host_enable_env`, as
+`docker compose config` resolves it, parses as true. The deploy parses it the way the
+worker's settings parse a boolean: `true`, `1`, `yes`, `on`, `t` and `y` in any case are
+on; `false`, `0`, `no`, `off`, `f` and `n` are off. Any other value, or a missing one,
+stops the deploy before anything changes. The switch is not `enable_variable`, which
+gates the role's AWS resources in OpenTofu. An enabled worker that cannot run, parked on
+a configuration error for example, never turns healthy, so it fails the deploy.
+
 Rollback moves the API, the profiled Compose workers and the bundle back to the previous
 tag, re-activating that release from its already verified directory. When the previous
-release had no bundle, rollback runs `deactivate`.
+release had no bundle, rollback runs `deactivate`. Rollback applies the same host-switch
+rule, with the switch as it is at rollback time.

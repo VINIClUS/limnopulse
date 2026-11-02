@@ -317,18 +317,25 @@ This parses the production manifest using the example environment and a dummy
 image tag; it does not start services or contact the VPS. The build workflow
 uses the same gate.
 
-The deploy stages the workers bundle first. A missing or tampered bundle, a
-bad `SHA256SUMS` or a rollback floor stops it before anything changes, with
-the helper's exit code. It then starts Compose with every profile in
-`deploy.compose_profiles` and waits for `api` and each profiled worker to be
-healthy. Next it activates the bundle. Only then does it record `IMAGE_TAG`
+The deploy first reads each profiled worker's host switch through
+`docker compose config`. For the telemetry ingest worker that switch is
+`TELEMETRY_V2_WRITE_ENABLED` in `.env`. A value the worker could not parse as a
+boolean stops the deploy before anything changes. It then stages the workers
+bundle. A missing or tampered bundle, a bad `SHA256SUMS` or a rollback floor
+stops it before anything changes, with the helper's exit code.
+
+Next, Compose starts with the profile of each enabled worker. Each disabled
+worker's container is stopped and removed, so no old-tag container is left
+running. The deploy waits for `api` and each enabled worker to be healthy, then
+activates the bundle. Only then does it record `IMAGE_TAG`
 and `WORKERS_BUNDLE_SHA256` in `.env.image`. Until that last step, Compose
 reads the candidate tag from `.env.image.candidate`.
 
 If an image pull, the Compose update, a health wait or the activation fails,
 the deploy rolls back to the release that `.env.image` records:
 
-- Compose pulls and starts the previous tag with the same profiles.
+- Compose pulls and starts the previous tag under the same host-switch rule,
+  with the switches as they are at rollback time.
 - The helper re-activates the previous bundle. If `.env.image` recorded no
   bundle, as with releases from before ADR-020, it runs `deactivate` instead.
   `deactivate` stops the units it removes. A later `activate` only
@@ -342,10 +349,11 @@ On a first deployment with no previous tag, the deploy stops the candidate
 services and deactivates the bundle, preserving all volumes. Inspect
 `/var/log/limnopulse-deploy.log` before retrying a failed promotion.
 
-Every promotion waits for the profiled telemetry ingest worker. A worker parked
-on a configuration error (exit `78`) stays unhealthy. This happens, for
-example, after the P3 rollback sets `TELEMETRY_V2_WRITE_ENABLED=false`. While
-it is parked, every promotion fails its health wait and rolls back.
+With `TELEMETRY_V2_WRITE_ENABLED=false`, the ingest worker's state after the P3
+rollback, the deploy removes the worker and neither starts nor waits for it.
+With the switch on, the worker must turn healthy. One parked on a configuration
+error (exit `78`), such as writes on with no queue URL, never does, so the
+promotion fails its health wait and rolls back.
 
 For isolated testing, the script accepts `LIMNOPULSE_STACK_DIR`,
 `LIMNOPULSE_DEPLOY_LOG` and `LIMNOPULSE_HEALTH_TIMEOUT_SECONDS`. Defaults remain
