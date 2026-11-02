@@ -235,6 +235,9 @@ unnecessary overlap.
 `stall_after_seconds` in `ops/workers/roles.yaml`), and 78 on a configuration
 error.
 
+A 78 failure line names the failing settings under `settings` (an env key, a flag
+or a credential), never their values. `-h` prints the usage and exits 0.
+
 A systemd deployment uses a oneshot service and a timer; the relay itself must
 not contain a loop. The unit follows `ops/workers/roles.yaml` (see
 `ops/workers/README.md`); without its credentials it exits 78:

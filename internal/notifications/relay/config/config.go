@@ -117,7 +117,7 @@ func Load(args []string, lookup LookupEnv) (RunConfig, error) {
 		}
 	}
 
-	fs := flag.NewFlagSet("notifications relay", flag.ContinueOnError)
+	fs := flag.NewFlagSet("notification-relay", flag.ContinueOnError)
 	fs.SetOutput(io.Discard)
 	relayTime := ""
 	fs.StringVar(&relayTime, "relay-time", "", "logical RFC3339 relay time")
@@ -144,8 +144,16 @@ func Load(args []string, lookup LookupEnv) (RunConfig, error) {
 	if _, err = notifications.OwnedRelayBuckets(config.Shard, config.ShardCount); err != nil {
 		return RunConfig{}, err
 	}
-	if config.QueryParallelism < 1 || config.WorkParallelism < 1 || config.MaxWork < 1 {
-		return RunConfig{}, fmt.Errorf("parallelism and work limits must be positive")
+	for _, limit := range []struct {
+		name  string
+		value int
+	}{
+		{"query-parallelism", config.QueryParallelism}, {"work-parallelism", config.WorkParallelism},
+		{"max-work", config.MaxWork},
+	} {
+		if limit.value < 1 {
+			return RunConfig{}, fmt.Errorf("%s must be positive", limit.name)
+		}
 	}
 	if config.FanoutPageSize < 1 || config.FanoutPageSize > 99 {
 		return RunConfig{}, fmt.Errorf("fanout-page-size must be between 1 and 99")

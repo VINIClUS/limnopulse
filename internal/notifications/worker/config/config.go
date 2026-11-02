@@ -171,7 +171,7 @@ func load(name string, args []string, lookup LookupEnv, withFeedback bool) (RunC
 	case "aws":
 	case "success", "retryable", "permanent", "ambiguous_timeout", "connection_reset":
 		if hosted {
-			return RunConfig{}, fmt.Errorf("fake email sender is allowed only in local or test")
+			return RunConfig{}, fmt.Errorf("NOTIFICATION_EMAIL_SENDER_MODE must be aws in staging and prod")
 		}
 	default:
 		return RunConfig{}, fmt.Errorf("NOTIFICATION_EMAIL_SENDER_MODE is invalid")
@@ -180,7 +180,7 @@ func load(name string, args []string, lookup LookupEnv, withFeedback bool) (RunC
 		return RunConfig{}, fmt.Errorf("NOTIFICATION_FAKE_MESSAGE_ID is invalid")
 	}
 	if config.FakeMessageID != "" && config.EmailSenderMode == "aws" {
-		return RunConfig{}, fmt.Errorf("fake message ID requires a fake email sender")
+		return RunConfig{}, fmt.Errorf("NOTIFICATION_FAKE_MESSAGE_ID requires a fake NOTIFICATION_EMAIL_SENDER_MODE")
 	}
 	required := []struct{ name, value string }{
 		{"AWS_REGION", config.AWSRegion}, {"DYNAMODB_DOMAIN_TABLE", config.DynamoDBTable},
@@ -201,9 +201,17 @@ func load(name string, args []string, lookup LookupEnv, withFeedback bool) (RunC
 	if withFeedback && config.SQSQueueURL == config.SQSFeedbackURL {
 		return RunConfig{}, fmt.Errorf("SQS_NOTIFICATION_JOBS_URL and SQS_SES_EVENTS_URL must be distinct")
 	}
-	if config.SendConcurrency < 1 || (withFeedback && config.FeedbackConcurrency < 1) || config.MaxSendRate <= 0 ||
-		math.IsNaN(config.MaxSendRate) || math.IsInf(config.MaxSendRate, 0) || config.SendBurst < 1 {
-		return RunConfig{}, fmt.Errorf("send concurrency, rate and burst must be positive")
+	if config.SendConcurrency < 1 {
+		return RunConfig{}, fmt.Errorf("--send-concurrency (NOTIFICATION_SEND_CONCURRENCY) must be positive")
+	}
+	if withFeedback && config.FeedbackConcurrency < 1 {
+		return RunConfig{}, fmt.Errorf("--feedback-concurrency (NOTIFICATION_FEEDBACK_CONCURRENCY) must be positive")
+	}
+	if config.MaxSendRate <= 0 || math.IsNaN(config.MaxSendRate) || math.IsInf(config.MaxSendRate, 0) {
+		return RunConfig{}, fmt.Errorf("--max-send-rate (NOTIFICATION_MAX_SEND_RATE) must be a positive number")
+	}
+	if config.SendBurst < 1 {
+		return RunConfig{}, fmt.Errorf("--send-burst (NOTIFICATION_SEND_BURST) must be positive")
 	}
 	if err := ValidateQueueTiming(hosted, config.ReceiveWait, config.InvalidVisibility); err != nil {
 		return RunConfig{}, err
@@ -228,16 +236,16 @@ func HostedEnvironment(appEnv string) (bool, error) {
 // consumer shares. Hosted environments keep the long poll and the default visibility.
 func ValidateQueueTiming(hosted bool, receiveWait, invalidVisibility time.Duration) error {
 	if hosted && receiveWait == 0 {
-		return fmt.Errorf("zero receive wait is allowed only in local or test")
+		return fmt.Errorf("--receive-wait may be 0s only in local or test")
 	}
 	if hosted && invalidVisibility != InvalidVisibility {
-		return fmt.Errorf("short invalid visibility is allowed only in local or test")
+		return fmt.Errorf("--invalid-visibility may be overridden only in local or test")
 	}
 	if receiveWait < 0 || receiveWait > 20*time.Second || receiveWait%time.Second != 0 {
-		return fmt.Errorf("receive wait must be a whole number of seconds between 0s and 20s")
+		return fmt.Errorf("--receive-wait must be a whole number of seconds between 0s and 20s")
 	}
 	if invalidVisibility <= 0 || invalidVisibility > 12*time.Hour || invalidVisibility%time.Second != 0 {
-		return fmt.Errorf("invalid visibility must be a whole number of seconds between 1s and 12h")
+		return fmt.Errorf("--invalid-visibility must be a whole number of seconds between 1s and 12h")
 	}
 	return nil
 }

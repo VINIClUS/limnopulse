@@ -30,7 +30,23 @@ RUN_INTEGRATION = os.getenv("RUN_NOTIFICATION_INTEGRATION") == "1"
 SQS_ENDPOINT = "http://127.0.0.1:9324"
 TELEGRAM_FAKE_ENDPOINT = "http://127.0.0.1:8089"
 # ADR-020: one executable per worker role.
-ROLE_BINARIES = ("notification-relay", "email-worker", "ses-feedback-worker", "telegram-worker")
+ROLE_BINARIES = (
+    "alert-evaluator",
+    "notification-relay",
+    "email-worker",
+    "ses-feedback-worker",
+    "telegram-worker",
+    "limnopulse-admin",
+)
+# The arguments that ask each executable for its usage; the flag set's name heads it.
+HELP_REQUESTS = {
+    "alert-evaluator": (["run", "-h"], "alert-evaluator run"),
+    "notification-relay": (["-h"], "notification-relay"),
+    "email-worker": (["-h"], "email-worker"),
+    "ses-feedback-worker": (["-h"], "ses-feedback-worker"),
+    "telegram-worker": (["-h"], "telegram-worker"),
+    "limnopulse-admin": (["backfill-relay", "-h"], "limnopulse-admin backfill-relay"),
+}
 # A developer shell or CI runner must not make a test process look systemd-supervised.
 SUPERVISOR_ENVIRONMENT = (
     "NOTIFY_SOCKET",
@@ -277,7 +293,7 @@ def _telegram_content_hash(template_id: str, body_text: str) -> str:
     return digest.hexdigest()
 
 
-def _base_environment(runtime: Runtime, mode: str) -> dict[str, str]:
+def _local_environment() -> dict[str, str]:
     environment = os.environ.copy()
     for name in SUPERVISOR_ENVIRONMENT:
         environment.pop(name, None)
@@ -287,6 +303,15 @@ def _base_environment(runtime: Runtime, mode: str) -> dict[str, str]:
             "AWS_ACCESS_KEY_ID": "local",
             "AWS_SECRET_ACCESS_KEY": "local",
             "AWS_EC2_METADATA_DISABLED": "true",
+        }
+    )
+    return environment
+
+
+def _base_environment(runtime: Runtime, mode: str) -> dict[str, str]:
+    environment = _local_environment()
+    environment.update(
+        {
             "AWS_REGION": "us-east-1",
             "DYNAMODB_DOMAIN_TABLE": runtime.table.name,
             "DYNAMODB_ENDPOINT_URL": "http://127.0.0.1:8001",
@@ -401,6 +426,20 @@ def _stop_worker(worker: Workers | subprocess.Popen[str]) -> dict[str, Any]:
         for key in ("messages_received", "messages_deleted", "visibility_changed")
     }
     return {**totals, "email": email, "feedback": feedback}
+
+
+def _run_once(
+    binaries: Path, role: str, args: list[str], environment: dict[str, str]
+) -> subprocess.CompletedProcess[str]:
+    return subprocess.run(
+        [str(binaries / role), *args],
+        cwd=ROOT,
+        env=environment,
+        capture_output=True,
+        check=False,
+        text=True,
+        timeout=60,
+    )
 
 
 def _run_relay(runtime: Runtime, relay_time: datetime) -> dict[str, Any]:
@@ -1290,3 +1329,61 @@ def test_elasticmq_redrives_after_eight_receives_without_automatic_dlq_consumpti
     ).get("Messages", [])
     assert len(dlq) == 1
     assert dlq[0]["Body"] == "not-json"
+
+
+@pytest.mark.parametrize("role", ROLE_BINARIES)
+def test_each_executable_prints_its_usage_and_exits_0_on_help(
+    notification_binaries: Path, role: str
+) -> None:
+    args, name = HELP_REQUESTS[role]
+    completed = _run_once(notification_binaries, role, args, _local_environment())
+    assert completed.returncode == 0, (role, completed.returncode, completed.stdout)
+    assert completed.stdout.startswith(f"Usage of {name}:\n"), completed.stdout
+
+
+def test_a_malformed_ses_source_exits_78_naming_the_setting_but_not_its_value(
+    runtime: Runtime,
+) -> None:
+    # A configuration error must stop the unit (RestartPreventExitStatus=78), not restart it.
+    environment = _base_environment(runtime, "aws")
+    environment["SES_FROM_EMAIL"] = "Alerts alerts@example.test"
+    completed = _run_once(runtime.binaries, "email-worker", ["--receive-wait=0s"], environment)
+    assert completed.returncode == 78, completed.stdout
+    failure = json.loads(completed.stdout)
+    assert failure["exit_code"] == 78
+    assert failure["error_categories"] == {"configuration": 1}
+    assert failure["settings"] == ["SES_FROM_EMAIL"]
+    assert "alerts@example.test" not in completed.stdout + completed.stderr
+
+
+@pytest.mark.parametrize(
+    ("role", "args", "settings"),
+    (
+        ("alert-evaluator", [], None),
+        ("alert-evaluator", ["backfill-relay"], None),
+        ("limnopulse-admin", [], None),
+        ("limnopulse-admin", ["backfill-relay"], ["tenant"]),
+        ("notification-relay", ["--max-work=0"], ["max-work"]),
+    ),
+)
+def test_a_oneshot_or_admin_usage_error_exits_78(
+    runtime: Runtime, role: str, args: list[str], settings: list[str] | None
+) -> None:
+    completed = _run_once(runtime.binaries, role, args, _base_environment(runtime, "success"))
+    assert completed.returncode == 78, (role, args, completed.stdout)
+    failure = json.loads(completed.stdout)
+    assert failure["exit_code"] == 78
+    assert failure.get("settings") == settings
+
+
+def test_admin_backfill_dry_run_over_the_local_table_exits_0(runtime: Runtime) -> None:
+    completed = _run_once(
+        runtime.binaries,
+        "limnopulse-admin",
+        ["backfill-relay", "--tenant=tnt_admin_integration"],
+        _base_environment(runtime, "success"),
+    )
+    assert completed.returncode == 0, completed.stdout
+    result = json.loads(completed.stdout)
+    assert result["result"] == "success"
+    assert result["scope_completed"] is True

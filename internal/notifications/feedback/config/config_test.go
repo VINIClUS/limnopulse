@@ -78,8 +78,8 @@ func TestLoadRejectsInvalidConfiguration(t *testing.T) {
 		"unknown env":      {environment: map[string]string{"APP_ENV": "dev"}, fragment: "APP_ENV"},
 		"zero concurrency": {args: []string{"--feedback-concurrency=0"}, environment: feedbackEnvironment(), fragment: "concurrency"},
 		"positional":       {args: []string{"extra"}, environment: feedbackEnvironment(), fragment: "positional"},
-		"hosted zero wait": {args: []string{"--receive-wait=0s"}, environment: hosted, fragment: "zero receive wait"},
-		"fractional wait":  {args: []string{"--receive-wait=500ms"}, environment: feedbackEnvironment(), fragment: "receive wait"},
+		"hosted zero wait": {args: []string{"--receive-wait=0s"}, environment: hosted, fragment: "--receive-wait may be 0s"},
+		"fractional wait":  {args: []string{"--receive-wait=500ms"}, environment: feedbackEnvironment(), fragment: "--receive-wait must be a whole number"},
 	} {
 		if _, err := Load(test.args, lookup(test.environment)); err == nil || !strings.Contains(err.Error(), test.fragment) {
 			t.Fatalf("%s: error = %v, want %q", name, err, test.fragment)

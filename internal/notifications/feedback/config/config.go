@@ -88,7 +88,7 @@ func Load(args []string, lookup LookupEnv) (RunConfig, error) {
 		}
 	}
 	if config.Concurrency < 1 {
-		return RunConfig{}, fmt.Errorf("feedback concurrency must be positive")
+		return RunConfig{}, fmt.Errorf("--feedback-concurrency (NOTIFICATION_FEEDBACK_CONCURRENCY) must be positive")
 	}
 	if err := workerconfig.ValidateQueueTiming(hosted, config.ReceiveWait, config.InvalidVisibility); err != nil {
 		return RunConfig{}, err

@@ -198,13 +198,13 @@ func testRole(loads, runs *int) Role[roleConfig] {
 	return Role[roleConfig]{
 		Load: func(args []string, lookup func(string) (string, bool)) (roleConfig, error) {
 			*loads++
-			setting, _ := lookup("SETTING")
+			setting, _ := lookup("ROLE_SETTING")
 			secret, _ := lookup("SECRET")
 			if len(args) == 1 && args[0] == "-h" {
 				return roleConfig{}, &workerflag.Help{Usage: "Usage of role:\n"}
 			}
 			if setting == "" || len(args) != 0 {
-				return roleConfig{}, errors.New("SETTING is required")
+				return roleConfig{}, errors.New("ROLE_SETTING is required")
 			}
 			return roleConfig{setting: setting, secret: secret}, nil
 		},
@@ -228,7 +228,7 @@ func TestRoleMainLoadsItsConfigurationAndRunsUntilStopped(t *testing.T) {
 	loads, runs := 0, 0
 	var output bytes.Buffer
 	code := testRole(&loads, &runs).Main(context.Background(), nil, &output,
-		roleEnv(map[string]string{"SETTING": "on"}), newSupervisor(time.Second, signals))
+		roleEnv(map[string]string{"ROLE_SETTING": "on"}), newSupervisor(time.Second, signals))
 	if code != workerproc.ExitSuccess || loads != 1 || runs != 1 {
 		t.Fatalf("exit=%d loads=%d runs=%d output=%s", code, loads, runs, output.String())
 	}
@@ -240,7 +240,7 @@ func TestRoleMainExits78BeforeRunningOnABadSettingOrFlag(t *testing.T) {
 		var output bytes.Buffer
 		environment := map[string]string{}
 		if args != nil {
-			environment["SETTING"] = "on"
+			environment["ROLE_SETTING"] = "on"
 		}
 		code := testRole(&loads, &runs).Main(context.Background(), args, &output, roleEnv(environment),
 			newSupervisor(time.Second, make(chan os.Signal)))
@@ -254,7 +254,7 @@ func TestRoleMainExits78WithoutCredentialsUnderSystemd(t *testing.T) {
 	loads, runs := 0, 0
 	var output bytes.Buffer
 	code := testRole(&loads, &runs).Main(context.Background(), nil, &output,
-		roleEnv(map[string]string{"SETTING": "on", workerproc.SupervisorEnv: "systemd"}),
+		roleEnv(map[string]string{"ROLE_SETTING": "on", workerproc.SupervisorEnv: "systemd"}),
 		newSupervisor(time.Second, make(chan os.Signal)))
 	if code != workerproc.ExitConfiguration || loads != 0 || runs != 0 {
 		t.Fatalf("exit=%d loads=%d runs=%d", code, loads, runs)
@@ -293,7 +293,9 @@ func TestRoleMainServesTheSecretFromItsCredentialOnly(t *testing.T) {
 	code := role.Main(context.Background(), nil, &output,
 		roleEnv(map[string]string{"CREDENTIALS_DIRECTORY": dir, "SECRET": "env-file-password"}),
 		newSupervisor(time.Second, make(chan os.Signal)))
-	if code != workerproc.ExitConfiguration || loaded.secret != "" || bytes.Contains(output.Bytes(), []byte("password")) {
+	if code != workerproc.ExitConfiguration || loaded.secret != "" ||
+		bytes.Contains(output.Bytes(), []byte("env-file-password")) ||
+		bytes.Contains(output.Bytes(), []byte("credential-password")) {
 		t.Fatalf("exit=%d secret=%q output=%s", code, loaded.secret, output.String())
 	}
 }
@@ -302,7 +304,7 @@ func TestRoleMainPrintsTheUsageAndExits0OnHelp(t *testing.T) {
 	loads, runs := 0, 0
 	var output bytes.Buffer
 	code := testRole(&loads, &runs).Main(context.Background(), []string{"-h"}, &output,
-		roleEnv(map[string]string{"SETTING": "on"}), newSupervisor(time.Second, make(chan os.Signal)))
+		roleEnv(map[string]string{"ROLE_SETTING": "on"}), newSupervisor(time.Second, make(chan os.Signal)))
 	if code != workerproc.ExitSuccess || runs != 0 || output.String() != "Usage of role:\n" {
 		t.Fatalf("exit=%d runs=%d output=%q", code, runs, output.String())
 	}
@@ -313,7 +315,7 @@ func TestRoleMainNamesTheFailingSetting(t *testing.T) {
 	var output bytes.Buffer
 	testRole(&loads, &runs).Main(context.Background(), nil, &output, roleEnv(map[string]string{}),
 		newSupervisor(time.Second, make(chan os.Signal)))
-	if !strings.Contains(output.String(), `"settings":["SETTING"]`) {
+	if !strings.Contains(output.String(), `"settings":["ROLE_SETTING"]`) {
 		t.Fatalf("output = %s", output.String())
 	}
 }

@@ -53,7 +53,7 @@ func TestLoadAllowsFakeMessageIDOnlyForLocalFakeSender(t *testing.T) {
 		"SQS_NOTIFICATION_JOBS_URL": "https://sqs/jobs", "SQS_SES_EVENTS_URL": "https://sqs/events",
 		"SES_FROM_EMAIL": "alerts@example.com", "NOTIFICATION_FAKE_MESSAGE_ID": "provider_message_1",
 	}
-	if _, err := Load(nil, lookup(base)); err == nil || !strings.Contains(err.Error(), "fake message ID") {
+	if _, err := Load(nil, lookup(base)); err == nil || !strings.Contains(err.Error(), "NOTIFICATION_FAKE_MESSAGE_ID requires") {
 		t.Fatalf("AWS sender accepted fake message ID: %v", err)
 	}
 	base["NOTIFICATION_EMAIL_SENDER_MODE"] = "success"
@@ -62,7 +62,7 @@ func TestLoadAllowsFakeMessageIDOnlyForLocalFakeSender(t *testing.T) {
 	}
 	base["APP_ENV"] = "prod"
 	base["NOTIFICATION_MAX_SEND_RATE"] = "1"
-	if _, err := Load(nil, lookup(base)); err == nil || !strings.Contains(err.Error(), "fake email sender") {
+	if _, err := Load(nil, lookup(base)); err == nil || !strings.Contains(err.Error(), "NOTIFICATION_EMAIL_SENDER_MODE must be aws") {
 		t.Fatalf("production accepted fake sender: %v", err)
 	}
 }
@@ -208,10 +208,10 @@ func TestHostedEnvironmentAndQueueTiming(t *testing.T) {
 		wait, visibility  time.Duration
 		wantErrorFragment string
 	}{
-		{hosted: true, wait: 0, visibility: InvalidVisibility, wantErrorFragment: "zero receive wait"},
-		{hosted: true, wait: ReceiveWait, visibility: time.Second, wantErrorFragment: "short invalid visibility"},
-		{wait: 21 * time.Second, visibility: InvalidVisibility, wantErrorFragment: "receive wait"},
-		{wait: ReceiveWait, visibility: 13 * time.Hour, wantErrorFragment: "invalid visibility"},
+		{hosted: true, wait: 0, visibility: InvalidVisibility, wantErrorFragment: "--receive-wait may be 0s"},
+		{hosted: true, wait: ReceiveWait, visibility: time.Second, wantErrorFragment: "--invalid-visibility may be overridden"},
+		{wait: 21 * time.Second, visibility: InvalidVisibility, wantErrorFragment: "--receive-wait must be a whole number"},
+		{wait: ReceiveWait, visibility: 13 * time.Hour, wantErrorFragment: "--invalid-visibility must be a whole number"},
 	} {
 		err := ValidateQueueTiming(test.hosted, test.wait, test.visibility)
 		if err == nil || !strings.Contains(err.Error(), test.wantErrorFragment) {

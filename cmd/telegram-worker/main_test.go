@@ -89,7 +89,9 @@ func TestTelegramWorkerRefusesAnEnvFilePasswordNextToTheCredential(t *testing.T)
 	_, started, code, output := run(t, environment(map[string]string{
 		"CREDENTIALS_DIRECTORY": credentialsDirectory(t), "REDIS_PASSWORD": "env-file-password",
 	}))
-	if started || code != workerproc.ExitConfiguration || strings.Contains(output, "password\"") {
+	// The failure names the setting and the credential, never the value.
+	if started || code != workerproc.ExitConfiguration || strings.Contains(output, "env-file-password") ||
+		!strings.Contains(output, `"settings":["REDIS_PASSWORD","redis-password"]`) {
 		t.Fatalf("started=%t exit=%d output=%s", started, code, output)
 	}
 }

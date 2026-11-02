@@ -232,14 +232,35 @@ func validateRunConfig(
 	if config.DrainGrace <= 0 || config.DrainGrace >= config.GlobalDeadline {
 		return fmt.Errorf("drain-grace must be positive and less than global-deadline")
 	}
-	if config.PerRuleTimeout <= 0 || config.LeaseTTL <= config.PerRuleTimeout {
+	if config.PerRuleTimeout <= 0 {
+		return fmt.Errorf("per-rule-timeout must be positive")
+	}
+	if config.LeaseTTL <= config.PerRuleTimeout {
 		return fmt.Errorf("lease-ttl must be greater than per-rule-timeout")
 	}
-	if config.EvaluationParallelism < 1 || config.QueryParallelism < 1 || config.MaxRules < 1 || config.PageSize < 1 || config.SystemicErrorThreshold < 1 {
-		return fmt.Errorf("parallelism and work limits must be positive")
+	for _, limit := range []struct {
+		name  string
+		value int
+	}{
+		{"evaluation-parallelism", config.EvaluationParallelism}, {"query-parallelism", config.QueryParallelism},
+		{"max-rules", config.MaxRules}, {"page-size", config.PageSize},
+		{"systemic-error-threshold", config.SystemicErrorThreshold}, {"min-points", config.MinimumPoints},
+	} {
+		if limit.value < 1 {
+			return fmt.Errorf("%s must be positive", limit.name)
+		}
 	}
-	if config.ExpectedSampleInterval <= 0 || config.MinimumCoverageRatio <= 0 || config.MinimumCoverageRatio > 1 || config.MinimumPoints < 1 || config.AllowedLateness < 0 || config.MaximumSampleAge <= 0 {
-		return fmt.Errorf("quality settings are invalid")
+	if config.ExpectedSampleInterval <= 0 {
+		return fmt.Errorf("expected-sample-interval must be positive")
+	}
+	if config.MinimumCoverageRatio <= 0 || config.MinimumCoverageRatio > 1 {
+		return fmt.Errorf("min-coverage-ratio must be greater than 0 and at most 1")
+	}
+	if config.AllowedLateness < 0 {
+		return fmt.Errorf("allowed-lateness must not be negative")
+	}
+	if config.MaximumSampleAge <= 0 {
+		return fmt.Errorf("max-sample-age must be positive")
 	}
 	if config.TelemetrySource != TelemetrySourceLegacy && config.TelemetrySource != TelemetrySourceV2 {
 		return fmt.Errorf("telemetry-source must be legacy or v2")

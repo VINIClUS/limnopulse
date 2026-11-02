@@ -5,7 +5,7 @@ from pathlib import Path
 
 import pytest
 
-from tests.support.go_sources import MODULE, closure, closure_files
+from tests.support.go_sources import MODULE, closure, closure_files, strip_comments
 from tests.support.worker_roles import load_roles, roles_by_name
 
 ROOT = Path(__file__).resolve().parents[2]
@@ -40,6 +40,45 @@ SECRET_KEYS = {
 }
 
 
+# Each continuous role's loader and the package whose shutdown constants it uses.
+# The feedback worker reuses the email worker's drain constant.
+STOP_CONSTANTS = {
+    "email-worker": (
+        "internal/notifications/worker/config/config.go",
+        "internal/notifications/worker/config/config.go",
+    ),
+    "ses-feedback-worker": (
+        "internal/notifications/feedback/config/config.go",
+        "internal/notifications/worker/config/config.go",
+    ),
+    "telegram-worker": (
+        "internal/notifications/telegramworker/config/config.go",
+        "internal/notifications/telegramworker/config/config.go",
+    ),
+}
+# Every configuration error names its setting, so a 78 exit's failure line can (ADR-020).
+SETTING_LOADERS = (
+    "internal/alertevaluator/config.go",
+    "internal/notifications/relay/config/config.go",
+    "internal/notifications/worker/config/config.go",
+    "internal/notifications/feedback/config/config.go",
+    "internal/notifications/telegramworker/config/config.go",
+    "cmd/email-worker/main.go",
+    "cmd/limnopulse-admin/main.go",
+)
+ERROR_CALL = re.compile(r'(?:fmt\.Errorf|errors\.New)\(\s*"((?:[^"\\]|\\.)*)"(?:\s*,\s*([\w.]+))?')
+# What workercmd.Settings reads: an env key, a --flag, "<flag> must|is|may ..." or a credential.
+NAMED_SETTING = re.compile(
+    r"[A-Z][A-Z0-9]*(?:_[A-Z0-9]+)+|(?:^|[\s(])--[a-z]"
+    r"|^[a-z][a-z0-9]*(?:-[a-z0-9]+)+ (?:must|is|may)\b|credential"
+)
+# A message whose leading %s is a setting name passed by the loader.
+NAME_ARGUMENT = re.compile(r"(?:^|\.)(?:key|name|flag|flagName)$")
+# Argument-shape errors name no setting; they are argv mistakes.
+ARGV_ERRORS = re.compile(r"positional arguments|^expected a command: ")
+STRING_LITERAL = re.compile(r'"(?:[^"\\]|\\.)*"|`[^`]*`')
+
+
 def _production_files(directory: Path) -> list[Path]:
     return sorted(
         path for path in directory.glob("*.go") if not path.name.endswith("_test.go")
@@ -53,6 +92,12 @@ def _production_source(directory: Path) -> str:
 def _ses_links(entrypoint: str) -> list[str]:
     return sorted(package for package in closure(entrypoint) if SES_PACKAGE.search(package))
 
+
+def _seconds(path: str, name: str) -> int:
+    source = (ROOT / path).read_text(encoding="utf-8")
+    match = re.search(rf"^\s*{name}\s*=\s*(\d+) \* time\.Second$", source, re.MULTILINE)
+    assert match, (path, name)
+    return int(match.group(1))
 
 def _role(name: str) -> dict:
     return roles_by_name(load_roles())[name]
@@ -230,3 +275,47 @@ def test_email_and_ses_feedback_are_separate_processes_with_separate_loaders() -
 def test_only_the_email_worker_links_ses(name: str) -> None:
     assert _ses_links(f"cmd/{name}") == []
     assert _ses_links("cmd/email-worker")
+
+
+@pytest.mark.parametrize("name", CONTINUOUS_ROLES)
+def test_a_stop_drains_and_flushes_within_the_units_stop_timeout(name: str) -> None:
+    # On SIGTERM a role drains in-flight work, then flushes telemetry; systemd kills it after
+    # TimeoutStopSec, which would cut a send or a delivery-state write short.
+    loader, constants = STOP_CONSTANTS[name]
+    source = (ROOT / loader).read_text(encoding="utf-8")
+    # The drain budget is a constant, not a setting an env file or flag could raise.
+    code = strip_comments(source)
+    assert re.search(r"DrainTimeout:\s+(?:workerconfig\.)?DrainTimeout,", code)
+    assert not [text for text in STRING_LITERAL.findall(code) if "drain" in text.lower()]
+    assert not re.search(r"&config\.DrainTimeout\b|config\.DrainTimeout\s*=[^=]", code)
+    budget = _seconds(constants, "DrainTimeout") + _seconds(constants, "OTLPFlushTimeout")
+    assert budget < _role(name)["timeout_stop_seconds"], (name, budget)
+
+
+def test_the_legacy_duplication_exclusion_lives_only_as_long_as_cmd_notifications() -> None:
+    properties = (ROOT / "sonar-project.properties").read_text(encoding="utf-8")
+    exclusions = re.findall(r"^sonar\.cpd\.exclusions=.*$", properties, re.MULTILINE)
+    legacy = ["sonar.cpd.exclusions=cmd/notifications/**"]
+    assert exclusions == (legacy if (ROOT / "cmd/notifications").exists() else [])
+
+
+@pytest.mark.parametrize("loader", SETTING_LOADERS)
+def test_each_configuration_error_names_its_setting(loader: str) -> None:
+    code = strip_comments((ROOT / loader).read_text(encoding="utf-8"))
+    # A message built elsewhere (errors.New(check.message)) would escape this check.
+    calls = re.findall(r"(?:fmt\.Errorf|errors\.New)\(", code)
+    messages = ERROR_CALL.findall(code)
+    assert messages, loader
+    assert len(messages) == len(calls), loader
+    for message, argument in messages:
+        if NAMED_SETTING.search(message) or ARGV_ERRORS.search(message):
+            continue
+        assert re.match(r"(?:--)?%s\b", message) and NAME_ARGUMENT.search(argument), message
+
+
+def test_shard_errors_name_the_shard_flags() -> None:
+    for path in ("internal/alertevaluator/schedule.go", "internal/notifications/schedule.go"):
+        messages = [m for m, _ in ERROR_CALL.findall((ROOT / path).read_text(encoding="utf-8"))]
+        shard = [message for message in messages if "shard" in message]
+        assert len(shard) == 2, path
+        assert all(message.startswith(("--shard-count ", "--shard ")) for message in shard), shard
