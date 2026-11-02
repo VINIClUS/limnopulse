@@ -229,3 +229,26 @@ func lookup(values map[string]string) LookupEnv {
 		return value, ok
 	}
 }
+
+func TestLoadNamesTheSettingThatFailed(t *testing.T) {
+	base := map[string]string{
+		"APP_ENV": "local", "AWS_REGION": "sa-east-1", "DYNAMODB_DOMAIN_TABLE": "domain",
+		"SQS_NOTIFICATION_JOBS_URL": "https://sqs/jobs", "SES_FROM_EMAIL": "alerts@example.com",
+		"SQS_SES_EVENTS_URL": "https://sqs/events",
+	}
+	for _, test := range []struct {
+		args   []string
+		prefix string
+	}{
+		{[]string{"--send-concurrency=0"}, "--send-concurrency (NOTIFICATION_SEND_CONCURRENCY) must be positive"},
+		{[]string{"--feedback-concurrency=0"}, "--feedback-concurrency (NOTIFICATION_FEEDBACK_CONCURRENCY) must be positive"},
+		{[]string{"--max-send-rate=0"}, "--max-send-rate (NOTIFICATION_MAX_SEND_RATE) must be a positive number"},
+		{[]string{"--max-send-rate=+Inf"}, "--max-send-rate (NOTIFICATION_MAX_SEND_RATE) must be a positive number"},
+		{[]string{"--send-burst=0"}, "--send-burst (NOTIFICATION_SEND_BURST) must be positive"},
+		{[]string{"--invalid-visibility=0s"}, "--invalid-visibility must be a whole number"},
+	} {
+		if _, err := Load(test.args, lookup(base)); err == nil || !strings.HasPrefix(err.Error(), test.prefix) {
+			t.Fatalf("Load(%v) error = %v, want %q", test.args, err, test.prefix)
+		}
+	}
+}

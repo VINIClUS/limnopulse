@@ -93,3 +93,46 @@ func clone(values map[string]string) map[string]string {
 	}
 	return copy
 }
+
+func TestLoadNamesTheSettingThatFailed(t *testing.T) {
+	local := map[string]string{
+		"APP_ENV": "test", "TELEGRAM_DELIVERY_ENABLED": "true", "AWS_REGION": "us-east-1",
+		"DYNAMODB_DOMAIN_TABLE": "domain", "SQS_TELEGRAM_JOBS_URL": "queue",
+		"REDIS_ADDR": "redis:6379", "TELEGRAM_BOT_TOKEN": "token",
+	}
+	hosted := map[string]string{
+		"APP_ENV": "prod", "TELEGRAM_DELIVERY_ENABLED": "true", "AWS_REGION": "sa-east-1",
+		"DYNAMODB_DOMAIN_TABLE": "domain", "SQS_TELEGRAM_JOBS_URL": "https://sqs/telegram",
+		"REDIS_ADDR":                    "redis.internal:6379",
+		"TELEGRAM_BOT_TOKEN_SECRET_ARN": "arn:aws:secretsmanager:sa-east-1:123:secret:telegram",
+	}
+	for _, test := range []struct {
+		base   map[string]string
+		key    string
+		value  string
+		args   []string
+		prefix string
+	}{
+		{base: local, key: "TELEGRAM_SEND_CONCURRENCY", value: "0", prefix: "--send-concurrency (TELEGRAM_SEND_CONCURRENCY) must be positive"},
+		{base: local, key: "TELEGRAM_GLOBAL_RATE", value: "+Inf", prefix: "TELEGRAM_GLOBAL_RATE must be a positive number"},
+		{base: local, key: "TELEGRAM_DESTINATION_RATE", value: "NaN", prefix: "TELEGRAM_DESTINATION_RATE must be a positive number"},
+		{base: local, key: "TELEGRAM_GLOBAL_BURST", value: "0", prefix: "TELEGRAM_GLOBAL_BURST must be positive"},
+		{base: local, key: "TELEGRAM_DESTINATION_BURST", value: "0", prefix: "TELEGRAM_DESTINATION_BURST must be positive"},
+		{base: local, key: "REDIS_DB", value: "-1", prefix: "REDIS_DB must not be negative"},
+		{base: local, args: []string{"--receive-wait=500ms"}, prefix: "--receive-wait must be a whole number"},
+		{base: local, args: []string{"--invalid-visibility=0s"}, prefix: "--invalid-visibility must be a whole number"},
+		{base: hosted, args: []string{"--receive-wait=0s"}, prefix: "--receive-wait may be 0s only in local or test"},
+		{base: hosted, args: []string{"--invalid-visibility=1s"}, prefix: "--invalid-visibility may be overridden"},
+	} {
+		values := clone(test.base)
+		if test.key != "" {
+			values[test.key] = test.value
+		}
+		if _, err := Load(test.args, lookup(values)); err == nil || !strings.HasPrefix(err.Error(), test.prefix) {
+			t.Fatalf("Load(%v, %s=%s) error = %v, want %q", test.args, test.key, test.value, err, test.prefix)
+		}
+	}
+	if _, err := Load(nil, lookup(hosted)); err != nil {
+		t.Fatalf("hosted defaults rejected: %v", err)
+	}
+}

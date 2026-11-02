@@ -1,6 +1,7 @@
 package alertevaluator
 
 import (
+	"strings"
 	"testing"
 	"time"
 )
@@ -171,5 +172,32 @@ func TestStagingValidationIsUnchangedByTelemetrySource(t *testing.T) {
 	delete(hosted, "TELEGRAM_DELIVERY_ENABLED")
 	if _, err := LoadRunConfig([]string{"--telemetry-source=v2"}, env(hosted)); err == nil {
 		t.Fatal("telemetry source relaxed the explicit Telegram flag rule")
+	}
+}
+
+func TestLoadRunConfigNamesTheSettingThatFailed(t *testing.T) {
+	for _, test := range []struct {
+		args   []string
+		prefix string
+	}{
+		{[]string{"--shard-count=0"}, "--shard-count must be between"},
+		{[]string{"--shard=1", "--shard-count=1"}, "--shard must be between 0 and --shard-count minus 1"},
+		{[]string{"--per-rule-timeout=0s"}, "per-rule-timeout must be positive"},
+		{[]string{"--per-rule-timeout=20s", "--lease-ttl=15s"}, "lease-ttl must be greater than per-rule-timeout"},
+		{[]string{"--evaluation-parallelism=0"}, "evaluation-parallelism must be positive"},
+		{[]string{"--query-parallelism=0"}, "query-parallelism must be positive"},
+		{[]string{"--max-rules=0"}, "max-rules must be positive"},
+		{[]string{"--page-size=0"}, "page-size must be positive"},
+		{[]string{"--systemic-error-threshold=0"}, "systemic-error-threshold must be positive"},
+		{[]string{"--min-points=0"}, "min-points must be positive"},
+		{[]string{"--expected-sample-interval=0s"}, "expected-sample-interval must be positive"},
+		{[]string{"--min-coverage-ratio=0"}, "min-coverage-ratio must be greater than 0 and at most 1"},
+		{[]string{"--min-coverage-ratio=1.5"}, "min-coverage-ratio must be greater than 0 and at most 1"},
+		{[]string{"--allowed-lateness=-1s"}, "allowed-lateness must not be negative"},
+		{[]string{"--max-sample-age=0s"}, "max-sample-age must be positive"},
+	} {
+		if _, err := LoadRunConfig(test.args, env(nil)); err == nil || !strings.HasPrefix(err.Error(), test.prefix) {
+			t.Fatalf("LoadRunConfig(%v) error = %v, want %q", test.args, err, test.prefix)
+		}
 	}
 }
