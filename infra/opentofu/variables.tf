@@ -298,6 +298,20 @@ variable "worker_alarm_email" {
   }
 }
 
+variable "limnopulse_admin_trusted_principal_arns" {
+  description = "IAM user or role ARNs, ArnLike patterns allowed, that may assume the limnopulse-admin role (matched on aws:PrincipalArn). For a role session, including an IAM Identity Center one, give the role's ARN, never the session's. Empty trusts every principal in this account whose own policy allows sts:AssumeRole on the role; set it to the operators' principals in the untracked tfvars."
+  type        = list(string)
+  default     = []
+
+  validation {
+    condition = alltrue([
+      for arn in var.limnopulse_admin_trusted_principal_arns :
+      can(regex("^arn:aws:iam::[0-9]{12}:(user|role)/\\S+$", arn))
+    ])
+    error_message = "limnopulse_admin_trusted_principal_arns must hold IAM user or role ARNs (arn:aws:iam::<account>:user/... or :role/...)."
+  }
+}
+
 locals {
   # Owner=vinisantana matches the design spec's tagging contract (§ resource
   # tagging): every taggable resource carries Project/Environment/ManagedBy/

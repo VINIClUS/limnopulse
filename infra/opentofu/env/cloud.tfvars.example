@@ -69,3 +69,9 @@ worker_queue_age_alarm_threshold_seconds = 300
 worker_queue_depth_alarm_threshold       = 100
 worker_alarm_actions                     = []
 worker_alarm_email                       = ""
+
+# The principals that may assume the limnopulse-admin role. Empty trusts any principal in the
+# account that is allowed sts:AssumeRole on it. Set the operators' role or user ARNs in the
+# untracked copy, for example "arn:aws:iam::<account>:role/<operator-role>". For IAM Identity
+# Center, give the permission set's role ARN with a wildcard, never a session ARN.
+limnopulse_admin_trusted_principal_arns = []

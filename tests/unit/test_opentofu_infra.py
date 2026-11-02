@@ -464,6 +464,7 @@ ADR020_VARIABLES = {
     "worker_queue_depth_alarm_threshold",
     "worker_alarm_actions",
     "worker_alarm_email",
+    "limnopulse_admin_trusted_principal_arns",
 }
 ADR020_OUTPUTS = {
     "alert_evaluator_iam_user_name",
@@ -1270,6 +1271,8 @@ def test_worker_enable_variables_are_false_bools_for_every_unit_role() -> None:
         assert re.search(rf"^{name}\s+=\s+\S", tfvars, re.MULTILINE), name
     assert variables["worker_alarm_actions"].attrs["default"] == "[]"
     assert re.search(r'^worker_alarm_email\s+=\s+""$', tfvars, re.MULTILINE)
+    assert variables["limnopulse_admin_trusted_principal_arns"].attrs["default"] == "[]"
+    assert re.search(r"^limnopulse_admin_trusted_principal_arns\s+=\s+\[\]$", tfvars, re.MULTILINE)
 
 
 def test_worker_principals_are_one_per_go_role_and_gated_with_their_channel() -> None:
@@ -1304,10 +1307,24 @@ def test_the_admin_role_trusts_only_this_account() -> None:
     assert set(statement.attrs) == {"sid", "effect", "actions"}
     assert statement.attrs["effect"] == '"Allow"'
     assert _list_items(statement.attrs["actions"]) == ['"sts:AssumeRole"']
-    assert [block.kind for block in statement.blocks] == ["principals"]
+    assert [block.kind for block in statement.blocks] == ["principals", "condition"]
     assert _statement_principal(statement) == (
         '"AWS"',
         ['"arn:aws:iam::${data.aws_caller_identity.workers.account_id}:root"'],
+    )
+    # aws:PrincipalArn narrows the account to the operators' list; unset, it allows exactly
+    # what the root trust allows.
+    (condition,) = statement.nested("condition")
+    assert condition.attrs == {
+        "test": '"ArnLike"',
+        "variable": '"aws:PrincipalArn"',
+        "values": "local.limnopulse_admin_trusted_principal_arns",
+    }
+    (local,) = [block for block in blocks if block.kind == "locals"]
+    assert re.sub(r"\s+", " ", local.attrs["limnopulse_admin_trusted_principal_arns"]) == (
+        "( length(var.limnopulse_admin_trusted_principal_arns) > 0"
+        " ? var.limnopulse_admin_trusted_principal_arns"
+        ' : ["arn:aws:iam::${data.aws_caller_identity.workers.account_id}:*"] )'
     )
 
 

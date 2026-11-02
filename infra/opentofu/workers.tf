@@ -1,6 +1,7 @@
 # ADR-020: one IAM principal per worker role (ops/workers/roles.yaml `iam_principal`). Each
-# policy grants exactly the actions its role's Go import closure (cmd/<role>) calls, on the
-# queues, table, indexes, secret and SES resources that role uses.
+# policy grants exactly the actions its role's Go import closure (cmd/<role>) calls, less a
+# file the role links but provably never runs, on the queues, table, indexes, secret and SES
+# resources that role uses.
 # tests/unit/test_iam_runtime_transactions.py derives those actions from the Go sources and
 # fails on any grant that is missing, extra or scoped to the wrong resource. No policy here
 # is shared between two principals, and none of the older shared policies (ses.tf
@@ -12,9 +13,10 @@
 #
 # Users are gated like the resources they use: the email and SES-feedback principals with
 # var.email_delivery, the Telegram principal with var.telegram_delivery. The other three
-# users and the admin role are unconditional because their queue and table always exist. The <role>_enabled variables
-# gate only alarm actions (worker_alarms.tf), never a principal: a unit must run with its
-# key before its first datapoint, and the enable variable comes last.
+# users and the admin role are unconditional because their queue and table always exist.
+# The <role>_enabled variables gate only alarm actions (worker_alarms.tf), never a
+# principal: a unit must run with its key before its first datapoint, and the enable
+# variable comes last.
 
 data "aws_caller_identity" "workers" {}
 
@@ -23,6 +25,14 @@ locals {
   # email principal's policy refuses to plan without a bare mailbox, so the empty default
   # never reaches an ARN.
   workers_ses_from_domain = try(split("@", var.ses_from_address)[1], "")
+
+  # The principals the limnopulse-admin trust allows: the operators' list when set, else
+  # every IAM principal of this account, which the root trust already allows.
+  limnopulse_admin_trusted_principal_arns = (
+    length(var.limnopulse_admin_trusted_principal_arns) > 0
+    ? var.limnopulse_admin_trusted_principal_arns
+    : ["arn:aws:iam::${data.aws_caller_identity.workers.account_id}:*"]
+  )
 }
 
 # --- alert-evaluator: rules -> outbox ------------------------------------------------------
@@ -47,16 +57,14 @@ data "aws_iam_policy_document" "alert_evaluator_runtime" {
     resources = [aws_dynamodb_table.domain.arn]
   }
 
-  # The due-rule scan reads the AlertEvaluationByDue index. The closure also links the
-  # schedule backfill, which queries the table itself.
+  # The due-rule scan reads the AlertEvaluationByDue index, never the table itself. The
+  # closure links the schedule backfills (alertevaluator/dynamo/backfill.go), which query the
+  # table, but only limnopulse-admin runs them.
   statement {
-    sid     = "DomainTableQuery"
-    effect  = "Allow"
-    actions = ["dynamodb:Query"]
-    resources = [
-      aws_dynamodb_table.domain.arn,
-      "${aws_dynamodb_table.domain.arn}/index/AlertEvaluationByDue",
-    ]
+    sid       = "DomainIndexQuery"
+    effect    = "Allow"
+    actions   = ["dynamodb:Query"]
+    resources = ["${aws_dynamodb_table.domain.arn}/index/AlertEvaluationByDue"]
   }
 }
 
@@ -400,8 +408,9 @@ resource "aws_iam_user_policy_attachment" "worker_monitor_runtime" {
 # A role, not a user. The backfills run by hand, rarely, and no enable variable would ever
 # retire a standing key, so the operator assumes this role for one run instead. The binary
 # then holds exactly these grants and only short-lived credentials. The trust names the
-# account itself: only an identity in this account that is granted sts:AssumeRole on the
-# role can assume it.
+# account itself, so only an identity in this account that is granted sts:AssumeRole on the
+# role can assume it. aws:PrincipalArn narrows that to var.limnopulse_admin_trusted_principal_arns
+# once the operators set it.
 data "aws_iam_policy_document" "limnopulse_admin_trust" {
   statement {
     sid     = "AccountOperators"
@@ -411,6 +420,12 @@ data "aws_iam_policy_document" "limnopulse_admin_trust" {
     principals {
       type        = "AWS"
       identifiers = ["arn:aws:iam::${data.aws_caller_identity.workers.account_id}:root"]
+    }
+
+    condition {
+      test     = "ArnLike"
+      variable = "aws:PrincipalArn"
+      values   = local.limnopulse_admin_trusted_principal_arns
     }
   }
 }
@@ -424,29 +439,22 @@ resource "aws_iam_role" "limnopulse_admin" {
   tags = local.common_tags
 }
 
-# The backfills query the table and update items. The closure also links the evaluator store
-# package (alertevaluator/dynamo), whose due-rule index query, GetItem and transaction Put
-# items are granted with it.
+# The backfills query the table and update items, nothing else. They share a package with
+# the evaluator's store (alertevaluator/dynamo/store.go), so the closure links it, but the
+# admin binary runs none of the store's reads or writes.
 data "aws_iam_policy_document" "limnopulse_admin_runtime" {
   statement {
-    sid    = "DomainTableItems"
-    effect = "Allow"
-    actions = [
-      "dynamodb:GetItem",
-      "dynamodb:PutItem",
-      "dynamodb:UpdateItem",
-    ]
+    sid       = "DomainTableItems"
+    effect    = "Allow"
+    actions   = ["dynamodb:UpdateItem"]
     resources = [aws_dynamodb_table.domain.arn]
   }
 
   statement {
-    sid     = "DomainTableQuery"
-    effect  = "Allow"
-    actions = ["dynamodb:Query"]
-    resources = [
-      aws_dynamodb_table.domain.arn,
-      "${aws_dynamodb_table.domain.arn}/index/AlertEvaluationByDue",
-    ]
+    sid       = "DomainTableQuery"
+    effect    = "Allow"
+    actions   = ["dynamodb:Query"]
+    resources = [aws_dynamodb_table.domain.arn]
   }
 }
 

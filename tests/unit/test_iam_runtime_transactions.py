@@ -38,9 +38,10 @@ the unit-health namespace). Nothing more, nothing less, and nothing the scan can
 import ast
 import copy
 import functools
+import itertools
 import os
 import re
-from collections.abc import Callable, Iterable, Iterator, Mapping
+from collections.abc import Callable, Iterable, Iterator, Mapping, Sequence
 from dataclasses import dataclass, field
 from pathlib import Path
 
@@ -2011,6 +2012,7 @@ handler = __import__("pkg.handlers")
             "pkg/renamed.py",
             """
 import functools
+import itertools
 from builtins import getattr as lookup
 from operator import attrgetter, methodcaller as caller
 
@@ -2044,6 +2046,9 @@ class Renamed:
 # `<service>.<Op>Input`, and a transaction item wherever it names `types.Put` and friends. So an
 # operation counts whether it is called, declared in a client interface or built and passed on. A
 # package the role links but never runs still adds grants, which keeps the scan on the safe side.
+# The one narrowing is GO_ROLE_UNRUN_FILES: a file listed there drops out of that role's scan, and
+# `_assert_never_run` fails unless no code reachable from the role's `main`, an `init` or a
+# package variable can run one of the file's AWS-naming functions.
 
 GO_AWS_OPERATIONS: dict[str, dict[str, str | None]] = {
     "dynamodb": {
@@ -2120,6 +2125,46 @@ GO_ROLE_FLOORS = {
     "worker-monitor": {("cloudwatch:PutMetricData", "*")},
     "limnopulse-admin": {("dynamodb:Query", "table"), ("dynamodb:UpdateItem", "table")},
 }
+# Files a role links, through a package it needs, but never runs. internal/alertevaluator/dynamo
+# holds both the evaluator's store and the schedule backfills, and only limnopulse-admin calls the
+# backfills.
+GO_ROLE_UNRUN_FILES = {
+    "alert-evaluator": frozenset({"internal/alertevaluator/dynamo/backfill.go"}),
+    "limnopulse-admin": frozenset({"internal/alertevaluator/dynamo/store.go"}),
+}
+# Methods the runtime, the standard library or the AWS SDK may call through an interface the
+# module never names. Each counts as reachable from the start.
+GO_IMPLICIT_METHODS = frozenset(
+    {
+        "As",
+        "Close",
+        "Do",
+        "Error",
+        "Format",
+        "GoString",
+        "Is",
+        "Len",
+        "Less",
+        "LogValue",
+        "MarshalBinary",
+        "MarshalJSON",
+        "MarshalText",
+        "Read",
+        "Retrieve",
+        "RoundTrip",
+        "Scan",
+        "ServeHTTP",
+        "Set",
+        "String",
+        "Swap",
+        "UnmarshalBinary",
+        "UnmarshalJSON",
+        "UnmarshalText",
+        "Unwrap",
+        "Value",
+        "Write",
+    }
+)
 
 _SES_IDENTITY_ARN = (
     '"arn:aws:ses:${var.aws_region}:${data.aws_caller_identity.workers.account_id}:identity/'
@@ -2237,7 +2282,9 @@ def _go_queries(
     return targets, fields
 
 
-def _derive_go_role(files: Iterable[go_sources.GoFile], linked: Iterable[str]) -> _GoRole:
+def _derive_go_role(
+    files: Iterable[go_sources.GoFile], linked: Iterable[str], unrun: frozenset[str] = frozenset()
+) -> _GoRole:
     for package in linked:
         if not package.startswith("github.com/aws/"):
             continue
@@ -2247,6 +2294,7 @@ def _derive_go_role(files: Iterable[go_sources.GoFile], linked: Iterable[str]) -
             f"unmodelled AWS package {package}"
         )
     files = list(files)
+    # Constants resolve against every file, an unrun one too: it still compiles into the binary.
     packages: dict[str, list[go_sources.GoFile]] = {}
     for file in files:
         packages.setdefault(file.package, []).append(file)
@@ -2254,6 +2302,8 @@ def _derive_go_role(files: Iterable[go_sources.GoFile], linked: Iterable[str]) -
     queries: set[str] = set()
     env_keys: set[str] = set()
     for file in files:
+        if file.relative in unrun:
+            continue
         blank = _blank_go_literals(file.code)
         env_keys |= set(re.findall(r'"([A-Z][A-Z0-9]*(?:_[A-Z0-9]+)+)"', file.code))
         index_fields = 0
@@ -2270,6 +2320,10 @@ def _derive_go_role(files: Iterable[go_sources.GoFile], linked: Iterable[str]) -
                             qualified + r"(Put|Update|Delete|ConditionCheck)\b", blank
                         ):
                             operations.add(ITEM_ACTIONS[match.group(1)])
+                    # SendEmail authorizes a template resource too, which no policy grants.
+                    assert service != "sesv2" or not re.search(qualified + r"Template\b", blank), (
+                        f"{file.relative}: a templated send needs the SES template resource"
+                    )
                     continue
                 for match in re.finditer(qualified + r"(\w+)Input\b", blank):
                     operation = match.group(1)
@@ -2291,9 +2345,115 @@ def _derive_go_role(files: Iterable[go_sources.GoFile], linked: Iterable[str]) -
     return _GoRole(frozenset(operations), frozenset(queries), frozenset(env_keys))
 
 
+def _go_declarations(file: go_sources.GoFile) -> Iterator[tuple[str, str | None, str]]:
+    """(kind, name, blanked text) of every top-level func, method and var declaration.
+
+    gofmt starts every top-level declaration in column 0 and indents everything inside one.
+    """
+    blank = _blank_go_literals(file.code)
+    starts = [match.start() for match in re.finditer(r"(?m)^[A-Za-z]", blank)] + [len(blank)]
+    for start, end in itertools.pairwise(starts):
+        text = blank[start:end]
+        if match := re.match(r"func\s*(\([^)]*\)\s*)?(\w+)", text):
+            yield ("method" if match.group(1) else "func", match.group(2), text)
+        elif text.startswith("var"):
+            yield ("var", None, text)
+
+
+def _go_reachable(
+    files: Sequence[go_sources.GoFile], main_package: str
+) -> set[tuple[str, str | None, str]]:
+    """(file, name, text) of every declaration that code reachable from `main` may run.
+
+    The roots are `main`, every `init`, every package variable and every GO_IMPLICIT_METHODS
+    method. A bare `name` reaches that package function, `alias.name` the function in the
+    imported package, and any `.name` every method of that name in the closure, so a name
+    collision can only add reach.
+    """
+    functions: dict[tuple[str, str], list[tuple[str, str | None, str]]] = {}
+    methods: dict[str, list[tuple[str, str | None, str]]] = {}
+    files_by_name = {file.relative: file for file in files}
+    roots: list[tuple[str, str | None, str]] = []
+    for file in files:
+        blank = _blank_go_literals(file.code)
+        assert re.search(r"\bMethodByName\b", blank) is None, (
+            f"{file.relative}: a method called by a name the scan cannot see"
+        )
+        for kind, name, text in _go_declarations(file):
+            declaration = (file.relative, name, text)
+            if kind == "func":
+                functions.setdefault((file.package, name), []).append(declaration)
+            elif kind == "method":
+                methods.setdefault(name, []).append(declaration)
+            if (
+                kind == "var"
+                or (kind == "func" and name == "init")
+                or (kind == "func" and name == "main" and file.package == main_package)
+                or (kind == "method" and name in GO_IMPLICIT_METHODS)
+            ):
+                roots.append(declaration)
+    reached: set[tuple[str, str | None, str]] = set()
+    pending = roots
+    while pending:
+        declaration = pending.pop()
+        if declaration in reached:
+            continue
+        reached.add(declaration)
+        file = files_by_name[declaration[0]]
+        aliases = {alias: path for path, names in file.imports.items() for alias in names}
+        text = declaration[2]
+        for match in re.finditer(r"(?<![\w.])([A-Za-z_]\w*)(?:\s*\.\s*([A-Za-z_]\w*))?", text):
+            first, second = match.groups()
+            if second and first in aliases:
+                pending += functions.get((aliases[first], second), [])
+            else:
+                pending += functions.get((file.package, first), [])
+        for name in re.findall(r"\.\s*([A-Za-z_]\w*)", text):
+            pending += methods.get(name, [])
+    return reached
+
+
+def _names_aws_operation(file: go_sources.GoFile, text: str) -> bool:
+    """Whether `text` names an AWS operation input or a DynamoDB transaction item."""
+    for path, names in file.imports.items():
+        if not path.startswith(_GO_SERVICE):
+            continue
+        sub = path.removeprefix(_GO_SERVICE).partition("/")[2]
+        shape = r"(?:Put|Update|Delete|ConditionCheck)\b" if sub == "types" else r"\w+Input\b"
+        for name in names - {"_"}:
+            if re.search(rf"(?<![\w.]){re.escape(name)}\s*\.\s*{shape}", text):
+                return True
+    return False
+
+
+def _assert_never_run(
+    files: Sequence[go_sources.GoFile], main_package: str, unrun: frozenset[str]
+) -> None:
+    """Fail unless each unrun file is linked, names an AWS operation and none of it is reached."""
+    if not unrun:
+        return
+    by_name = {file.relative: file for file in files}
+    reached = _go_reachable(files, main_package)
+    for relative in sorted(unrun):
+        assert relative in by_name, f"{relative} is not in the closure any more"
+        file = by_name[relative]
+        naming = {
+            (relative, name, text)
+            for _, name, text in _go_declarations(file)
+            if _names_aws_operation(file, text)
+        }
+        assert naming, f"{relative} names no AWS operation, so excluding it changes nothing"
+        ran = sorted(name or "a package variable" for _, name, _ in naming & reached)
+        assert not ran, f"{relative} is not unrun: {main_package} reaches {', '.join(ran)}"
+
+
 @functools.cache
-def _go_role(entrypoint: str) -> _GoRole:
-    return _derive_go_role(go_sources.closure_files(entrypoint), go_sources.closure(entrypoint))
+def _go_role(name: str) -> _GoRole:
+    entrypoint = roles_by_name(load_roles())[name]["entrypoint"]
+    files = go_sources.closure_files(entrypoint)
+    unrun = GO_ROLE_UNRUN_FILES.get(name, frozenset())
+    _assert_never_run(files, go_sources.MODULE + entrypoint, unrun)
+    return _derive_go_role(files, go_sources.closure(entrypoint), unrun)
 
 
 def _setting_resources(texts: Mapping[str, str]) -> dict[str, str]:
@@ -2495,7 +2655,7 @@ def _required_for(texts: Mapping[str, str], name: str) -> set[Grant]:
     role = roles_by_name(table)[name]
     return _role_requirements(
         role,
-        _go_role(role["entrypoint"]),
+        _go_role(name),
         _setting_resources(texts),
         table["unit_health"]["namespace"],
     )
@@ -2594,7 +2754,7 @@ def test_derived_indexes_are_domain_table_indexes() -> None:
     derived = {
         target.removeprefix("index/")
         for name in GO_ROLE_NAMES
-        for target in _go_role(roles_by_name(load_roles())[name]["entrypoint"]).queries
+        for target in _go_role(name).queries
         if target.startswith("index/")
     }
 
@@ -2686,6 +2846,13 @@ def test_go_role_scanner_reads_operations_items_and_indexes() -> None:
             id="waiter",
         ),
         pytest.param(
+            'import sestypes "github.com/aws/aws-sdk-go-v2/service/sesv2/types"\n'
+            "func s() { _ = sestypes.EmailContent{Template: &sestypes.Template{}} }",
+            {"github.com/aws/aws-sdk-go-v2/service/sesv2/types"},
+            "a templated send needs the SES template resource",
+            id="ses-template",
+        ),
+        pytest.param(
             "", {"github.com/aws/aws-sdk-go-v2/service/s3"}, "unmodelled AWS package", id="service"
         ),
         pytest.param(
@@ -2699,6 +2866,164 @@ def test_go_role_scanner_reads_operations_items_and_indexes() -> None:
 def test_go_role_scanner_fails_closed(extra: str, linked: set[str], message: str) -> None:
     with pytest.raises(AssertionError, match=message):
         _derive_go_role(_fixture_files(_GO_FIXTURE + extra), _GO_FIXTURE_LINKED | linked)
+
+
+@pytest.mark.parametrize("role", sorted(GO_ROLE_UNRUN_FILES))
+def test_each_unrun_file_still_narrows_its_role(role: str) -> None:
+    entrypoint = roles_by_name(load_roles())[role]["entrypoint"]
+    whole = _derive_go_role(go_sources.closure_files(entrypoint), go_sources.closure(entrypoint))
+    narrowed = _go_role(role)
+
+    assert (narrowed.operations, narrowed.queries) != (whole.operations, whole.queries)
+
+
+def test_the_unrun_files_leave_the_evaluator_its_index_and_the_admin_its_backfills() -> None:
+    evaluator, admin = _go_role("alert-evaluator"), _go_role("limnopulse-admin")
+
+    assert evaluator.queries == {"index/AlertEvaluationByDue"}
+    assert admin.operations == {"dynamodb:Query", "dynamodb:UpdateItem"}
+    assert admin.queries == {"table"}
+
+
+def _fixture_package(sources: Mapping[str, str]) -> list[go_sources.GoFile]:
+    """One GoFile per `path: source`, in the module package of the path's directory."""
+    files = []
+    for path, source in sources.items():
+        code = go_sources.strip_comments(source)
+        files.append(
+            go_sources.GoFile(
+                path=ROOT / path,
+                package=go_sources.MODULE + path.rpartition("/")[0],
+                code=code,
+                imports=go_sources._imports(code),
+            )
+        )
+    return files
+
+
+# main runs the backfill and links the runner for a type. The runner would reach the store
+# through an interface, but nothing runs it.
+_UNRUN_FIXTURE = {
+    "cmd/tool/main.go": """package main
+
+import (
+\t"github.com/VINIClUS/limnopulse/internal/runner"
+\t"github.com/VINIClUS/limnopulse/internal/store"
+)
+
+func main() { store.Backfill(runner.Options{}) }
+""",
+    "internal/store/backfill.go": """package store
+
+import ddb "github.com/aws/aws-sdk-go-v2/service/dynamodb"
+
+func Backfill(o any) { _ = ddb.QueryInput{}; helper() }
+""",
+    "internal/store/store.go": """package store
+
+import ddb "github.com/aws/aws-sdk-go-v2/service/dynamodb"
+
+type Store struct{}
+
+func (s Store) Load() { _ = ddb.GetItemInput{} }
+
+func helper() {}
+""",
+    "internal/runner/runner.go": """package runner
+
+type Options struct{}
+
+type loader interface{ Load() }
+
+func Run(l loader) { l.Load() }
+""",
+}
+_UNRUN_MAIN = go_sources.MODULE + "cmd/tool"
+_UNRUN_STORE = frozenset({"internal/store/store.go"})
+
+
+def test_an_unrun_file_drops_out_of_the_scan_when_nothing_runs_it() -> None:
+    files = _fixture_package(_UNRUN_FIXTURE)
+
+    _assert_never_run(files, _UNRUN_MAIN, _UNRUN_STORE)
+    role = _derive_go_role(files, {"github.com/aws/aws-sdk-go-v2/service/dynamodb"}, _UNRUN_STORE)
+    assert role.operations == {"dynamodb:Query"}
+
+
+@pytest.mark.parametrize(
+    ("path", "old", "new", "unrun", "message"),
+    [
+        pytest.param(
+            None, "", "", {"internal/store/gone.go"}, "not in the closure any more", id="gone"
+        ),
+        pytest.param(
+            None,
+            "",
+            "",
+            {"internal/runner/runner.go"},
+            "names no AWS operation",
+            id="nothing-to-exclude",
+        ),
+        pytest.param(
+            "cmd/tool/main.go",
+            "store.Backfill(runner.Options{})",
+            "store.Store{}.Load()",
+            _UNRUN_STORE,
+            "reaches Load",
+            id="called",
+        ),
+        pytest.param(
+            "cmd/tool/main.go",
+            "store.Backfill(runner.Options{})",
+            "runner.Run(store.Store{})",
+            _UNRUN_STORE,
+            "reaches Load",
+            id="through-an-interface",
+        ),
+        pytest.param(
+            "internal/store/store.go",
+            "func helper() {}",
+            "func helper() {}\n\nfunc init() { Store{}.Load() }",
+            _UNRUN_STORE,
+            "reaches Load",
+            id="init",
+        ),
+        pytest.param(
+            "internal/store/store.go",
+            "func helper() {}",
+            "func helper() {}\n\nvar probe = ddb.GetItemInput{}",
+            _UNRUN_STORE,
+            "reaches a package variable",
+            id="package-variable",
+        ),
+        pytest.param(
+            "internal/store/store.go",
+            "func helper() {}",
+            'func helper() {}\n\nfunc (s Store) String() string { _ = ddb.GetItemInput{}; return "" }',
+            _UNRUN_STORE,
+            "reaches String",
+            id="implicit-method",
+        ),
+        pytest.param(
+            "cmd/tool/main.go",
+            "store.Backfill(runner.Options{})",
+            '_ = reflect.ValueOf(store.Store{}).MethodByName("Load")',
+            _UNRUN_STORE,
+            "a method called by a name the scan cannot see",
+            id="reflection",
+        ),
+    ],
+)
+def test_an_unrun_file_fails_closed(
+    path: str | None, old: str, new: str, unrun: set[str], message: str
+) -> None:
+    sources = dict(_UNRUN_FIXTURE)
+    if path is not None:
+        assert sources[path].count(old) == 1, (path, old)
+        sources[path] = sources[path].replace(old, new)
+
+    with pytest.raises(AssertionError, match=message):
+        _assert_never_run(_fixture_package(sources), _UNRUN_MAIN, frozenset(unrun))
 
 
 _EMAIL_DOCUMENT = 'data "aws_iam_policy_document" "email_worker_runtime" {'

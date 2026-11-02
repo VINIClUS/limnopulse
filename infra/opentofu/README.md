@@ -78,13 +78,13 @@ resource.
 
 | Role | Principal | Exists with | Grants |
 |---|---|---|---|
-| `alert-evaluator` | user `alert_evaluator` | always | table GetItem, PutItem, UpdateItem; Query on the table and `AlertEvaluationByDue` |
+| `alert-evaluator` | user `alert_evaluator` | always | table GetItem, PutItem, UpdateItem; Query on `AlertEvaluationByDue` only |
 | `notification-relay` | user `notification_relay` | always | table GetItem, UpdateItem, ConditionCheckItem; Query on the table and `NotificationRelayByAvailableAt`; SendMessage on the email jobs queue, and on the Telegram jobs queue with `telegram_delivery` |
 | `email-worker` | user `email_worker` | `email_delivery` | table items; consume the email jobs queue; `ses:SendEmail` on the From identity (mailbox and domain) and the configuration set, only from `ses_from_address` |
 | `ses-feedback-worker` | user `ses_feedback_worker` | `email_delivery` | table items; consume the SES events queue |
 | `telegram-worker` | user `telegram_worker` | `telegram_delivery` | table items; consume the Telegram jobs queue; read the bot token secret |
 | `worker-monitor` | user `worker_monitor` | always | `cloudwatch:PutMetricData`, only to `Limnopulse/Workers` |
-| `limnopulse-admin` | role `limnopulse_admin` | always | table GetItem, PutItem, UpdateItem; Query on the table and `AlertEvaluationByDue` |
+| `limnopulse-admin` | role `limnopulse_admin` | always | table UpdateItem; Query on the table |
 
 "Table items" are GetItem, PutItem, UpdateItem and ConditionCheckItem on the
 domain table: a transaction's Put, Update and ConditionCheck items each need
@@ -92,28 +92,43 @@ their own action. No consumer gets `sqs:GetQueueAttributes` and none gets Query,
 because none of them calls it. The email and SES-feedback principals share only
 the table item actions both need, and no policy serves two principals.
 
-The `alert-evaluator` and `limnopulse-admin` grants follow from package
-granularity. Both link `internal/alertevaluator/dynamo`, which holds the
-evaluator store and the schedule backfills. So the evaluator also gets Query on
-the table, and the admin role the store's GetItem, PutItem and index Query.
+The closure is read per package, and `internal/alertevaluator/dynamo` holds
+both the evaluator's store and the schedule backfills. So the test leaves
+`backfill.go` out of the evaluator's derivation and `store.go` out of the
+admin's (`GO_ROLE_UNRUN_FILES`). It fails if either file disappears or stops
+naming an AWS operation. It also fails if code reachable from the binary's
+`main`, an `init` or a package variable can run one of the file's AWS calls.
 
 ### Access keys
 
 OpenTofu creates no access key, as for every user in `iam_runtime.tf`: a key in
 the state would be a plaintext secret. Each `<principal>_iam_user_name` output
 names a user. When enabling a role, an operator creates its key out of band
-with their own credentials, for example for the email-worker:
+with their own credentials. They write it straight into the role's
+`aws-access-key-id` and `aws-secret-access-key` credentials under
+`/etc/limnopulse/workers/credentials/<role>/`
+([`ops/workers/README.md`](../../ops/workers/README.md)), so the secret never
+reaches a terminal, a shell history, an env file, a ticket or chat. For example,
+for the email-worker, from this directory:
 
 ```bash
-aws iam create-access-key --user-name "$(tofu output -raw email_worker_iam_user_name)"
+role=email-worker
+user="$(tofu output -raw email_worker_iam_user_name)"
+dir="/etc/limnopulse/workers/credentials/$role"
+read -r id secret < <(aws iam create-access-key --user-name "$user" \
+  --query 'AccessKey.[AccessKeyId,SecretAccessKey]' --output text)
+if [ -n "$secret" ]; then
+  printf '%s' "$id" | ssh <worker-host> "sudo sh -c 'umask 077; cat > $dir/aws-access-key-id'"
+  printf '%s' "$secret" | ssh <worker-host> "sudo sh -c 'umask 077; cat > $dir/aws-secret-access-key'"
+fi
+unset id secret
 ```
 
-Write the two values straight into the role's `aws-access-key-id` and
-`aws-secret-access-key` credentials under
-`/etc/limnopulse/workers/credentials/<role>/`
-([`ops/workers/README.md`](../../ops/workers/README.md)). Never put them in an env
-file, a shell history, a ticket or chat. To rotate a key, create the second one,
-install it, restart the unit, then delete the first.
+The key travels on stdin, so `sudo` on the host must not prompt. Otherwise run
+the same lines in a root shell on the host, with the operator's AWS
+credentials there and the two `printf` lines writing to `$dir` directly. To
+rotate a key, create the second one the same way (IAM allows two per user),
+restart the unit, then delete the first with `aws iam delete-access-key`.
 
 ### Enabling and disabling a role
 
@@ -129,10 +144,20 @@ To enable a role:
    exist. Leave `<role>_enabled` false.
 2. Create the role's access key and install it, as above.
 3. Enable its unit or timer with a persistent `systemctl enable --now`.
-4. Wait for the first `UnitHealthy` datapoint, and until the role's unit-health
-   alarm is `OK`. CloudWatch acts only on state changes, so turning actions on
-   while the alarm is already in `ALARM` never notifies for that breach.
-5. Set `<role>_enabled = true` in the untracked tfvars and apply it.
+4. Wait for the first `UnitHealthy` datapoint, then until every alarm of the
+   role is `OK`: its unit-health alarm and, for a consumer, its queue age, depth
+   and DLQ alarms. CloudWatch acts only on state changes, so an alarm already in
+   `ALARM` when actions turn on never notifies for that breach. Drain a backlog
+   or a DLQ first rather than enabling over it. List the role's alarm states
+   with:
+
+   ```bash
+   aws cloudwatch describe-alarms --alarm-name-prefix "<project_name>-<environment>-<role>-" \
+     --query 'MetricAlarms[].[AlarmName,StateValue]' --output text
+   ```
+
+5. For the email-worker only, pass the SES check below.
+6. Set `<role>_enabled = true` in the untracked tfvars and apply it.
 
 To disable a role, reverse the order:
 
@@ -140,24 +165,99 @@ To disable a role, reverse the order:
 2. Disable the unit or timer. `worker-monitor` stops publishing for the role.
 3. Delete the role's access key (`aws iam delete-access-key`) and its
    credential files.
+4. Turn a delivery flag off only after every role it carries is disabled and
+   its key deleted. `email_delivery` carries the email-worker and the
+   SES-feedback worker, and `telegram_delivery` carries the Telegram worker and
+   the relay's Telegram send grant. That apply destroys those users, together
+   with any key still on one (`force_destroy`), their alarms and the channel's
+   other gated resources. The preconditions only refuse `<role>_enabled = true`
+   without the flag, so nothing stops it under a running unit.
 
-So a disabled role holds no key. The one exception is steps 2 to 4 of enabling,
-because the unit needs its key to produce the datapoint that step 5 waits for.
+So a disabled role holds no key. The one exception is steps 2 to 5 of enabling,
+because the unit needs its key to produce the datapoint that step 4 waits for.
 OpenTofu cannot see an out-of-band key; check with `aws iam list-access-keys`.
+
+### The email-worker's SES check
+
+`ses:SendEmail` is scoped to the From identity, both the mailbox and its domain,
+and to the configuration set. The Service Authorization Reference lists
+`identity`, `configuration-set` and `template` as the resources of SES v2
+`SendEmail`. The sender never sends a template, and the derivation fails if it
+starts to. Before setting `email_worker_enabled`, check that scope against the
+account, from this directory:
+
+1. Simulate the email principal for all three resources with the From
+   condition. Every line must end in `allowed`:
+
+   ```bash
+   from=<ses_from_address>
+   account="$(aws sts get-caller-identity --query Account --output text)"
+   region="$(tofu output -raw aws_region)"
+   ses="arn:aws:ses:$region:$account"
+   arn="$(aws iam get-user --user-name "$(tofu output -raw email_worker_iam_user_name)" \
+     --query User.Arn --output text)"
+   aws iam simulate-principal-policy --policy-source-arn "$arn" --action-names ses:SendEmail \
+     --resource-arns "$ses:identity/$from" "$ses:identity/${from#*@}" \
+       "$ses:configuration-set/$(tofu output -raw ses_configuration_set_name)" \
+     --context-entries "ContextKeyName=ses:FromAddress,ContextKeyValues=$from,ContextKeyType=string" \
+     --query 'EvaluationResults[].ResourceSpecificResults[].[EvalResourceName,EvalResourceDecision]' \
+     --output text
+   ```
+
+2. With the email-worker's own key, as root on the worker host, send one
+   message to the SES mailbox simulator, which SES accepts in the sandbox too.
+   A `MessageId` means SES authorized the identity and the From condition.
+   Leave the configuration set out: its events carry no delivery, so the
+   SES-feedback worker would retry them into its DLQ. Step 1 covers the
+   configuration set.
+
+   ```bash
+   dir=/etc/limnopulse/workers/credentials/email-worker
+   AWS_ACCESS_KEY_ID="$(cat "$dir/aws-access-key-id")" \
+   AWS_SECRET_ACCESS_KEY="$(cat "$dir/aws-secret-access-key")" \
+   aws sesv2 send-email --region <aws_region> --from-email-address <ses_from_address> \
+     --destination ToAddresses=success@simulator.amazonses.com \
+     --content 'Simple={Subject={Data=email-worker check},Body={Text={Data=ADR-020 principal check}}}'
+   ```
 
 ### limnopulse-admin
 
 The backfills run by hand and rarely, and no enable variable would ever retire a
 standing key. So `limnopulse_admin` is a role that an operator assumes for one
 run, not a user. It holds exactly the backfills' grants and has short-lived
-credentials only. Its trust names this account: an identity in the account
-can assume it if its own policy allows `sts:AssumeRole` on the
-`limnopulse_admin_role_arn` output. `limnopulse-admin` uses the AWS default
-credential chain, so export the assumed role's session into the environment
-first, for example with `aws configure export-credentials --profile <a profile
-whose role_arn is that output> --format env`. Then run a backfill such as
-`limnopulse-admin backfill-relay --tenant=<id>`, which is a dry run unless
-`--apply` is set.
+credentials only.
+
+Its trust names this account, narrowed on `aws:PrincipalArn` by
+`limnopulse_admin_trusted_principal_arns`. Set that list in the untracked
+tfvars to the operators' IAM role or user ARNs. `ArnLike` patterns are allowed,
+and for an IAM Identity Center permission set you give its role ARN, for example
+`arn:aws:iam::<account>:role/aws-reserved/sso.amazonaws.com/*/AWSReservedSSO_<permission-set>_*`.
+`aws:PrincipalArn` holds a role's ARN, never a session's. While the list is
+empty, any identity in the account whose own policy allows `sts:AssumeRole` on
+the role can assume it.
+
+`limnopulse-admin` uses the AWS default credential chain. Add a profile for the
+role to `~/.aws/config`:
+
+```ini
+[profile limnopulse-admin]
+role_arn = <the limnopulse_admin_role_arn output>
+source_profile = <your operator profile>
+duration_seconds = 3600
+```
+
+Then load a session into the shell, run the backfill and drop the session.
+`--format env` prints only `export` lines, so `eval` them rather than printing
+them:
+
+```bash
+eval "$(aws configure export-credentials --profile limnopulse-admin --format env)"
+AWS_REGION=<aws_region> DYNAMODB_DOMAIN_TABLE=<dynamodb_domain_table> \
+  limnopulse-admin backfill-relay --tenant=<id>
+unset AWS_ACCESS_KEY_ID AWS_SECRET_ACCESS_KEY AWS_SESSION_TOKEN AWS_CREDENTIAL_EXPIRATION
+```
+
+`backfill-relay` is a dry run unless `--apply` is set.
 
 ### Alarms
 
