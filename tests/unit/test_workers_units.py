@@ -496,6 +496,21 @@ def test_an_env_template_holds_only_settings_its_role_reads(name):
         assert not re.search(r"\d{12}", value), key
 
 
+def test_every_template_placeholder_names_an_opentofu_output():
+    outputs = {
+        name
+        for path in (ROOT / "infra/opentofu").glob("*.tf")
+        for name in re.findall(r'^output "([a-z0-9_]+)"', path.read_text(), re.M)
+    }
+    placeholders = {
+        name
+        for path in ENV_DIR.iterdir()
+        for name in re.findall(r"REPLACE_WITH_TOFU_OUTPUT_([a-z0-9_]+)", path.read_text())
+    }
+    assert placeholders, "no template names an OpenTofu output"
+    assert placeholders <= outputs, placeholders - outputs
+
+
 def test_the_secret_settings_have_credentials_instead():
     assert "influxdb-token" in role("alert-evaluator")["credentials"]
     assert "redis-password" in role("telegram-worker")["credentials"]

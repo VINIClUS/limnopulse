@@ -115,7 +115,10 @@ and `notifications` images; ADR-020 retired both, and no release pulls them.
 
 ADR-020 adds the `workers` package, the workers bundle that `build.yml` pushes
 as an OCI artifact. Make it public too: the activation helper (step 7) pulls it
-as root with no registry credentials.
+as root with no registry credentials. The package exists only after the first
+push, so that run's `workers-publish` job pushes and attests the bundle and then
+ends red at "Pull the bundle back and verify it as deploy.yml does", whose pull
+is anonymous. Make the `workers` package public, then re-run the failed job.
 
 ## 5. Caddy — do this alone, deliberately
 

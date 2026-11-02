@@ -201,6 +201,11 @@ def test_workers_publisher_pulls_and_verifies_what_it_pushed_as_deploy_does():
     assert run.index("export DOCKER_CONFIG") < run.index("oras pull")
     assert "DOCKER_CONFIG" not in check["env"]
     assert "the GHCR workers package must be public (ops/vps/README.md, section 4)" in run
+    # Section 4 tells the owner the first main push ends red there, and how to recover.
+    readme = (ROOT / "ops/vps/README.md").read_text()
+    section = readme[readme.index("## 4. GHCR package visibility") : readme.index("## 5.")]
+    assert f'"{check["name"]}"' in " ".join(section.split())
+    assert "re-run the failed job" in section
     # And the bytes in GHCR are the bytes CI built and attested.
     assert 'cmp "dist/workers/$file" "$bundle_dir/$file"' in check["run"]
     assert 'tag="$WORKERS_TAG"' in check["run"]
