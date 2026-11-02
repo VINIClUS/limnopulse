@@ -13,6 +13,7 @@ from tests.support.worker_roles import (
     FORCED_COMMAND,
     OPENTOFU_DIR,
     ROOT,
+    compose_services,
     load_credential_lines,
     load_roles,
     roles_by_name,
@@ -106,6 +107,16 @@ def test_the_deploy_starts_the_ingest_profile(table):
     assert ingest["compose_profile"] in table["deploy"]["compose_profiles"]
 
 
+def test_the_ingest_worker_has_a_host_switch_in_its_compose_environment(table):
+    ingest = roles_by_name(table)["telemetry-ingest"]
+    assert ingest["host_enable_env"] == "TELEMETRY_V2_WRITE_ENABLED"
+    assert ingest["host_enable_env"] != ingest["enable_variable"]
+    service = compose_services()[ingest["compose_service"]]
+    assert service["environment"][ingest["host_enable_env"]] == (
+        "${TELEMETRY_V2_WRITE_ENABLED:-false}"
+    )
+
+
 def test_the_ingest_worker_parks_on_configuration_errors(table):
     ingest = roles_by_name(table)["telemetry-ingest"]
     assert ingest["restart"] == "unless-stopped"
@@ -122,6 +133,7 @@ def test_the_ingest_worker_parks_on_configuration_errors(table):
         ("worker-monitor", "enable_variable"),
         ("telemetry-ingest", "unit_health_reason"),
         ("telemetry-ingest", "liveness_file"),
+        ("telemetry-ingest", "host_enable_env"),
         ("limnopulse-admin", "rollback"),
     ),
 )
@@ -279,6 +291,27 @@ def test_a_duplicate_unit_is_rejected(table):
         (
             lambda t: roles_by_name(t)["telemetry-ingest"].update(compose_profile="workers"),
             "telemetry-ingest: compose.production.yaml does not put it in profile workers",
+        ),
+        (
+            lambda t: roles_by_name(t)["telemetry-ingest"].update(
+                host_enable_env="TELEMETRY_INGEST_ENABLED"
+            ),
+            (
+                "telemetry-ingest: host_enable_env TELEMETRY_INGEST_ENABLED is not in its "
+                "compose.production.yaml environment"
+            ),
+        ),
+        (
+            lambda t: roles_by_name(t)["telemetry-ingest"].update(
+                host_enable_env="telemetry_v2_write_enabled"
+            ),
+            "telemetry-ingest: host_enable_env must be an environment variable name",
+        ),
+        (
+            lambda t: roles_by_name(t)["telemetry-ingest"].update(
+                host_enable_env="TELEMETRY_V2_WRITE_ENABLED\n"
+            ),
+            "telemetry-ingest: host_enable_env must be an environment variable name",
         ),
         (
             lambda t: roles_by_name(t)["telemetry-ingest"].update(restart="on-failure:5"),

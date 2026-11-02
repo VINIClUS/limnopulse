@@ -220,7 +220,7 @@ def test_runbook_documents_the_adr_020_restart_liveness_and_park_rules() -> None
         "every permit wedged",
     ):
         assert stale not in runbook, stale
-    # A rollback that turns writes off leaves a parked worker, which a later deploy waits on.
+    # An enabled worker that cannot run parks, and a deploy that waits on it fails.
     assert re.search(r"fails its health gate", _section("Rollback"))
 
 
@@ -232,7 +232,10 @@ def test_plan_marks_d7_and_d21_superseded_by_adr_020_and_keeps_their_text() -> N
     assert "The default deploy does not start it." in d21
     # Each superseded row points at its amendment where a reader meets it (like D16's `(A48)`).
     assert "**Superseded by ADR-020 (A49).**" in d7
-    assert "**Superseded by ADR-020 (A49):** every deploy passes `--profile ingestion`." in d21
+    assert (
+        "**Superseded by ADR-020 (A49):** while `TELEMETRY_V2_WRITE_ENABLED` is on, every deploy "
+        "passes `--profile ingestion`; while it is off, the deploy removes the worker."
+    ) in d21
     raw = markdown_section(text, "Audit amendments (r2)")
     (a49,) = [line for line in raw.splitlines() if line.startswith("| A49 |")]
     for pattern in (
@@ -240,6 +243,9 @@ def test_plan_marks_d7_and_d21_superseded_by_adr_020_and_keeps_their_text() -> N
         r"D7's bounded `on-failure` restart",
         r"D21's rule that the default deploy does not start the worker",
         r"`unless-stopped`",
+        # ADR-020 S4: the profile follows the host switch, so a parked worker never blocks a deploy.
+        r"While `TELEMETRY_V2_WRITE_ENABLED` is on, every deploy passes `--profile ingestion`",
+        r"While it is off, the deploy removes the worker",
         r"exits 78",
         r"`127\.0\.0\.1:8086`",
         r"A47 shutdown budget .{0,40}unchanged",
