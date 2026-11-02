@@ -30,14 +30,20 @@ ROLE_FIELDS = ("name", "lifecycle", "schedule_seconds", "units", "unit_health")
 UNITS_FIELDS = ("service", "timer")
 
 
+def role_projection(role: dict[str, Any]) -> dict[str, Any]:
+    projected = {key: role[key] for key in ROLE_FIELDS if key in role}
+    if "units" in projected:
+        units = role["units"]
+        projected["units"] = {key: units[key] for key in UNITS_FIELDS if key in units}
+    return projected
+
+
 def monitor_projection(table: dict[str, Any]) -> dict[str, Any]:
     """Return the fields of the role table that worker-monitor decodes."""
     return {
         "schema_version": table["schema_version"],
         "unit_health": {key: table["unit_health"][key] for key in UNIT_HEALTH_FIELDS},
-        "roles": [
-            {key: role[key] for key in ROLE_FIELDS if key in role} for role in table["roles"]
-        ],
+        "roles": [role_projection(role) for role in table["roles"]],
     }
 
 
