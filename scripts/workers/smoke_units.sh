@@ -107,9 +107,11 @@ if ! systemctl start "limnopulse-$monitor.service"; then
 fi
 expect "limnopulse-$monitor.service" Result success
 expect "limnopulse-$monitor.service" ExecMainStatus 0
-# A dynamic user would have been disconnected by the bus; the static one must be in use.
-if ! getent passwd "limnopulse-$monitor" >/dev/null; then
-  echo "::error::sysusers.d did not create limnopulse-$monitor"
+# The bus drops a dynamic user, so the monitor must run as the static one: a uid below
+# systemd's dynamic range (61184-65519), which sysusers.d created.
+uid="$(getent passwd "limnopulse-$monitor" | cut -d: -f3)"
+if [[ -z "$uid" || "$uid" -ge 61184 ]]; then
+  echo "::error::limnopulse-$monitor is not a static user (uid '${uid}')"
   failed=1
 fi
 
