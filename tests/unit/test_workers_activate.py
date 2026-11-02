@@ -856,6 +856,56 @@ def test_a_rollback_restarts_the_timer_of_a_role_the_candidate_dropped(host):
     ]
 
 
+def test_a_promotion_that_drops_a_role_with_an_active_timer_succeeds(host):
+    # The gate covers only the units the release declares: a dropped role's timer is meant to stop.
+    timer = "limnopulse-alert-evaluator.timer"
+    host.env["FAKE_ENABLED"] = timer
+    host.deploy_release(A)
+    host.set_unit_states({timer: "active"})
+    assert host.run("stage", B, host.publish(B, drop_roles=("alert-evaluator",))).returncode == 0
+    result = host.run("activate", B)
+    assert result.returncode == 0, result.stderr
+    assert host.unit_states()[timer] == "inactive"
+    assert not (host.state / "running.json").exists()
+
+
+def test_a_recorded_unit_the_release_no_longer_declares_is_not_started(host):
+    # Its file is gone, so systemd could not start it; the release dropped it on purpose.
+    timer, worker = "limnopulse-alert-evaluator.timer", CONTINUOUS[0]
+    host.env.update(
+        FAKE_ENABLED=f"{timer},{worker}", FAKE_FAIL_RESTART=worker, FAKE_FAIL_RESTART_RELEASE=B
+    )
+    host.deploy_release(A)
+    host.set_unit_states({timer: "active", worker: "active"})
+    assert host.run("stage", B, host.publish(B)).returncode == 0
+    assert host.run("activate", B).returncode == 1
+    assert json.loads((host.state / "running.json").read_text()) == sorted([timer, worker])
+    assert host.run("stage", C, host.publish(C, drop_roles=("alert-evaluator",))).returncode == 0
+    host.reset_calls()
+    result = host.run("activate", C)
+    assert result.returncode == 0, result.stderr
+    assert systemctl_calls(host, "reset-failed", "start") == [
+        ["reset-failed", worker],
+        ["start", worker],
+    ]
+    assert host.unit_states()[timer] == "inactive"
+    assert not (host.state / "running.json").exists()
+
+
+def test_an_active_unit_that_is_not_enabled_is_not_brought_back(host):
+    # A schedule someone disabled but left running is not the activation's to start again.
+    timer, worker = "limnopulse-alert-evaluator.timer", CONTINUOUS[0]
+    host.env.update(FAKE_ENABLED=worker, FAKE_FAIL_RESTART=worker, FAKE_FAIL_RESTART_RELEASE=B)
+    host.deploy_release(A)
+    host.set_unit_states({timer: "active", worker: "active"})
+    assert host.run("stage", B, host.publish(B, drop_roles=("alert-evaluator",))).returncode == 0
+    assert host.run("activate", B).returncode == 1
+    assert json.loads((host.state / "running.json").read_text()) == [worker]
+    assert host.run("activate", A).returncode == 0
+    states = host.unit_states()
+    assert (states[timer], states[worker]) == ("inactive", "active")
+
+
 def test_a_timer_that_is_not_active_after_the_activation_fails_it(host):
     timer = "limnopulse-alert-evaluator.timer"
     host.env["FAKE_ENABLED"] = timer
