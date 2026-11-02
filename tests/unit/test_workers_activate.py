@@ -830,8 +830,47 @@ def test_a_worker_that_had_already_failed_is_left_alone(host):
     assert host.unit_states() == {failed: "failed", healthy: "active"}
 
 
+def test_a_rollback_restarts_the_timer_of_a_role_the_candidate_dropped(host):
+    timer, worker = "limnopulse-alert-evaluator.timer", CONTINUOUS[0]
+    host.env.update(
+        FAKE_ENABLED=f"{timer},{worker}", FAKE_FAIL_RESTART=worker, FAKE_FAIL_RESTART_RELEASE=B
+    )
+    host.deploy_release(A)
+    host.set_unit_states({timer: "active", worker: "active"})
+    dropped = host.publish(B, drop_roles=("alert-evaluator",))
+    assert host.run("stage", B, dropped).returncode == 0
+    assert host.run("activate", B).returncode == 1
+    # The candidate's activation stopped and removed the timer of the role it dropped.
+    assert host.unit_states()[timer] == "inactive"
+    assert json.loads((host.state / "running.json").read_text()) == sorted([timer, worker])
+    host.reset_calls()
+    result = host.run("activate", A)
+    assert result.returncode == 0, result.stderr
+    states = host.unit_states()
+    assert (states[timer], states[worker]) == ("active", "active")
+    assert systemctl_calls(host, "reset-failed", "start") == [
+        ["reset-failed", timer],
+        ["start", timer],
+        ["reset-failed", worker],
+        ["start", worker],
+    ]
+
+
+def test_a_timer_that_is_not_active_after_the_activation_fails_it(host):
+    timer = "limnopulse-alert-evaluator.timer"
+    host.env["FAKE_ENABLED"] = timer
+    host.deploy_release(A)
+    host.set_unit_states({timer: "active"})
+    assert host.run("stage", B, host.publish(B)).returncode == 0
+    host.env["FAKE_RELOAD_STOPS"] = timer
+    result = host.run("activate", B)
+    assert result.returncode == 1
+    assert f"['{timer}'] ran before the activation" in result.stderr
+    assert json.loads((host.state / "running.json").read_text()) == [timer]
+
+
 @pytest.mark.parametrize(
-    "data", [b"{", b"{}", b"false", b'["ssh.service"]', b'["limnopulse-alert-evaluator.timer"]']
+    "data", [b"{", b"{}", b"false", b"[1]", b'["ssh.service"]', b'["limnopulse-email-worker"]']
 )
 def test_a_malformed_running_record_is_refused(host, data):
     host.deploy_release(A)

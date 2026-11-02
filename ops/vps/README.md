@@ -349,9 +349,10 @@ the deploy rolls back to the release that `.env.image` records:
   registry outage, it still starts the previous tag from the cached images,
   and the rollback is reported as failed.
 - If the failure came at or after the activation, the helper re-activates the
-  previous bundle. It runs `reset-failed` and `start` on each worker that was
-  running before the failed activation, so a candidate binary that exited 78
-  does not leave its worker down. If `.env.image` recorded no bundle, as with releases from
+  previous bundle. It runs `reset-failed` and `start` on each service and timer
+  that was active before the failed activation. So a candidate binary that
+  exited 78 does not leave its worker down, and a role the candidate dropped
+  gets its timer back. If `.env.image` recorded no bundle, as with releases from
   before ADR-020, it runs `deactivate` instead. An earlier failure leaves the
   bundle alone, since it never moved.
   `deactivate` stops the units it removes. A later `activate` only

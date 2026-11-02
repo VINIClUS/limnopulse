@@ -54,6 +54,8 @@ for item in sorted(source.iterdir()):
 #   FAKE_FAIL_RESTART_RELEASE limits this to the named `current` release.
 # - A unit in FAKE_CRASH_AFTER_START starts, then crashes, so it ends up `activating`
 #   (auto-restart).
+# - `daemon-reload` stops an active unit in FAKE_RELOAD_STOPS, as a broken new unit file
+#   would.
 FAKE_SYSTEMCTL = """\
 import json, os, sys
 from pathlib import Path
@@ -100,6 +102,10 @@ elif args[:1] == ["reset-failed"]:
 elif args[:1] == ["stop"]:
     for unit in args[1:]:
         states[unit] = "inactive"
+elif args[:1] == ["daemon-reload"]:
+    for unit in split("FAKE_RELOAD_STOPS"):
+        if states.get(unit) == "active":
+            states[unit] = "inactive"
 state_file.write_text(json.dumps(states))
 sys.exit(status)
 """

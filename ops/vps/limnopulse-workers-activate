@@ -78,7 +78,8 @@ ENABLED_STATES = frozenset({"enabled", "enabled-runtime"})
 
 FLOORS_FILE = "floors.json"
 UNITS_FILE = "units.json"
-# The enabled services that were running when an activation began; removed once one succeeds.
+# The enabled services and timers that were active when an activation began; removed once one
+# succeeds.
 RUNNING_FILE = "running.json"
 LOCK_FILE = ".lock"
 STAGE_PREFIX = ".stage-"
@@ -484,13 +485,12 @@ def read_installed_units(paths: Paths) -> list[str]:
 
 
 def read_running(paths: Paths) -> list[str] | None:
-    """The running services an activation that did not finish recorded, or None."""
+    """The active units an activation that did not finish recorded, or None."""
     units = read_json(paths.state / RUNNING_FILE)
     if units is None:
         return None
     if not isinstance(units, list) or not all(
-        isinstance(unit, str) and UNIT_RE.fullmatch(unit) and unit.endswith(".service")
-        for unit in units
+        isinstance(unit, str) and UNIT_RE.fullmatch(unit) for unit in units
     ):
         raise Failure(f"{RUNNING_FILE} is malformed")
     return units
@@ -730,12 +730,12 @@ def activate(paths: Paths, tag: str, override: bool) -> None:
     check_floors(meta, floors, override)
     previous = current_tag(paths)
     installed = read_installed_units(paths)
-    # Record the enabled services running now, with those an activation that did not finish
-    # recorded, before anything stops. Each one this release still runs must run again after.
-    # A unit that had already failed is not running, so it is left alone.
+    # Record the enabled services and timers active now, with those an activation that did not
+    # finish recorded, before anything stops. Each one this release declares must be active
+    # after. A unit that had already failed is not active, so it is left alone.
     pending = read_running(paths)
-    running = {unit for unit in installed if unit.endswith(".service") and is_enabled(unit)}
-    running = {unit for unit in running if is_active(unit)} | set(pending or ())
+    running = {unit for unit in installed if is_enabled(unit) and is_active(unit)}
+    running |= set(pending or ())
     write_json(paths.state / RUNNING_FILE, sorted(running))
     # Record the union first, so a deactivate after a partial failure still finds every unit.
     write_json(paths.state / UNITS_FILE, sorted(set(installed) | set(meta.units)))
@@ -753,8 +753,9 @@ def activate(paths: Paths, tag: str, override: bool) -> None:
                 log(str(error))
                 restart_failed.append(unit)
     # A rollback brings back what the activation it undoes stopped: try-restart leaves a failed
-    # unit down. reset-failed clears a failure that RestartPreventExitStatus=78 made final.
-    for unit in sorted(set(pending or ()) & set(meta.continuous)):
+    # unit down, and a timer of a role the candidate dropped was stopped with it. reset-failed
+    # clears a failure that RestartPreventExitStatus=78 made final.
+    for unit in sorted(set(pending or ()) & set(meta.units)):
         try:
             systemctl("reset-failed", unit)
             systemctl("start", unit)
@@ -763,7 +764,7 @@ def activate(paths: Paths, tag: str, override: bool) -> None:
             restart_failed.append(unit)
     if restart_failed:
         raise Failure(f"restarting {restart_failed} failed")
-    down = [unit for unit in sorted(running & set(meta.continuous)) if not is_active(unit)]
+    down = [unit for unit in sorted(running & set(meta.units)) if not is_active(unit)]
     if down:
         raise Failure(f"{down} ran before the activation and are not running after it")
     for role, floor in meta.floors.items():
