@@ -88,7 +88,7 @@ actions follow "Enabling and disabling a role" in
 4. `telegram-worker`, with Telegram still off on the relay and the evaluator.
 5. `notification-relay`.
 6. `alert-evaluator`. If this rollout includes Telegram, hold the evaluator until
-   [Telegram on the producers](#telegram-on-the-producers), and enable it there with
+   [Telegram rollout](#telegram-rollout) step 5, and enable it there with
    Telegram on.
 
 Consumers come before producers. A producer started first leaves its jobs aging in a queue
@@ -123,7 +123,7 @@ For each role:
 | `worker-monitor` | The static user exists: `getent passwd limnopulse-worker-monitor` shows a uid below 61184 (`ops/vps/README.md`, step 7.5). |
 | `ses-feedback-worker` | `email_delivery` is applied. The 3C-A "Cloud rollout" steps 1 to 6 are done: the relay index is `ACTIVE`, the email outboxes are backfilled and SES is validated. No older feedback worker is running. |
 | `email-worker` | The SES-feedback worker is enabled and its alarms are `OK`. The SES check passes (`infra/opentofu/README.md`, "The email-worker's SES check"). Its simulation runs on the *workstation* and its test send on the *host*. The apply that first created `NotificationRelayByAvailableAt` is not the one that enables it ("Notification rollout boundary"). |
-| `telegram-worker` | The 3C-B "Cloud rollout" steps 1 to 6 are done: queue, secrets, webhook and binding, binaries with every Telegram flag `false`, and the final `limnopulse-admin backfill-telegram` with the evaluator stopped ([Telegram on the producers](#telegram-on-the-producers)). Redis is published on the host loopback with a password, and in the same change the API's `REDIS_URL` gets that password. `compose.production.yaml` publishes no Redis port and hard-codes a password-less `REDIS_URL`, so that change comes first. The password is the worker's `redis-password` credential. Only the worker's env file sets `TELEGRAM_DELIVERY_ENABLED=true` (3C-B step 7). |
+| `telegram-worker` | The 3C-B "Cloud rollout" steps 1 to 6 are done: queue, secrets, webhook and binding, binaries with every Telegram flag `false`, and the final `limnopulse-admin backfill-telegram` with the evaluator stopped ([Telegram rollout](#telegram-rollout)). Redis is published on the host loopback with a password, and in the same change the API's `REDIS_URL` gets that password. `compose.production.yaml` publishes no Redis port and hard-codes a password-less `REDIS_URL`, so that change comes first. The password is the worker's `redis-password` credential. Only the worker's env file sets `TELEGRAM_DELIVERY_ENABLED=true` (3C-B step 7). |
 | `notification-relay` | `NotificationRelayByAvailableAt` is `ACTIVE`, and `limnopulse-admin backfill-relay` reports zero rows needing update. The apply that first created the index is not the one that enables it. With Telegram on, the env file also sets `SQS_TELEGRAM_JOBS_URL` and `LIMNOPULSE_WEB_URL`. |
 | `alert-evaluator` | The `influxdb-token` credential is a dedicated token, readable only against `INFLUXDB_BUCKET_RAW`. It is never the bootstrap admin `INFLUXDB_TOKEN` that the API and InfluxDB use. Create it with [Evaluator token](#evaluator-token). The data-quality settings in the env file match the devices. `limnopulse-admin backfill-schedule` has been applied ([`docs/alert-evaluator-phase-3b.md`](alert-evaluator-phase-3b.md), "Initial schedule backfill"). |
 
@@ -152,40 +152,46 @@ with open("/etc/limnopulse/workers/credentials/alert-evaluator/influxdb-token", 
 print(auth["id"])'
 ```
 
-### Telegram on the producers
+### Telegram rollout
 
-Turn Telegram on as 3C-B step 8 describes: first the relay, then the evaluator, for a
-controlled tenant cohort. Then confirm one opening and one recovery.
+Telegram goes on in the order of the 3C-B "Cloud rollout", steps 6 to 8: the final
+backfill, then the worker, then the producers. From the final `backfill-telegram` until the
+evaluator's env file has Telegram on, the evaluator must not run. An evaluator run with
+Telegram off marks each new Telegram outbox `deferred_unsupported_channel`, and only
+`backfill-telegram` makes those outboxes deliverable.
 
-From the final `backfill-telegram` until the evaluator's env file has Telegram on, the
-evaluator stays stopped. An evaluator run with Telegram off marks each new Telegram outbox
-`deferred_unsupported_channel`, and only `backfill-telegram` makes those outboxes
-deliverable.
+1. **Pause the evaluator, if it is already enabled.** In a first rollout it is held and was
+   never enabled, so skip to step 2.
+   - *Workstation:* set `alert_evaluator_enabled = false` and apply it. The pause stops the
+     evaluator's `UnitHealthy` data, and with actions on its alarm would page.
+   - *Host:* disable the timer and stop any run already in progress. Stopping the timer
+     alone leaves an in-progress run going, and `disable` keeps the timer off across a
+     reboot. Go on only once the service reads `inactive`:
 
-In a first rollout the evaluator is held and was never enabled, so nothing needs pausing.
-To pause an evaluator that is already enabled:
+     ```bash
+     systemctl disable --now limnopulse-alert-evaluator.timer
+     systemctl stop limnopulse-alert-evaluator.service
+     systemctl is-active limnopulse-alert-evaluator.service   # must print inactive (or failed)
+     ```
 
-1. *Workstation:* set `alert_evaluator_enabled = false` and apply it. The pause stops its
-   `UnitHealthy` data, and with actions on its alarm would page.
-2. *Host:* disable the timer and stop any run already in progress. Stopping the timer alone
-   leaves an in-progress run going, and `disable` keeps it off across a reboot. Start the
-   final backfill only once the service reads `inactive`:
+2. **Final backfill.** *Workstation:* run `backfill-telegram` (dry run, `--apply`, dry run)
+   until it reports nothing to update.
+3. **Telegram worker.** Enable it with the steps above and its gate. Only its env file sets
+   `TELEGRAM_DELIVERY_ENABLED=true`; the relay and the evaluator stay off. Confirm Redis,
+   the Bot API and zero DLQ input (3C-B step 7), and wait until its alarms read `OK`.
+4. **Relay.** Turn Telegram on in the relay's env file, with `SQS_TELEGRAM_JOBS_URL` and
+   `LIMNOPULSE_WEB_URL`, for a controlled tenant cohort (3C-B step 8). The next tick reads
+   it.
+5. **Evaluator.** Turn Telegram on in the evaluator's env file.
+   - *Host:* if it was paused in step 1, run
+     `systemctl enable --now limnopulse-alert-evaluator.timer`.
+   - *Workstation:* once its unit-health alarm reads `OK`, set
+     `alert_evaluator_enabled = true` and apply it.
+   - In a first rollout, enable it now with the steps above.
+6. Confirm one opening and one recovery before a broader cohort.
 
-   ```bash
-   systemctl disable --now limnopulse-alert-evaluator.timer
-   systemctl stop limnopulse-alert-evaluator.service
-   systemctl is-active limnopulse-alert-evaluator.service   # must print inactive (or failed)
-   ```
-
-3. Run the final `backfill-telegram`, then turn Telegram on in the relay's env file and
-   then the evaluator's.
-4. *Host:* `systemctl enable --now limnopulse-alert-evaluator.timer`.
-5. *Workstation:* once its unit-health alarm reads `OK`, set `alert_evaluator_enabled = true`
-   and apply it.
-
-If the evaluator ran in that window anyway, pause it as in steps 1 and 2. Repeat the
-`backfill-telegram` dry run, `--apply` and dry run until it reports nothing to update.
-Then continue with step 3.
+If the evaluator ran between steps 2 and 5 anyway, pause it as in step 1. Then repeat
+step 2 and continue from where you stopped.
 
 ## Disable a Go role
 
