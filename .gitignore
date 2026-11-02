@@ -8,6 +8,10 @@ __pycache__/
 .pytest_cache/
 # ops/e2e harness runs (Node-RED user dir, MQTTX capture, verdicts)
 .e2e-out/
+# ADR-020 workers bundle builds (make workers-binaries / workers-bundle)
+/dist/
+# ops/lab bootstrap tools (uv, Go)
+.lab-tools/
 .terraform/
 *.tfstate
 *.tfstate.*

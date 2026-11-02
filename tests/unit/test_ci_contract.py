@@ -37,6 +37,18 @@ NOTIFICATIONS_RECIPE = [
     "uv sync --locked --extra dev",
     "RUN_NOTIFICATION_INTEGRATION=1 uv run --locked --no-sync python -m pytest -q tests/integration/test_notifications_local.py",
 ]
+# ADR-020 workers bundle targets; CI's workers-bundle job and trivy's workers scan run them.
+WORKERS_RECIPES = {
+    "workers-units": ["uv run --locked --no-sync python -m scripts.workers.units"],
+    "workers-binaries": [
+        "uv run --locked --no-sync python -m scripts.workers.build_bundle binaries"
+    ],
+    "workers-bundle": [
+        "uv run --locked --no-sync python -m scripts.workers.build_bundle bundle"
+        " --tag main-0000000000000000000000000000000000000000"
+    ],
+    "workers-clean": ["rm -rf dist/workers"],
+}
 INGESTION_RECIPE = [
     "uv sync --locked --extra dev",
     "RUN_INGESTION_INTEGRATION=1 RUN_INFLUX_INTEGRATION=1 uv run --locked --no-sync python -m pytest -q tests/ingestion",
@@ -264,6 +276,7 @@ def test_makefile_exposes_safe_reproducible_targets() -> None:
         "verify-influx",
         "verify-ingestion",
         *expected,
+        *WORKERS_RECIPES,
     }
 
     verify_rule = re.search(r"^verify:(.*)$", makefile, flags=re.MULTILINE)
@@ -274,6 +287,7 @@ def test_makefile_exposes_safe_reproducible_targets() -> None:
         **expected,
         "verify-influx": influx_recipe,
         "verify-ingestion": INGESTION_RECIPE,
+        **WORKERS_RECIPES,
     }.items():
         result = subprocess.run(
             ["make", "--no-print-directory", "-n", "UV=uv", "TOFU=tofu", target],

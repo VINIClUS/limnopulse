@@ -10,7 +10,9 @@ Install GNU Make, Python 3.12 or newer, uv, the Go version declared by
 `go.mod`, OpenTofu 1.10.0 or newer (required for the S3 backend's native
 locking used by `infra/opentofu/backend.example.hcl`), and Docker with the
 Compose plugin. The uv and OpenTofu binaries can be overridden with the `UV`
-and `TOFU` Make variables when a controlled local binary is required.
+and `TOFU` Make variables when a controlled local binary is required. The workers
+unit tests also need `systemd-analyze` from systemd 255 or newer; without it they
+skip locally and fail in CI.
 
 ## Local gates
 
@@ -36,10 +38,34 @@ timeout, rollback failure and first-deployment cleanup without deleting
 volumes. It never connects to the VPS.
 
 Build jobs for pull requests use read-only repository access and do not
-persist checkout credentials. Only the separate publisher, gated on a push
-to `main`, receives `packages: write`; both paths use the same four-image
-matrix and build steps. The parse-only production gate remains read-only.
-`tests/unit/test_build_workflow.py` pins both.
+persist checkout credentials. Only the separate publishers, gated on a push
+to `main`, receive `packages: write`: `publish` uses the same two-image matrix
+(`api`, `frontend`) and build steps as `image`, and `workers-publish` the same
+steps as `workers-bundle` (below). The parse-only production gate remains
+read-only. `tests/unit/test_build_workflow.py` pins them.
+
+## Workers bundle gate
+
+ADR-020 ships the Go workers as static executables in one workers bundle per
+release, never as container images (`ops/workers/README.md`). The normal
+`make verify-python` suite checks it without Go:
+
+- `tests/unit/test_workers_units.py` requires `ops/workers/systemd` to equal
+  the rendering of `ops/workers/roles.yaml` (`make workers-units`), checks
+  every unit setting against the table, runs `systemd-analyze verify` on all
+  units and pins each service's `systemd-analyze security` exposure.
+- `tests/unit/test_workers_bundle.py` packs bundles from fake executables
+  with `scripts/workers/build_bundle.py`, checks the layout and that two
+  builds produce the same bytes, and runs the S4 activation helper's `stage`
+  and `activate` against one.
+
+Real executables are built only in CI. The `workers-bundle` job of the build
+workflow runs `make workers-binaries` and `make workers-bundle`, rebuilds from
+a second checkout with an empty Go build cache and requires identical
+tarballs. It then verifies the bundle with `--static-elf` and runs
+`scripts/workers/smoke_units.sh` as root on the disposable runner, which
+installs the units on its systemd and starts each one once. The trivy
+workflow's `workers` job scans the executables with a rootfs scan.
 
 Leave rollout variables unset for the normal test command so each test can
 choose its settings. Forcing `V1_POND_DEVICE_PROJECTION_ENABLED=false` in the

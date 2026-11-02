@@ -31,12 +31,13 @@
 //     UnitFileState=enabled: a unit that is only linked reads "linked", one enabled with
 //     --runtime reads "enabled-runtime", and neither publishes.
 //   - Allow AF_UNIX and the system D-Bus socket in the monitor's sandbox. As a
-//     DynamicUser, systemctl show reaches systemd over D-Bus.
+//     non-root user, systemctl show reaches systemd over D-Bus. dbus-daemon drops a
+//     user it cannot resolve, and it cannot resolve a dynamic one, so the unit names
+//     a static user (ops/workers/README.md, "Units").
 //   - Set AWS_REGION in the monitor's env file. Without a region it exits 78.
 //   - Ship the whole role table as roles.json, json.dumps(yaml.safe_load(roles.yaml)), at
 //     DefaultTablePath. ParseTable must accept the shipped file.
-//   - Record the mid-run caveat in ops/workers/README.md "Unit health" with the units;
-//     the README does not mention it yet.
+//   - Record the mid-run caveat in ops/workers/README.md "Unit health" with the units.
 //
 // # What the alarms must tolerate
 //

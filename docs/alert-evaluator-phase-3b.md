@@ -9,15 +9,20 @@ exits 78, and the backfills are `limnopulse-admin` commands.
 
 ## Run locally
 
-Initialize DynamoDB and the local seed before the first evaluation:
+Initialize DynamoDB and the local seed before the first evaluation, then run one
+evaluation with `scripts/dev/run_worker.sh` (ADR-020: Compose runs no Go worker). It
+builds `cmd/alert-evaluator` and runs it with the local settings in
+`scripts/dev/workers/alert-evaluator.env`, which point at DynamoDB Local and InfluxDB on
+their host ports:
 
 ```bash
+docker compose up -d dynamodb-local influxdb
 python scripts/dev/init_dynamodb.py
 python scripts/dev/seed_local.py
-docker compose --profile manual run --rm alert-evaluator run
+scripts/dev/run_worker.sh alert-evaluator run
 ```
 
-Build or run without Compose:
+Or build the executables yourself:
 
 ```bash
 go build -o bin/alert-evaluator ./cmd/alert-evaluator

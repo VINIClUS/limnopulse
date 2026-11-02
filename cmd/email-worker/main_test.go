@@ -55,8 +55,7 @@ func TestEmailWorkerRunsOnlyTheEmailJobsConsumerUntilStopped(t *testing.T) {
 			return worker.RunSummary{Result: "success", Graceful: true, MessagesReceived: 2}, nil
 		},
 	})
-	if code != 0 || captured.SQSQueueURL != privateJobsQueue || captured.SendConcurrency != 3 ||
-		captured.SQSFeedbackURL != "" || captured.FeedbackConcurrency != 0 {
+	if code != 0 || captured.SQSQueueURL != privateJobsQueue || captured.SendConcurrency != 3 {
 		t.Fatalf("exit=%d config=%#v output=%s", code, captured, output.String())
 	}
 	var summary worker.RunSummary

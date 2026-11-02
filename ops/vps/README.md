@@ -105,16 +105,20 @@ Register the **private** half as the `VPS_SSH_KEY` secret, and
 
 ## 4. GHCR package visibility
 
-After the first `build.yml` push to `main`, each of the four packages it
-creates (`api`, `frontend`, `alert-evaluator`, `notifications`) is
-**private** by default regardless of the repo being public. In
+After the first `build.yml` push to `main`, each of the two image packages it
+creates (`api`, `frontend`) is **private** by default regardless of the repo
+being public. In
 `https://github.com/users/VINIClUS/packages/container/<name>/settings`,
-switch visibility to public for all four — otherwise `docker compose pull`
-on the VPS fails `unauthorized`.
+switch visibility to public for both — otherwise `docker compose pull`
+on the VPS fails `unauthorized`. Earlier releases also pushed `alert-evaluator`
+and `notifications` images; ADR-020 retired both, and no release pulls them.
 
 ADR-020 adds the `workers` package, the workers bundle that `build.yml` pushes
 as an OCI artifact. Make it public too: the activation helper (step 7) pulls it
-as root with no registry credentials.
+as root with no registry credentials. The package exists only after the first
+push, so that run's `workers-publish` job pushes and attests the bundle and then
+ends red at "Pull the bundle back and verify it as deploy.yml does", whose pull
+is anonymous. Make the `workers` package public, then re-run the failed job.
 
 ## 5. Caddy — do this alone, deliberately
 
@@ -182,12 +186,20 @@ ADR-020 adds to the VPS:
 - the release directories;
 - the per-role configuration.
 
+The units need systemd 254 or newer, for `RestartSteps=` and
+`RestartMaxDelaySec=`; CI exercises them on systemd 255. Check the host first:
+
+```bash
+systemctl --version | head -n 1
+```
+
 Every path and name below comes from `ops/workers/roles.yaml`. `<vps>` is the
 deploy host. From your workstation, with a checkout of this repo:
 
 ```bash
 scp ops/vps/limnopulse-deploy.sh ops/vps/limnopulse-workers-activate root@<vps>:/tmp/
 scp ops/vps/sudoers.d/limnopulse-deploy root@<vps>:/tmp/limnopulse-deploy.sudoers
+scp ops/workers/sysusers.d/limnopulse-workers.conf root@<vps>:/tmp/limnopulse-workers.sysusers
 ```
 
 ### 7.1 oras, pinned and checksum-verified
@@ -255,6 +267,11 @@ own IAM principal, so the names repeat but the keys differ.
 | `telegram-worker` | `aws-access-key-id`, `aws-secret-access-key`, `redis-password` |
 | `worker-monitor` | `aws-access-key-id`, `aws-secret-access-key` |
 
+The AWS key pair is installed with `install_worker_key` (`infra/opentofu/README.md`,
+"Access keys") when a role is enabled, following "Enabling and disabling a role"
+there. The `read -rs` pattern below is for the other credentials (`influxdb-token`,
+`redis-password`).
+
 ```bash
 install -d -o root -g root -m 0755 /etc/limnopulse /etc/limnopulse/workers
 install -d -o root -g root -m 0700 /etc/limnopulse/workers/credentials
@@ -279,11 +296,35 @@ unset secret
 Roles ship disabled. The helper installs every unit but enables none, so a
 role's credentials can wait until an owner enables that role.
 
-### 7.5 Check and clean up
+### 7.5 worker-monitor's static user
+
+worker-monitor reads unit state over the system D-Bus, and dbus-daemon drops a
+dynamic user (`ops/workers/README.md`, "Units"). Its unit therefore names
+`User=limnopulse-worker-monitor`. That user must exist as a static user before
+`limnopulse-worker-monitor.timer` is enabled. Without it, the monitor exits 1
+every minute with "Transport endpoint is not connected" and every unit-health
+alarm breaches.
+
+```bash
+install -d -o root -g root -m 0755 /etc/sysusers.d
+install -o root -g root -m 0644 /tmp/limnopulse-workers.sysusers /etc/sysusers.d/limnopulse-workers.conf
+systemd-sysusers /etc/sysusers.d/limnopulse-workers.conf
+uid="$(getent passwd limnopulse-worker-monitor | cut -d: -f3)"
+if [ -n "$uid" ] && [ "$uid" -lt 61184 ]; then echo "static uid $uid"; else echo "not a static user: stop" >&2; fi
+```
+
+The uid must be below systemd's dynamic range (61184-65519), as in the CI
+smoke (`scripts/workers/smoke_units.sh`). sysusers creates nothing for a name
+that already resolves. If the check fails, a running monitor holds a dynamic
+user of that name: run `systemctl stop limnopulse-worker-monitor.service`,
+then run `systemd-sysusers` and the check again. Repeat this step whenever
+`ops/workers/sysusers.d/` changes.
+
+### 7.6 Check and clean up
 
 ```bash
 sudo -u limnopulse-deploy sudo -n /usr/local/sbin/limnopulse-workers-activate status
-rm -f /tmp/limnopulse-deploy.sh /tmp/limnopulse-workers-activate /tmp/limnopulse-deploy.sudoers
+rm -f /tmp/limnopulse-deploy.sh /tmp/limnopulse-workers-activate /tmp/limnopulse-deploy.sudoers /tmp/limnopulse-workers.sysusers
 ```
 
 `status` prints `current none` until the first promotion activates a bundle.

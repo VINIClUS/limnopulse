@@ -1,0 +1,52 @@
+# Rendered from ops/workers/roles.yaml by scripts/workers/units.py; do not edit by hand.
+
+[Unit]
+Description=LimnoPulse worker-monitor: unit health → CloudWatch
+Documentation=https://github.com/VINIClUS/limnopulse/blob/main/ops/workers/README.md
+Wants=network-online.target
+After=network-online.target
+After=limnopulse-alert-evaluator.service limnopulse-notification-relay.service
+
+[Service]
+Type=oneshot
+TimeoutStartSec=50
+TimeoutStopSec=10
+ExecStart=/opt/limnopulse/workers/current/bin/worker-monitor
+EnvironmentFile=/etc/limnopulse/workers/worker-monitor.env
+Environment=GOTRACEBACK=crash
+Environment=LIMNOPULSE_SUPERVISOR=systemd
+LoadCredential=aws-access-key-id:/etc/limnopulse/workers/credentials/worker-monitor/aws-access-key-id
+LoadCredential=aws-secret-access-key:/etc/limnopulse/workers/credentials/worker-monitor/aws-secret-access-key
+User=limnopulse-worker-monitor
+DynamicUser=yes
+CapabilityBoundingSet=
+AmbientCapabilities=
+NoNewPrivileges=yes
+DevicePolicy=closed
+KeyringMode=private
+LockPersonality=yes
+MemoryDenyWriteExecute=yes
+PrivateDevices=yes
+PrivateIPC=yes
+PrivateTmp=yes
+PrivateUsers=yes
+ProcSubset=pid
+ProtectClock=yes
+ProtectControlGroups=yes
+ProtectHome=yes
+ProtectHostname=yes
+ProtectKernelLogs=yes
+ProtectKernelModules=yes
+ProtectKernelTunables=yes
+ProtectProc=invisible
+ProtectSystem=strict
+RemoveIPC=yes
+RestrictNamespaces=yes
+RestrictRealtime=yes
+RestrictSUIDSGID=yes
+SystemCallArchitectures=native
+SystemCallErrorNumber=EPERM
+SystemCallFilter=@system-service
+SystemCallFilter=~@privileged @resources
+UMask=0077
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6

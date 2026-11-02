@@ -86,9 +86,10 @@ data "aws_iam_policy_document" "telegram_worker" {
     resources = [aws_sqs_queue.telegram_notification_jobs[0].arn]
   }
 
-  # notifications relay (cmd/notifications/main.go) publishes onto this
-  # queue under the same "workers" IAM identity that the telegram-worker
-  # consumer above uses — both processes share one runtime credential.
+  # Before ADR-020 the notifications relay published onto this queue under
+  # the same deprecated "workers" identity that the consumer above used.
+  # Since ADR-020 the relay and the Telegram worker each have their own
+  # principal in workers.tf; this grant stays with the deprecated user.
   statement {
     sid       = "TelegramJobsProducer"
     effect    = "Allow"

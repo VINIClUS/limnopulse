@@ -120,20 +120,22 @@ def wait_for_readings(start: str, stop: str, expected_sequences: set[int]) -> No
     raise RuntimeError("synthetic telemetry was not visible through the API")
 
 
+def evaluator_command(logical_time: str) -> list[str]:
+    """One evaluation as an executable (ADR-020), with the local settings run_worker.sh exports.
+
+    `verify` sets GO to the lab's pinned toolchain."""
+    return [
+        str(ROOT / "scripts/dev/run_worker.sh"),
+        "alert-evaluator",
+        "run",
+        f"--evaluation-time={logical_time}",
+        "--max-sample-age=2m",
+    ]
+
+
 def run_evaluator(logical_time: str) -> None:
     completed = subprocess.run(
-        [
-            "docker",
-            "compose",
-            "--profile",
-            "manual",
-            "run",
-            "--rm",
-            "alert-evaluator",
-            "run",
-            f"--evaluation-time={logical_time}",
-            "--max-sample-age=2m",
-        ],
+        evaluator_command(logical_time),
         cwd=ROOT,
         check=False,
         text=True,

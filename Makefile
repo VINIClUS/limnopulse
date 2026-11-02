@@ -1,7 +1,9 @@
 UV ?= uv
 TOFU ?= tofu
+# ADR-020 workers bundle: the release tag it is built for (output goes to dist/workers).
+WORKERS_TAG ?= main-0000000000000000000000000000000000000000
 
-.PHONY: verify verify-python verify-go verify-tofu verify-compose verify-compose-production verify-influx verify-ingestion
+.PHONY: verify verify-python verify-go verify-tofu verify-compose verify-compose-production verify-influx verify-ingestion workers-units workers-binaries workers-bundle workers-clean
 
 verify: verify-python verify-go verify-tofu verify-compose verify-compose-production
 
@@ -35,3 +37,20 @@ verify-influx:
 verify-ingestion:
 	$(UV) sync --locked --extra dev
 	RUN_INGESTION_INTEGRATION=1 RUN_INFLUX_INTEGRATION=1 $(UV) run --locked --no-sync python -m pytest -q tests/ingestion
+
+# ADR-020 workers bundle (ops/workers/README.md). workers-units fails when ops/workers/systemd
+# drifted from roles.yaml; regenerate it with `python -m scripts.workers.units --write`.
+# workers-binaries runs `go build` for every Go role into dist/workers/bin; CI runs it, then
+# workers-bundle packs dist/workers/limnopulse-workers-$(WORKERS_TAG).tar.gz and verifies it.
+# workers-binaries refuses a non-empty bin/, so a rebuild starts with workers-clean.
+workers-units:
+	$(UV) run --locked --no-sync python -m scripts.workers.units
+
+workers-binaries:
+	$(UV) run --locked --no-sync python -m scripts.workers.build_bundle binaries
+
+workers-bundle:
+	$(UV) run --locked --no-sync python -m scripts.workers.build_bundle bundle --tag $(WORKERS_TAG)
+
+workers-clean:
+	rm -rf dist/workers

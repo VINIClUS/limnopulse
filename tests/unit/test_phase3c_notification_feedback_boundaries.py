@@ -39,7 +39,6 @@ def test_feedback_metrics_are_bounded_and_worker_does_not_consume_dlqs() -> None
     metrics = (ROOT / "internal" / "notifications" / "feedback" / "metrics.go").read_text(
         encoding="utf-8"
     )
-    command = (ROOT / "cmd" / "notifications" / "worker_command.go").read_text(encoding="utf-8")
     config = (ROOT / "internal" / "notifications" / "worker" / "config" / "config.go").read_text(
         encoding="utf-8"
     )
@@ -53,10 +52,9 @@ def test_feedback_metrics_are_bounded_and_worker_does_not_consume_dlqs() -> None
     ):
         assert forbidden not in metrics.lower()
 
-    assert command.count("workersqs.Queue{") == 2
-    assert "QueueURL: config.SQSQueueURL" in command
-    assert "QueueURL: config.SQSFeedbackURL" in command
-    assert "DLQ" not in command
+    # ADR-020 S3 deleted the shared cmd/notifications worker; each consumer polls its one
+    # queue (next test), and neither reads a DLQ.
+    assert not (ROOT / "cmd" / "notifications").exists()
     assert "DLQ" not in config
 
 

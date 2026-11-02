@@ -52,6 +52,25 @@ enabled, so a disabled role publishes nothing.
 - **worker-monitor:** reports itself too.
 - **Not covered:** the Compose ingest worker and the operator CLI publish no unit health.
 
+**Mid-run caveat.** systemd clears `Result` and every `ExecMain*` property when a run
+starts, so a one-shot sampled while it runs reads unhealthy (`0`): its previous outcome is
+no longer visible. The units keep that rare:
+
+- `limnopulse-worker-monitor.service` is ordered `After=` the other one-shot services. A
+  monitor start queued while one of them runs waits for it, so the monitor samples them
+  between runs.
+- The monitor's timer fires at second 30 of each minute, the others at second 0. Every
+  timer sets `AccuracySec=1s`, so systemd never coalesces them into one start.
+
+A race can still catch a one-shot mid-run, and the first interval after boot or enable
+has no finished run yet, so unit-health alarms use an M-of-N window
+(`internal/workermonitor/doc.go`). worker-monitor reads itself as healthy while its timer
+is active, because it is always mid-run when it looks.
+
+Enable a role with a persistent `systemctl enable` of its service (continuous) or timer
+(one-shot). The gate reads `UnitFileState=enabled`: a unit that is only linked reads
+`linked`, one enabled with `--runtime` reads `enabled-runtime`, and neither publishes.
+
 The Compose ingest worker restarts `unless-stopped`. It stamps `liveness_file` on every
 loop turn, and its Compose healthcheck runs the `healthcheck` subcommand against that
 stamp. A stall exits `1` and Compose restarts it. A configuration error exits `78`, and
@@ -84,6 +103,97 @@ In `bundle.env`, `<ROLE>` is the role name upper-cased with `-` replaced by `_`.
 CI pushes the bundle to GHCR as an OCI artifact,
 `ghcr.io/viniclus/limnopulse/workers:<tag>`, with the artifact type from `roles.yaml`. It
 attaches a build-provenance attestation for the tarball.
+
+**Building it.** `scripts/workers/build_bundle.py` builds and checks the bundle
+(`make workers-binaries`, then `make workers-bundle`). It works only in `dist/workers` of
+the checkout it runs from, and no argument names a path:
+
+- `binaries` builds every Go role into `dist/workers/bin` with `CGO_ENABLED=0`,
+  `GOOS=linux`, `GOARCH=amd64`, `GOAMD64=v1`, `-trimpath`, `-buildvcs=false` and
+  `-ldflags='-s -w -buildid='`. Two builds of one commit with one Go toolchain produce
+  the same bytes. It refuses a non-empty `bin/`; `make workers-clean` removes
+  `dist/workers` before a rebuild.
+- `bundle --tag <tag>` writes `dist/workers/limnopulse-workers-<tag>.tar.gz`. It packs
+  USTAR entries sorted by path, mtime 0, uid and gid 0 with no owner names, `bin/*` 0755
+  and the rest 0644, through `gzip -9 -n`. It refuses a `bin/` directory that is not
+  exactly one file per Go role, and units that drifted from `roles.yaml`.
+- `verify --tag <tag>` checks that tarball against `roles.yaml` and the committed units,
+  and that it is the canonical packing of its own contents. `--static-elf` also requires
+  each binary to be a static x86-64 executable with no dynamic loader.
+
+The `workers-bundle` job in `.github/workflows/build.yml` runs on pull requests. It builds
+the bundle twice, from two checkouts with separate Go build caches, and requires the two
+tarballs to be identical. It then verifies one and runs `scripts/workers/smoke_units.sh`,
+which installs it on the runner's systemd. Every role but worker-monitor gets empty
+credentials there and must exit `78` without a restart; worker-monitor reads every unit
+over D-Bus and exits `0`. On a push to `main`, `workers-publish` runs the same steps,
+attests the tarball file with `actions/attest-build-provenance`, and pushes it with
+`oras push` as one file layer titled with its bare file name. It then pulls the bundle
+back anonymously, as `deploy.yml` and the VPS helper do, requires the bytes it built, and
+runs the same `gh attestation verify` as `deploy.yml`. A broken publish therefore fails on
+`main` rather than at the next deploy. So does a private package: the GHCR `workers`
+package must be public (`ops/vps/README.md`, section 4).
+
+## Units
+
+`ops/workers/systemd/` holds the units the bundle ships. `scripts/workers/units.py`
+renders them from `roles.yaml`, and `tests/unit/test_workers_units.py` fails when they
+drift; after editing either, run `.venv/bin/python -m scripts.workers.units --write`.
+
+The host needs systemd 254 or newer: older releases ignore `RestartSteps=` and
+`RestartMaxDelaySec=` with a warning, so a crashing service restarts every 5 s
+indefinitely. CI runs the units on systemd 255.
+
+| Setting | Continuous service | One-shot service and timer |
+|---|---|---|
+| Type | `notify`, `NotifyAccess=main`, `WatchdogSec=watchdog_seconds` | `oneshot`, `TimeoutStartSec=timeout_start_seconds` |
+| Restart | `on-failure` from 5 s backing off to 60 s, `RestartPreventExitStatus=78` | none; the timer starts the next run |
+| Stop | `TimeoutStopSec=timeout_stop_seconds` | `TimeoutStopSec` = interval − start timeout, so a timed-out run is gone before the next tick |
+| Install | `WantedBy=multi-user.target` | the timer only: `OnCalendar` once a minute, `AccuracySec=1s`, `WantedBy=timers.target` |
+
+Every service runs `ExecStart=<binary>` (`alert-evaluator` adds `run`) as a `DynamicUser`
+with `EnvironmentFile=<env_file>`, `go_unit_environment` and one
+`LoadCredential=<name>:<credential_source>` per credential. The shared sandbox drops
+every capability, makes the file system read-only (`ProtectSystem=strict`, private `/tmp`
+and devices, no home), and allows only the `@system-service` system calls without
+`@privileged` and `@resources`. No unit sets `PrivateNetwork=`: every role talks to AWS.
+`RestrictAddressFamilies` allows `AF_INET` and `AF_INET6`, plus `AF_UNIX` where a unit
+needs it:
+
+- continuous services, for `sd_notify`; the system D-Bus socket stays inaccessible to them;
+- worker-monitor, whose `systemctl show` reaches systemd over
+  `/run/dbus/system_bus_socket`.
+
+**worker-monitor's static user.** PID 1 starts `dbus-daemon` with
+`SYSTEMD_NSS_DYNAMIC_BYPASS=1`, so the bus cannot resolve a dynamic user's groups and
+drops its connection. A dynamic monitor fails every run with "Transport endpoint is not
+connected" (Ubuntu 24.04 and 26.04 alike). Its unit therefore keeps `DynamicUser=yes` and
+adds `User=limnopulse-worker-monitor`: systemd uses an existing user of that name instead
+of allocating one, and the sandbox stays the same.
+`ops/workers/sysusers.d/limnopulse-workers.conf` declares the user, with no login shell.
+The host installs it as `/etc/sysusers.d/limnopulse-workers.conf` and runs
+`systemd-sysusers` before it enables the monitor's timer (`ops/vps/README.md`, step 7.5).
+Without the user, the monitor publishes nothing and the unit-health alarms breach.
+`scripts/workers/units.py` renders the file too.
+
+`tests/unit/test_workers_units.py` runs `systemd-analyze verify` on every unit and
+requires `systemd-analyze security` to score each service at or below its pinned
+exposure threshold.
+
+**Env files.** `ops/workers/env/<role>.env.example` is the template for
+`/etc/limnopulse/workers/<role>.env` (root, 0600). It holds non-secret settings only.
+
+- Secrets are credentials: the AWS keys, the InfluxDB token and the Redis password. The
+  Telegram bot token stays in Secrets Manager (`TELEGRAM_BOT_TOKEN_SECRET_ARN`).
+- `EnvironmentFile=` overrides `Environment=`, so an env file must never set
+  `GOTRACEBACK` or `LIMNOPULSE_SUPERVISOR`.
+- An env file never sets an `*_ENDPOINT_URL`, which would point the AWS clients at an
+  emulator with static local keys.
+
+**Local runs.** `scripts/dev/run_worker.sh <role> [arguments...]` builds `cmd/<role>`
+and runs it against the local emulators with `scripts/dev/workers/<role>.env`. It unsets
+the systemd supervision variables, so a local run never waits for credentials or
+`sd_notify`. Compose runs no Go worker.
 
 ## Activation helper
 

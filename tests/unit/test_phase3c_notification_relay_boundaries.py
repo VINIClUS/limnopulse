@@ -13,12 +13,9 @@ def _production_go_sources(directory: Path) -> str:
 
 def test_notification_relay_is_query_only_bounded_and_one_shot() -> None:
     relay_sources = _production_go_sources(ROOT / "internal" / "notifications" / "relay")
-    command_source = (ROOT / "cmd" / "notifications" / "main.go").read_text(
-        encoding="utf-8"
-    )
     # ADR-020: the notification-relay executable and its composition stay one-shot too.
     entrypoint_source = _production_go_sources(ROOT / "cmd" / "notification-relay")
-    sources = relay_sources + "\n" + command_source + "\n" + entrypoint_source
+    sources = relay_sources + "\n" + entrypoint_source
 
     assert ".Scan(" not in sources
     assert "ScanInput" not in sources
