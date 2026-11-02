@@ -93,9 +93,13 @@ func connect(ctx context.Context, deps dependencies, load workercmd.AWSLoader) (
 	region := envOr(deps.LookupEnv, "AWS_REGION", "us-east-1")
 	endpoint := envOr(deps.LookupEnv, "DYNAMODB_ENDPOINT_URL", "")
 	table := envOr(deps.LookupEnv, "DYNAMODB_DOMAIN_TABLE", "LimnopulseDomain")
-	if strings.TrimSpace(region) == "" || strings.TrimSpace(table) == "" {
-		err := errors.New("AWS_REGION and DYNAMODB_DOMAIN_TABLE must not be empty")
-		return nil, "", workercmd.Fail(deps.Output, workerproc.Configuration(err), "configuration")
+	for _, required := range []struct{ name, value string }{
+		{"AWS_REGION", region}, {"DYNAMODB_DOMAIN_TABLE", table},
+	} {
+		if strings.TrimSpace(required.value) == "" {
+			err := fmt.Errorf("%s must not be empty", required.name)
+			return nil, "", workercmd.Fail(deps.Output, workerproc.Configuration(err), "configuration")
+		}
 	}
 	client, err := deps.LoadDynamo(ctx, load, region, endpoint)
 	if err != nil {

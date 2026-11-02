@@ -28,8 +28,11 @@ SES_PACKAGE = re.compile(
     r"^github\.com/aws/aws-sdk-go-v2/service/ses(?:v2)?(?:/|$)"
     rf"|^{re.escape(MODULE)}internal/notifications/worker/ses(?:/|$)"
 )
-TIMER_CALLS = r"(?:Sleep|Tick|NewTicker|NewTimer|After|AfterFunc)\s*\("
-ENV_CALLS = r"(?:Getenv|LookupEnv|Environ)\s*\("
+# Bare names, so a function value (`nap := time.Sleep`) counts as much as a call.
+TIMER_NAMES = r"(?:Sleep|Tick|NewTicker|NewTimer|After|AfterFunc|Ticker|Timer)\b"
+ENV_NAMES = r"(?:Getenv|LookupEnv|Environ)\b"
+# A main hands os.LookupEnv to its loader as a value and never reads the env itself.
+MAIN_ENV_READS = r"(?:Getenv|Environ)\b|LookupEnv\s*\("
 # A secret's env key may be named only by its loader and by the main that maps it to a credential.
 SECRET_KEYS = {
     "INFLUXDB_TOKEN": {"internal/alertevaluator/config.go", "cmd/alert-evaluator/main.go"},
@@ -64,6 +67,7 @@ SETTING_LOADERS = (
     "internal/notifications/feedback/config/config.go",
     "internal/notifications/telegramworker/config/config.go",
     "cmd/email-worker/main.go",
+    "cmd/telegram-worker/main.go",
     "cmd/limnopulse-admin/main.go",
 )
 ERROR_CALL = re.compile(r'(?:fmt\.Errorf|errors\.New)\(\s*"((?:[^"\\]|\\.)*)"(?:\s*,\s*([\w.]+))?')
@@ -138,15 +142,19 @@ def test_oneshot_closures_never_sleep_poll_or_supervise(name: str) -> None:
         assert "ReceiveMessage" not in file.code, file.relative
         # workerproc's ticker and stall grace serve continuous roles only.
         if file.package != WORKERPROC:
-            assert not file.uses("time", TIMER_CALLS), file.relative
+            assert not file.uses("time", TIMER_NAMES), file.relative
 
 
 @pytest.mark.parametrize("name", S1_ROLES)
 def test_roles_read_settings_only_through_their_lookup(name: str) -> None:
+    main = MODULE + f"cmd/{name}"
     for file in closure_files(f"cmd/{name}"):
-        if file.package != WORKERPROC:
-            assert not file.uses("os", ENV_CALLS), file.relative
-            assert not file.uses("syscall", ENV_CALLS), file.relative
+        if file.package == main:
+            assert not file.uses("os", MAIN_ENV_READS), file.relative
+            assert not file.uses("syscall", ENV_NAMES), file.relative
+        elif file.package != WORKERPROC:
+            assert not file.uses("os", ENV_NAMES), file.relative
+            assert not file.uses("syscall", ENV_NAMES), file.relative
         for key, allowed in SECRET_KEYS.items():
             if f'"{key}"' in file.code:
                 assert file.relative in allowed, (key, file.relative)

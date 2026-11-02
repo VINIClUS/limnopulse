@@ -153,7 +153,10 @@ binding and migration are verified.
    Redis password from its `redis-password` credential and exits 78 if
    `REDIS_PASSWORD` is also set in its env file. It exits 0 only after
    `SIGTERM`/`SIGINT`, 1 after a fatal error or a stalled receive loop, and 78
-   on a configuration error.
+   on a configuration error. That includes a `TELEGRAM_GLOBAL_RATE` or
+   `TELEGRAM_DESTINATION_RATE` so low that one limiter wait plus the provider
+   timeout would reach the stall limit, because the worker waits for the limiter
+   in-process.
 8. Enable Telegram on the relay and evaluator, in that order, for a controlled
    tenant cohort. Confirm one opening and recovery before broader activation.
 9. Monitor the queue, DLQ, limiter and durable states. Track queue age,

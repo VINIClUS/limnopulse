@@ -8,6 +8,7 @@ package main
 
 import (
 	"context"
+	"fmt"
 	"io"
 	"os"
 	"time"
@@ -40,9 +41,30 @@ func main() {
 func runMain(ctx context.Context, args []string, deps dependencies) int {
 	return consumer.Role[telegramworkerconfig.RunConfig]{
 		Load: func(args []string, lookup func(string) (string, bool)) (telegramworkerconfig.RunConfig, error) {
-			return telegramworkerconfig.Load(args, lookup)
+			config, err := telegramworkerconfig.Load(args, lookup)
+			if err != nil {
+				return config, err
+			}
+			return config, checkRole(config)
 		},
 		Run:    deps.Run,
 		Secret: &consumer.Secret{Credential: workerproc.CredentialRedisPassword, Key: "REDIS_PASSWORD"},
 	}.Main(ctx, args, deps.Output, deps.LookupEnv, deps.Supervisor)
+}
+
+// checkRole rejects at load a rate whose limiter wait would outlast the stall limit. The
+// processor sleeps out a RateLimitError in-process, and the Redis limiter asks for the longer
+// of the two buckets' waits, so a slow bucket would read as a stalled loop and restart forever.
+func checkRole(config telegramworkerconfig.RunConfig) error {
+	for _, rate := range []struct {
+		name  string
+		value float64
+	}{
+		{"TELEGRAM_GLOBAL_RATE", config.GlobalRate}, {"TELEGRAM_DESTINATION_RATE", config.DestinationRate},
+	} {
+		if 1/rate.value+config.ProviderTimeout.Seconds() >= stallAfter.Seconds() {
+			return fmt.Errorf("%s is too low for the %s stall limit", rate.name, stallAfter)
+		}
+	}
+	return nil
 }

@@ -439,6 +439,9 @@ func TestBackfillRelayExitCodesCoverSuccessPartialAndFatalResults(t *testing.T) 
 			if (result.Summary != nil) != test.wantSummary {
 				t.Fatalf("summary presence = %v, want %v; result = %#v", result.Summary != nil, test.wantSummary, result)
 			}
+			if test.wantCategory == "configuration" && !reflect.DeepEqual(result.Settings, []string{"DYNAMODB_DOMAIN_TABLE"}) {
+				t.Fatalf("settings = %#v, want only DYNAMODB_DOMAIN_TABLE", result.Settings)
+			}
 		})
 	}
 }

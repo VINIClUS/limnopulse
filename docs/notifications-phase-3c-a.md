@@ -233,7 +233,9 @@ unnecessary overlap.
 `email-worker` and `ses-feedback-worker` exit 0 only after `SIGTERM`/`SIGINT`,
 1 after a fatal error or a stalled receive loop (no progress for
 `stall_after_seconds` in `ops/workers/roles.yaml`), and 78 on a configuration
-error.
+error. `email-worker` also exits 78 at load when, in `aws` mode, `SES_FROM_EMAIL`
+is malformed, or when `NOTIFICATION_MAX_SEND_RATE` is so low that one limiter wait
+plus the provider timeout would reach the stall limit.
 
 A 78 failure line names the failing settings under `settings` (an env key, a flag
 or a credential), never their values. `-h` prints the usage and exits 0.

@@ -180,24 +180,35 @@ func TestLoadRunConfigNamesTheSettingThatFailed(t *testing.T) {
 		args   []string
 		prefix string
 	}{
-		{[]string{"--shard-count=0"}, "--shard-count must be between"},
-		{[]string{"--shard=1", "--shard-count=1"}, "--shard must be between 0 and --shard-count minus 1"},
-		{[]string{"--per-rule-timeout=0s"}, "per-rule-timeout must be positive"},
-		{[]string{"--per-rule-timeout=20s", "--lease-ttl=15s"}, "lease-ttl must be greater than per-rule-timeout"},
-		{[]string{"--evaluation-parallelism=0"}, "evaluation-parallelism must be positive"},
-		{[]string{"--query-parallelism=0"}, "query-parallelism must be positive"},
-		{[]string{"--max-rules=0"}, "max-rules must be positive"},
-		{[]string{"--page-size=0"}, "page-size must be positive"},
-		{[]string{"--systemic-error-threshold=0"}, "systemic-error-threshold must be positive"},
-		{[]string{"--min-points=0"}, "min-points must be positive"},
-		{[]string{"--expected-sample-interval=0s"}, "expected-sample-interval must be positive"},
-		{[]string{"--min-coverage-ratio=0"}, "min-coverage-ratio must be greater than 0 and at most 1"},
-		{[]string{"--min-coverage-ratio=1.5"}, "min-coverage-ratio must be greater than 0 and at most 1"},
-		{[]string{"--allowed-lateness=-1s"}, "allowed-lateness must not be negative"},
-		{[]string{"--max-sample-age=0s"}, "max-sample-age must be positive"},
+		{[]string{"--shard-count=0"}, "--shard-count (ALERT_EVALUATOR_SHARD_COUNT) must be between"},
+		{[]string{"--shard=1", "--shard-count=1"}, "--shard (ALERT_EVALUATOR_SHARD) must be between 0 and --shard-count minus 1"},
+		{[]string{"--per-rule-timeout=0s"}, "--per-rule-timeout (ALERT_EVALUATOR_PER_RULE_TIMEOUT) must be positive"},
+		{[]string{"--per-rule-timeout=20s", "--lease-ttl=15s"}, "--lease-ttl (ALERT_EVALUATOR_LEASE_TTL) must be greater than --per-rule-timeout"},
+		{[]string{"--evaluation-parallelism=0"}, "--evaluation-parallelism (ALERT_EVALUATOR_EVALUATION_PARALLELISM) must be positive"},
+		{[]string{"--query-parallelism=0"}, "--query-parallelism (ALERT_EVALUATOR_QUERY_PARALLELISM) must be positive"},
+		{[]string{"--max-rules=0"}, "--max-rules (ALERT_EVALUATOR_MAX_RULES) must be positive"},
+		{[]string{"--page-size=0"}, "--page-size (ALERT_EVALUATOR_PAGE_SIZE) must be positive"},
+		{[]string{"--systemic-error-threshold=0"}, "--systemic-error-threshold (ALERT_EVALUATOR_SYSTEMIC_ERROR_THRESHOLD) must be positive"},
+		{[]string{"--min-points=0"}, "--min-points (ALERT_EVALUATOR_MIN_POINTS) must be positive"},
+		{[]string{"--expected-sample-interval=0s"}, "--expected-sample-interval (ALERT_EVALUATOR_EXPECTED_SAMPLE_INTERVAL) must be positive"},
+		{[]string{"--min-coverage-ratio=0"}, "--min-coverage-ratio (ALERT_EVALUATOR_MIN_COVERAGE_RATIO) must be greater than 0 and at most 1"},
+		{[]string{"--min-coverage-ratio=1.5"}, "--min-coverage-ratio (ALERT_EVALUATOR_MIN_COVERAGE_RATIO) must be greater than 0 and at most 1"},
+		{[]string{"--allowed-lateness=-1s"}, "--allowed-lateness (ALERT_EVALUATOR_ALLOWED_LATENESS) must not be negative"},
+		{[]string{"--max-sample-age=0s"}, "--max-sample-age (ALERT_EVALUATOR_MAX_SAMPLE_AGE) must be positive"},
+		{[]string{"--global-deadline=60s"}, "--global-deadline (ALERT_EVALUATOR_GLOBAL_DEADLINE) must be positive"},
+		{[]string{"--drain-grace=0s"}, "--drain-grace (ALERT_EVALUATOR_DRAIN_GRACE) must be positive"},
+		{[]string{"--telemetry-source=v3"}, "--telemetry-source (ALERT_EVALUATOR_TELEMETRY_SOURCE) must be legacy or v2"},
 	} {
 		if _, err := LoadRunConfig(test.args, env(nil)); err == nil || !strings.HasPrefix(err.Error(), test.prefix) {
 			t.Fatalf("LoadRunConfig(%v) error = %v, want %q", test.args, err, test.prefix)
 		}
+	}
+}
+
+func TestStagingNamesTheQualitySettingThatIsNotExplicit(t *testing.T) {
+	_, err := LoadRunConfig(nil, env(map[string]string{"APP_ENV": "staging", "TELEGRAM_DELIVERY_ENABLED": "false"}))
+	if err == nil || !strings.HasPrefix(err.Error(), "--") || !strings.Contains(err.Error(), "(ALERT_EVALUATOR_") ||
+		!strings.HasSuffix(err.Error(), " must be explicit in staging") {
+		t.Fatalf("error = %v", err)
 	}
 }

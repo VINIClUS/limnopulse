@@ -105,8 +105,10 @@ func TestTelegramWorkerKeepsTheEnvPasswordForLocalRuns(t *testing.T) {
 
 func TestTelegramWorkerExits78OnConfigurationErrors(t *testing.T) {
 	for name, lookup := range map[string]func(string) (string, bool){
-		"delivery disabled": environment(map[string]string{"TELEGRAM_DELIVERY_ENABLED": "false"}),
-		"no credentials":    environment(map[string]string{workerproc.SupervisorEnv: "systemd"}),
+		"delivery disabled":                      environment(map[string]string{"TELEGRAM_DELIVERY_ENABLED": "false"}),
+		"global rate below the stall limit":      environment(map[string]string{"TELEGRAM_GLOBAL_RATE": "0.012"}),
+		"destination rate below the stall limit": environment(map[string]string{"TELEGRAM_DESTINATION_RATE": "0.012"}),
+		"no credentials":                         environment(map[string]string{workerproc.SupervisorEnv: "systemd"}),
 		"missing password credential": environment(map[string]string{
 			"CREDENTIALS_DIRECTORY": func() string {
 				dir := credentialsDirectory(t)
@@ -119,6 +121,26 @@ func TestTelegramWorkerExits78OnConfigurationErrors(t *testing.T) {
 	} {
 		if _, started, code, output := run(t, lookup); started || code != workerproc.ExitConfiguration {
 			t.Fatalf("%s: started=%t exit=%d output=%s", name, started, code, output)
+		}
+	}
+}
+
+func TestTelegramWorkerRejectsARateWhoseWaitOutlastsTheStallLimit(t *testing.T) {
+	for _, test := range []struct {
+		global, destination float64
+		wantErr             string
+	}{
+		{global: 25, destination: 1},
+		{global: 1.0 / 78, destination: 1.0 / 78},
+		{global: 1.0 / 81, destination: 1, wantErr: "TELEGRAM_GLOBAL_RATE"},
+		{global: 25, destination: 1.0 / 81, wantErr: "TELEGRAM_DESTINATION_RATE"},
+		{global: 25, destination: 1e-12, wantErr: "TELEGRAM_DESTINATION_RATE"},
+	} {
+		err := checkRole(telegramworkerconfig.RunConfig{
+			GlobalRate: test.global, DestinationRate: test.destination, ProviderTimeout: 10 * time.Second,
+		})
+		if (test.wantErr == "" && err != nil) || (test.wantErr != "" && (err == nil || !strings.HasPrefix(err.Error(), test.wantErr))) {
+			t.Fatalf("global=%v destination=%v: err=%v, want %q", test.global, test.destination, err, test.wantErr)
 		}
 	}
 }

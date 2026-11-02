@@ -22,23 +22,27 @@ class GoFile:
     package: str
     # The source without comments; string literals are kept.
     code: str
-    # Import path -> local name: the alias, "." for a dot import, "_" for a blank one.
-    imports: dict[str, str]
+    # Import path -> every local name it is imported under: an alias, "." for a dot import,
+    # "_" for a blank one. A file may import one path twice, under two names.
+    imports: dict[str, frozenset[str]]
 
     @property
     def relative(self) -> str:
         return self.path.relative_to(ROOT).as_posix()
 
     def uses(self, import_path: str, member: str) -> bool:
-        """Whether the code refers to `<local name>.<member>` (a regex) of import_path."""
-        name = self.imports.get(import_path)
-        if name is None or name == "_":
-            return False
-        if name == ".":
-            # A dot import hides every qualified reference; count it as a use.
-            return True
-        pattern = rf"(?<![\w.]){re.escape(name)}\s*\.\s*(?:{member})"
-        return re.search(pattern, self.code) is not None
+        """Whether the code refers to `<local name>.<member>` (a regex) of import_path under
+        any of its local names, called or not."""
+        for name in self.imports.get(import_path, ()):
+            if name == "_":
+                continue
+            if name == ".":
+                # A dot import hides every qualified reference; count it as a use.
+                return True
+            pattern = rf"(?<![\w.]){re.escape(name)}\s*\.\s*(?:{member})"
+            if re.search(pattern, self.code):
+                return True
+        return False
 
 
 def strip_comments(source: str) -> str:
@@ -78,7 +82,7 @@ def _default_name(import_path: str) -> str:
     return parts[-1]
 
 
-def _imports(code: str) -> dict[str, str]:
+def _imports(code: str) -> dict[str, frozenset[str]]:
     specs: list[tuple[str | None, str]] = []
     for block in _IMPORT_BLOCK.findall(code):
         for line in block.splitlines():
@@ -86,7 +90,10 @@ def _imports(code: str) -> dict[str, str]:
             if match:
                 specs.append((match.group(1), match.group(2)))
     specs.extend((alias or None, path) for alias, path in _IMPORT_LINE.findall(code))
-    return {path: alias or _default_name(path) for alias, path in specs}
+    names: dict[str, set[str]] = {}
+    for alias, path in specs:
+        names.setdefault(path, set()).add(alias or _default_name(path))
+    return {path: frozenset(local) for path, local in names.items()}
 
 
 @cache

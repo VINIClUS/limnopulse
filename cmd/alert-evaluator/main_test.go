@@ -8,6 +8,7 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
+	"reflect"
 	"strings"
 	"sync/atomic"
 	"testing"
@@ -197,20 +198,23 @@ func TestEvaluatorExitsOneWhenItCannotCompose(t *testing.T) {
 }
 
 func TestRunRejectsInvalidSettingsAsConfigurationErrors(t *testing.T) {
+	source := []string{"ALERT_EVALUATOR_TELEMETRY_SOURCE", "telemetry-source"}
 	for _, test := range []struct {
-		env  string
-		args []string
+		env      string
+		args     []string
+		settings []string
 	}{
-		{env: "bogus", args: []string{"run"}},
-		{env: "legacy", args: []string{"run", "--telemetry-source=V2"}},
-		{env: "legacy", args: []string{"run", "--no-such-flag"}},
-		{env: "legacy", args: []string{"run", "--evaluation-time=yesterday"}},
+		{env: "bogus", args: []string{"run"}, settings: source},
+		{env: "legacy", args: []string{"run", "--telemetry-source=V2"}, settings: source},
+		{env: "legacy", args: []string{"run", "--no-such-flag"}, settings: []string{"no-such-flag"}},
+		{env: "legacy", args: []string{"run", "--evaluation-time=yesterday"}, settings: []string{"evaluation-time"}},
 	} {
 		code, captured, output := evaluateWith(t, test.args,
 			environment(map[string]string{"ALERT_EVALUATOR_TELEMETRY_SOURCE": test.env}), alertevaluator.RunSummary{}, nil)
 		line := decodeFailure(t, output)
 		if code != workerproc.ExitConfiguration || captured != nil || line.Result != "fatal_failure" || line.RetryRecommended ||
-			len(line.ErrorCategories) != 1 || line.ErrorCategories["configuration"] != 1 || len(line.Settings) != 1 {
+			len(line.ErrorCategories) != 1 || line.ErrorCategories["configuration"] != 1 ||
+			!reflect.DeepEqual(line.Settings, test.settings) {
 			t.Fatalf("env %q args %v: exit %d, line %+v; want a configuration failure", test.env, test.args, code, line)
 		}
 	}
