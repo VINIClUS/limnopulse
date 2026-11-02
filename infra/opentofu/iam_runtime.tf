@@ -28,6 +28,10 @@ resource "aws_iam_user" "api" {
   tags = local.common_tags
 }
 
+# DEPRECATED (ADR-020). Every Go worker role now has its own principal in workers.tf, and no
+# Go worker runs in production under this user. It and its grants below stay only until the
+# per-role cutover is verified; README.md, "Worker roles", says how to remove them. Do not
+# attach anything new to it.
 resource "aws_iam_user" "workers" {
   name          = "${var.project_name}-${var.environment}-workers"
   force_destroy = true
