@@ -123,7 +123,7 @@ For each role:
 | `worker-monitor` | The static user exists: `getent passwd limnopulse-worker-monitor` shows a uid below 61184 (`ops/vps/README.md`, step 7.5). |
 | `ses-feedback-worker` | `email_delivery` is applied. The 3C-A "Cloud rollout" steps 1 to 6 are done: the relay index is `ACTIVE`, the email outboxes are backfilled and SES is validated. No older feedback worker is running. |
 | `email-worker` | The SES-feedback worker is enabled and its alarms are `OK`. The SES check passes (`infra/opentofu/README.md`, "The email-worker's SES check"). Its simulation runs on the *workstation* and its test send on the *host*. The apply that first created `NotificationRelayByAvailableAt` is not the one that enables it ("Notification rollout boundary"). |
-| `telegram-worker` | The 3C-B "Cloud rollout" steps 1 to 6 are done: queue, secrets, webhook and binding, binaries with every Telegram flag `false`, and the final `limnopulse-admin backfill-telegram` with the evaluator timer stopped. Redis is published on the host loopback with a password, and in the same change the API's `REDIS_URL` gets that password. `compose.production.yaml` publishes no Redis port and hard-codes a password-less `REDIS_URL`, so that change comes first. The password is the worker's `redis-password` credential. Only the worker's env file sets `TELEGRAM_DELIVERY_ENABLED=true` (3C-B step 7). |
+| `telegram-worker` | The 3C-B "Cloud rollout" steps 1 to 6 are done: queue, secrets, webhook and binding, binaries with every Telegram flag `false`, and the final `limnopulse-admin backfill-telegram` with the evaluator stopped ([Telegram on the producers](#telegram-on-the-producers)). Redis is published on the host loopback with a password, and in the same change the API's `REDIS_URL` gets that password. `compose.production.yaml` publishes no Redis port and hard-codes a password-less `REDIS_URL`, so that change comes first. The password is the worker's `redis-password` credential. Only the worker's env file sets `TELEGRAM_DELIVERY_ENABLED=true` (3C-B step 7). |
 | `notification-relay` | `NotificationRelayByAvailableAt` is `ACTIVE`, and `limnopulse-admin backfill-relay` reports zero rows needing update. The apply that first created the index is not the one that enables it. With Telegram on, the env file also sets `SQS_TELEGRAM_JOBS_URL` and `LIMNOPULSE_WEB_URL`. |
 | `alert-evaluator` | The `influxdb-token` credential is a dedicated token, readable only against `INFLUXDB_BUCKET_RAW`. It is never the bootstrap admin `INFLUXDB_TOKEN` that the API and InfluxDB use. Create it with [Evaluator token](#evaluator-token). The data-quality settings in the env file match the devices. `limnopulse-admin backfill-schedule` has been applied ([`docs/alert-evaluator-phase-3b.md`](alert-evaluator-phase-3b.md), "Initial schedule backfill"). |
 
@@ -158,11 +158,21 @@ Turn Telegram on as 3C-B step 8 describes: first the relay, then the evaluator, 
 controlled tenant cohort. Then confirm one opening and one recovery.
 
 From the final `backfill-telegram` until the evaluator's env file has Telegram on, the
-evaluator timer stays stopped. An evaluator run with Telegram off marks each new Telegram
-outbox `deferred_unsupported_channel`, and only `backfill-telegram` makes those outboxes deliverable. If the
-evaluator did run in that window:
+evaluator stays stopped. An evaluator run with Telegram off marks each new Telegram outbox
+`deferred_unsupported_channel`, and only `backfill-telegram` makes those outboxes
+deliverable.
 
-1. Stop its timer.
+Stopping the timer does not stop a run that is already in progress. So stop both units,
+and start the final backfill only once the service reads `inactive` (*host*):
+
+```bash
+systemctl stop limnopulse-alert-evaluator.timer limnopulse-alert-evaluator.service
+systemctl is-active limnopulse-alert-evaluator.service   # must print inactive (or failed)
+```
+
+If the evaluator ran in that window anyway:
+
+1. Stop both units as above.
 2. Repeat the `backfill-telegram` dry run, `--apply` and dry run until it reports nothing
    to update.
 3. Turn on the flags.
