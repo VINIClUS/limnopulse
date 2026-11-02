@@ -427,11 +427,13 @@ INGESTION_GATE = "var.telemetry_ingress ? 1 : 0"
 ALARM_EMAIL_GATE = 'var.telemetry_ingress && var.telemetry_ingress_alarm_email != "" ? 1 : 0'
 ALARM_TOPIC = "aws_sns_topic.telemetry_ingress_alarms[0]"
 UNCHANGED_FILE_SHA256 = {
-    "iam_runtime.tf": "5673fcec2dbe4279cf3917ab05955a69598147f1af2d144a5e4cfdca4616dcc5",
+    # ADR-020 S6 changed only comments: the shared workers user is marked deprecated.
+    "iam_runtime.tf": "8e7502f3f948bb2016531ab72771d819be24f9ad73abeda03c95b6f288d93620",
     "queues.tf": "d85972d656c951d6a728fecfe4f762f0e96dc1e4687ee39d068edbea74ad9425",
 }
 # Digest of every pre-P3 block in variables.tf and outputs.tf (see _pre_p3_digest): P3-02
-# may only append telemetry_ingress* / telemetry_ingest* blocks to those files.
+# may only append telemetry_ingress* / telemetry_ingest* blocks to those files, and ADR-020
+# S6 only the ADR020_VARIABLES and ADR020_OUTPUTS blocks.
 PRE_P3_BLOCKS_SHA256 = {
     "variables.tf": "05b652d1d9e61efd4622e0ba4593d517708ec5260ca2164e2c5938ac6bee9288",
     "outputs.tf": "67f70e1569ba6bb1fc765025f92b8358101f8b90fc453272e8d46fd960aadda4",
@@ -448,6 +450,31 @@ MODULE_TF_FILES = {
     "telegram.tf",
     "variables.tf",
     "versions.tf",
+    "worker_alarms.tf",
+    "workers.tf",
+}
+ADR020_VARIABLES = {
+    "alert_evaluator_enabled",
+    "notification_relay_enabled",
+    "email_worker_enabled",
+    "ses_feedback_worker_enabled",
+    "telegram_worker_enabled",
+    "worker_monitor_enabled",
+    "worker_queue_age_alarm_threshold_seconds",
+    "worker_queue_depth_alarm_threshold",
+    "worker_alarm_actions",
+    "worker_alarm_email",
+    "limnopulse_admin_trusted_principal_arns",
+}
+ADR020_OUTPUTS = {
+    "alert_evaluator_iam_user_name",
+    "notification_relay_iam_user_name",
+    "email_worker_iam_user_name",
+    "ses_feedback_worker_iam_user_name",
+    "telegram_worker_iam_user_name",
+    "worker_monitor_iam_user_name",
+    "limnopulse_admin_role_arn",
+    "worker_alarm_topic_arn",
 }
 INGRESS_QUEUE = "aws_sqs_queue.telemetry_ingress[0]"
 DLQ_QUEUE = "aws_sqs_queue.telemetry_ingress_dlq[0]"
@@ -582,7 +609,11 @@ def _pre_p3_digest(relative_path: str) -> str:
         _block_signature(block)
         for block in _tofu_blocks(relative_path)
         if not (
-            block.labels and block.labels[0].startswith(("telemetry_ingress", "telemetry_ingest"))
+            block.labels
+            and (
+                block.labels[0].startswith(("telemetry_ingress", "telemetry_ingest"))
+                or block.labels[0] in ADR020_VARIABLES | ADR020_OUTPUTS
+            )
         )
     ]
     return hashlib.sha256(json.dumps(signatures).encode()).hexdigest()
@@ -1180,3 +1211,330 @@ def test_ingestion_queues_tf_hcl_reader_accepts_inline_comments() -> None:
     ]
     assert _list_items(statement.attrs["resources"]) == ["aws_dynamodb_table.domain.arn"]
     assert statement.attrs["sid"] == '"A#B"'
+
+
+# --- ADR-020 S6: per-role worker principals, enable variables and alarms -------------------
+#
+# ops/workers/roles.yaml is the source: every role's iam_principal, enable_variable and alarms,
+# and the table's unit_health and standalone_alarms, must be what workers.tf and
+# worker_alarms.tf declare. test_iam_runtime_transactions.py checks the principals' grants.
+
+WORKER_ALARM_ACTIONS = "concat(var.worker_alarm_actions, [aws_sns_topic.worker_alarms.arn])"
+WORKER_ALARM_TOPIC = "aws_sns_topic.worker_alarms"
+# A role's principal (and so its alarms) exists only with the delivery flag it serves.
+WORKER_PRINCIPAL_GATES = {
+    "email_worker": "var.email_delivery ? 1 : 0",
+    "ses_feedback_worker": "var.email_delivery ? 1 : 0",
+    "telegram_worker": "var.telegram_delivery ? 1 : 0",
+}
+WORKER_TOPIC_EMAIL_GATE = 'var.worker_alarm_email != "" ? 1 : 0'
+
+
+def _worker_roles() -> list[dict[str, Any]]:
+    from tests.support.worker_roles import load_roles
+
+    return load_roles()["roles"]
+
+
+def _worker_principals() -> dict[str, _HclBlock]:
+    return {
+        block.labels[1]: block
+        for block in _tofu_blocks("workers.tf")
+        if block.kind == "resource" and block.labels[0] in {"aws_iam_user", "aws_iam_role"}
+    }
+
+
+def _all_blocks() -> list[_HclBlock]:
+    return [
+        block
+        for path in sorted(TOFU_ROOT.glob("*.tf"))
+        for block in _parse_hcl_body(path.read_text(encoding="utf-8"))[1]
+    ]
+
+
+def test_worker_enable_variables_are_false_bools_for_every_unit_role() -> None:
+    variables = {
+        block.labels[0]: block for block in _tofu_blocks("variables.tf") if block.kind == "variable"
+    }
+    tfvars = _read("env/cloud.tfvars.example")
+    units = [role for role in _worker_roles() if role["lifecycle"] in {"continuous", "oneshot"}]
+
+    enable = {role["enable_variable"] for role in units}
+    assert enable == {name for name in ADR020_VARIABLES if name.endswith("_enabled")}
+    for name in enable:
+        assert variables[name].attrs["type"] == "bool", name
+        assert variables[name].attrs["default"] == "false", name
+        assert "description" in variables[name].attrs, name
+        assert re.search(rf"^{name}\s+=\s+false$", tfvars, re.MULTILINE), name
+    for name in ADR020_VARIABLES:
+        assert name in variables, name
+        assert re.search(rf"^{name}\s+=\s+\S", tfvars, re.MULTILINE), name
+    assert variables["worker_alarm_actions"].attrs["default"] == "[]"
+    assert re.search(r'^worker_alarm_email\s+=\s+""$', tfvars, re.MULTILINE)
+    assert variables["limnopulse_admin_trusted_principal_arns"].attrs["default"] == "[]"
+    assert re.search(r"^limnopulse_admin_trusted_principal_arns\s+=\s+\[\]$", tfvars, re.MULTILINE)
+
+
+def test_worker_principals_are_one_per_go_role_and_gated_with_their_channel() -> None:
+    principals = _worker_principals()
+    go_roles = [role for role in _worker_roles() if role["entrypoint"].startswith("cmd/")]
+
+    assert set(principals) == {role["iam_principal"] for role in go_roles}
+    for role in go_roles:
+        principal = principals[role["iam_principal"]]
+        # The operator CLI has a role it assumes for one run; every unit has a user.
+        kind = "aws_iam_role" if role["lifecycle"] == "cli" else "aws_iam_user"
+        assert principal.labels[0] == kind, role["name"]
+        assert (
+            principal.attrs["name"]
+            == f'"${{var.project_name}}-${{var.environment}}-{role["name"]}"'
+        )
+        assert principal.attrs["tags"] == "local.common_tags"
+        assert principal.attrs.get("count") == WORKER_PRINCIPAL_GATES.get(role["iam_principal"])
+        assert "permissions_boundary" not in principal.attrs
+        if kind == "aws_iam_user":
+            assert principal.attrs["force_destroy"] == "true", role["name"]
+
+
+def test_the_admin_role_trusts_only_this_account() -> None:
+    blocks = _tofu_blocks("workers.tf")
+    (admin,) = _resources(blocks, "aws_iam_role").values()
+    assert admin.attrs["assume_role_policy"] == (
+        "data.aws_iam_policy_document.limnopulse_admin_trust.json"
+    )
+    assert int(admin.attrs["max_session_duration"]) <= 3600
+    (statement,) = _policy_documents(blocks)["limnopulse_admin_trust"].nested("statement")
+    assert set(statement.attrs) == {"sid", "effect", "actions"}
+    assert statement.attrs["effect"] == '"Allow"'
+    assert _list_items(statement.attrs["actions"]) == ['"sts:AssumeRole"']
+    assert [block.kind for block in statement.blocks] == ["principals", "condition"]
+    assert _statement_principal(statement) == (
+        '"AWS"',
+        ['"arn:aws:iam::${data.aws_caller_identity.workers.account_id}:root"'],
+    )
+    # aws:PrincipalArn narrows the account to the operators' list; unset, it allows exactly
+    # what the root trust allows.
+    (condition,) = statement.nested("condition")
+    assert condition.attrs == {
+        "test": '"ArnLike"',
+        "variable": '"aws:PrincipalArn"',
+        "values": "local.limnopulse_admin_trusted_principal_arns",
+    }
+    (local,) = [block for block in blocks if block.kind == "locals"]
+    assert re.sub(r"\s+", " ", local.attrs["limnopulse_admin_trusted_principal_arns"]) == (
+        "( length(var.limnopulse_admin_trusted_principal_arns) > 0"
+        " ? var.limnopulse_admin_trusted_principal_arns"
+        ' : ["arn:aws:iam::${data.aws_caller_identity.workers.account_id}:*"] )'
+    )
+
+
+def test_no_access_key_is_managed_and_the_shared_workers_user_is_deprecated() -> None:
+    # Keys are created out of band (README.md, "Worker roles"); none ever reaches the state.
+    for block in _all_blocks():
+        assert block.labels[:1] != ("aws_iam_access_key",), block.labels
+        assert not any(re.search(r"aws_iam_access_key|\.secret\b", v) for v in block.attrs.values())
+    iam_runtime = _read("iam_runtime.tf")
+    assert re.search(
+        r'^# DEPRECATED \(ADR-020\)\..*\n(?:#.*\n)*resource "aws_iam_user" "workers" \{',
+        iam_runtime,
+        re.MULTILINE,
+    )
+    readme = _read("README.md")
+    assert "aws_iam_user.workers" in readme
+
+
+def _unit_health_attrs(alarm: _HclBlock, role: dict[str, Any], health: dict[str, Any]) -> None:
+    attrs = alarm.attrs
+    assert attrs["namespace"] == f'"{health["namespace"]}"'
+    assert attrs["metric_name"] == f'"{health["metric"]}"'
+    assert re.fullmatch(
+        rf'\{{\s*{health["dimension"]}\s*=\s*"{role["name"]}"\s*\}}', attrs["dimensions"]
+    )
+    assert attrs["treat_missing_data"] == f'"{health["treat_missing_data"]}"' == '"breaching"'
+    # The monitor publishes UnitHealthy with no unit; an alarm unit would match no datapoint.
+    assert "unit" not in attrs
+    assert attrs["statistic"] == '"Maximum"'
+    assert (attrs["comparison_operator"], attrs["threshold"]) == ('"LessThanThreshold"', "1")
+    period = int(attrs["period"])
+    evaluations = int(attrs["evaluation_periods"])
+    datapoints = int(attrs["datapoints_to_alarm"])
+    # M of N: one bad period never fires (the monitor publishes 0 for short spells by design),
+    # and one missing period inside the window is tolerated (timer jitter).
+    assert period >= 60 and period % 60 == 0
+    assert 2 <= datapoints < evaluations
+
+
+def _queue_alarm_attrs(
+    alarm: _HclBlock, kind: str, queue: str, queues: dict[str, _HclBlock]
+) -> None:
+    attrs = alarm.attrs
+    reference = f"aws_sqs_queue.{queue}{'[0]' if 'count' in queues[queue].attrs else ''}"
+    if kind == "queue-dlq":
+        redrive = _jsonencode_fields(queues[queue].attrs["redrive_policy"])
+        dlq = re.fullmatch(r"aws_sqs_queue\.(\w+)(\[0\])?\.arn", redrive["deadLetterTargetArn"])
+        assert dlq is not None
+        reference = f"aws_sqs_queue.{dlq.group(1)}{dlq.group(2) or ''}"
+    metric, threshold = {
+        "queue-age": (
+            "ApproximateAgeOfOldestMessage",
+            "var.worker_queue_age_alarm_threshold_seconds",
+        ),
+        "queue-depth": (
+            "ApproximateNumberOfMessagesVisible",
+            "var.worker_queue_depth_alarm_threshold",
+        ),
+        "queue-dlq": ("ApproximateNumberOfMessagesVisible", "0"),
+    }[kind]
+    assert attrs["namespace"] == '"AWS/SQS"'
+    assert attrs["metric_name"] == f'"{metric}"'
+    assert re.fullmatch(
+        rf"\{{\s*QueueName\s*=\s*{re.escape(reference)}\.name\s*\}}", attrs["dimensions"]
+    )
+    assert (attrs["comparison_operator"], attrs["threshold"]) == (
+        '"GreaterThanThreshold"',
+        threshold,
+    )
+    assert attrs["statistic"] == '"Maximum"'
+    assert attrs["treat_missing_data"] == '"notBreaching"'
+    assert int(attrs["evaluation_periods"]) >= 1
+
+
+def test_worker_alarms_are_exactly_the_role_table_alarms() -> None:
+    from tests.support.worker_roles import load_roles
+
+    table = load_roles()
+    alarms = _resources(_tofu_blocks("worker_alarms.tf"), "aws_cloudwatch_metric_alarm")
+    principals = _worker_principals()
+    queues = _resources(_all_blocks(), "aws_sqs_queue")
+
+    expected: set[str] = set()
+    for role in table["roles"]:
+        if role["lifecycle"] == "compose":
+            continue  # the ingest worker's queue alarms live in ingestion_queues.tf
+        gate = principals[role["iam_principal"]].attrs.get("count")
+        consumed = [queue["queue"] for queue in role["queues"] if queue["access"] == "consume"]
+        for kind in role["alarms"]:
+            label = f"{role['iam_principal']}_{kind.replace('-', '_')}"
+            expected.add(label)
+            alarm = alarms[label]
+            assert alarm.attrs.get("count") == gate, label
+            assert alarm.attrs["alarm_name"] == (
+                f'"${{var.project_name}}-${{var.environment}}-{role["name"]}-{kind}"'
+            )
+            assert alarm.attrs["actions_enabled"] == f"var.{role['enable_variable']}", label
+            assert alarm.attrs["alarm_actions"] == WORKER_ALARM_ACTIONS, label
+            assert alarm.attrs["ok_actions"] == WORKER_ALARM_ACTIONS, label
+            assert "insufficient_data_actions" not in alarm.attrs, label
+            assert "extended_statistic" not in alarm.attrs, label
+            assert alarm.blocks == [], label
+            if kind == "unit-health":
+                _unit_health_attrs(alarm, role, table["unit_health"])
+            else:
+                (queue,) = consumed
+                assert queues[queue].attrs.get("count") in {None, gate}, label
+                _queue_alarm_attrs(alarm, kind, queue, queues)
+    for standalone in table["standalone_alarms"]:
+        label = standalone["name"].replace("-", "_")
+        expected.add(label)
+        alarm = alarms[label]
+        # It belongs to no role: its gate is the routing's, and it always acts.
+        assert alarm.attrs.get("count") == f"var.{standalone['gate_variable']} ? 1 : 0"
+        assert "actions_enabled" not in alarm.attrs
+        assert alarm.attrs["alarm_actions"] == WORKER_ALARM_ACTIONS
+        queue = standalone["queue"]
+        assert re.fullmatch(
+            rf"\{{\s*QueueName\s*=\s*aws_sqs_queue\.{queue}\[0\]\.name\s*\}}",
+            alarm.attrs["dimensions"],
+        )
+        assert alarm.attrs["metric_name"] == '"ApproximateNumberOfMessagesVisible"'
+        assert (alarm.attrs["comparison_operator"], alarm.attrs["threshold"]) == (
+            '"GreaterThanThreshold"',
+            "0",
+        )
+    assert set(alarms) == expected
+
+
+def test_worker_alarm_topic_is_encrypted_and_only_cloudwatch_publishes() -> None:
+    blocks = _tofu_blocks("worker_alarms.tf")
+    documents = _policy_documents(blocks)
+    account = "data.aws_caller_identity.workers.account_id"
+
+    (key,) = _resources(blocks, "aws_kms_key").values()
+    assert key.attrs["enable_key_rotation"] == "true"
+    assert key.attrs["policy"] == "data.aws_iam_policy_document.worker_alarms_key.json"
+    (topic,) = _resources(blocks, "aws_sns_topic").values()
+    assert topic.attrs["kms_master_key_id"] == "aws_kms_key.worker_alarms.arn"
+    assert topic.attrs["name"] == '"${var.project_name}-${var.environment}-worker-alarms"'
+
+    statements = {
+        _unquote(s.attrs["sid"]): s for s in documents["worker_alarms_key"].nested("statement")
+    }
+    assert set(statements) == {"AccountAdministration", "CloudWatchAlarmPublish"}
+    assert _statement_principal(statements["AccountAdministration"]) == (
+        '"AWS"',
+        [f'"arn:aws:iam::${{{account}}}:root"'],
+    )
+    publish_key = statements["CloudWatchAlarmPublish"]
+    assert _statement_principal(publish_key) == ('"Service"', ['"cloudwatch.amazonaws.com"'])
+    assert [_unquote(a) for a in _list_items(publish_key.attrs["actions"])] == [
+        "kms:Decrypt",
+        "kms:GenerateDataKey*",
+    ]
+    for statement in (publish_key, *documents["worker_alarms_topic"].nested("statement")):
+        (condition,) = statement.nested("condition")
+        assert (condition.attrs["test"], condition.attrs["variable"]) == (
+            '"StringEquals"',
+            '"aws:SourceAccount"',
+        )
+        assert _list_items(condition.attrs["values"]) == [account]
+
+    (topic_policy,) = _resources(blocks, "aws_sns_topic_policy").values()
+    assert topic_policy.attrs["arn"] == f"{WORKER_ALARM_TOPIC}.arn"
+    (publish,) = documents["worker_alarms_topic"].nested("statement")
+    assert _list_items(publish.attrs["actions"]) == ['"sns:Publish"']
+    assert _list_items(publish.attrs["resources"]) == [f"{WORKER_ALARM_TOPIC}.arn"]
+    assert _statement_principal(publish) == ('"Service"', ['"cloudwatch.amazonaws.com"'])
+
+    (subscription,) = _resources(blocks, "aws_sns_topic_subscription").values()
+    assert subscription.attrs == {
+        "count": WORKER_TOPIC_EMAIL_GATE,
+        "topic_arn": f"{WORKER_ALARM_TOPIC}.arn",
+        "protocol": '"email"',
+        "endpoint": "var.worker_alarm_email",
+    }
+
+
+def test_an_enabled_role_needs_its_delivery_flag() -> None:
+    # A gated role's alarms do not exist without its flag, so the check sits on the topic.
+    (topic,) = _resources(_tofu_blocks("worker_alarms.tf"), "aws_sns_topic").values()
+    (lifecycle,) = topic.nested("lifecycle")
+    conditions = {block.attrs["condition"] for block in lifecycle.nested("precondition")}
+    expected = set()
+    for role in _worker_roles():
+        gate = WORKER_PRINCIPAL_GATES.get(role["iam_principal"])
+        if gate is not None:
+            flag = re.fullmatch(r"(var\.\w+) \? 1 : 0", gate).group(1)
+            expected.add(f"!var.{role['enable_variable']} || {flag}")
+    assert conditions == expected
+
+
+def test_worker_outputs_name_principals_and_never_a_secret() -> None:
+    outputs = {
+        block.labels[0]: block for block in _tofu_blocks("outputs.tf") if block.kind == "output"
+    }
+    for role in _worker_roles():
+        principal = role["iam_principal"]
+        if not role["entrypoint"].startswith("cmd/"):
+            continue
+        if role["lifecycle"] == "cli":
+            assert (
+                outputs[f"{principal}_role_arn"].attrs["value"] == f"aws_iam_role.{principal}.arn"
+            )
+            continue
+        value = outputs[f"{principal}_iam_user_name"].attrs["value"]
+        if principal in WORKER_PRINCIPAL_GATES:
+            assert value == f"try(aws_iam_user.{principal}[0].name, null)", principal
+        else:
+            assert value == f"aws_iam_user.{principal}.name", principal
+    assert outputs["worker_alarm_topic_arn"].attrs["value"] == f"{WORKER_ALARM_TOPIC}.arn"
+    assert {name for name in outputs if name in ADR020_OUTPUTS} == ADR020_OUTPUTS

@@ -149,3 +149,46 @@ output "telemetry_ingress_alarm_topic_arn" {
   description = "SNS topic the telemetry ingress alarms publish to."
   value       = try(aws_sns_topic.telemetry_ingress_alarms[0].arn, null)
 }
+
+# ADR-020 per-role principals (workers.tf). IAM user names only, never a secret: an operator
+# creates a role's access key out of band when enabling it (README.md, "Worker roles"). Null
+# when the principal's delivery flag is off.
+output "alert_evaluator_iam_user_name" {
+  description = "IAM user for the alert-evaluator unit; create its access key out of band."
+  value       = aws_iam_user.alert_evaluator.name
+}
+
+output "notification_relay_iam_user_name" {
+  description = "IAM user for the notification-relay unit; create its access key out of band."
+  value       = aws_iam_user.notification_relay.name
+}
+
+output "email_worker_iam_user_name" {
+  description = "IAM user for the email-worker unit; create its access key out of band."
+  value       = try(aws_iam_user.email_worker[0].name, null)
+}
+
+output "ses_feedback_worker_iam_user_name" {
+  description = "IAM user for the ses-feedback-worker unit; create its access key out of band."
+  value       = try(aws_iam_user.ses_feedback_worker[0].name, null)
+}
+
+output "telegram_worker_iam_user_name" {
+  description = "IAM user for the telegram-worker unit; create its access key out of band."
+  value       = try(aws_iam_user.telegram_worker[0].name, null)
+}
+
+output "worker_monitor_iam_user_name" {
+  description = "IAM user for the worker-monitor unit; create its access key out of band."
+  value       = aws_iam_user.worker_monitor.name
+}
+
+output "limnopulse_admin_role_arn" {
+  description = "Role an operator assumes for one limnopulse-admin backfill run."
+  value       = aws_iam_role.limnopulse_admin.arn
+}
+
+output "worker_alarm_topic_arn" {
+  description = "SNS topic the ADR-020 worker alarms publish to."
+  value       = aws_sns_topic.worker_alarms.arn
+}
