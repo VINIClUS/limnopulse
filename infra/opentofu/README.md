@@ -115,8 +115,8 @@ The function below works in this order:
 1. It checks that the destination is writable before any key exists.
 2. It creates the key and writes both files as `.new`.
 3. It swaps both files in with one script on the host. That script backs up
-   the current pair as `.old` first, and if either move fails it puts both
-   back.
+   the current pair as `.old` first, and removes a partial backup if a copy
+   fails. If either move fails, it puts both files back.
 4. It checks every step. On any failure it deletes the new key, so no live key
    is left that nobody holds, and a running unit keeps a matching id and
    secret.
@@ -130,7 +130,8 @@ install_worker_key() {  # <role> <IAM user> <worker host>
   # both (and removes a file that had no previous version).
   local swap='cd "$1" || exit 1
     for f in aws-access-key-id aws-secret-access-key; do
-      [ ! -e "$f" ] || cp -p "$f" "$f.old" || exit 1
+      [ ! -e "$f" ] || cp -p "$f" "$f.old" ||
+        { rm -f aws-access-key-id.old aws-secret-access-key.old; exit 1; }
     done
     if mv aws-access-key-id.new aws-access-key-id &&
        mv aws-secret-access-key.new aws-secret-access-key; then
@@ -161,8 +162,10 @@ install_worker_key() {  # <role> <IAM user> <worker host>
 }
 ```
 
-If `.old` files remain in the directory after a failure, the restore itself
-failed. Move them back by hand before restarting the unit.
+A failed backup removes its partial `.old` copies before anything moves. So
+`.old` files left in the directory after a failure mean the restore itself
+failed, and they hold the previous pair. Move them back by hand before
+restarting the unit.
 
 For example, for the email-worker, run this from this directory:
 

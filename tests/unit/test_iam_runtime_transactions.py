@@ -2463,7 +2463,14 @@ def _names_aws_operation(file: go_sources.GoFile, text: str) -> bool:
 
 
 def _go_embedded_files(files: Sequence[go_sources.GoFile]) -> dict[str, str]:
-    """Path -> text of every file a closure file embeds with `//go:embed`."""
+    """Path -> text of every file a closure file embeds with `//go:embed`.
+
+    A binary file decodes with replacement characters: its text parts are still scanned.
+    """
+
+    def shown(path: Path) -> str:
+        return path.relative_to(ROOT).as_posix() if path.is_relative_to(ROOT) else str(path)
+
     embedded: dict[str, str] = {}
     for file in files:
         # The directive is a comment, so it is read from the source, not from file.code.
@@ -2471,14 +2478,25 @@ def _go_embedded_files(files: Sequence[go_sources.GoFile]) -> dict[str, str]:
         for patterns in re.findall(r"(?m)^//go:embed\s+(.+)$", source):
             for pattern in patterns.split():
                 matches = sorted(file.path.parent.glob(pattern.strip('"`')))
-                assert matches, f"{file.relative}: //go:embed {pattern} matches nothing"
+                assert matches, f"{shown(file.path)}: //go:embed {pattern} matches nothing"
                 for match in matches:
                     for path in sorted(match.rglob("*")) if match.is_dir() else [match]:
                         if path.is_file():
-                            embedded[path.relative_to(ROOT).as_posix()] = path.read_text(
-                                encoding="utf-8"
-                            )
+                            embedded[shown(path)] = path.read_bytes().decode(errors="replace")
     return embedded
+
+
+def _go_string_literals(code: str) -> list[str]:
+    """Every interpreted and raw string literal in `code`; rune literals are skipped.
+
+    The spans come from `_blank_go_literals`, which reads escapes and runes such as `'"'`.
+    """
+    blank = _blank_go_literals(code)
+    return [
+        code[match.start() : match.end()]
+        for match in re.finditer(r"\"[^\"\n]*\"|`[^`]*`|'[^'\n]*'", blank)
+        if not match.group().startswith("'")
+    ]
 
 
 def _go_template_methods(
@@ -2490,7 +2508,7 @@ def _go_template_methods(
     """
     texts = dict(templates)
     for file in files:
-        literals = re.findall(r'"(?:[^"\\\n]|\\.)*"|`[^`]*`', file.code)
+        literals = _go_string_literals(file.code)
         for index, literal in enumerate(text for text in literals if "{{" in text):
             texts[f"{file.relative} template literal {index}"] = literal
     named: dict[str, set[str]] = {}
@@ -3197,6 +3215,22 @@ _MAIN_IMPORTS = "import (\n"
             re.escape(f"a template names Load ({_MAIN_GO} template literal 0)"),
             id="template-literal",
         ),
+        # A rune holding a double quote must not pair with the next string's quote.
+        pytest.param(
+            (
+                (
+                    _MAIN_GO,
+                    _MAIN_CALL,
+                    (
+                        f"{_MAIN_CALL}; _ = '\"'; "
+                        '_ = template.Must(template.New("x").Parse("{{.Load}}"))'
+                    ),
+                ),
+            ),
+            _UNRUN_STORE,
+            re.escape(f"a template names Load ({_MAIN_GO} template literal 0)"),
+            id="template-literal-after-a-rune",
+        ),
     ],
 )
 def test_an_unrun_file_fails_closed(
@@ -3220,6 +3254,25 @@ def test_func_literals_are_not_declarations_outside_column_0() -> None:
     )
 
     _assert_fixture_never_run(sources, _UNRUN_STORE)
+
+
+def test_a_binary_embed_is_read_without_failing_the_scan(tmp_path: Path) -> None:
+    source = 'package assets\n\nimport _ "embed"\n\n//go:embed logo.png\nvar logo []byte\n'
+    (tmp_path / "assets.go").write_text(source, encoding="utf-8")
+    (tmp_path / "logo.png").write_bytes(b"\x89PNG\r\n\x1a\n" + bytes(range(256)) + b"{{.Load}}")
+    code = go_sources.strip_comments(source)
+    file = go_sources.GoFile(
+        path=tmp_path / "assets.go",
+        package=go_sources.MODULE + "internal/assets",
+        code=code,
+        imports=go_sources._imports(code),
+    )
+
+    embedded = _go_embedded_files([file])
+
+    assert list(embedded) == [str(tmp_path / "logo.png")]
+    # Its text parts are still read, so an action in a binary embed still counts.
+    assert set(_go_template_methods([], embedded)) == {"Load"}
 
 
 _EMAIL_DOCUMENT = 'data "aws_iam_policy_document" "email_worker_runtime" {'
