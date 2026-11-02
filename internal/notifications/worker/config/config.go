@@ -14,7 +14,9 @@ import (
 )
 
 const (
-	DefaultSendConcurrency     = 4
+	DefaultSendConcurrency = 4
+	// DefaultFeedbackConcurrency is the SES-feedback worker's default; its loader
+	// (internal/notifications/feedback/config) reads it from here.
 	DefaultFeedbackConcurrency = 2
 	DefaultMaxSendRate         = 1.0
 	DefaultSendBurst           = 1
@@ -35,48 +37,37 @@ const (
 type LookupEnv func(string) (string, bool)
 
 type RunConfig struct {
-	AppEnv              string
-	SendConcurrency     int
-	FeedbackConcurrency int
-	MaxSendRate         float64
-	SendBurst           int
-	ReceiveWait         time.Duration
-	ReceiveBatch        int
-	VisibilityTimeout   time.Duration
-	ProcessingLease     time.Duration
-	ProviderTimeout     time.Duration
-	DrainTimeout        time.Duration
-	RenewalInterval     time.Duration
-	SQSRequestTimeout   time.Duration
-	SQSReceiveTimeout   time.Duration
-	InvalidVisibility   time.Duration
-	OTLPFlushTimeout    time.Duration
-	ConfigurationSet    string
-	AWSRegion           string
-	DynamoDBTable       string
-	DynamoDBEndpoint    string
-	SQSQueueURL         string
-	SQSFeedbackURL      string
-	SQSEndpoint         string
-	SESFromEmail        string
-	SESEndpoint         string
-	OTLPEndpoint        string
-	EmailSenderMode     string
-	FakeMessageID       string
+	AppEnv            string
+	SendConcurrency   int
+	MaxSendRate       float64
+	SendBurst         int
+	ReceiveWait       time.Duration
+	ReceiveBatch      int
+	VisibilityTimeout time.Duration
+	ProcessingLease   time.Duration
+	ProviderTimeout   time.Duration
+	DrainTimeout      time.Duration
+	RenewalInterval   time.Duration
+	SQSRequestTimeout time.Duration
+	SQSReceiveTimeout time.Duration
+	InvalidVisibility time.Duration
+	OTLPFlushTimeout  time.Duration
+	ConfigurationSet  string
+	AWSRegion         string
+	DynamoDBTable     string
+	DynamoDBEndpoint  string
+	SQSQueueURL       string
+	SQSEndpoint       string
+	SESFromEmail      string
+	SESEndpoint       string
+	OTLPEndpoint      string
+	EmailSenderMode   string
+	FakeMessageID     string
 }
 
-// Load reads the combined jobs and SES-feedback worker of cmd/notifications.
-func Load(args []string, lookup LookupEnv) (RunConfig, error) {
-	return load("notifications worker", args, lookup, true)
-}
-
-// LoadEmail reads the email-jobs consumer alone (ADR-020 email-worker). It needs no SES
-// events queue and accepts no feedback setting; cmd/ses-feedback-worker has its own loader.
+// LoadEmail reads the email-jobs consumer (ADR-020 email-worker). It needs no SES events
+// queue and accepts no feedback setting; cmd/ses-feedback-worker has its own loader.
 func LoadEmail(args []string, lookup LookupEnv) (RunConfig, error) {
-	return load("email-worker", args, lookup, false)
-}
-
-func load(name string, args []string, lookup LookupEnv, withFeedback bool) (RunConfig, error) {
 	config := RunConfig{
 		AppEnv: "local", SendConcurrency: DefaultSendConcurrency,
 		EmailSenderMode: "aws",
@@ -88,9 +79,6 @@ func load(name string, args []string, lookup LookupEnv, withFeedback bool) (RunC
 		SQSReceiveTimeout: SQSReceiveTimeout,
 		InvalidVisibility: InvalidVisibility, OTLPFlushTimeout: OTLPFlushTimeout,
 		ConfigurationSet: ConfigurationSet,
-	}
-	if withFeedback {
-		config.FeedbackConcurrency = DefaultFeedbackConcurrency
 	}
 	if lookup == nil {
 		lookup = func(string) (string, bool) { return "", false }
@@ -110,10 +98,6 @@ func load(name string, args []string, lookup LookupEnv, withFeedback bool) (RunC
 	integerValues := map[string]*int{
 		"NOTIFICATION_SEND_CONCURRENCY": &config.SendConcurrency,
 		"NOTIFICATION_SEND_BURST":       &config.SendBurst,
-	}
-	if withFeedback {
-		textValues["SQS_SES_EVENTS_URL"] = &config.SQSFeedbackURL
-		integerValues["NOTIFICATION_FEEDBACK_CONCURRENCY"] = &config.FeedbackConcurrency
 	}
 	for key, target := range textValues {
 		if value, ok := lookup(key); ok {
@@ -139,12 +123,9 @@ func load(name string, args []string, lookup LookupEnv, withFeedback bool) (RunC
 		}
 	}
 
-	fs := flag.NewFlagSet(name, flag.ContinueOnError)
+	fs := flag.NewFlagSet("email-worker", flag.ContinueOnError)
 	fs.SetOutput(io.Discard)
 	fs.IntVar(&config.SendConcurrency, "send-concurrency", config.SendConcurrency, "concurrent email sends")
-	if withFeedback {
-		fs.IntVar(&config.FeedbackConcurrency, "feedback-concurrency", config.FeedbackConcurrency, "concurrent SES feedback messages")
-	}
 	fs.Float64Var(&config.MaxSendRate, "max-send-rate", config.MaxSendRate, "maximum provider calls per second")
 	fs.IntVar(&config.SendBurst, "send-burst", config.SendBurst, "send rate limiter burst")
 	fs.DurationVar(&config.ReceiveWait, "receive-wait", config.ReceiveWait, "SQS long-poll wait (0s disables only in local/test)")
@@ -187,9 +168,6 @@ func load(name string, args []string, lookup LookupEnv, withFeedback bool) (RunC
 		{"SQS_NOTIFICATION_JOBS_URL", config.SQSQueueURL}, {"SES_FROM_EMAIL", config.SESFromEmail},
 		{"SES_CONFIGURATION_SET_NAME", config.ConfigurationSet},
 	}
-	if withFeedback {
-		required = append(required, struct{ name, value string }{"SQS_SES_EVENTS_URL", config.SQSFeedbackURL})
-	}
 	for _, item := range required {
 		if item.value == "" {
 			return RunConfig{}, fmt.Errorf("%s is required", item.name)
@@ -198,14 +176,8 @@ func load(name string, args []string, lookup LookupEnv, withFeedback bool) (RunC
 	if err := (worker.SESConfigurationSetName(config.ConfigurationSet)).Validate(); err != nil {
 		return RunConfig{}, fmt.Errorf("SES_CONFIGURATION_SET_NAME is invalid: %w", err)
 	}
-	if withFeedback && config.SQSQueueURL == config.SQSFeedbackURL {
-		return RunConfig{}, fmt.Errorf("SQS_NOTIFICATION_JOBS_URL and SQS_SES_EVENTS_URL must be distinct")
-	}
 	if config.SendConcurrency < 1 {
 		return RunConfig{}, fmt.Errorf("--send-concurrency (NOTIFICATION_SEND_CONCURRENCY) must be positive")
-	}
-	if withFeedback && config.FeedbackConcurrency < 1 {
-		return RunConfig{}, fmt.Errorf("--feedback-concurrency (NOTIFICATION_FEEDBACK_CONCURRENCY) must be positive")
 	}
 	if config.MaxSendRate <= 0 || math.IsNaN(config.MaxSendRate) || math.IsInf(config.MaxSendRate, 0) {
 		return RunConfig{}, fmt.Errorf("--max-send-rate (NOTIFICATION_MAX_SEND_RATE) must be a positive number")

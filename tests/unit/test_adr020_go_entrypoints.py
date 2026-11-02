@@ -279,7 +279,11 @@ def test_email_and_ses_feedback_are_separate_processes_with_separate_loaders() -
     email_load = (ROOT / "internal/notifications/worker/config/config.go").read_text(
         encoding="utf-8"
     )
-    assert 'return load("email-worker", args, lookup, false)' in email_load
+    # Only the email loader is left; the combined jobs-and-feedback Load went with
+    # cmd/notifications.
+    assert "func LoadEmail(args []string, lookup LookupEnv) (RunConfig, error) {" in email_load
+    assert "func Load(" not in email_load
+    assert "SQS_SES_EVENTS_URL" not in email_load
 
     email_links = closure("cmd/email-worker")
     feedback_links = closure("cmd/ses-feedback-worker")
