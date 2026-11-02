@@ -306,7 +306,7 @@ def test_binaries_builds_every_go_role_static_trimmed_and_without_a_build_id(tmp
         f"{out}{os.sep}",
         *(f"./cmd/{name}" for name in GO_ROLES),
     ]
-    with pytest.raises(build_bundle.BundleError, match="not empty"):
+    with pytest.raises(build_bundle.BundleError, match="not empty; remove it first"):
         build_bundle.build_binaries(out, go=str(go))
 
 

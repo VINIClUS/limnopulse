@@ -47,6 +47,7 @@ WORKERS_RECIPES = {
         "uv run --locked --no-sync python -m scripts.workers.build_bundle bundle"
         " --tag main-0000000000000000000000000000000000000000"
     ],
+    "workers-clean": ["rm -rf dist/workers"],
 }
 INGESTION_RECIPE = [
     "uv sync --locked --extra dev",

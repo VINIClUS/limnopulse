@@ -195,6 +195,32 @@ jobs:
             "ghcr.io/viniclus/limnopulse/workers:${WORKERS_TAG}" \
             "${file}:application/vnd.limnopulse.workers.bundle.v1.tar+gzip"
 
+      # No pull request exercises oras push or the attestation. Repeat deploy.yml's checks on
+      # what was just published, so a broken publish fails on main, not at the next deploy.
+      - name: Pull the bundle back and verify it as deploy.yml does
+        if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+        env:
+          REPOSITORY: ${{ github.repository }}
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          tag="$WORKERS_TAG"
+          file="limnopulse-workers-${tag}.tar.gz"
+          bundle_dir="$(mktemp -d)"
+          oras pull --no-tty -o "$bundle_dir" "ghcr.io/viniclus/limnopulse/workers:${tag}"
+          if [ "$(ls -A "$bundle_dir")" != "$file" ]; then
+            echo "::error::the pushed bundle must contain exactly ${file}"
+            exit 1
+          fi
+          cmp "dist/workers/$file" "$bundle_dir/$file"
+          gh attestation verify "$bundle_dir/$file" \
+            --repo "$REPOSITORY" \
+            --signer-workflow "$REPOSITORY/.github/workflows/build.yml" \
+            --source-ref refs/heads/main \
+            --source-digest "${tag#main-}" \
+            --deny-self-hosted-runners
+          sha256sum "$bundle_dir/$file"
+
   workers-publish:
     # Only a main-branch push can publish and attest the workers bundle.
     if: github.event_name == 'push' && github.ref == 'refs/heads/main'

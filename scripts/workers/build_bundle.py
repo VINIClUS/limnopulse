@@ -90,7 +90,7 @@ def build_binaries(out: Path, go: str = "go") -> list[Path]:
     """Build each Go role's entrypoint into `out`, which must not exist or be empty."""
     roles = table()
     if out.exists() and any(out.iterdir()):
-        raise BundleError(f"{out} is not empty")
+        raise BundleError(f"{out} is not empty; remove it first (make workers-clean)")
     out.mkdir(parents=True, exist_ok=True)
     entrypoints = [
         f"./{role['entrypoint']}" for role in roles["roles"] if role["lifecycle"] in GO_LIFECYCLES

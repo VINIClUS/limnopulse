@@ -1,8 +1,9 @@
 """Render the ADR-020 systemd units from `ops/workers/roles.yaml`.
 
 `ops/workers/systemd/` holds the rendered units, and the workers bundle ships exactly those
-files. `ops/workers/sysusers.d/` declares the static users they name; the host installs it. `tests/unit/test_workers_units.py` checks that they equal this rendering, so edit this
-file or roles.yaml, never a unit, and regenerate them from the repository root:
+files. `ops/workers/sysusers.d/` declares the static users they name; the host installs it.
+`tests/unit/test_workers_units.py` checks that both equal this rendering, so edit this file
+or roles.yaml, never a unit, and regenerate them from the repository root:
 
     .venv/bin/python -m scripts.workers.units --write
 

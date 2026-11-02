@@ -126,8 +126,11 @@ def test_workers_bundle_is_built_twice_verified_and_smoked_on_pull_requests():
             "Attest the bundle",
             "Log in to GHCR",
             "Push the bundle to GHCR",
+            "Pull the bundle back and verify it as deploy.yml does",
         }
         assert (step.get("if") == MAIN_PUSH) == publishing, step.get("name")
+    # The round trip is the last step: it checks what the push left in GHCR.
+    assert names[-1] == "Pull the bundle back and verify it as deploy.yml does"
 
 
 def test_workers_publisher_pushes_one_attested_file_layer_with_the_roles_yaml_types():
@@ -165,6 +168,38 @@ def test_workers_publisher_pushes_one_attested_file_layer_with_the_roles_yaml_ty
     assert "sha256sum --check --strict" in _step(publisher, "Install oras")["run"]
 
 
+def _attestation_verify(run: str) -> list[str]:
+    """The gh attestation verify command of a step, one argument per line."""
+    command, inside = [], False
+    for line in run.splitlines():
+        inside = inside or line.strip().startswith("gh attestation verify")
+        if inside:
+            command.append(line.strip().removesuffix("\\").strip())
+            if not line.rstrip().endswith("\\"):
+                return command
+    raise AssertionError("no gh attestation verify")
+
+
+def test_workers_publisher_pulls_and_verifies_what_it_pushed_as_deploy_does():
+    publisher = _workflow("build.yml")["jobs"]["workers-publish"]
+    check = _step(publisher, "Pull the bundle back and verify it as deploy.yml does")
+    deploy = next(
+        step
+        for step in _workflow("deploy.yml")["jobs"]["deploy-vps"]["steps"]
+        if step.get("name") == "Pull and verify the workers bundle"
+    )
+    # The same pull, the same single-file check and the same attestation policy.
+    pull = 'oras pull --no-tty -o "$bundle_dir" "ghcr.io/viniclus/limnopulse/workers:${tag}"'
+    assert pull in check["run"] and pull in deploy["run"]
+    assert '"$(ls -A "$bundle_dir")" != "$file"' in check["run"]
+    assert _attestation_verify(check["run"]) == _attestation_verify(deploy["run"])
+    assert check["env"]["REPOSITORY"] == deploy["env"]["REPOSITORY"]
+    assert check["env"]["GH_TOKEN"] == deploy["env"]["GH_TOKEN"]
+    # And the bytes in GHCR are the bytes CI built and attested.
+    assert 'cmp "dist/workers/$file" "$bundle_dir/$file"' in check["run"]
+    assert 'tag="$WORKERS_TAG"' in check["run"]
+
+
 def test_no_go_image_is_built_or_scanned():
     for path in GO_DOCKERFILES:
         assert not (ROOT / path).exists(), path
@@ -179,6 +214,8 @@ def test_no_go_image_is_built_or_scanned():
 
 def test_trivy_scans_the_worker_executables_as_a_rootfs():
     job = _workflow("trivy.yml")["jobs"]["workers"]
+    checkout = next(s for s in job["steps"] if s.get("uses", "").startswith("actions/checkout@"))
+    assert checkout["with"]["persist-credentials"] == "false"
     build = _step(job, "Build the worker executables")["run"]
     assert "make workers-binaries" in build
     scan = _step(job, "Trivy rootfs scan (worker executables)")
@@ -201,5 +238,7 @@ def test_release_executables_build_with_the_latest_patch_of_go_mods_minor():
         _workflow("trivy.yml")["jobs"]["workers"],
     ]
     for job in jobs:
-        setup = next(step for step in job["steps"] if step.get("uses", "").startswith("actions/setup-go@"))
+        setup = next(
+            step for step in job["steps"] if step.get("uses", "").startswith("actions/setup-go@")
+        )
         assert setup["with"] == {"go-version": minor, "check-latest": "true"}

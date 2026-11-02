@@ -119,7 +119,10 @@ jobs:
   workers:
     runs-on: ubuntu-latest
     steps:
+      # It builds pull-request code, so the checkout keeps no token.
       - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+        with:
+          persist-credentials: false
 
       # The latest patch of go.mod's Go minor, as the retired golang:1.26 images had: go.mod
       # names the oldest toolchain it accepts, and a release ships the newest stdlib fixes.
