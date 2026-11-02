@@ -69,7 +69,8 @@ FORBIDDEN_ENV = {
     "CREDENTIALS_DIRECTORY",
     "NOTIFY_SOCKET",
 }
-# What each role's loader refuses to start without (and, in prod, the explicit switches).
+# What each role's loader refuses to start without. The settings prod requires to be explicit
+# come from the loaders themselves (prod_explicit_env), so a new one fails the template test.
 REQUIRED_ENV = {
     "alert-evaluator": {
         "APP_ENV",
@@ -78,14 +79,12 @@ REQUIRED_ENV = {
         "INFLUXDB_URL",
         "INFLUXDB_ORG",
         "INFLUXDB_BUCKET_RAW",
-        "TELEGRAM_DELIVERY_ENABLED",
     },
     "notification-relay": {
         "APP_ENV",
         "AWS_REGION",
         "DYNAMODB_DOMAIN_TABLE",
         "SQS_NOTIFICATION_JOBS_URL",
-        "TELEGRAM_DELIVERY_ENABLED",
     },
     "email-worker": {
         "APP_ENV",
@@ -101,13 +100,25 @@ REQUIRED_ENV = {
         "AWS_REGION",
         "DYNAMODB_DOMAIN_TABLE",
         "SQS_TELEGRAM_JOBS_URL",
-        "TELEGRAM_DELIVERY_ENABLED",
         "TELEGRAM_BOT_TOKEN_SECRET_ARN",
         "REDIS_ADDR",
     },
     "worker-monitor": {"AWS_REGION"},
 }
 ENV_KEY = re.compile(r"[A-Z][A-Z0-9]*(?:_[A-Z0-9]+)+")
+# The loader each unit role starts from; every "must be explicit in" check lives in one.
+LOADERS = {
+    "alert-evaluator": "internal/alertevaluator/config.go",
+    "notification-relay": "internal/notifications/relay/config/config.go",
+    "email-worker": "internal/notifications/worker/config/config.go",
+    "ses-feedback-worker": "internal/notifications/feedback/config/config.go",
+    "telegram-worker": "internal/notifications/telegramworker/config/config.go",
+    "worker-monitor": "cmd/worker-monitor/main.go",
+}
+# A prod-explicit check names its setting in the message, or (alert-evaluator) loops over a
+# flag -> env map and names the env key through %s.
+EXPLICIT_LITERAL = re.compile(rf'"({ENV_KEY.pattern}) must be explicit in ')
+EXPLICIT_RANGE = re.compile(r"for \w+, \w+ := range (\w+) \{.{0,200}?must be explicit in ", re.S)
 OUR_UNIT = re.compile(r"\blimnopulse-[a-z0-9-]+\.(?:service|timer)\b")
 
 
@@ -144,6 +155,17 @@ def env_file(name: str) -> dict[str, str]:
         assert match.group(1) not in values, (name, line)
         values[match.group(1)] = match.group(2)
     return values
+
+
+def prod_explicit_env(loader: str) -> set[str]:
+    """The settings a loader refuses to default in staging and prod."""
+    code = (ROOT / loader).read_text(encoding="utf-8")
+    names = set(EXPLICIT_LITERAL.findall(code))
+    for table in EXPLICIT_RANGE.findall(code):
+        body = re.search(rf"\b{table} = map\[string\]string\{{(.*?)\n\}}", code, re.S)
+        assert body, (loader, table)
+        names |= set(re.findall(rf':\s*"({ENV_KEY.pattern})"', body.group(1)))
+    return names
 
 
 def systemd_analyze() -> str:
@@ -396,10 +418,38 @@ def test_there_is_one_env_template_per_unit_role_at_its_env_file_name():
         assert Path(role(name)["env_file"]).name + ".example" in names
 
 
+def test_the_prod_explicit_settings_are_read_from_each_roles_loader():
+    assert set(LOADERS) == set(CONTINUOUS + ONESHOT)
+    for name, loader in LOADERS.items():
+        assert loader in {file.relative for file in closure_files(f"cmd/{name}")}, name
+    # Every prod-explicit check in the Go tree is in a loader above.
+    checks = {
+        str(path.relative_to(ROOT))
+        for directory in ("cmd", "internal")
+        for path in (ROOT / directory).rglob("*.go")
+        if not path.name.endswith("_test.go") and "must be explicit in" in path.read_text()
+    }
+    assert checks <= set(LOADERS.values()), checks - set(LOADERS.values())
+    # The parser finds today's checks, so an empty result cannot pass for none.
+    assert prod_explicit_env(LOADERS["alert-evaluator"]) == {
+        "TELEGRAM_DELIVERY_ENABLED",
+        "ALERT_EVALUATOR_EXPECTED_SAMPLE_INTERVAL",
+        "ALERT_EVALUATOR_MIN_COVERAGE_RATIO",
+        "ALERT_EVALUATOR_MIN_POINTS",
+        "ALERT_EVALUATOR_ALLOWED_LATENESS",
+        "ALERT_EVALUATOR_MAX_SAMPLE_AGE",
+    }
+    assert prod_explicit_env(LOADERS["email-worker"]) == {"NOTIFICATION_MAX_SEND_RATE"}
+    assert prod_explicit_env(LOADERS["notification-relay"]) == {"TELEGRAM_DELIVERY_ENABLED"}
+    assert prod_explicit_env(LOADERS["telegram-worker"]) == {"TELEGRAM_DELIVERY_ENABLED"}
+
+
 @pytest.mark.parametrize("name", CONTINUOUS + ONESHOT)
 def test_an_env_template_holds_only_settings_its_role_reads(name):
     values = env_file(name)
-    assert REQUIRED_ENV[name] <= set(values), REQUIRED_ENV[name] - set(values)
+    # A copied template must start in prod: every required and every prod-explicit setting.
+    required = REQUIRED_ENV[name] | prod_explicit_env(LOADERS[name])
+    assert required <= set(values), required - set(values)
     assert not set(values) & FORBIDDEN_ENV
     assert not [key for key in values if key.endswith("_ENDPOINT_URL")]
     assert values.get("APP_ENV", "prod") == "prod"
