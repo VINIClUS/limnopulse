@@ -5,10 +5,10 @@ from pathlib import Path
 
 import pytest
 
+from tests.support.go_sources import MODULE, closure, closure_files
 from tests.support.worker_roles import load_roles, roles_by_name
 
 ROOT = Path(__file__).resolve().parents[2]
-MODULE = "github.com/VINIClUS/limnopulse/"
 # The roles S1 gives an entrypoint; worker-monitor is S2's.
 S1_ROLES = (
     "alert-evaluator",
@@ -20,14 +20,24 @@ S1_ROLES = (
 )
 ONESHOT_ROLES = ("alert-evaluator", "notification-relay")
 CONTINUOUS_ROLES = ("email-worker", "ses-feedback-worker", "telegram-worker")
-SES_PACKAGES = (
-    "github.com/aws/aws-sdk-go-v2/service/sesv2",
-    MODULE + "internal/notifications/worker/ses",
-)
+WORKER_PACKAGE = MODULE + "internal/notifications/worker"
+WORKERPROC = MODULE + "internal/workerproc"
 FEEDBACK_PACKAGE = MODULE + "internal/notifications/feedback"
-IMPORT_BLOCK = re.compile(r"^import \((.*?)^\)", re.MULTILINE | re.DOTALL)
-SINGLE_IMPORT = re.compile(r'^import (?:\w+ )?"([^"]+)"', re.MULTILINE)
-QUOTED = re.compile(r'"([^"]+)"')
+# Any SES SDK package (sesv2, sesv2/types, ...) or the email sender.
+SES_PACKAGE = re.compile(
+    r"^github\.com/aws/aws-sdk-go-v2/service/ses(?:v2)?(?:/|$)"
+    rf"|^{re.escape(MODULE)}internal/notifications/worker/ses(?:/|$)"
+)
+TIMER_CALLS = r"(?:Sleep|Tick|NewTicker|NewTimer|After|AfterFunc)\s*\("
+ENV_CALLS = r"(?:Getenv|LookupEnv|Environ)\s*\("
+# A secret's env key may be named only by its loader and by the main that maps it to a credential.
+SECRET_KEYS = {
+    "INFLUXDB_TOKEN": {"internal/alertevaluator/config.go", "cmd/alert-evaluator/main.go"},
+    "REDIS_PASSWORD": {
+        "internal/notifications/telegramworker/config/config.go",
+        "cmd/telegram-worker/main.go",
+    },
+}
 
 
 def _production_files(directory: Path) -> list[Path]:
@@ -40,28 +50,8 @@ def _production_source(directory: Path) -> str:
     return "\n".join(path.read_text(encoding="utf-8") for path in _production_files(directory))
 
 
-def _imports(directory: Path) -> set[str]:
-    found: set[str] = set()
-    for path in _production_files(directory):
-        source = path.read_text(encoding="utf-8")
-        for block in IMPORT_BLOCK.findall(source):
-            found.update(QUOTED.findall(block))
-        found.update(SINGLE_IMPORT.findall(source))
-    return found
-
-
-def _closure(entrypoint: str) -> set[str]:
-    """Every package the entrypoint links, following this module's packages only."""
-    seen: set[str] = set()
-    pending = [MODULE + entrypoint]
-    while pending:
-        package = pending.pop()
-        if package in seen:
-            continue
-        seen.add(package)
-        if package.startswith(MODULE):
-            pending.extend(_imports(ROOT / package.removeprefix(MODULE)))
-    return seen
+def _ses_links(entrypoint: str) -> list[str]:
+    return sorted(package for package in closure(entrypoint) if SES_PACKAGE.search(package))
 
 
 def _role(name: str) -> dict:
@@ -79,11 +69,42 @@ def test_each_role_has_its_own_executable(name: str) -> None:
     main = _main(name)
     assert re.search(r"^package main$", main, re.MULTILINE)
     assert "func main() {" in main
+
+
+@pytest.mark.parametrize("name", S1_ROLES)
+def test_no_role_links_code_that_uses_the_multi_consumer_supervisor(name: str) -> None:
     # The supervision moved to systemd: no role multiplexes consumers in one process.
-    for directory in (ROOT / "cmd" / name, ROOT / "internal/notifications/worker/consumer"):
-        source = _production_source(directory)
-        assert "worker.Supervisor" not in source
-        assert "Consumers:" not in source
+    files = closure_files(f"cmd/{name}")
+    assert files
+    for file in files:
+        if file.package == WORKER_PACKAGE:
+            # Only its own (legacy, S3-deleted) file may name the type.
+            assert file.path.name == "supervisor.go" or not re.search(
+                r"\bSupervisor\b", file.code
+            ), file.relative
+        else:
+            assert not file.uses(WORKER_PACKAGE, r"Supervisor\b"), file.relative
+
+
+@pytest.mark.parametrize("name", ONESHOT_ROLES)
+def test_oneshot_closures_never_sleep_poll_or_supervise(name: str) -> None:
+    for file in closure_files(f"cmd/{name}"):
+        assert not file.uses(WORKERPROC, r"Continuous\b"), file.relative
+        assert "ReceiveMessage" not in file.code, file.relative
+        # workerproc's ticker and stall grace serve continuous roles only.
+        if file.package != WORKERPROC:
+            assert not file.uses("time", TIMER_CALLS), file.relative
+
+
+@pytest.mark.parametrize("name", S1_ROLES)
+def test_roles_read_settings_only_through_their_lookup(name: str) -> None:
+    for file in closure_files(f"cmd/{name}"):
+        if file.package != WORKERPROC:
+            assert not file.uses("os", ENV_CALLS), file.relative
+            assert not file.uses("syscall", ENV_CALLS), file.relative
+        for key, allowed in SECRET_KEYS.items():
+            if f'"{key}"' in file.code:
+                assert file.relative in allowed, (key, file.relative)
 
 
 @pytest.mark.parametrize("name", CONTINUOUS_ROLES)
@@ -198,16 +219,14 @@ def test_email_and_ses_feedback_are_separate_processes_with_separate_loaders() -
     )
     assert 'return load("email-worker", args, lookup, false)' in email_load
 
-    email_links = _closure("cmd/email-worker")
-    feedback_links = _closure("cmd/ses-feedback-worker")
+    email_links = closure("cmd/email-worker")
+    feedback_links = closure("cmd/ses-feedback-worker")
     assert not any(package.startswith(FEEDBACK_PACKAGE) for package in email_links)
     assert MODULE + "internal/notifications/feedback/compose" in feedback_links
-    assert not set(SES_PACKAGES) & feedback_links
     assert MODULE + "internal/notifications/worker/compose" not in feedback_links
 
 
-def test_telegram_worker_does_not_link_ses() -> None:
-    links = _closure("cmd/telegram-worker")
-    assert MODULE + "internal/notifications/telegramworker/compose" in links
-    assert not set(SES_PACKAGES) & links
-    assert set(SES_PACKAGES) <= _closure("cmd/email-worker")
+@pytest.mark.parametrize("name", ("ses-feedback-worker", "telegram-worker"))
+def test_only_the_email_worker_links_ses(name: str) -> None:
+    assert _ses_links(f"cmd/{name}") == []
+    assert _ses_links("cmd/email-worker")
