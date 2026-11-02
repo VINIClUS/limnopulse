@@ -104,18 +104,6 @@ func Load(args []string, lookup LookupEnv) (RunConfig, error) {
 		}
 		config.TelegramDeliveryEnabled = parsed
 	}
-	for _, required := range []struct {
-		name  string
-		value string
-	}{
-		{name: "AWS_REGION", value: config.AWSRegion},
-		{name: "DYNAMODB_DOMAIN_TABLE", value: config.DynamoDBTable},
-		{name: "SQS_NOTIFICATION_JOBS_URL", value: config.SQSQueueURL},
-	} {
-		if required.value == "" {
-			return RunConfig{}, fmt.Errorf("%s is required", required.name)
-		}
-	}
 
 	fs := flag.NewFlagSet("notification-relay", flag.ContinueOnError)
 	fs.SetOutput(io.Discard)
@@ -132,6 +120,19 @@ func Load(args []string, lookup LookupEnv) (RunConfig, error) {
 	}
 	if len(fs.Args()) != 0 {
 		return RunConfig{}, fmt.Errorf("relay does not accept positional arguments")
+	}
+	// After the flags, so -h prints the usage without any environment.
+	for _, required := range []struct {
+		name  string
+		value string
+	}{
+		{name: "AWS_REGION", value: config.AWSRegion},
+		{name: "DYNAMODB_DOMAIN_TABLE", value: config.DynamoDBTable},
+		{name: "SQS_NOTIFICATION_JOBS_URL", value: config.SQSQueueURL},
+	} {
+		if required.value == "" {
+			return RunConfig{}, fmt.Errorf("%s is required", required.name)
+		}
 	}
 	if relayTime != "" {
 		parsed, parseErr := time.Parse(time.RFC3339Nano, relayTime)

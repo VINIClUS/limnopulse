@@ -1,9 +1,12 @@
 package config
 
 import (
+	"errors"
 	"strings"
 	"testing"
 	"time"
+
+	"github.com/VINIClUS/limnopulse/internal/workerflag"
 )
 
 func TestLoadAcceptsRelayFlagsAndRequiredEnvironment(t *testing.T) {
@@ -165,5 +168,14 @@ func TestLoadNamesTheFlagThatFailed(t *testing.T) {
 		if _, err := Load(test.args, requiredLookup()); err == nil || !strings.HasPrefix(err.Error(), test.prefix) {
 			t.Fatalf("Load(%v) error = %v, want %q", test.args, err, test.prefix)
 		}
+	}
+}
+
+func TestLoadAnswersHelpWithoutAnyEnvironment(t *testing.T) {
+	var help *workerflag.Help
+	_, err := Load([]string{"-h"}, func(string) (string, bool) { return "", false })
+	if !errors.As(err, &help) || !strings.HasPrefix(help.Usage, "Usage of notification-relay:\n") ||
+		!strings.Contains(help.Usage, "-max-work") {
+		t.Fatalf("Load(-h) error = %v", err)
 	}
 }
