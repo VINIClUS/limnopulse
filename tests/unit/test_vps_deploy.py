@@ -113,7 +113,7 @@ if args[:1] == ["compose"]:
     candidate = args[4] == ".env.image.candidate"
     if candidate and key == os.environ.get("FAKE_FAIL_OPERATION"):
         sys.exit(21)
-    if not candidate and operation != "config" and os.environ.get("FAKE_FAIL_ROLLBACK") == "1":
+    if not candidate and operation != "config" and os.environ["FAKE_FAIL_ROLLBACK"] in ("all", key):
         sys.exit(22)
     if operation == "config":
         switch = os.environ["FAKE_SWITCH" if candidate else "FAKE_ROLLBACK_SWITCH"]
@@ -195,7 +195,7 @@ def deploy(tmp_path):
         rollback_switch=None,
         fail="",
         unhealthy="",
-        rollback_fail=False,
+        rollback_fail="",
         helper_exits=None,
         status=None,
         keep_worker=False,
@@ -222,7 +222,7 @@ def deploy(tmp_path):
             "FAKE_ROLLBACK_SWITCH": switch if rollback_switch is None else rollback_switch,
             "FAKE_FAIL_OPERATION": fail,
             "FAKE_UNHEALTHY": unhealthy,
-            "FAKE_FAIL_ROLLBACK": "1" if rollback_fail else "0",
+            "FAKE_FAIL_ROLLBACK": rollback_fail,
             "FAKE_HELPER_EXITS": json.dumps(helper_exits or {}),
             "FAKE_HELPER_STATUS": status,
             "FAKE_KEEP_WORKER": "1" if keep_worker else "0",
@@ -476,18 +476,52 @@ def test_rollback_never_overrides_a_floor_refusal(deploy):
     assert steps(run.calls) == promotion(("activate", CANDIDATE)) + rollback(WITH_BUNDLE)
     assert not any("--override-floor" in call["argv"] for call in run.calls)
     assert "needs a manual decision" in run.log
+    assert "needs a manual decision" in run.result.stdout
     assert "rollback failed" in run.log
     assert run.image_file.read_text() == WITH_BUNDLE
 
 
 def test_failed_rollback_is_reported_and_does_not_recurse(deploy):
-    run = deploy(fail="up", rollback_fail=True)
+    run = deploy(fail="up", rollback_fail="all")
     assert run.result.returncode == 1
     flow = promotion(("up", CANDIDATE, "ingestion"))
-    assert steps(run.calls) == flow + [("config", PREVIOUS), ("pull", PREVIOUS, "ingestion")]
+    assert steps(run.calls) == flow + [
+        ("config", PREVIOUS),
+        ("pull", PREVIOUS, "ingestion"),
+        ("up", PREVIOUS, "ingestion"),
+    ]
+    assert run.log.count("deploy failed") == 1
     assert "rollback failed" in run.log.lower()
     assert "deploy ok" not in run.log
     assert run.image_file.read_text() == WITH_BUNDLE
+
+
+@pytest.mark.parametrize("enabled", [True, False])
+@pytest.mark.parametrize("failure", ["api health", "activate"])
+def test_a_registry_outage_during_rollback_still_starts_the_cached_previous_tag(
+    deploy, failure, enabled
+):
+    options, last = (FAILURES if enabled else DISABLED_FAILURES)[failure]
+    run = deploy(switch="true" if enabled else "false", rollback_fail="pull", **options)
+    assert run.result.returncode == 1
+    activated = last[0] == "activate"
+    assert steps(run.calls) == promotion(last, enabled) + rollback(
+        WITH_BUNDLE, enabled, activated=activated
+    )
+    assert "pull failed; starting from the cached images" in run.log
+    # The outage is still reported: the previous images may be older than the recorded tag's.
+    assert "rollback failed" in run.log
+    assert run.image_file.read_text() == WITH_BUNDLE
+
+
+@pytest.mark.parametrize("failure", ["up", "api health", "activate", "activate floor"])
+def test_the_rollback_is_logged_once_and_reaches_the_workflow(deploy, failure):
+    options, _ = FAILURES[failure]
+    run = deploy(**options)
+    assert run.result.returncode == 1
+    assert run.log.count("deploy failed") == 1
+    assert run.result.stdout.count("deploy failed") == 1
+    assert run.result.stdout.count("rolling back to prev=") == 1
 
 
 @pytest.mark.parametrize("enabled", [True, False])
@@ -721,22 +755,26 @@ def test_end_to_end_rollback_reactivates_the_previous_bundle(deploy):
     previous = host.deploy_release(PREVIOUS)
     recorded = f"IMAGE_TAG={PREVIOUS}\nWORKERS_BUNDLE_SHA256={previous}\n"
     digest = host.publish(CANDIDATE)
-    # The candidate's activation swaps current, then fails its try-restart.
+    # The running worker's candidate binary exits 78: try-restart leaves the unit failed.
     host.env.update(FAKE_ENABLED=unit, FAKE_FAIL_RESTART=unit, FAKE_FAIL_RESTART_RELEASE=CANDIDATE)
+    host.set_unit_states({unit: "active"})
     run = deploy(previous=recorded, request=f"{CANDIDATE} {digest}", real_helper=True)
     assert run.result.returncode == 1, run.log
     assert ("activate", CANDIDATE) in steps(run.calls)
     assert steps(run.calls)[-1] == ("activate", PREVIOUS)
     assert "rollback failed" not in run.log
     assert os.readlink(host.current) == f"releases/{PREVIOUS}"
+    # The rollback brings the worker back on the previous binary.
+    assert host.unit_states()[unit] == "active"
+    assert not (host.state / "running.json").exists()
     assert run.image_file.read_text() == recorded
 
 
 def test_end_to_end_rollback_to_a_release_without_a_bundle_deactivates(deploy):
     host = deploy.host
-    # The activation installs the units and swaps current, then fails its try-restart.
+    # The activation installs the units and swaps current, then systemctl fails its try-restart.
     host.env["FAKE_ENABLED"] = "limnopulse-email-worker.service"
-    host.env["FAKE_FAIL_RESTART"] = "limnopulse-email-worker.service"
+    host.env["FAKE_FAIL_SYSTEMCTL"] = "try-restart"
     digest = host.publish(CANDIDATE)
     run = deploy(previous=IMAGE_ONLY, request=f"{CANDIDATE} {digest}", real_helper=True)
     assert run.result.returncode == 1

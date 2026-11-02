@@ -78,6 +78,8 @@ ENABLED_STATES = frozenset({"enabled", "enabled-runtime"})
 
 FLOORS_FILE = "floors.json"
 UNITS_FILE = "units.json"
+# The enabled services that were running when an activation began; removed once one succeeds.
+RUNNING_FILE = "running.json"
 LOCK_FILE = ".lock"
 STAGE_PREFIX = ".stage-"
 CURRENT_TMP_PREFIX = ".current-"
@@ -481,6 +483,27 @@ def read_installed_units(paths: Paths) -> list[str]:
     return units
 
 
+def read_running(paths: Paths) -> list[str] | None:
+    """The running services an activation that did not finish recorded, or None."""
+    units = read_json(paths.state / RUNNING_FILE)
+    if units is None:
+        return None
+    if not isinstance(units, list) or not all(
+        isinstance(unit, str) and UNIT_RE.fullmatch(unit) and unit.endswith(".service")
+        for unit in units
+    ):
+        raise Failure(f"{RUNNING_FILE} is malformed")
+    return units
+
+
+def clear_running(paths: Paths) -> None:
+    try:
+        os.unlink(paths.state / RUNNING_FILE)
+    except FileNotFoundError:
+        return
+    fsync_dir(paths.state)
+
+
 def current_tag(paths: Paths) -> str | None:
     try:
         info = os.lstat(paths.current)
@@ -587,6 +610,10 @@ def systemctl(*args: str, capture: bool = False) -> subprocess.CompletedProcess[
 
 def is_enabled(unit: str) -> bool:
     return systemctl("is-enabled", unit, capture=True).stdout.strip() in ENABLED_STATES
+
+
+def is_active(unit: str) -> bool:
+    return systemctl("is-active", unit, capture=True).stdout.strip() == "active"
 
 
 def stop_and_remove(paths: Paths, units: list[str]) -> bool:
@@ -703,6 +730,13 @@ def activate(paths: Paths, tag: str, override: bool) -> None:
     check_floors(meta, floors, override)
     previous = current_tag(paths)
     installed = read_installed_units(paths)
+    # Record the enabled services running now, with those an activation that did not finish
+    # recorded, before anything stops. Each one this release still runs must run again after.
+    # A unit that had already failed is not running, so it is left alone.
+    pending = read_running(paths)
+    running = {unit for unit in installed if unit.endswith(".service") and is_enabled(unit)}
+    running = {unit for unit in running if is_active(unit)} | set(pending or ())
+    write_json(paths.state / RUNNING_FILE, sorted(running))
     # Record the union first, so a deactivate after a partial failure still finds every unit.
     write_json(paths.state / UNITS_FILE, sorted(set(installed) | set(meta.units)))
     stop_and_remove(paths, [unit for unit in installed if unit not in meta.units])
@@ -718,11 +752,24 @@ def activate(paths: Paths, tag: str, override: bool) -> None:
             except Failure as error:
                 log(str(error))
                 restart_failed.append(unit)
+    # A rollback brings back what the activation it undoes stopped: try-restart leaves a failed
+    # unit down. reset-failed clears a failure that RestartPreventExitStatus=78 made final.
+    for unit in sorted(set(pending or ()) & set(meta.continuous)):
+        try:
+            systemctl("reset-failed", unit)
+            systemctl("start", unit)
+        except Failure as error:
+            log(str(error))
+            restart_failed.append(unit)
     if restart_failed:
-        raise Failure(f"try-restart failed for {restart_failed}")
+        raise Failure(f"restarting {restart_failed} failed")
+    down = [unit for unit in sorted(running & set(meta.continuous)) if not is_active(unit)]
+    if down:
+        raise Failure(f"{down} ran before the activation and are not running after it")
     for role, floor in meta.floors.items():
         floors[role] = max(floors.get(role, 0), floor)
     write_json(paths.state / FLOORS_FILE, floors)
+    clear_running(paths)
     log(f"activated {tag}")
     prune(paths, {tag, previous})
 
@@ -734,6 +781,8 @@ def deactivate(paths: Paths) -> None:
         units |= {
             name for name in os.listdir(paths.releases / current / UNITS) if UNIT_RE.fullmatch(name)
         }
+    # Nothing runs without a bundle, so nothing is left to bring back.
+    clear_running(paths)
     if not units and current is None:
         log("no workers bundle is active")
         return

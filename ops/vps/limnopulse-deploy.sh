@@ -104,18 +104,28 @@ resolve_workers() {
   done <<<"$resolved"
 }
 
-# start_release <compose command...>: pull, stop and remove each disabled worker, then start
-# the stack with the profiles of the enabled ones. Plain `up` without a profile would leave
-# a disabled worker's old container running.
+# start_release [--keep-going] <compose command...>: pull, stop and remove each disabled
+# worker, then start the stack with the profiles of the enabled ones. Plain `up` without a
+# profile would leave a disabled worker's old container running. A promotion stops at the first
+# failure. A rollback (--keep-going) logs a failed pull, starts the previous tag from the images
+# still cached, and then returns the failure.
 start_release() {
-  local entry service profile enabled_profiles=()
+  local keep_going=0 pull_failed=0 entry service profile enabled_profiles=()
+  if [ "$1" = --keep-going ]; then
+    keep_going=1
+    shift
+  fi
   for entry in "${PROFILED_WORKERS[@]}"; do
     read -r service profile _ <<<"$entry"
     if contains "$service" "${ENABLED_WORKERS[@]}"; then
       enabled_profiles+=(--profile "$profile")
     fi
   done
-  "$@" "${enabled_profiles[@]}" pull >>"$LOG" 2>&1 || return 1
+  if ! "$@" "${enabled_profiles[@]}" pull >>"$LOG" 2>&1; then
+    [ "$keep_going" -eq 1 ] || return 1
+    log "pull failed; starting from the cached images" || true
+    pull_failed=1
+  fi
   for entry in "${PROFILED_WORKERS[@]}"; do
     read -r service profile _ <<<"$entry"
     if contains "$service" "${DISABLED_WORKERS[@]}"; then
@@ -135,6 +145,7 @@ start_release() {
       fi
     fi
   done
+  return "$pull_failed"
 }
 
 # --- request validation; nothing above this line does deploy I/O ---
@@ -222,7 +233,7 @@ rollback() {
     if ! resolve_workers "${COMPOSE[@]}"; then
       log "cannot re-read the host switches; rolling back with the values read at promotion" || true
     fi
-    start_release "${COMPOSE[@]}" || rollback_failed=1
+    start_release --keep-going "${COMPOSE[@]}" || rollback_failed=1
   else
     # Compose still needs the candidate env file while stopping its services.
     # Stop preserves the volumes and network; this is not a stack reset.
@@ -278,9 +289,11 @@ until all_healthy; do
   sleep 3
 done
 
-# 4. Activate the bundle. From here on, a rollback must move the bundle back too.
+# 4. Activate the bundle. From here on, a rollback must move the bundle back too. The rollback
+# runs here, not from the ERR trap inside the redirected call, so its log lines reach the
+# workflow once.
 ACTIVATION_STARTED=1
-activation activate "$TAG" >>"$LOG" 2>&1
+activation activate "$TAG" >>"$LOG" 2>&1 || rollback
 
 # 5. Record the release. Nothing after the rename may roll it back.
 printf 'IMAGE_TAG=%s\nWORKERS_BUNDLE_SHA256=%s\n' "$TAG" "$BUNDLE_SHA256" > .env.image.next

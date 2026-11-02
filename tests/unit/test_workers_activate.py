@@ -564,7 +564,8 @@ def test_activate_swaps_current_atomically_after_daemon_reload(host):
     assert seen <= {release_link(A), release_link(B)}
     assert os.readlink(host.current) == release_link(B)
     calls = host.calls("systemctl")
-    assert calls[0] == {"tool": "systemctl", "argv": ["daemon-reload"], "current": release_link(A)}
+    reload = next(call for call in calls if call["argv"] == ["daemon-reload"])
+    assert reload == {"tool": "systemctl", "argv": ["daemon-reload"], "current": release_link(A)}
     assert {
         "tool": "systemctl",
         "argv": ["try-restart", CONTINUOUS[0]],
@@ -719,12 +720,140 @@ def test_activate_removes_the_units_a_release_dropped(host):
 def test_a_failed_try_restart_fails_the_activation_and_records_no_floor(host):
     host.env["FAKE_ENABLED"] = CONTINUOUS[1]
     host.env["FAKE_FAIL_RESTART"] = CONTINUOUS[1]
+    host.set_unit_states({CONTINUOUS[1]: "active"})
     digest = host.publish(A, epochs={FEEDBACK: 2}, floors={FEEDBACK: 2})
     assert host.run("stage", A, digest).returncode == 0
     assert host.run("activate", A).returncode == 1
     assert not (host.state / "floors.json").exists()
     del host.env["FAKE_FAIL_RESTART"]
     host.deploy_release(B)  # epoch 1 is still allowed: the failed activation set no floor
+
+
+# --- running workers across an activation and its rollback -------------------------------
+
+
+def systemctl_calls(host, *commands):
+    return [call["argv"] for call in host.calls("systemctl") if call["argv"][0] in commands]
+
+
+def test_a_candidate_that_stops_a_running_worker_fails_its_activation(host):
+    # The candidate's binary exits 78: the unit is left failed and systemd never restarts it.
+    worker = CONTINUOUS[0]
+    host.env.update(FAKE_ENABLED=worker, FAKE_FAIL_RESTART=worker, FAKE_FAIL_RESTART_RELEASE=B)
+    host.deploy_release(A)
+    host.set_unit_states({worker: "active"})
+    assert (
+        host.run("stage", B, host.publish(B, epochs={FEEDBACK: 2}, floors={FEEDBACK: 2})).returncode
+        == 0
+    )
+    result = host.run("activate", B)
+    assert result.returncode == 1
+    assert "restarting ['limnopulse-email-worker.service'] failed" in result.stderr
+    assert host.unit_states()[worker] == "failed"
+    assert json.loads((host.state / "running.json").read_text()) == [worker]
+    assert f'"{FEEDBACK}": 2' not in (host.state / "floors.json").read_text()
+
+
+def test_the_rollback_activation_brings_the_worker_back(host):
+    worker = CONTINUOUS[0]
+    host.env.update(FAKE_ENABLED=worker, FAKE_FAIL_RESTART=worker, FAKE_FAIL_RESTART_RELEASE=B)
+    host.deploy_release(A)
+    host.set_unit_states({worker: "active"})
+    assert host.run("stage", B, host.publish(B)).returncode == 0
+    assert host.run("activate", B).returncode == 1
+    host.reset_calls()
+    result = host.run("activate", A)
+    assert result.returncode == 0, result.stderr
+    assert os.readlink(host.current) == release_link(A)
+    assert host.unit_states()[worker] == "active"
+    restore = [
+        (call["argv"], call["current"])
+        for call in host.calls("systemctl")
+        if call["argv"][0] in ("reset-failed", "start")
+    ]
+    assert restore == [
+        (["reset-failed", worker], release_link(A)),
+        (["start", worker], release_link(A)),
+    ]
+    assert not (host.state / "running.json").exists()
+
+
+def test_a_rollback_that_cannot_bring_the_worker_back_fails(host):
+    worker = CONTINUOUS[0]
+    host.env.update(FAKE_ENABLED=worker, FAKE_FAIL_RESTART=worker)
+    host.deploy_release(A)
+    host.set_unit_states({worker: "active"})
+    assert host.run("stage", B, host.publish(B)).returncode == 0
+    assert host.run("activate", B).returncode == 1
+    result = host.run("activate", A)
+    assert result.returncode == 1
+    assert host.unit_states()[worker] == "failed"
+    # The record stays, so a later activation still tries to bring the worker back.
+    assert json.loads((host.state / "running.json").read_text()) == [worker]
+
+
+def test_a_worker_that_crashes_after_starting_fails_the_activation(host):
+    # try-restart succeeds, but the worker is not running once it returns.
+    worker = CONTINUOUS[2]
+    host.env.update(FAKE_ENABLED=worker, FAKE_CRASH_AFTER_START=worker)
+    host.deploy_release(A)
+    host.set_unit_states({worker: "active"})
+    assert host.run("stage", B, host.publish(B)).returncode == 0
+    result = host.run("activate", B)
+    assert result.returncode == 1
+    assert "['limnopulse-telegram-worker.service'] ran before the activation" in result.stderr
+    assert not systemctl_calls(host, "reset-failed", "start")
+
+
+def test_a_worker_that_had_already_failed_is_left_alone(host):
+    failed, healthy = CONTINUOUS[0], CONTINUOUS[1]
+    host.env.update(FAKE_ENABLED=f"{failed},{healthy}", FAKE_FAIL_RESTART=healthy)
+    host.env["FAKE_FAIL_RESTART_RELEASE"] = B
+    host.deploy_release(A)
+    host.set_unit_states({failed: "failed", healthy: "active"})
+    # A promotion that keeps the running worker up passes despite the failed one.
+    assert host.run("stage", C, host.publish(C)).returncode == 0
+    host.reset_calls()
+    assert host.run("activate", C).returncode == 0
+    assert host.unit_states()[failed] == "failed"
+    assert not systemctl_calls(host, "reset-failed", "start")
+    # A rollback brings back only what was running before the failed promotion.
+    assert host.run("stage", B, host.publish(B)).returncode == 0
+    assert host.run("activate", B).returncode == 1
+    assert json.loads((host.state / "running.json").read_text()) == [healthy]
+    host.reset_calls()
+    assert host.run("activate", C).returncode == 0
+    assert systemctl_calls(host, "reset-failed", "start") == [
+        ["reset-failed", healthy],
+        ["start", healthy],
+    ]
+    assert host.unit_states() == {failed: "failed", healthy: "active"}
+
+
+@pytest.mark.parametrize(
+    "data", [b"{", b"{}", b"false", b'["ssh.service"]', b'["limnopulse-alert-evaluator.timer"]']
+)
+def test_a_malformed_running_record_is_refused(host, data):
+    host.deploy_release(A)
+    (host.state / "running.json").write_bytes(data)
+    host.reset_calls()
+    before = host.snapshot()
+    result = host.run("activate", A)
+    assert result.returncode == 1
+    assert "running.json is" in result.stderr
+    assert host.snapshot() == before
+    assert host.calls() == []
+
+
+def test_deactivate_forgets_the_running_record(host):
+    worker = CONTINUOUS[0]
+    host.env.update(FAKE_ENABLED=worker, FAKE_FAIL_RESTART=worker, FAKE_FAIL_RESTART_RELEASE=B)
+    host.deploy_release(A)
+    host.set_unit_states({worker: "active"})
+    assert host.run("stage", B, host.publish(B)).returncode == 0
+    assert host.run("activate", B).returncode == 1
+    assert host.run("deactivate").returncode == 0
+    assert not (host.state / "running.json").exists()
 
 
 # --- rollback floors ----------------------------------------------------------------------

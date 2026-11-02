@@ -93,8 +93,8 @@ it only through the sudoers line in `roles.yaml`. The helper validates its own a
 | Command | Effect |
 |---|---|
 | `stage <tag> <sha256>` | Pulls as root into a root-owned temporary directory. Verifies the tarball SHA-256, then `SHA256SUMS`, then the floor. Extracts to `releases/<tag>` and records the verified SHA-256 in `state/`. Changes no unit. |
-| `activate <tag>` | Re-verifies `SHA256SUMS` and the floor. Installs the release's units, runs `daemon-reload` and swaps `current` with an atomic rename. Runs `try-restart` on enabled continuous units and enables nothing. |
-| `deactivate` | Removes the installed units and the `current` link. This is the "no bundle" state of releases from before ADR-020. |
+| `activate <tag>` | Re-verifies `SHA256SUMS` and the floor. Records in `state/running.json` the enabled services that are active. Installs the release's units, runs `daemon-reload` and swaps `current` with an atomic rename. Runs `try-restart` on enabled continuous units and enables nothing. If an earlier `activate` left a record (it did not finish, as before a rollback), it then runs `reset-failed` and `start` on each continuous unit in that record. Every recorded unit that the release runs must then be active, or it fails with `1`. A unit that had already failed is not recorded, so it is left alone. Only a successful `activate` removes the record. |
+| `deactivate` | Removes the installed units, the `current` link and the running record. This is the "no bundle" state of releases from before ADR-020. |
 | `status` | Prints the current tag, the staged releases and the recorded floors. |
 
 Exit codes: `0` ok, `1` failure, `3` floor refused, `78` usage. It keeps two releases.
@@ -144,7 +144,10 @@ every promotion. The deploy therefore removes it instead. ADR-020 itself is unch
 this section is the rule.
 
 Rollback moves the API and the profiled Compose workers back to the previous tag, applying
-the same host-switch rule with the switch as it is at rollback time. The bundle moves back
+the same host-switch rule with the switch as it is at rollback time. If the registry fails
+the rollback's pull, it still starts the previous tag from the cached images and reports
+the failure. The bundle moves back
 only if step 4 ran; before that it never moved. Then rollback re-activates the previous
-release from its already verified directory, or runs `deactivate` when the previous
-release had no bundle.
+release from its already verified directory, which brings back the workers the failed
+activation stopped. When the previous release had no bundle, it runs `deactivate`
+instead.

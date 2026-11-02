@@ -48,24 +48,60 @@ for item in sorted(source.iterdir()):
     shutil.copyfile(item, Path(args[3]) / item.name)
 """
 
+# Tracks each unit's active state in FAKE_UNIT_STATE, as systemd would:
+# - `try-restart` acts only on an active unit, and `start` makes a unit active.
+# - A unit in FAKE_FAIL_RESTART fails to start, like a binary exiting 78, and is left `failed`.
+#   FAKE_FAIL_RESTART_RELEASE limits this to the named `current` release.
+# - A unit in FAKE_CRASH_AFTER_START starts, then crashes, so it ends up `activating`
+#   (auto-restart).
 FAKE_SYSTEMCTL = """\
 import json, os, sys
+from pathlib import Path
 args = sys.argv[1:]
 current = os.environ.get("FAKE_CURRENT", "")
 target = os.readlink(current) if current and os.path.islink(current) else None
 with open(os.environ["FAKE_CALLS"], "a") as log:
     log.write(json.dumps({"tool": "systemctl", "argv": args, "current": target}) + "\\n")
 split = lambda name: [item for item in os.environ.get(name, "").split(",") if item]
+if args[:1] and args[0] in split("FAKE_FAIL_SYSTEMCTL"):
+    sys.exit(1)
+state_file = Path(os.environ["FAKE_UNIT_STATE"])
+states = json.loads(state_file.read_text()) if state_file.exists() else {}
+failing_release = os.environ.get("FAKE_FAIL_RESTART_RELEASE")
+def failing(unit):
+    if unit not in split("FAKE_FAIL_RESTART"):
+        return False
+    return not failing_release or target == f"releases/{failing_release}"
+def start(unit):
+    if failing(unit):
+        states[unit] = "failed"
+        return 1
+    states[unit] = "activating" if unit in split("FAKE_CRASH_AFTER_START") else "active"
+    return 0
+status = 0
 if args[:1] == ["is-enabled"]:
     enabled = args[1] in split("FAKE_ENABLED")
     print("enabled" if enabled else "disabled")
-    sys.exit(0 if enabled else 1)
-failing_release = os.environ.get("FAKE_FAIL_RESTART_RELEASE")
-if args[:1] == ["try-restart"] and args[1] in split("FAKE_FAIL_RESTART"):
-    if not failing_release or target == f"releases/{failing_release}":
-        sys.exit(1)
-if args[:1] and args[0] in split("FAKE_FAIL_SYSTEMCTL"):
-    sys.exit(1)
+    status = 0 if enabled else 1
+elif args[:1] == ["is-active"]:
+    print(states.get(args[1], "inactive"))
+    status = 0 if states.get(args[1]) == "active" else 3
+elif args[:1] == ["try-restart"]:
+    for unit in args[1:]:
+        if states.get(unit) == "active":
+            status |= start(unit)
+elif args[:1] == ["start"]:
+    for unit in args[1:]:
+        status |= start(unit)
+elif args[:1] == ["reset-failed"]:
+    for unit in args[1:]:
+        if states.get(unit) == "failed":
+            states[unit] = "inactive"
+elif args[:1] == ["stop"]:
+    for unit in args[1:]:
+        states[unit] = "inactive"
+state_file.write_text(json.dumps(states))
+sys.exit(status)
 """
 
 # Stands in for sudo with the sudoers rule: only the helper path, with -n, as root via sudo.
@@ -204,6 +240,7 @@ class Host:
         self.registry = self.base / "registry"
         self.bin = self.base / "bin"
         self.calls_file = self.base / "calls.jsonl"
+        self.unit_state = self.base / "unit-state.json"
         for directory in (self.releases, self.state, self.units, self.registry, self.bin):
             directory.mkdir(parents=True, exist_ok=True)
         for directory in (self.workers, self.releases, self.state, self.units):
@@ -222,6 +259,7 @@ class Host:
             "FAKE_CALLS": str(self.calls_file),
             "FAKE_REGISTRY": str(self.registry),
             "FAKE_CURRENT": str(self.current),
+            "FAKE_UNIT_STATE": str(self.unit_state),
             **self.env,
         }
 
@@ -256,6 +294,13 @@ class Host:
             result = self.run(*args)
             assert result.returncode == 0, result.stderr
         return digest
+
+    def set_unit_states(self, states: dict[str, str]) -> None:
+        """Set units' active states (`active`, `failed`, ...) as the fake systemctl sees them."""
+        self.unit_state.write_text(json.dumps({**self.unit_states(), **states}))
+
+    def unit_states(self) -> dict[str, str]:
+        return json.loads(self.unit_state.read_text()) if self.unit_state.exists() else {}
 
     def calls(self, tool: str | None = None) -> list[dict[str, Any]]:
         if not self.calls_file.exists():
