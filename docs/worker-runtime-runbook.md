@@ -125,12 +125,32 @@ For each role:
 | `email-worker` | The SES-feedback worker is enabled and its alarms are `OK`. The SES check passes (`infra/opentofu/README.md`, "The email-worker's SES check"). Its simulation runs on the *workstation* and its test send on the *host*. The apply that first created `NotificationRelayByAvailableAt` is not the one that enables it ("Notification rollout boundary"). |
 | `telegram-worker` | The 3C-B "Cloud rollout" steps 1 to 6 are done: queue, secrets, webhook and binding, binaries with every Telegram flag `false`, and the final `limnopulse-admin backfill-telegram` with the evaluator timer stopped. Redis is published on the host loopback with a password, and in the same change the API's `REDIS_URL` gets that password. `compose.production.yaml` publishes no Redis port and hard-codes a password-less `REDIS_URL`, so that change comes first. The password is the worker's `redis-password` credential. Only the worker's env file sets `TELEGRAM_DELIVERY_ENABLED=true` (3C-B step 7). |
 | `notification-relay` | `NotificationRelayByAvailableAt` is `ACTIVE`, and `limnopulse-admin backfill-relay` reports zero rows needing update. The apply that first created the index is not the one that enables it. With Telegram on, the env file also sets `SQS_TELEGRAM_JOBS_URL` and `LIMNOPULSE_WEB_URL`. |
-| `alert-evaluator` | The `influxdb-token` credential is a dedicated token, readable only against `INFLUXDB_BUCKET_RAW`. It is never the bootstrap admin `INFLUXDB_TOKEN` that the API and InfluxDB use. Create it as the P3 runbook creates the ingest worker's token ("Production environment"), but with `--read-bucket` and a dated `--description alert-evaluator-<YYYYMMDD>`. Write its `token` field straight into the credential file without printing it, and note its `id` from the same `--json` output. The data-quality settings in the env file match the devices. `limnopulse-admin backfill-schedule` has been applied ([`docs/alert-evaluator-phase-3b.md`](alert-evaluator-phase-3b.md), "Initial schedule backfill"). |
+| `alert-evaluator` | The `influxdb-token` credential is a dedicated token, readable only against `INFLUXDB_BUCKET_RAW`. It is never the bootstrap admin `INFLUXDB_TOKEN` that the API and InfluxDB use. Create it with [Evaluator token](#evaluator-token). The data-quality settings in the env file match the devices. `limnopulse-admin backfill-schedule` has been applied ([`docs/alert-evaluator-phase-3b.md`](alert-evaluator-phase-3b.md), "Initial schedule backfill"). |
 
 **Backfills.** *Workstation:* run each backfill under the assumed `limnopulse_admin` role,
 as "limnopulse-admin" in [`infra/opentofu/README.md`](../infra/opentofu/README.md)
 describes. Name the tenants explicitly. Do a dry run, review it, run with `--apply`, then
 dry-run again until it reports nothing left to update.
+
+### Evaluator token
+
+*Host,* as root from `/opt/limnopulse`. This creates the dedicated read token. Its form
+follows the P3 runbook's ingest token ("Production environment"), with `--read-bucket`
+and a dated description. The command writes the `token` field straight into the
+credential file and prints only the token's `id`. Note that id. Find `<bucket_id>` with
+`influx bucket list --org <org> --name <bucket> --hide-headers`, run the same way.
+
+```bash
+umask 077
+sudo -u limnopulse-deploy docker compose --env-file .env --env-file .env.image \
+  -f compose.production.yaml exec -T influxdb sh -c 'INFLUX_TOKEN=$DOCKER_INFLUXDB_INIT_ADMIN_TOKEN \
+  influx auth create --org <org> --read-bucket <bucket_id> --description alert-evaluator-<YYYYMMDD> --json' \
+  | python3 -c 'import json, sys
+auth = json.load(sys.stdin)
+with open("/etc/limnopulse/workers/credentials/alert-evaluator/influxdb-token", "w") as f:
+    f.write(auth["token"])
+print(auth["id"])'
+```
 
 ### Telegram on the producers
 
@@ -187,11 +207,10 @@ another role's alarm actions are on pages for that role within minutes.
 
 **InfluxDB token (evaluator).** All steps run on the *host*.
 
-1. Create a second dedicated read token, the same way as in the evaluator's gate, with
-   today's date in its description. Note its `id`.
-2. Write its `token` field over `influxdb-token` without printing it.
-3. Let the next tick read it.
-4. Once a run succeeds, find the old dedicated token in `influx auth list`: it is the
+1. Run [Evaluator token](#evaluator-token) again, with today's date in the description.
+   It writes the new token over `influxdb-token` and prints its `id`. Note the id.
+2. Let the next tick read it.
+3. Once a run succeeds, find the old dedicated token in `influx auth list`: it is the
    `alert-evaluator-<date>` entry whose id is not the one you noted. Delete it with
    `influx auth delete --id <id>`. Run `influx` inside the `influxdb` container, as the
    P3 runbook does. Never delete the bootstrap admin token.
