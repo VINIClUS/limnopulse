@@ -111,7 +111,8 @@ the checkout it runs from, and no argument names a path:
 - `binaries` builds every Go role into `dist/workers/bin` with `CGO_ENABLED=0`,
   `GOOS=linux`, `GOARCH=amd64`, `GOAMD64=v1`, `-trimpath`, `-buildvcs=false` and
   `-ldflags='-s -w -buildid='`. Two builds of one commit with one Go toolchain produce
-  the same bytes.
+  the same bytes. It refuses a non-empty `bin/`; `make workers-clean` removes
+  `dist/workers` before a rebuild.
 - `bundle --tag <tag>` writes `dist/workers/limnopulse-workers-<tag>.tar.gz`. It packs
   USTAR entries sorted by path, mtime 0, uid and gid 0 with no owner names, `bin/*` 0755
   and the rest 0644, through `gzip -9 -n`. It refuses a `bin/` directory that is not
@@ -127,13 +128,19 @@ which installs it on the runner's systemd. Every role but worker-monitor gets em
 credentials there and must exit `78` without a restart; worker-monitor reads every unit
 over D-Bus and exits `0`. On a push to `main`, `workers-publish` runs the same steps,
 attests the tarball file with `actions/attest-build-provenance`, and pushes it with
-`oras push` as one file layer titled with its bare file name.
+`oras push` as one file layer titled with its bare file name. It then pulls the bundle
+back, requires the bytes it built, and runs the same `gh attestation verify` as
+`deploy.yml`, so a broken publish fails on `main` rather than at the next deploy.
 
 ## Units
 
 `ops/workers/systemd/` holds the units the bundle ships. `scripts/workers/units.py`
 renders them from `roles.yaml`, and `tests/unit/test_workers_units.py` fails when they
 drift; after editing either, run `.venv/bin/python -m scripts.workers.units --write`.
+
+The host needs systemd 254 or newer: older releases ignore `RestartSteps=` and
+`RestartMaxDelaySec=` with a warning, so a crashing service restarts every 5 s
+indefinitely. CI runs the units on systemd 255.
 
 | Setting | Continuous service | One-shot service and timer |
 |---|---|---|
@@ -163,9 +170,9 @@ adds `User=limnopulse-worker-monitor`: systemd uses an existing user of that nam
 of allocating one, and the sandbox stays the same.
 `ops/workers/sysusers.d/limnopulse-workers.conf` declares the user, with no login shell.
 The host installs it as `/etc/sysusers.d/limnopulse-workers.conf` and runs
-`systemd-sysusers` before it enables the monitor's timer. Without the user, the monitor
-publishes nothing and the unit-health alarms breach. `scripts/workers/units.py` renders
-the file too.
+`systemd-sysusers` before it enables the monitor's timer (`ops/vps/README.md`, step 7.5).
+Without the user, the monitor publishes nothing and the unit-health alarms breach.
+`scripts/workers/units.py` renders the file too.
 
 `tests/unit/test_workers_units.py` runs `systemd-analyze verify` on every unit and
 requires `systemd-analyze security` to score each service at or below its pinned

@@ -391,6 +391,36 @@ def test_the_monitor_names_a_static_user_because_the_bus_cannot_resolve_a_dynami
             assert units.static_user(role(name)) is None, name
 
 
+def test_the_host_bootstrap_creates_the_static_user_before_the_monitor_runs():
+    readme = (ROOT / "ops/vps/README.md").read_text(encoding="utf-8")
+    copy = (
+        "scp ops/workers/sysusers.d/limnopulse-workers.conf "
+        "root@<vps>:/tmp/limnopulse-workers.sysusers"
+    )
+    install = (
+        "install -o root -g root -m 0644 /tmp/limnopulse-workers.sysusers "
+        "/etc/sysusers.d/limnopulse-workers.conf"
+    )
+    step = readme[readme.index("### 7.5 worker-monitor's static user") :]
+    step = step[: step.index("\n### ")]
+    assert copy in readme
+    assert install in step
+    assert "systemd-sysusers /etc/sysusers.d/limnopulse-workers.conf" in step
+    # The same static-uid post-condition the CI smoke checks.
+    assert '[ "$uid" -lt 61184 ]' in step
+    assert '"$uid" -ge 61184' in (ROOT / "scripts/workers/smoke_units.sh").read_text()
+    assert "limnopulse-worker-monitor.timer" in step
+    cleanup = readme[readme.index("### 7.6 Check and clean up") :]
+    assert "/tmp/limnopulse-workers.sysusers" in cleanup
+
+
+def test_the_host_systemd_minimum_is_documented():
+    # RestartSteps= and RestartMaxDelaySec= arrived in systemd 254.
+    assert any("RestartSteps=" in line for line in units.RESTART)
+    for path in ("ops/workers/README.md", "ops/vps/README.md"):
+        assert "systemd 254 or newer" in (ROOT / path).read_text(encoding="utf-8"), path
+
+
 def test_systemd_sysusers_accepts_the_file(tmp_path):
     tool = shutil.which("systemd-sysusers")
     if tool is None:
