@@ -11,6 +11,7 @@ from tests.support.worker_roles import (
     ADR_ROLES,
     EXIT_CODES,
     FORCED_COMMAND,
+    OPENTOFU_DIR,
     ROOT,
     load_credential_lines,
     load_roles,
@@ -352,3 +353,31 @@ def test_go_credential_names_cover_every_role_credential(table):
     declared = set(re.findall(r'^\s+Credential\w+\s+= "([a-z0-9-]+)"$', source, flags=re.MULTILINE))
     used = {credential for role in table["roles"] for credential in role.get("credentials", [])}
     assert used == declared
+
+
+def _opentofu_without(tmp_path, variable: str):
+    """A copy of the OpenTofu module with one variable block removed."""
+    directory = tmp_path / "opentofu"
+    directory.mkdir()
+    removed = 0
+    block = re.compile(
+        rf'^variable "{re.escape(variable)}" \{{\n.*?^\}}\n', re.MULTILINE | re.DOTALL
+    )
+    for path in sorted(OPENTOFU_DIR.glob("*.tf")):
+        text, count = block.subn("", path.read_text(encoding="utf-8"))
+        removed += count
+        (directory / path.name).write_text(text, encoding="utf-8")
+    assert removed == 1, variable
+    return directory
+
+
+@pytest.mark.parametrize(
+    "role",
+    [role["name"] for role in load_roles()["roles"] if "enable_variable" in role],
+)
+def test_an_enable_variable_missing_from_opentofu_is_rejected(table, tmp_path, role):
+    variable = roles_by_name(table)[role]["enable_variable"]
+
+    assert validate_roles(table, _opentofu_without(tmp_path, variable)) == [
+        f"{role}: enable_variable {variable} is not an OpenTofu variable"
+    ]

@@ -220,6 +220,84 @@ variable "telemetry_ingress_alarm_email" {
   }
 }
 
+# ADR-020 enable variables, one per unit role (ops/workers/roles.yaml `enable_variable`).
+# Each turns on its role's alarm actions (worker_alarms.tf) and nothing else. Set one only
+# after the role's unit runs and its unit-health alarm is OK; see README.md, "Worker roles".
+variable "alert_evaluator_enabled" {
+  description = "Turn on the alert-evaluator alarm actions. Set only after its timer runs and its unit-health alarm is OK."
+  type        = bool
+  default     = false
+}
+
+variable "notification_relay_enabled" {
+  description = "Turn on the notification-relay alarm actions. Set only after its timer runs and its unit-health alarm is OK."
+  type        = bool
+  default     = false
+}
+
+variable "email_worker_enabled" {
+  description = "Turn on the email-worker alarm actions. Needs email_delivery. Set only after its service runs and its unit-health alarm is OK."
+  type        = bool
+  default     = false
+}
+
+variable "ses_feedback_worker_enabled" {
+  description = "Turn on the ses-feedback-worker alarm actions. Needs email_delivery. Set only after its service runs and its unit-health alarm is OK."
+  type        = bool
+  default     = false
+}
+
+variable "telegram_worker_enabled" {
+  description = "Turn on the telegram-worker alarm actions. Needs telegram_delivery. Set only after its service runs and its unit-health alarm is OK."
+  type        = bool
+  default     = false
+}
+
+variable "worker_monitor_enabled" {
+  description = "Turn on the worker-monitor alarm actions. Set only after its timer runs and its unit-health alarm is OK."
+  type        = bool
+  default     = false
+}
+
+variable "worker_queue_age_alarm_threshold_seconds" {
+  description = "ApproximateAgeOfOldestMessage alarm threshold for the email jobs, SES events and Telegram jobs queues."
+  type        = number
+  default     = 300
+
+  validation {
+    condition     = var.worker_queue_age_alarm_threshold_seconds > 0
+    error_message = "worker_queue_age_alarm_threshold_seconds must be greater than zero."
+  }
+}
+
+variable "worker_queue_depth_alarm_threshold" {
+  description = "ApproximateNumberOfMessagesVisible alarm threshold for the email jobs, SES events and Telegram jobs queues."
+  type        = number
+  default     = 100
+
+  validation {
+    condition     = var.worker_queue_depth_alarm_threshold > 0
+    error_message = "worker_queue_depth_alarm_threshold must be greater than zero."
+  }
+}
+
+variable "worker_alarm_actions" {
+  description = "Extra ARNs notified by the ADR-020 worker alarms, on top of the module's own worker alarm topic."
+  type        = list(string)
+  default     = []
+}
+
+variable "worker_alarm_email" {
+  description = "On-call mailbox subscribed to the worker alarm topic. Empty creates no subscription; set it only in the untracked tfvars, and confirm the subscription from the email AWS sends."
+  type        = string
+  default     = ""
+
+  validation {
+    condition     = var.worker_alarm_email == "" || can(regex("^[^@\\s]+@[^@\\s]+\\.[^@\\s]+$", var.worker_alarm_email))
+    error_message = "worker_alarm_email must be empty or a bare email address."
+  }
+}
+
 locals {
   # Owner=vinisantana matches the design spec's tagging contract (§ resource
   # tagging): every taggable resource carries Project/Environment/ManagedBy/

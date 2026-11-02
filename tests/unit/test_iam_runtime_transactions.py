@@ -26,6 +26,13 @@ its grants exist only behind `var.telemetry_ingress` (`ingestion_queues.tf`). It
 ones reachable from the worker's compose entrypoint. The same scanner derives them over the modules
 the worker imports, and they must be granted on the right table by the attachments that come with
 the user.
+
+ADR-020 gives every Go worker role its own principal (`iam_principal` in `ops/workers/roles.yaml`,
+declared in `workers.tf`). The shared `workers` user above is deprecated and keeps its tests until
+it is removed. Each per-role principal must grant exactly what its role's Go import closure,
+rooted at `cmd/<role>`, calls: every AWS operation and transaction item, the table or index each
+Query names, and each service's resources (queues, secret, SES identity and configuration set,
+the unit-health namespace). Nothing more, nothing less, and nothing the scan cannot model.
 """
 
 import ast
@@ -39,6 +46,8 @@ from pathlib import Path
 
 import pytest
 
+from tests.support import go_sources
+from tests.support.worker_roles import load_roles, roles_by_name
 from tests.unit.test_ingestion_compose import ENTRYPOINT
 
 # The minimal HCL reader of the P3-02 infra tests; `tests/api` imports unit-test helpers the same way.
@@ -2026,3 +2035,824 @@ class Renamed:
         "pkg/renamed.py::Renamed.escaped",
         "pkg/renamed.py::Renamed.bound",
     }
+
+
+# --- ADR-020: one IAM principal per Go worker role ---------------------------------------------
+#
+# The derivation reads every non-test file of every module package `cmd/<role>` links
+# (`go_sources.closure_files`). It names an AWS operation wherever the code names its input type,
+# `<service>.<Op>Input`, and a transaction item wherever it names `types.Put` and friends. So an
+# operation counts whether it is called, declared in a client interface or built and passed on. A
+# package the role links but never runs still adds grants, which keeps the scan on the safe side.
+
+GO_AWS_OPERATIONS: dict[str, dict[str, str | None]] = {
+    "dynamodb": {
+        "GetItem": "dynamodb:GetItem",
+        "PutItem": "dynamodb:PutItem",
+        "UpdateItem": "dynamodb:UpdateItem",
+        "DeleteItem": "dynamodb:DeleteItem",
+        "Query": "dynamodb:Query",
+        # Authorized per item (ITEM_ACTIONS); IAM has no action for the call itself.
+        "TransactWriteItems": None,
+    },
+    "sqs": {
+        "ReceiveMessage": "sqs:ReceiveMessage",
+        "DeleteMessage": "sqs:DeleteMessage",
+        "ChangeMessageVisibility": "sqs:ChangeMessageVisibility",
+        "SendMessage": "sqs:SendMessage",
+    },
+    # IAM authorizes the SES v2 API under the `ses:` prefix.
+    "sesv2": {"SendEmail": "ses:SendEmail"},
+    "secretsmanager": {"GetSecretValue": "secretsmanager:GetSecretValue"},
+    "cloudwatch": {"PutMetricData": "cloudwatch:PutMetricData"},
+}
+# SDK packages that make no API call of their own. Any other AWS package fails the scan.
+GO_AWS_PLUMBING = {
+    "github.com/aws/aws-sdk-go-v2/aws",
+    "github.com/aws/aws-sdk-go-v2/aws/signer/v4",
+    "github.com/aws/aws-sdk-go-v2/config",
+    "github.com/aws/aws-sdk-go-v2/credentials",
+    "github.com/aws/aws-sdk-go-v2/feature/dynamodb/attributevalue",
+    "github.com/aws/smithy-go",
+}
+_GO_SERVICE = "github.com/aws/aws-sdk-go-v2/service/"
+SQS_ACCESS_ACTIONS = {
+    "consume": {"sqs:ReceiveMessage", "sqs:DeleteMessage", "sqs:ChangeMessageVisibility"},
+    "produce": {"sqs:SendMessage"},
+}
+# SendEmail is authorized on the sending identity (the From mailbox, or its domain when only the
+# domain is verified) and on the configuration set the send names; the condition pins the mailbox.
+SES_IDENTITIES = {"ses/identity/address", "ses/identity/domain"}
+SES_FROM_CONDITION = ("StringEquals", "ses:FromAddress", ("var.ses_from_address",))
+GO_ROLE_NAMES = tuple(
+    role["name"] for role in load_roles()["roles"] if role["entrypoint"].startswith("cmd/")
+)
+# Hand inventory: the derived grants must contain at least these, so a scanner that silently
+# loses a shape cannot pass.
+GO_ROLE_FLOORS = {
+    "alert-evaluator": {
+        ("dynamodb:Query", "index/AlertEvaluationByDue"),
+        ("dynamodb:PutItem", "table"),
+        ("dynamodb:UpdateItem", "table"),
+    },
+    "notification-relay": {
+        ("dynamodb:Query", "index/NotificationRelayByAvailableAt"),
+        ("dynamodb:ConditionCheckItem", "table"),
+        ("sqs:SendMessage", "queue/notification_jobs"),
+        ("sqs:SendMessage", "queue/telegram_notification_jobs"),
+    },
+    "email-worker": {
+        ("ses:SendEmail", "ses/configuration-set/notifications"),
+        ("ses:SendEmail", "ses/identity/address"),
+        ("sqs:ReceiveMessage", "queue/notification_jobs"),
+        ("dynamodb:PutItem", "table"),
+    },
+    "ses-feedback-worker": {
+        ("sqs:ReceiveMessage", "queue/ses_events"),
+        ("dynamodb:ConditionCheckItem", "table"),
+        ("dynamodb:PutItem", "table"),
+    },
+    "telegram-worker": {
+        ("secretsmanager:GetSecretValue", "secret/telegram_bot_token"),
+        ("sqs:ReceiveMessage", "queue/telegram_notification_jobs"),
+        ("dynamodb:PutItem", "table"),
+    },
+    "worker-monitor": {("cloudwatch:PutMetricData", "*")},
+    "limnopulse-admin": {("dynamodb:Query", "table"), ("dynamodb:UpdateItem", "table")},
+}
+
+_SES_IDENTITY_ARN = (
+    '"arn:aws:ses:${var.aws_region}:${data.aws_caller_identity.workers.account_id}:identity/'
+)
+_WORKER_LITERAL_RESOURCES = {
+    _SES_IDENTITY_ARN + '${var.ses_from_address}"': "ses/identity/address",
+    _SES_IDENTITY_ARN + '${local.workers_ses_from_domain}"': "ses/identity/domain",
+    '"*"': "*",
+}
+_WORKER_RESOURCE_PATTERNS = (
+    (r"aws_dynamodb_table\.domain\.arn", "table"),
+    (r'"\$\{aws_dynamodb_table\.domain\.arn\}/index/([A-Za-z0-9_.-]+)"', "index/{}"),
+    (r"aws_sqs_queue\.(\w+)(?:\[0\])?\.arn", "queue/{}"),
+    (r"aws_secretsmanager_secret\.(\w+)(?:\[0\])?\.arn", "secret/{}"),
+    (r"aws_sesv2_configuration_set\.(\w+)(?:\[0\])?\.arn", "ses/configuration-set/{}"),
+)
+_OUTPUT_RESOURCE_KINDS = {
+    "sqs_queue": "queue",
+    "secretsmanager_secret": "secret",
+    "sesv2_configuration_set": "ses/configuration-set",
+}
+
+Grant = tuple[str, str, tuple]
+
+
+@dataclass(frozen=True)
+class _GoRole:
+    # IAM actions of the operations and transaction items the closure names.
+    operations: frozenset[str]
+    # "table" or "index/<name>", one per Query literal.
+    queries: frozenset[str]
+    # Every UPPER_SNAKE string literal: the settings the closure may read.
+    env_keys: frozenset[str]
+
+
+def _blank_go_literals(code: str) -> str:
+    """`code` with the inside of every string, rune and raw-string literal blanked, offsets kept."""
+    out: list[str] = []
+    index = 0
+    while index < len(code):
+        char = code[index]
+        if char not in "\"'`":
+            out.append(char)
+            index += 1
+            continue
+        if char == "`":
+            end = code.index("`", index + 1)
+        else:
+            end = index + 1
+            while code[end] != char:
+                end += 2 if code[end] == "\\" else 1
+        out.append(char + re.sub(r"[^\n]", " ", code[index + 1 : end]) + char)
+        index = end + 1
+    return "".join(out)
+
+
+def _go_closing_brace(blank: str, index: int) -> int:
+    depth = 0
+    for position in range(index, len(blank)):
+        if blank[position] == "{":
+            depth += 1
+        elif blank[position] == "}":
+            depth -= 1
+            if depth == 0:
+                return position
+    raise AssertionError("unbalanced braces")
+
+
+def _go_constant(
+    file: go_sources.GoFile, expression: str, packages: Mapping[str, list[go_sources.GoFile]]
+) -> str:
+    """The string value of a package constant named `Name` or `alias.Name`."""
+    package, name = file.package, expression
+    if "." in expression:
+        alias, name = expression.split(".", 1)
+        owners = [path for path, names in file.imports.items() if alias in names]
+        assert len(owners) == 1, f"{file.relative}: cannot resolve the index constant {expression}"
+        package = owners[0]
+    pattern = rf'(?m)^\s*(?:const\s+)?{re.escape(name)}\s*(?:string\s*)?=\s*"([^"]+)"'
+    values = {value for f in packages.get(package, []) for value in re.findall(pattern, f.code)}
+    assert len(values) == 1, f"{file.relative}: cannot resolve the index constant {expression}"
+    return values.pop()
+
+
+def _go_queries(
+    file: go_sources.GoFile,
+    name: str,
+    blank: str,
+    packages: Mapping[str, list[go_sources.GoFile]],
+) -> tuple[set[str], int]:
+    """The table or index of every `<name>.QueryInput{...}` literal, and its IndexName fields."""
+    targets: set[str] = set()
+    fields = 0
+    for match in re.finditer(rf"(?<![\w.]){re.escape(name)}\s*\.\s*QueryInput\b", blank):
+        rest = blank[match.end() :]
+        if not rest.lstrip().startswith("{"):
+            # A pointer in a signature or an interface. A value built any other way would get
+            # its fields set outside this scan.
+            assert blank[: match.start()].rstrip().endswith("*"), (
+                f"{file.relative}: a QueryInput built outside a literal"
+            )
+            continue
+        start = match.end() + len(rest) - len(rest.lstrip())
+        end = _go_closing_brace(blank, start)
+        named = re.findall(r"\bIndexName\b", blank[start:end])
+        fields += len(named)
+        if not named:
+            targets.add("table")
+            continue
+        index = re.search(
+            r"\bIndexName\s*:\s*\w+\.String\(\s*([A-Za-z_][\w.]*)\s*\)", file.code[start:end]
+        )
+        assert index is not None and len(named) == 1, f"{file.relative}: unmodelled IndexName"
+        targets.add("index/" + _go_constant(file, index.group(1), packages))
+    return targets, fields
+
+
+def _derive_go_role(files: Iterable[go_sources.GoFile], linked: Iterable[str]) -> _GoRole:
+    for package in linked:
+        if not package.startswith("github.com/aws/"):
+            continue
+        service, _, sub = package.removeprefix(_GO_SERVICE).partition("/")
+        modelled = package.startswith(_GO_SERVICE) and service in GO_AWS_OPERATIONS
+        assert package in GO_AWS_PLUMBING or (modelled and sub in {"", "types"}), (
+            f"unmodelled AWS package {package}"
+        )
+    files = list(files)
+    packages: dict[str, list[go_sources.GoFile]] = {}
+    for file in files:
+        packages.setdefault(file.package, []).append(file)
+    operations: set[str] = set()
+    queries: set[str] = set()
+    env_keys: set[str] = set()
+    for file in files:
+        blank = _blank_go_literals(file.code)
+        env_keys |= set(re.findall(r'"([A-Z][A-Z0-9]*(?:_[A-Z0-9]+)+)"', file.code))
+        index_fields = 0
+        for path, names in file.imports.items():
+            if not path.startswith(_GO_SERVICE):
+                continue
+            service, _, sub = path.removeprefix(_GO_SERVICE).partition("/")
+            assert "." not in names, f"{file.relative}: dot import of {path}"
+            for name in names - {"_"}:
+                qualified = rf"(?<![\w.]){re.escape(name)}\s*\.\s*"
+                if sub == "types":
+                    if service == "dynamodb":
+                        for match in re.finditer(
+                            qualified + r"(Put|Update|Delete|ConditionCheck)\b", blank
+                        ):
+                            operations.add(ITEM_ACTIONS[match.group(1)])
+                    continue
+                for match in re.finditer(qualified + r"(\w+)Input\b", blank):
+                    operation = match.group(1)
+                    assert operation in GO_AWS_OPERATIONS.get(service, {}), (
+                        f"{file.relative}: unmodelled {service} operation {operation}"
+                    )
+                    if action := GO_AWS_OPERATIONS[service][operation]:
+                        operations.add(action)
+                assert re.search(qualified + r"New\w+Waiter\b", blank) is None, (
+                    f"{file.relative}: a waiter calls operations of its own"
+                )
+                if service == "dynamodb":
+                    targets, fields = _go_queries(file, name, blank, packages)
+                    queries |= targets
+                    index_fields += fields
+        assert len(re.findall(r"\bIndexName\b", blank)) == index_fields, (
+            f"{file.relative}: IndexName outside a Query literal"
+        )
+    return _GoRole(frozenset(operations), frozenset(queries), frozenset(env_keys))
+
+
+@functools.cache
+def _go_role(entrypoint: str) -> _GoRole:
+    return _derive_go_role(go_sources.closure_files(entrypoint), go_sources.closure(entrypoint))
+
+
+def _setting_resources(texts: Mapping[str, str]) -> dict[str, str]:
+    """Runtime setting -> the queue, secret or configuration set its output carries.
+
+    outputs.tf describes each runtime output by the setting it feeds, e.g. SQS_SES_EVENTS_URL.
+    """
+    mapping: dict[str, str] = {}
+    for block in _parse_hcl_body(texts["outputs.tf"])[1]:
+        description = block.attrs.get("description", "")
+        if block.kind != "output" or not re.fullmatch(r'"[A-Z][A-Z0-9_]+"', description):
+            continue
+        kinds = "|".join(_OUTPUT_RESOURCE_KINDS)
+        match = re.search(rf"\baws_({kinds})\.(\w+)", block.attrs["value"])
+        if match:
+            mapping[_unquote(description)] = (
+                f"{_OUTPUT_RESOURCE_KINDS[match.group(1)]}/{match.group(2)}"
+            )
+    return mapping
+
+
+def _role_requirements(
+    role: Mapping, go: _GoRole, settings: Mapping[str, str], namespace: str
+) -> set[Grant]:
+    """The grants a Go role's closure needs, each scoped to the resource the role uses."""
+    name = role["name"]
+    reached = {settings[key] for key in go.env_keys if key in settings}
+    required: set[Grant] = set()
+    assert ("dynamodb:Query" in go.operations) == bool(go.queries), name
+    for action in go.operations:
+        if action == "dynamodb:Query":
+            required |= {(action, target, ()) for target in go.queries}
+        elif action.startswith("dynamodb:"):
+            required.add((action, "table", ()))
+    sqs = {action for action in go.operations if action.startswith("sqs:")}
+    queues = role["queues"]
+    assert bool(sqs) == bool(queues), f"{name}: SQS calls {sorted(sqs)} but queues {queues}"
+    if queues:
+        modes = {queue["access"] for queue in queues}
+        assert len(modes) == 1, f"{name}: one queue access mode per role is modelled"
+        (mode,) = modes
+        assert sqs <= SQS_ACCESS_ACTIONS[mode], f"{name}: {sorted(sqs)} do not only {mode}"
+        for queue in queues:
+            resource = f"queue/{queue['queue']}"
+            assert resource in reached, f"{name}: its closure never reads the URL of {resource}"
+            required |= {(action, resource, ()) for action in sqs}
+    if "ses:SendEmail" in go.operations:
+        sets = {resource for resource in reached if resource.startswith("ses/configuration-set/")}
+        assert sets, f"{name}: sends email without a configuration set setting"
+        required |= {
+            ("ses:SendEmail", resource, SES_FROM_CONDITION) for resource in SES_IDENTITIES | sets
+        }
+    if "secretsmanager:GetSecretValue" in go.operations:
+        secrets = {resource for resource in reached if resource.startswith("secret/")}
+        assert secrets, f"{name}: reads a secret without a secret ARN setting"
+        required |= {("secretsmanager:GetSecretValue", secret, ()) for secret in secrets}
+    if "cloudwatch:PutMetricData" in go.operations:
+        condition = ("StringEquals", "cloudwatch:namespace", (f'"{namespace}"',))
+        required.add(("cloudwatch:PutMetricData", "*", condition))
+    modelled = {"dynamodb", "sqs", "ses", "secretsmanager", "cloudwatch"}
+    assert {action.split(":")[0] for action in go.operations} <= modelled, name
+    return required
+
+
+def _block_values(block) -> Iterator[str]:
+    yield from block.attrs.values()
+    for inner in block.blocks:
+        yield from _block_values(inner)
+
+
+def _names(block, reference: str) -> bool:
+    pattern = re.compile(rf"(?<![\w.]){re.escape(reference)}(?!\w)")
+    return any(pattern.search(value) for value in _block_values(block))
+
+
+def _worker_resource(expression: str, resources: Mapping, gate: str | None) -> str:
+    """The resource kind a policy statement names; a gated target must share the policy's gate."""
+    if expression in _WORKER_LITERAL_RESOURCES:
+        return _WORKER_LITERAL_RESOURCES[expression]
+    for pattern, kind in _WORKER_RESOURCE_PATTERNS:
+        match = re.fullmatch(pattern, expression)
+        if match is None:
+            continue
+        target = re.search(r"\b(aws_\w+)\.(\w+)(\[0\])?", expression)
+        assert target is not None, expression
+        block = resources.get((target.group(1), target.group(2)))
+        assert block is not None, f"unknown resource {expression}"
+        target_gate = block.attrs.get("count")
+        assert (target.group(3) is not None) == (target_gate is not None), expression
+        assert target_gate in {None, gate}, f"{expression} is gated on {target_gate}, not on {gate}"
+        return kind.format(*match.groups())
+    raise AssertionError(f"unexpected resource {expression}")
+
+
+def _document_grants(document, resources: Mapping, gate: str | None) -> set[Grant]:
+    assert set(document.attrs) <= {"count"}, f"{document.labels}: only literal statements"
+    assert {block.kind for block in document.blocks} == {"statement"}, document.labels
+    grants: set[Grant] = set()
+    for statement in document.nested("statement"):
+        assert set(statement.attrs) <= {"sid", "effect", "actions", "resources"}, statement.attrs
+        assert statement.attrs.get("effect", '"Allow"') == '"Allow"', document.labels
+        assert {block.kind for block in statement.blocks} <= {"condition"}, document.labels
+        conditions = statement.nested("condition")
+        assert len(conditions) <= 1, f"{document.labels}: one condition per statement is modelled"
+        condition: tuple = ()
+        for block in conditions:
+            assert set(block.attrs) == {"test", "variable", "values"}, block.attrs
+            condition = (
+                _unquote(block.attrs["test"]),
+                _unquote(block.attrs["variable"]),
+                tuple(_list_items(block.attrs["values"])),
+            )
+        actions = [_unquote(item) for item in _list_items(statement.attrs["actions"])]
+        for action in actions:
+            assert "*" not in action, f"wildcard action {action} in {document.labels[1]}"
+        for expression in _list_items(statement.attrs["resources"]):
+            resource = _worker_resource(expression, resources, gate)
+            assert resource != "*" or condition, (
+                f"{document.labels[1]}: a * resource needs a condition"
+            )
+            grants |= {(action, resource, condition) for action in actions}
+    return grants
+
+
+def _principal_grants(texts: Mapping[str, str], principal: str) -> tuple[set[Grant], list[str]]:
+    """Every grant attached to the ADR-020 user or role `principal`, and its policy labels.
+
+    Only policy attachments may name the principal (outputs aside), and each one must be gated
+    exactly like its policy, its document, the principal and every gated resource it names.
+    """
+    blocks = [block for text in texts.values() for block in _parse_hcl_body(text)[1]]
+    owners = [
+        block
+        for block in blocks
+        if block.kind == "resource"
+        and block.labels[0] in {"aws_iam_user", "aws_iam_role"}
+        and block.labels[1] == principal
+    ]
+    assert len(owners) == 1, f"exactly one IAM user or role {principal}"
+    (owner,) = owners
+    assert "permissions_boundary" not in owner.attrs, "a permissions boundary is not modelled"
+    reference = f"{owner.labels[0]}.{principal}"
+    gate = owner.attrs.get("count")
+    index = "[0]" if gate is not None else ""
+    kind, key = (
+        ("aws_iam_user_policy_attachment", "user")
+        if owner.labels[0] == "aws_iam_user"
+        else ("aws_iam_role_policy_attachment", "role")
+    )
+    resources = {block.labels[:2]: block for block in blocks if block.kind == "resource"}
+    documents = {
+        block.labels[1]: block
+        for block in blocks
+        if block.kind == "data" and block.labels[0] == "aws_iam_policy_document"
+    }
+    grants: set[Grant] = set()
+    policies: list[str] = []
+    for block in blocks:
+        if block is owner or block.kind == "output" or not _names(block, reference):
+            continue
+        assert block.kind == "resource" and block.labels[0] == kind, (
+            f"unmodelled reference to {reference}: {block.kind} {block.labels}"
+        )
+        assert block.attrs[key] == f"{reference}{index}.name", block.labels
+        attachment_gate = block.attrs.get("count")
+        assert gate is None or attachment_gate == gate, (
+            f"{block.labels[1]} is gated on {attachment_gate}, not on the principal's {gate}"
+        )
+        suffix = r"(\[0\])?"
+        policy = re.fullmatch(rf"aws_iam_policy\.(\w+){suffix}\.arn", block.attrs["policy_arn"])
+        assert policy is not None, f"{block.labels[1]}: only this module's policies are modelled"
+        policy_block = resources[("aws_iam_policy", policy.group(1))]
+        document = re.fullmatch(
+            rf"data\.aws_iam_policy_document\.(\w+){suffix}\.json", policy_block.attrs["policy"]
+        )
+        assert document is not None, policy.group(1)
+        statements = documents[document.group(1)]
+        for gated in (policy_block, statements):
+            assert gated.attrs.get("count") == attachment_gate, (
+                f"{gated.labels[1]} is gated on {gated.attrs.get('count')}, "
+                f"not on {attachment_gate}"
+            )
+        indexed = attachment_gate is not None
+        assert (policy.group(2) is not None) == indexed == (document.group(2) is not None)
+        grants |= _document_grants(statements, resources, attachment_gate)
+        policies.append(policy.group(1))
+    assert grants, f"no grant reaches {reference}"
+    return grants, policies
+
+
+def _show(role: str, grant: Grant) -> str:
+    action, resource, condition = grant
+    shown = f"{role}: {action} on {resource}"
+    return f"{shown} if {condition[1]} = {', '.join(condition[2])}" if condition else shown
+
+
+def _required_for(texts: Mapping[str, str], name: str) -> set[Grant]:
+    table = load_roles()
+    role = roles_by_name(table)[name]
+    return _role_requirements(
+        role,
+        _go_role(role["entrypoint"]),
+        _setting_resources(texts),
+        table["unit_health"]["namespace"],
+    )
+
+
+def _worker_role_problems(texts: Mapping[str, str], name: str) -> list[str]:
+    required = _required_for(texts, name)
+    granted, _ = _principal_grants(texts, roles_by_name(load_roles())[name]["iam_principal"])
+    return sorted(
+        [f"missing: {_show(name, grant)}" for grant in required - granted]
+        + [f"extra: {_show(name, grant)}" for grant in granted - required]
+    )
+
+
+# --- Tests: per-role principals ------------------------------------------------------------------
+
+
+@pytest.mark.parametrize("role", GO_ROLE_NAMES)
+def test_each_go_role_principal_grants_exactly_its_closure(role: str) -> None:
+    assert _worker_role_problems(_tofu_texts(), role) == []
+
+
+def test_every_go_role_has_a_principal_in_workers_tf_and_nothing_else_does() -> None:
+    table = roles_by_name(load_roles())
+    assert set(GO_ROLE_NAMES) == set(GO_ROLE_FLOORS)
+    blocks = _parse_hcl_body((TOFU_DIR / "workers.tf").read_text(encoding="utf-8"))[1]
+    declared = {
+        block.labels[1]
+        for block in blocks
+        if block.kind == "resource" and block.labels[0] in {"aws_iam_user", "aws_iam_role"}
+    }
+    assert declared == {table[name]["iam_principal"] for name in GO_ROLE_NAMES}
+    for name in GO_ROLE_NAMES:
+        assert table[name]["entrypoint"] == f"cmd/{name}"
+
+
+@pytest.mark.parametrize("role", GO_ROLE_NAMES)
+def test_the_derivation_reaches_the_known_grants(role: str) -> None:
+    required = {(action, resource) for action, resource, _ in _required_for(_tofu_texts(), role)}
+
+    assert required >= GO_ROLE_FLOORS[role]
+
+
+def test_the_ses_consumers_share_only_what_both_derive() -> None:
+    texts = _tofu_texts()
+    roles = roles_by_name(load_roles())
+    email, email_policies = _principal_grants(texts, roles["email-worker"]["iam_principal"])
+    feedback, feedback_policies = _principal_grants(
+        texts, roles["ses-feedback-worker"]["iam_principal"]
+    )
+
+    shared = email & feedback
+    assert shared == _required_for(texts, "email-worker") & _required_for(
+        texts, "ses-feedback-worker"
+    )
+    assert {resource for _, resource, _ in shared} == {"table"}
+    assert set(email_policies).isdisjoint(feedback_policies)
+    assert {resource for _, resource, _ in email if resource.startswith("queue/")} == {
+        "queue/notification_jobs"
+    }
+    assert {resource for _, resource, _ in feedback if resource.startswith("queue/")} == {
+        "queue/ses_events"
+    }
+    assert not any(resource.startswith("ses/") for _, resource, _ in feedback)
+
+
+def test_no_policy_serves_two_principals_or_a_legacy_one() -> None:
+    texts = _tofu_texts()
+    roles = roles_by_name(load_roles())
+    seen: dict[str, str] = {}
+    for name in GO_ROLE_NAMES:
+        _, policies = _principal_grants(texts, roles[name]["iam_principal"])
+        for policy in policies:
+            assert seen.setdefault(policy, name) == name, (
+                f"{policy} serves {seen[policy]} and {name}"
+            )
+    # The shared workers policies (iam_runtime.tf, ses.tf, telegram.tf) stay off the new
+    # principals, and the new policies off the legacy users.
+    legacy = {
+        "dynamodb_domain_access_workers",
+        "notification_jobs_access",
+        "email_worker",
+        "telegram_worker",
+    }
+    assert legacy.isdisjoint(seen)
+    for path in sorted(TOFU_DIR.glob("*.tf")):
+        for block in _parse_hcl_body(path.read_text(encoding="utf-8"))[1]:
+            if any(_names(block, f"aws_iam_policy.{policy}") for policy in seen):
+                assert path.name == "workers.tf", (path.name, block.labels)
+
+
+def test_derived_indexes_are_domain_table_indexes() -> None:
+    dynamodb = _parse_hcl_body((TOFU_DIR / "dynamodb.tf").read_text(encoding="utf-8"))[1]
+    (domain,) = [block for block in dynamodb if block.labels == ("aws_dynamodb_table", "domain")]
+    indexes = {_unquote(block.attrs["name"]) for block in domain.nested("global_secondary_index")}
+    derived = {
+        target.removeprefix("index/")
+        for name in GO_ROLE_NAMES
+        for target in _go_role(roles_by_name(load_roles())[name]["entrypoint"]).queries
+        if target.startswith("index/")
+    }
+
+    assert derived == {"AlertEvaluationByDue", "NotificationRelayByAvailableAt"}
+    assert derived <= indexes
+
+
+def _fixture_files(source: str) -> list[go_sources.GoFile]:
+    code = go_sources.strip_comments(source)
+    return [
+        go_sources.GoFile(
+            path=ROOT / "fixture.go",
+            package=go_sources.MODULE + "internal/fixture",
+            code=code,
+            imports=go_sources._imports(code),
+        )
+    ]
+
+
+_GO_FIXTURE = """package fixture
+
+import (
+    "github.com/aws/aws-sdk-go-v2/aws"
+    ddb "github.com/aws/aws-sdk-go-v2/service/dynamodb"
+    "github.com/aws/aws-sdk-go-v2/service/dynamodb/types"
+)
+
+const ByDue = "AlertEvaluationByDue"
+
+type client interface {
+    Query(ctx context.Context, in *ddb.QueryInput) (*ddb.QueryOutput, error)
+}
+
+func due() { _ = &ddb.QueryInput{TableName: aws.String("t"), IndexName: aws.String(ByDue)} }
+func members() { _ = ddb.QueryInput{KeyConditionExpression: aws.String("PK = :pk")} }
+// ddb.ScanInput{IndexName: x} in a comment demands nothing, nor does "ddb.DeleteItemInput".
+func commit() {
+    items := []types.TransactWriteItem{{Put: &types.Put{}}}
+    _ = ddb.TransactWriteItemsInput{TransactItems: items}
+}
+var queueURL = "SQS_NOTIFICATION_JOBS_URL"
+"""
+_GO_FIXTURE_LINKED = {
+    "github.com/aws/aws-sdk-go-v2/aws",
+    "github.com/aws/aws-sdk-go-v2/service/dynamodb",
+    "github.com/aws/aws-sdk-go-v2/service/dynamodb/types",
+}
+
+
+def test_go_role_scanner_reads_operations_items_and_indexes() -> None:
+    role = _derive_go_role(_fixture_files(_GO_FIXTURE), _GO_FIXTURE_LINKED)
+
+    assert role.operations == {"dynamodb:Query", "dynamodb:PutItem"}
+    assert role.queries == {"index/AlertEvaluationByDue", "table"}
+    assert "SQS_NOTIFICATION_JOBS_URL" in role.env_keys
+
+
+@pytest.mark.parametrize(
+    ("extra", "linked", "message"),
+    [
+        pytest.param(
+            "func s() { _ = ddb.ScanInput{} }",
+            set(),
+            "unmodelled dynamodb operation Scan",
+            id="operation",
+        ),
+        pytest.param(
+            "func s(n string) { _ = ddb.QueryInput{IndexName: aws.String(n)} }",
+            set(),
+            "cannot resolve the index constant n",
+            id="index-variable",
+        ),
+        pytest.param(
+            "func s(in *ddb.QueryInput) { in.IndexName = aws.String(ByDue) }",
+            set(),
+            "IndexName outside a Query literal",
+            id="index-assigned",
+        ),
+        pytest.param(
+            "func s() { var in ddb.QueryInput; _ = in }",
+            set(),
+            "a QueryInput built outside a literal",
+            id="query-value",
+        ),
+        pytest.param(
+            "func s() { _ = ddb.NewTableExistsWaiter(nil) }",
+            set(),
+            "a waiter calls operations",
+            id="waiter",
+        ),
+        pytest.param(
+            "", {"github.com/aws/aws-sdk-go-v2/service/s3"}, "unmodelled AWS package", id="service"
+        ),
+        pytest.param(
+            "",
+            {"github.com/aws/aws-sdk-go-v2/feature/s3/manager"},
+            "unmodelled AWS package",
+            id="feature",
+        ),
+    ],
+)
+def test_go_role_scanner_fails_closed(extra: str, linked: set[str], message: str) -> None:
+    with pytest.raises(AssertionError, match=message):
+        _derive_go_role(_fixture_files(_GO_FIXTURE + extra), _GO_FIXTURE_LINKED | linked)
+
+
+_EMAIL_DOCUMENT = 'data "aws_iam_policy_document" "email_worker_runtime" {'
+_EMAIL_JOBS = "resources = [aws_sqs_queue.notification_jobs.arn]"
+_RELAY_DOCUMENT = 'data "aws_iam_policy_document" "notification_relay_runtime" {'
+_MONITOR_DOCUMENT = 'data "aws_iam_policy_document" "worker_monitor_runtime" {'
+_EVALUATOR_DOCUMENT = 'data "aws_iam_policy_document" "alert_evaluator_runtime" {'
+_RELAY_TELEGRAM = 'resource "aws_iam_user_policy_attachment" "notification_relay_telegram" {'
+_FEEDBACK_ATTACHMENT = 'resource "aws_iam_user_policy_attachment" "ses_feedback_worker_runtime" {'
+
+
+@pytest.mark.parametrize(
+    ("role", "header", "old", "new", "expected"),
+    [
+        pytest.param(
+            "email-worker",
+            _EMAIL_DOCUMENT,
+            '"dynamodb:PutItem",',
+            "",
+            "missing: email-worker: dynamodb:PutItem on table",
+            id="drop-action",
+        ),
+        pytest.param(
+            "email-worker",
+            _EMAIL_DOCUMENT,
+            '"dynamodb:UpdateItem",',
+            '"dynamodb:UpdateItem", "dynamodb:DeleteItem",',
+            "extra: email-worker: dynamodb:DeleteItem on table",
+            id="unused-action",
+        ),
+        pytest.param(
+            "email-worker",
+            _EMAIL_DOCUMENT,
+            _EMAIL_JOBS,
+            'resources = ["*"]',
+            "email_worker_runtime: a * resource needs a condition",
+            id="widen-resource",
+        ),
+        pytest.param(
+            "email-worker",
+            _EMAIL_DOCUMENT,
+            _EMAIL_JOBS,
+            "resources = [aws_sqs_queue.ses_events[0].arn]",
+            "extra: email-worker: sqs:ReceiveMessage on queue/ses_events",
+            id="wrong-queue",
+        ),
+        pytest.param(
+            "email-worker",
+            _EMAIL_DOCUMENT,
+            "      aws_sesv2_configuration_set.notifications[0].arn,\n",
+            "",
+            "missing: email-worker: ses:SendEmail on ses/configuration-set/notifications",
+            id="drop-configuration-set",
+        ),
+        pytest.param(
+            "email-worker",
+            _EMAIL_DOCUMENT,
+            'variable = "ses:FromAddress"',
+            'variable = "ses:FromDisplayName"',
+            "missing: email-worker: ses:SendEmail on ses/identity/address if ses:FromAddress",
+            id="wrong-ses-condition",
+        ),
+        pytest.param(
+            "email-worker",
+            _FEEDBACK_ATTACHMENT,
+            "aws_iam_user.ses_feedback_worker[0].name",
+            "aws_iam_user.email_worker[0].name",
+            "extra: email-worker: sqs:ReceiveMessage on queue/ses_events",
+            id="other-role-policy",
+        ),
+        pytest.param(
+            "worker-monitor",
+            _MONITOR_DOCUMENT,
+            'variable = "cloudwatch:namespace"',
+            'variable = "aws:RequestedRegion"',
+            "missing: worker-monitor: cloudwatch:PutMetricData on * if cloudwatch:namespace",
+            id="drop-namespace-condition",
+        ),
+        pytest.param(
+            "alert-evaluator",
+            _EVALUATOR_DOCUMENT,
+            '/index/AlertEvaluationByDue"',
+            '/index/*"',
+            "unexpected resource",
+            id="index-wildcard",
+        ),
+        pytest.param(
+            "alert-evaluator",
+            _EVALUATOR_DOCUMENT,
+            '/index/AlertEvaluationByDue"',
+            '/index/AlertEventsByTenantTime"',
+            "extra: alert-evaluator: dynamodb:Query on index/AlertEventsByTenantTime",
+            id="wrong-index",
+        ),
+        pytest.param(
+            "notification-relay",
+            _RELAY_DOCUMENT,
+            'actions   = ["sqs:SendMessage"]',
+            'actions   = ["sqs:*"]',
+            "wildcard action sqs:*",
+            id="wildcard-action",
+        ),
+        pytest.param(
+            "notification-relay",
+            _RELAY_TELEGRAM,
+            "count = var.telegram_delivery ? 1 : 0",
+            "count = var.email_delivery ? 1 : 0",
+            "is gated on var.telegram_delivery ? 1 : 0, not on var.email_delivery ? 1 : 0",
+            id="other-gate",
+        ),
+        pytest.param(
+            "notification-relay",
+            _RELAY_DOCUMENT,
+            "resources = [aws_sqs_queue.notification_jobs.arn]",
+            "resources = [aws_sqs_queue.telegram_notification_jobs[0].arn]",
+            "is gated on var.telegram_delivery ? 1 : 0, not on None",
+            id="ungated-grant-on-gated-queue",
+        ),
+    ],
+)
+def test_worker_principal_mutants_fail(
+    role: str, header: str, old: str, new: str, expected: str
+) -> None:
+    texts = _tofu_texts()
+    texts["workers.tf"] = _edit_block(texts["workers.tf"], header, old, new)
+
+    try:
+        problems = _worker_role_problems(texts, role)
+    except AssertionError as error:
+        problems = [str(error)]
+
+    assert any(expected in problem for problem in problems), problems
+
+
+@pytest.mark.parametrize(
+    "smuggled",
+    [
+        (
+            'resource "aws_iam_access_key" "worker_monitor" {\n'
+            "  user = aws_iam_user.worker_monitor.name\n"
+            "}\n"
+        ),
+        (
+            'resource "aws_iam_user_policy" "worker_monitor" {\n'
+            "  user   = aws_iam_user.worker_monitor.name\n"
+            '  policy = "{}"\n'
+            "}\n"
+        ),
+    ],
+    ids=["access-key", "inline-policy"],
+)
+def test_anything_else_naming_a_principal_fails(smuggled: str) -> None:
+    texts = _tofu_texts()
+    texts["workers.tf"] += "\n" + smuggled
+
+    with pytest.raises(AssertionError, match="unmodelled reference to aws_iam_user.worker_monitor"):
+        _worker_role_problems(texts, "worker-monitor")

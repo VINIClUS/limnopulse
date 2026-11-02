@@ -19,6 +19,10 @@ This directory contains the OpenTofu scaffold for cloud infrastructure. Docker C
   worker user, the API send grant and an unattached operator policy. The
   alarms publish to a KMS-encrypted SNS topic; `telemetry_ingress_alarm_email`
   subscribes the on-call mailbox, which must confirm the email AWS sends.
+- ADR-020 worker roles (`workers.tf`, `worker_alarms.tf`): one IAM principal per
+  Go worker role, one `<role>_enabled` variable per unit role (default `false`),
+  and unit-health and queue alarms on their own KMS-encrypted SNS topic. See
+  [Worker roles](#worker-roles-adr-020).
 - Placeholder variables for Redis and InfluxDB cloud endpoints.
 
 ## Not Included Yet
@@ -29,9 +33,9 @@ This directory contains the OpenTofu scaffold for cloud infrastructure. Docker C
 - SES identity verification, production sending-access requests, DNS records or
   sandbox-recipient verification. `SES_FROM_EMAIL` is a runtime secret/config
   chosen per environment, not a generic stack default.
-- Container orchestration, the external 60-second relay/evaluator schedulers,
-  worker autoscaling, dashboards, or alarms other than the telemetry ingress
-  queue alarms.
+- Container orchestration, worker autoscaling or dashboards. The relay,
+  evaluator and monitor schedules are systemd timers in the workers bundle
+  (ADR-020), not cloud resources.
 - Telegram container orchestration, webhook registration and secret values.
 - WhatsApp, SMS, or mobile push delivery.
 
@@ -48,15 +52,144 @@ Use `-backend=false` for local scaffold validation so placeholder backend values
 ## Notification rollout boundary
 
 Creating the relay GSI is not enough to enable publishing. Existing email
-NotificationOutboxes need the explicit tenant-scoped `notifications
-backfill-relay` migration, and the index must be `ACTIVE` before the relay runs.
-Do not enable the one-shot relay or continuous worker in the same infrastructure
-apply that first introduces the GSI. Verify SES identity/production access and
-map the `ses_configuration_set_name` output to
-`SES_CONFIGURATION_SET_NAME` on the worker. Start one worker before enabling the
-external relay schedule.
+NotificationOutboxes need the explicit tenant-scoped `limnopulse-admin
+backfill-relay` migration (run under the `limnopulse_admin` role, below), and
+the index must be `ACTIVE` before the relay runs. Do not enable the
+notification-relay timer or the email-worker in the same infrastructure apply
+that first introduces the GSI. Verify SES identity/production access and map the
+`ses_configuration_set_name` output to `SES_CONFIGURATION_SET_NAME` on the
+email-worker. Start the email-worker before enabling the notification-relay
+timer.
 
 The full order, rollback, DLQ handling and PII constraints are documented in
 [Phase 3C-A notification operations](../../docs/notifications-phase-3c-a.md).
 Telegram uses a separate queue, worker, secrets and staged feature flags; see
 [Phase 3C-B Telegram operations](../../docs/notifications-phase-3c-b.md).
+
+## Worker roles (ADR-020)
+
+`workers.tf` gives every Go worker role in
+[`ops/workers/roles.yaml`](../../ops/workers/roles.yaml) its own principal
+(`iam_principal`). `worker_alarms.tf` holds the roles' alarms.
+`tests/unit/test_iam_runtime_transactions.py` derives each role's AWS actions
+from the Go import closure of `cmd/<role>`. It fails if a policy grants an
+action the closure does not call, misses one, or scopes it to another role's
+resource.
+
+| Role | Principal | Exists with | Grants |
+|---|---|---|---|
+| `alert-evaluator` | user `alert_evaluator` | always | table GetItem, PutItem, UpdateItem; Query on the table and `AlertEvaluationByDue` |
+| `notification-relay` | user `notification_relay` | always | table GetItem, UpdateItem, ConditionCheckItem; Query on the table and `NotificationRelayByAvailableAt`; SendMessage on the email jobs queue, and on the Telegram jobs queue with `telegram_delivery` |
+| `email-worker` | user `email_worker` | `email_delivery` | table items; consume the email jobs queue; `ses:SendEmail` on the From identity (mailbox and domain) and the configuration set, only from `ses_from_address` |
+| `ses-feedback-worker` | user `ses_feedback_worker` | `email_delivery` | table items; consume the SES events queue |
+| `telegram-worker` | user `telegram_worker` | `telegram_delivery` | table items; consume the Telegram jobs queue; read the bot token secret |
+| `worker-monitor` | user `worker_monitor` | always | `cloudwatch:PutMetricData`, only to `Limnopulse/Workers` |
+| `limnopulse-admin` | role `limnopulse_admin` | always | table GetItem, PutItem, UpdateItem; Query on the table and `AlertEvaluationByDue` |
+
+"Table items" are GetItem, PutItem, UpdateItem and ConditionCheckItem on the
+domain table: a transaction's Put, Update and ConditionCheck items each need
+their own action. No consumer gets `sqs:GetQueueAttributes` and none gets Query,
+because none of them calls it. The email and SES-feedback principals share only
+the table item actions both need, and no policy serves two principals.
+
+The `alert-evaluator` and `limnopulse-admin` grants follow from package
+granularity. Both link `internal/alertevaluator/dynamo`, which holds the
+evaluator store and the schedule backfills. So the evaluator also gets Query on
+the table, and the admin role the store's GetItem, PutItem and index Query.
+
+### Access keys
+
+OpenTofu creates no access key, as for every user in `iam_runtime.tf`: a key in
+the state would be a plaintext secret. Each `<principal>_iam_user_name` output
+names a user. When enabling a role, an operator creates its key out of band
+with their own credentials, for example for the email-worker:
+
+```bash
+aws iam create-access-key --user-name "$(tofu output -raw email_worker_iam_user_name)"
+```
+
+Write the two values straight into the role's `aws-access-key-id` and
+`aws-secret-access-key` credentials under
+`/etc/limnopulse/workers/credentials/<role>/`
+([`ops/workers/README.md`](../../ops/workers/README.md)). Never put them in an env
+file, a shell history, a ticket or chat. To rotate a key, create the second one,
+install it, restart the unit, then delete the first.
+
+### Enabling and disabling a role
+
+`<role>_enabled` turns on that role's alarm actions and nothing else. A plan
+refuses `email_worker_enabled` or `ses_feedback_worker_enabled` without
+`email_delivery`, and `telegram_worker_enabled` without `telegram_delivery`.
+Enable `worker-monitor` first: every other unit-health alarm reads its
+datapoints.
+
+To enable a role:
+
+1. If the role has a delivery flag, turn it on; its principal and alarms then
+   exist. Leave `<role>_enabled` false.
+2. Create the role's access key and install it, as above.
+3. Enable its unit or timer with a persistent `systemctl enable --now`.
+4. Wait for the first `UnitHealthy` datapoint, and until the role's unit-health
+   alarm is `OK`. CloudWatch acts only on state changes, so turning actions on
+   while the alarm is already in `ALARM` never notifies for that breach.
+5. Set `<role>_enabled = true` in the untracked tfvars and apply it.
+
+To disable a role, reverse the order:
+
+1. Set `<role>_enabled = false` and apply it.
+2. Disable the unit or timer. `worker-monitor` stops publishing for the role.
+3. Delete the role's access key (`aws iam delete-access-key`) and its
+   credential files.
+
+So a disabled role holds no key. The one exception is steps 2 to 4 of enabling,
+because the unit needs its key to produce the datapoint that step 5 waits for.
+OpenTofu cannot see an out-of-band key; check with `aws iam list-access-keys`.
+
+### limnopulse-admin
+
+The backfills run by hand and rarely, and no enable variable would ever retire a
+standing key. So `limnopulse_admin` is a role that an operator assumes for one
+run, not a user. It holds exactly the backfills' grants and has short-lived
+credentials only. Its trust names this account: an identity in the account
+can assume it if its own policy allows `sts:AssumeRole` on the
+`limnopulse_admin_role_arn` output. `limnopulse-admin` uses the AWS default
+credential chain, so export the assumed role's session into the environment
+first, for example with `aws configure export-credentials --profile <a profile
+whose role_arn is that output> --format env`. Then run a backfill such as
+`limnopulse-admin backfill-relay --tenant=<id>`, which is a dry run unless
+`--apply` is set.
+
+### Alarms
+
+All worker alarms publish to the `worker-alarms` topic, which has its own
+rotated KMS key so that CloudWatch can encrypt to it. `worker_alarm_email`
+subscribes the on-call mailbox, which must confirm the email AWS sends.
+`worker_alarm_actions` adds more ARNs. A role's alarms exist exactly when its
+principal does.
+
+- **Unit health:** one alarm per unit role, on `Limnopulse/Workers` `UnitHealthy`
+  with `Role=<role>` and no unit. It fires when the Maximum over two-minute
+  periods is below 1 in 2 of 3 periods. Missing data is breaching, so a stopped
+  monitor or a silent host fires too, but a short spell of zeros, which the
+  monitor publishes by design, does not.
+- **Queues:** age, depth and DLQ alarms for the email jobs, SES events and
+  Telegram jobs queues, on their consumer role's enable variable. The thresholds
+  are `worker_queue_age_alarm_threshold_seconds` (300) and
+  `worker_queue_depth_alarm_threshold` (100); a DLQ alarm fires on any message.
+- **SES routing DLQ:** its own alarm, with `email_delivery`. It belongs to no
+  role, so its actions are on whenever it exists.
+
+### Removing the shared `workers` user
+
+`aws_iam_user.workers` in `iam_runtime.tf` is deprecated. No Go worker runs under
+it in production, and the per-role principals replace it. Remove it once every
+enabled role has run under its own principal:
+
+1. Confirm that `aws iam list-access-keys` shows no key for the
+   `workers_iam_user_name` output, or that no key was used since the cutover.
+2. In one change, remove the user, its four attachments (`workers_dynamodb`,
+   `workers_notification_jobs`, `workers_telegram`, `workers_email`), the
+   policies no other principal uses (`dynamodb_domain_access_workers`,
+   `notification_jobs_access`, `email_worker` in `ses.tf`, `telegram_worker` in
+   `telegram.tf`), the `workers_iam_user_name` output, and the `workers` checks in
+   `tests/unit/test_iam_runtime_transactions.py`.

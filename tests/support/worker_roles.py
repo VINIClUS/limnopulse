@@ -145,7 +145,7 @@ def compose_services(path: Path = PRODUCTION_COMPOSE) -> dict[str, dict[str, Any
     return yaml.safe_load(path.read_text(encoding="utf-8"))["services"]
 
 
-def validate_roles(table: dict[str, Any]) -> list[str]:
+def validate_roles(table: dict[str, Any], opentofu_dir: Path = OPENTOFU_DIR) -> list[str]:
     problems: list[str] = []
     problems += _validate_top_level(table)
     if not isinstance(table.get("roles"), list):
@@ -159,7 +159,7 @@ def validate_roles(table: dict[str, Any]) -> list[str]:
     for role in table["roles"]:
         problems += _validate_role(role, paths, table, shared_roles)
     problems += _validate_uniqueness(table["roles"], declared)
-    problems += _validate_queues(table, declared)
+    problems += _validate_queues(table, declared, opentofu_dir)
     problems += _validate_compose(table["roles"])
     return problems
 
@@ -394,9 +394,11 @@ def _validate_uniqueness(
     return problems
 
 
-def _validate_queues(table: dict[str, Any], declared: list[frozenset[str]]) -> list[str]:
+def _validate_queues(
+    table: dict[str, Any], declared: list[frozenset[str]], opentofu_dir: Path
+) -> list[str]:
     problems: list[str] = []
-    queues, variables = opentofu_names()
+    queues, variables = opentofu_names(opentofu_dir)
     consumers: dict[str, set[str]] = {}
     for role in table["roles"]:
         name = role.get("name")
@@ -407,7 +409,8 @@ def _validate_queues(table: dict[str, Any], declared: list[frozenset[str]]) -> l
                 problems.append(f"{name}: no role reads the SES routing DLQ")
             if queue.get("access") == "consume":
                 consumers.setdefault(queue.get("queue"), set()).add(name)
-        if role.get("lifecycle") == "compose" and role.get("enable_variable") not in variables:
+        # Unit roles and the Compose role alike: OpenTofu gates their alarms on it.
+        if "enable_variable" in role and role["enable_variable"] not in variables:
             problems.append(
                 f"{name}: enable_variable {role.get('enable_variable')} is not an OpenTofu variable"
             )

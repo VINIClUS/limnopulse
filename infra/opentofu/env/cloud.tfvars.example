@@ -53,3 +53,19 @@ telemetry_ingress_age_alarm_threshold_seconds = 300
 telemetry_ingress_depth_alarm_threshold       = 1000
 telemetry_ingress_alarm_actions               = []
 telemetry_ingress_alarm_email                 = ""
+
+# ADR-020 worker roles (workers.tf, worker_alarms.tf). Each <role>_enabled turns on only its
+# role's alarm actions. Set one after the role's unit runs and its unit-health alarm is OK
+# (README.md, "Worker roles"). The email and SES-feedback roles need email_delivery, the
+# Telegram role telegram_delivery. worker_alarm_email subscribes the on-call mailbox to the
+# worker alarm topic; set it only in the untracked copy.
+alert_evaluator_enabled                  = false
+notification_relay_enabled               = false
+email_worker_enabled                     = false
+ses_feedback_worker_enabled              = false
+telegram_worker_enabled                  = false
+worker_monitor_enabled                   = false
+worker_queue_age_alarm_threshold_seconds = 300
+worker_queue_depth_alarm_threshold       = 100
+worker_alarm_actions                     = []
+worker_alarm_email                       = ""
