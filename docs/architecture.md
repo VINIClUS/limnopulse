@@ -21,7 +21,7 @@ Limnopulse is the successor to the AquaFarm prototype. AquaFarm names in histori
 | Phase 2D | Current scaffold | OpenTofu for DynamoDB, Cognito and base cloud resources |
 | Phase 3A | Current | Alert Rule configuration, optimistic updates, replacement idempotency, transactional audit, TTL |
 | Phase 3B | Current | one-shot Go evaluator, 64-bucket due index, InfluxDB windows, durable Alert Events and notification outboxes |
-| Phase 3C-A | Current | one-shot outbox relay, SQS email jobs, continuous SES worker/feedback, durable deliveries and attempts |
+| Phase 3C-A | Current | one-shot outbox relay, SQS email jobs, continuous email and SES-feedback workers, durable deliveries and attempts |
 | Phase 3C-B | Current | FastAPI Telegram binding/webhook, isolated queue/worker, durable snapshots/attempts, Redis rate limit |
 
 “Current” means implemented in this repository. “Target” is architectural direction and must not be interpreted as a deployed capability.
@@ -55,13 +55,34 @@ flowchart LR
     TelegramWorker --> Telegram[Telegram Bot API]
     SES --> EventBridge
     EventBridge --> Feedback[SQS SES Events]
-    Feedback --> EmailWorker
+    Feedback --> FeedbackWorker[Continuous SES Feedback Worker]
+    FeedbackWorker --> Dynamo
     TelegramWebhook[Telegram Webhook] -->|secret header| API
 ```
 
 All shown edges are present repository responsibilities or local/cloud
-scaffolds. Cloud container orchestration and webhook registration remain
-environment-specific deployment work.
+scaffolds. Webhook registration remains environment-specific deployment work.
+
+## Worker runtime
+
+Each worker role is its own supervised process, with its own failure boundary,
+configuration, IAM principal and alarms
+([ADR-020](adr/ADR-020-each-worker-role-is-a-supervised-process.md)).
+[`ops/workers/roles.yaml`](../ops/workers/roles.yaml) is the role table.
+
+- **Go roles** are static executables in one workers bundle per release. On the
+  VPS they run as systemd units: the evaluator, the relay and worker-monitor are
+  one-shot services started every 60 seconds by their timers, and the email,
+  SES-feedback and Telegram workers are continuous notify/watchdog services.
+  `limnopulse-admin` is an operator CLI with no unit.
+- **The telemetry ingest worker** stays a Compose service in profile
+  `ingestion`, restarted `unless-stopped` and observed through its healthcheck.
+- **One release tag** moves the API image, the profiled Compose workers and the
+  bundle together.
+- **worker-monitor** publishes `Limnopulse/Workers` `UnitHealthy` for each
+  enabled unit role.
+
+The [worker runtime runbook](worker-runtime-runbook.md) covers operating them.
 
 ## Canonical names
 
@@ -258,7 +279,7 @@ The one-shot Go evaluator:
 3. apply aggregation/operator thresholds;
 4. use Redis only for cooldown and short deduplication;
 5. atomically creates Alert Events, transitions and NotificationOutboxes;
-6. exits and leaves scheduling to an external 60-second scheduler.
+6. exits; its systemd timer starts it again every 60 seconds (ADR-020).
 
 One AlertEvent represents one continuous episode. Opening requires `duration`;
 recovery occurs on the first complete, sufficiently covered, fresh and valid
@@ -270,10 +291,12 @@ contract.
 
 The one-shot relay expands an email outbox into deterministic immutable
 deliveries, publishes compact SQS jobs, and conditionally records publication.
-The continuous worker uses fenced DynamoDB leases and attempt transactions,
-rechecks membership/suppression, rate limits SES calls, retries typed transient
-failures and reconciles SES feedback routed by EventBridge. Duplicate jobs are
-safe; DynamoDB, not SQS or Redis, owns identity and state.
+The continuous email worker uses fenced DynamoDB leases and attempt
+transactions, rechecks membership/suppression, rate limits SES calls and retries
+typed transient failures. A separate continuous SES-feedback worker, with its
+own process and principal (ADR-020), reconciles SES feedback routed by
+EventBridge. Duplicate jobs are safe; DynamoDB, not SQS or Redis, owns identity
+and state.
 
 Opening and recovery are separate deliveries. A recovery delivery depends on a
 succeeded opening delivery and is cancelled when the opening was not sent.
@@ -281,8 +304,8 @@ Hard bounce and complaint feedback create a hashed suppression record without a
 plain address. The normalized address and rendered content remain durable only
 on the Delivery snapshot; Attempt rows and telemetry do not duplicate them.
 
-The worker does not consume any DLQ automatically, and the EventBridge routing
-DLQ is not a worker input. Phase 3C-A exposes no public Delivery/Attempt API.
+Neither worker consumes any DLQ automatically, and the EventBridge routing DLQ
+is not a worker input. Phase 3C-A exposes no public Delivery/Attempt API.
 
 ## Phase 3C-B: Telegram binding and delivery
 

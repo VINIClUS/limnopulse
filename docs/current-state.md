@@ -19,3 +19,5 @@ The nine rows below intentionally inventory V4 domain surfaces rather than every
 | Device permanently bound to a pond | `obsolete` | `src/limnopulse_api/domain/entities.py` | Replace canonical v2 `pond_id` with temporal Deployment while projecting legacy behavior. | Phase 1 |
 
 The execution baseline above is the frozen approved V4 planning point. Issue #28 originally branched from `main@e95d3eee9c813e3946d43f297071a80b62dd123b`; after Issue #27 merged, the branch was updated with the pre-#47 `main@f0ce773a08131c340a54d12824427a5a3fcbb25a`, then reconciled with current `main@37dd32e68e4bd7d00993eeda38276420a775cc5c`. The current-main runtime additions are included in the runtime baseline; documentation and tests after that baseline do not change runtime behavior.
+
+**Worker runtime after the baseline:** [ADR-020](adr/ADR-020-each-worker-role-is-a-supervised-process.md) later gave each worker role its own supervised process. The Go roles run as systemd units from a workers bundle on the VPS, and the telemetry ingest worker runs as a Compose service. The [worker runtime runbook](worker-runtime-runbook.md) covers operating them. It changes no row above.
