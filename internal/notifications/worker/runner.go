@@ -23,20 +23,19 @@ type Loop interface {
 }
 
 type RunSummary struct {
-	Result               string                     `json:"result"`
-	ExitCode             int                        `json:"exit_code"`
-	Graceful             bool                       `json:"graceful"`
-	Fatal                bool                       `json:"fatal"`
-	DrainTimedOut        bool                       `json:"drain_timed_out"`
-	MessagesReceived     int                        `json:"messages_received"`
-	MessagesDeleted      int                        `json:"messages_deleted"`
-	VisibilityChanged    int                        `json:"visibility_changed"`
-	QueueErrors          int                        `json:"queue_errors"`
-	ErrorCategories      map[string]int             `json:"error_categories,omitempty"`
-	Metrics              MetricsSnapshot            `json:"metrics"`
-	FeedbackMetrics      FeedbackMetricsSnapshot    `json:"feedback_metrics"`
-	TelemetryExportError string                     `json:"telemetry_export_error,omitempty"`
-	Consumers            map[string]ConsumerSummary `json:"consumers,omitempty"`
+	Result               string                  `json:"result"`
+	ExitCode             int                     `json:"exit_code"`
+	Graceful             bool                    `json:"graceful"`
+	Fatal                bool                    `json:"fatal"`
+	DrainTimedOut        bool                    `json:"drain_timed_out"`
+	MessagesReceived     int                     `json:"messages_received"`
+	MessagesDeleted      int                     `json:"messages_deleted"`
+	VisibilityChanged    int                     `json:"visibility_changed"`
+	QueueErrors          int                     `json:"queue_errors"`
+	ErrorCategories      map[string]int          `json:"error_categories,omitempty"`
+	Metrics              MetricsSnapshot         `json:"metrics"`
+	FeedbackMetrics      FeedbackMetricsSnapshot `json:"feedback_metrics"`
+	TelemetryExportError string                  `json:"telemetry_export_error,omitempty"`
 }
 
 type FeedbackMetricsSnapshot struct {
@@ -47,17 +46,6 @@ type FeedbackMetricsSnapshot struct {
 	AwaitingDLQ       int64 `json:"awaiting_dlq"`
 	PersistenceErrors int64 `json:"persistence_errors"`
 	Suppressed        int64 `json:"suppressed"`
-}
-
-type ConsumerSummary struct {
-	Graceful          bool           `json:"graceful"`
-	Fatal             bool           `json:"fatal"`
-	DrainTimedOut     bool           `json:"drain_timed_out"`
-	MessagesReceived  int            `json:"messages_received"`
-	MessagesDeleted   int            `json:"messages_deleted"`
-	VisibilityChanged int            `json:"visibility_changed"`
-	QueueErrors       int            `json:"queue_errors"`
-	ErrorCategories   map[string]int `json:"error_categories,omitempty"`
 }
 
 type Runner struct {

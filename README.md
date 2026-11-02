@@ -97,10 +97,17 @@ admins and owners may manually resolve. Mutations require `expected_version`.
 Run one local evaluation after initializing DynamoDB and telemetry:
 
 ```bash
-docker compose --profile manual run --rm alert-evaluator run
+scripts/dev/run_worker.sh alert-evaluator run
 ```
 
-The process exits after the owned work is complete. Scheduling remains external.
+`scripts/dev/run_worker.sh <role>` builds `cmd/<role>` with the Go toolchain and runs it
+with the local settings in `scripts/dev/workers/<role>.env`, which point at the
+emulators' host ports; a variable already set in your shell wins. Compose runs no Go
+worker (ADR-020): production runs the same executables as systemd units from the
+workers bundle ([`ops/workers/README.md`](ops/workers/README.md)).
+
+The process exits after the owned work is complete. In production a systemd timer
+starts it every 60 seconds.
 See [Phase 3B evaluator operations](docs/alert-evaluator-phase-3b.md) for replay,
 sharding, schedule backfill, scheduler examples, exit codes and metrics.
 Before switching consumers to the active-alert index, follow the tenant-by-tenant
@@ -108,19 +115,21 @@ rollout in [active-alert index operations](docs/alert-active-index-rollout.md).
 
 ## Email Notifications
 
-Phase 3C-A adds a one-shot notification relay plus one continuous email/SES
-feedback worker. For a deterministic local run, initialize DynamoDB, start the
-fake worker, and invoke the relay:
+Phase 3C-A adds a one-shot notification relay plus the continuous email worker and
+SES feedback worker, each its own process (ADR-020). For a deterministic local run,
+initialize DynamoDB, start the fake email worker and the feedback worker (each in its
+own terminal), and invoke the relay:
 
 ```bash
 docker compose up -d dynamodb-local elasticmq
 python scripts/dev/init_dynamodb.py
-docker compose --profile notifications up -d notification-worker
-docker compose --profile notifications run --rm notification-relay
+scripts/dev/run_worker.sh email-worker
+scripts/dev/run_worker.sh ses-feedback-worker
+scripts/dev/run_worker.sh notification-relay
 ```
 
-The local worker uses a fake successful sender; it never contacts SES. The relay
-has no loop and is intended for an external 60-second scheduler. DynamoDB holds
+The local email worker uses a fake successful sender; it never contacts SES. The
+relay has no loop; in production a systemd timer starts it every 60 seconds. DynamoDB holds
 the authoritative delivery and attempt state, while SQS remains an at-least-once
 transport. Phase 3C-A adds no public Delivery or Attempt API.
 
@@ -146,13 +155,14 @@ DELETE /v1/tenants/{tenant_id}/me/telegram-binding
 POST   /webhooks/telegram
 ```
 
-For local delivery, start the dedicated queue consumer and WireMock Bot API:
+For local delivery, start the WireMock Bot API and the emulators, then the dedicated
+queue consumer (in its own terminal) and the relay:
 
 ```bash
 docker compose --profile notifications up -d \
-  redis dynamodb-local elasticmq telegram-bot-api-fake \
-  telegram-notification-worker
-docker compose --profile notifications run --rm notification-relay
+  redis dynamodb-local elasticmq telegram-bot-api-fake
+scripts/dev/run_worker.sh telegram-worker
+scripts/dev/run_worker.sh notification-relay
 ```
 
 DynamoDB owns binding, destination, preferences, deliveries, attempts and

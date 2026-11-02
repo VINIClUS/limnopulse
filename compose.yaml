@@ -70,82 +70,9 @@ services:
       - ./infra/telegraf/telegraf.conf:/etc/telegraf/telegraf.conf:ro
       - ./infra/telegraf/device_registry.star:/etc/telegraf/device_registry.star:ro
 
-  alert-evaluator:
-    profiles: ["manual"]
-    build:
-      context: .
-      dockerfile: Dockerfile.alert-evaluator
-    depends_on:
-      - dynamodb-local
-      - influxdb
-    environment:
-      APP_ENV: local
-      AWS_REGION: us-east-1
-      DYNAMODB_DOMAIN_TABLE: LimnopulseDomain
-      DYNAMODB_ENDPOINT_URL: http://dynamodb-local:8000
-      INFLUXDB_URL: http://influxdb:8086
-      INFLUXDB_TOKEN: local-dev-token
-      INFLUXDB_ORG: limnopulse
-      INFLUXDB_BUCKET_RAW: limnopulse_raw
-      TELEGRAM_DELIVERY_ENABLED: "true"
-    command: ["run"]
-    restart: "no"
-
-  notification-relay:
-    profiles: ["notifications"]
-    build:
-      context: .
-      dockerfile: Dockerfile.notifications
-    depends_on:
-      dynamodb-local:
-        condition: service_started
-      elasticmq:
-        condition: service_healthy
-    environment:
-      AWS_ACCESS_KEY_ID: local
-      AWS_SECRET_ACCESS_KEY: local
-      AWS_EC2_METADATA_DISABLED: "true"
-      AWS_REGION: us-east-1
-      DYNAMODB_DOMAIN_TABLE: LimnopulseDomain
-      DYNAMODB_ENDPOINT_URL: http://dynamodb-local:8000
-      SQS_ENDPOINT_URL: http://elasticmq:9324
-      SQS_NOTIFICATION_JOBS_URL: http://elasticmq:9324/000000000000/limnopulse-notification-jobs
-      SQS_TELEGRAM_JOBS_URL: http://elasticmq:9324/000000000000/limnopulse-telegram-notification-jobs
-      TELEGRAM_DELIVERY_ENABLED: "true"
-      LIMNOPULSE_WEB_URL: http://localhost:3000
-    command: ["relay"]
-    restart: "no"
-
-  notification-worker:
-    profiles: ["notifications"]
-    build:
-      context: .
-      dockerfile: Dockerfile.notifications
-    depends_on:
-      dynamodb-local:
-        condition: service_started
-      elasticmq:
-        condition: service_healthy
-    environment:
-      APP_ENV: local
-      AWS_ACCESS_KEY_ID: local
-      AWS_SECRET_ACCESS_KEY: local
-      AWS_EC2_METADATA_DISABLED: "true"
-      AWS_REGION: us-east-1
-      DYNAMODB_DOMAIN_TABLE: LimnopulseDomain
-      DYNAMODB_ENDPOINT_URL: http://dynamodb-local:8000
-      SQS_ENDPOINT_URL: http://elasticmq:9324
-      SQS_NOTIFICATION_JOBS_URL: http://elasticmq:9324/000000000000/limnopulse-notification-jobs
-      SQS_SES_EVENTS_URL: http://elasticmq:9324/000000000000/limnopulse-ses-events
-      SES_FROM_EMAIL: alerts@example.test
-      SES_CONFIGURATION_SET_NAME: limnopulse-notifications
-      NOTIFICATION_EMAIL_SENDER_MODE: success
-      NOTIFICATION_MAX_SEND_RATE: "10"
-    command: ["worker"]
-    init: true
-    stop_grace_period: 45s
-    restart: unless-stopped
-
+  # The Telegram Bot API fake for the local Telegram worker and the notification
+  # integration test. ADR-020: the Go workers themselves run as executables, not in
+  # Compose (scripts/dev/run_worker.sh).
   telegram-bot-api-fake:
     profiles: ["notifications"]
     image: wiremock/wiremock:3.13.1-alpine
@@ -153,39 +80,6 @@ services:
       - "127.0.0.1:8089:8080"
     volumes:
       - ./infra/telegram/wiremock:/home/wiremock/mappings:ro
-
-  telegram-notification-worker:
-    profiles: ["notifications"]
-    build:
-      context: .
-      dockerfile: Dockerfile.notifications
-    depends_on:
-      dynamodb-local:
-        condition: service_started
-      elasticmq:
-        condition: service_healthy
-      redis:
-        condition: service_started
-      telegram-bot-api-fake:
-        condition: service_started
-    environment:
-      APP_ENV: local
-      AWS_ACCESS_KEY_ID: local
-      AWS_SECRET_ACCESS_KEY: local
-      AWS_EC2_METADATA_DISABLED: "true"
-      AWS_REGION: us-east-1
-      DYNAMODB_DOMAIN_TABLE: LimnopulseDomain
-      DYNAMODB_ENDPOINT_URL: http://dynamodb-local:8000
-      SQS_ENDPOINT_URL: http://elasticmq:9324
-      SQS_TELEGRAM_JOBS_URL: http://elasticmq:9324/000000000000/limnopulse-telegram-notification-jobs
-      REDIS_ADDR: redis:6379
-      TELEGRAM_DELIVERY_ENABLED: "true"
-      TELEGRAM_BOT_TOKEN: 123456:local-test-token
-      TELEGRAM_BOT_API_BASE_URL: http://telegram-bot-api-fake:8080
-    command: ["telegram-worker"]
-    init: true
-    stop_grace_period: 45s
-    restart: unless-stopped
 
   # V4 P3 telemetry ingest worker (D7, D21): `docker compose --profile ingestion up`.
   # The API image with an entrypoint override; it refuses to start (exit 78, a configuration

@@ -22,5 +22,5 @@ sudo systemctl is-active --quiet limnopulse-lab-api.service || \
   fail "LimnoPulse API systemd unit is not active" 7
 wait_for_http http://127.0.0.1:8000/healthz
 wait_for_http http://127.0.0.1:8000/readyz
-"$ROOT/.venv/bin/python" ops/lab/smoke.py
+GO="$(lab_go)" "$ROOT/.venv/bin/python" ops/lab/smoke.py
 printf 'limnopulse lab: verification complete\n'

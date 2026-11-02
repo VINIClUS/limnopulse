@@ -2,33 +2,28 @@ from pathlib import Path
 
 import yaml
 
+from tests.support.local_workers import local_env
+
 ROOT = Path(__file__).resolve().parents[2]
 
 
-def test_compose_has_isolated_telegram_queue_worker_and_fake_transport() -> None:
+def test_local_telegram_worker_has_an_isolated_queue_and_the_fake_transport() -> None:
     compose = yaml.safe_load((ROOT / "compose.yaml").read_text(encoding="utf-8"))
-    services = compose["services"]
-    relay = services["notification-relay"]
-    worker = services["telegram-notification-worker"]
-    fake = services["telegram-bot-api-fake"]
-    evaluator = services["alert-evaluator"]
+    fake = compose["services"]["telegram-bot-api-fake"]
+    # ADR-020: the worker, the relay and the evaluator run as executables
+    # (scripts/dev/run_worker.sh); Compose keeps only the Bot API fake.
+    relay = local_env("notification-relay")
+    worker = local_env("telegram-worker")
+    evaluator = local_env("alert-evaluator")
 
-    assert worker["command"] == ["telegram-worker"]
-    assert worker["profiles"] == ["notifications"]
-    assert worker["environment"]["SQS_TELEGRAM_JOBS_URL"].endswith(
-        "/limnopulse-telegram-notification-jobs"
-    )
-    assert worker["environment"]["REDIS_ADDR"] == "redis:6379"
-    assert worker["environment"]["TELEGRAM_DELIVERY_ENABLED"] == "true"
-    assert worker["environment"]["TELEGRAM_BOT_API_BASE_URL"] == (
-        "http://telegram-bot-api-fake:8080"
-    )
-    assert "redis" in worker["depends_on"]
-    assert relay["environment"]["TELEGRAM_DELIVERY_ENABLED"] == "true"
-    assert evaluator["environment"]["TELEGRAM_DELIVERY_ENABLED"] == "true"
-    assert relay["environment"]["SQS_TELEGRAM_JOBS_URL"].endswith(
-        "/limnopulse-telegram-notification-jobs"
-    )
+    assert worker["SQS_TELEGRAM_JOBS_URL"].endswith("/limnopulse-telegram-notification-jobs")
+    assert worker["REDIS_ADDR"] == "127.0.0.1:6379"
+    assert worker["TELEGRAM_DELIVERY_ENABLED"] == "true"
+    assert worker["TELEGRAM_BOT_API_BASE_URL"] == "http://127.0.0.1:8089"
+    assert fake["ports"] == ["127.0.0.1:8089:8080"]
+    assert relay["TELEGRAM_DELIVERY_ENABLED"] == "true"
+    assert evaluator["TELEGRAM_DELIVERY_ENABLED"] == "true"
+    assert relay["SQS_TELEGRAM_JOBS_URL"].endswith("/limnopulse-telegram-notification-jobs")
     assert fake["profiles"] == ["notifications"]
 
     elasticmq = (ROOT / "infra" / "elasticmq" / "elasticmq.conf").read_text(encoding="utf-8")

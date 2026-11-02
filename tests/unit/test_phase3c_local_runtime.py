@@ -8,6 +8,7 @@ from pathlib import Path
 import yaml
 
 from scripts.dev.publish_ses_event import build_ses_event, publish_event
+from tests.support.local_workers import local_env
 
 ROOT = Path(__file__).resolve().parents[2]
 
@@ -124,38 +125,39 @@ def test_elasticmq_defines_telemetry_ingress_queue_and_dlq_exactly() -> None:
     )
 
 
-def test_notification_compose_processes_use_real_sdk_endpoints_and_safe_fake_sender() -> None:
-    compose = yaml.safe_load((ROOT / "compose.yaml").read_text(encoding="utf-8"))
-    relay = compose["services"]["notification-relay"]
-    worker = compose["services"]["notification-worker"]
-
-    assert relay["profiles"] == ["notifications"]
-    assert relay["command"] == ["relay"]
-    assert relay["restart"] == "no"
-    assert worker["profiles"] == ["notifications"]
-    assert worker["command"] == ["worker"]
-    assert worker["init"] is True
-    assert worker["stop_grace_period"] == "45s"
-    assert worker["environment"]["NOTIFICATION_EMAIL_SENDER_MODE"] == "success"
-    assert "NOTIFICATION_FAKE_MESSAGE_ID" not in worker["environment"]
-    assert worker["environment"]["SES_CONFIGURATION_SET_NAME"] == "limnopulse-notifications"
-    assert worker["environment"]["SQS_ENDPOINT_URL"] == "http://elasticmq:9324"
-    assert worker["environment"]["SQS_NOTIFICATION_JOBS_URL"].endswith(
-        "/limnopulse-notification-jobs"
+def test_local_notification_processes_use_real_sdk_endpoints_and_safe_fake_sender() -> None:
+    # ADR-020: the relay and both SES consumers run as executables (scripts/dev/run_worker.sh)
+    # against the emulators' host ports; Compose runs none of them.
+    services = yaml.safe_load((ROOT / "compose.yaml").read_text(encoding="utf-8"))["services"]
+    for legacy in ("notification-relay", "notification-worker", "telegram-notification-worker"):
+        assert legacy not in services
+    relay, worker, feedback = (
+        local_env("notification-relay"),
+        local_env("email-worker"),
+        local_env("ses-feedback-worker"),
     )
-    assert worker["environment"]["SQS_SES_EVENTS_URL"].endswith("/limnopulse-ses-events")
-    assert "SES_ENDPOINT_URL" not in worker["environment"]
+
+    assert relay["SQS_NOTIFICATION_JOBS_URL"].endswith("/limnopulse-notification-jobs")
+    assert worker["NOTIFICATION_EMAIL_SENDER_MODE"] == "success"
+    assert "NOTIFICATION_FAKE_MESSAGE_ID" not in worker
+    assert worker["SES_CONFIGURATION_SET_NAME"] == "limnopulse-notifications"
+    assert worker["SQS_ENDPOINT_URL"] == "http://127.0.0.1:9324"
+    assert worker["SQS_NOTIFICATION_JOBS_URL"].endswith("/limnopulse-notification-jobs")
+    assert "SES_ENDPOINT_URL" not in worker
+    # The SES feedback consumer is its own process with its own queue.
+    assert "SQS_SES_EVENTS_URL" not in worker
+    assert feedback["SQS_SES_EVENTS_URL"].endswith("/limnopulse-ses-events")
+    assert feedback["SQS_ENDPOINT_URL"] == "http://127.0.0.1:9324"
 
 
-def test_notifications_container_is_distroless_nonroot_and_keeps_commands_external() -> None:
-    dockerfile = (ROOT / "Dockerfile.notifications").read_text(encoding="utf-8")
-
-    assert "CGO_ENABLED=0" in dockerfile
-    assert "gcr.io/distroless/static-debian12:nonroot" in dockerfile
-    assert "USER nonroot:nonroot" in dockerfile
-    assert 'ENTRYPOINT ["/notifications"]' in dockerfile
-    assert "CMD" not in dockerfile
-    assert "HEALTHCHECK NONE" in dockerfile
+def test_no_go_worker_has_a_container_image() -> None:
+    # ADR-020: Docker never runs a Go worker.
+    for dockerfile in ("Dockerfile.notifications", "Dockerfile.alert-evaluator"):
+        assert not (ROOT / dockerfile).exists()
+    compose = yaml.safe_load((ROOT / "compose.yaml").read_text(encoding="utf-8"))
+    for name, service in compose["services"].items():
+        dockerfile = (service.get("build") or {}).get("dockerfile", "")
+        assert dockerfile in ("", "Dockerfile.api"), name
 
 
 def test_synthetic_ses_helper_builds_every_supported_event_without_recipient_pii() -> None:

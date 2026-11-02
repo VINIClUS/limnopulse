@@ -33,6 +33,10 @@ docker compose up -d redis dynamodb-local influxdb mqtt-broker telegraf elasticm
 wait_for_compose_services redis dynamodb-local influxdb mqtt-broker telegraf elasticmq
 "$UV_BIN" run --locked python scripts/dev/init_dynamodb.py
 "$UV_BIN" run --locked python scripts/dev/seed_local.py
+# ADR-020: the smoke runs the evaluator as an executable (scripts/dev/run_worker.sh), not
+# in Compose. Build it once here so the verify hook only links it.
+ensure_lab_go
+"$(lab_go)" build -trimpath -o /dev/null ./cmd/alert-evaluator
 
 UNIT_TMP="$(mktemp)"
 trap 'rm -f "$UNIT_TMP"' EXIT

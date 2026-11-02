@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import os
+import re
 import subprocess
 import sys
 from pathlib import Path
@@ -56,12 +57,21 @@ def _run_hook(tmp_path: Path, name: str) -> subprocess.CompletedProcess[str]:
         encoding="utf-8",
     )
     uv_bin.chmod(0o755)
+    go_bin = bin_dir / "lab-go"
+    go_bin.write_text(
+        "#!/usr/bin/env bash\n"
+        "printf '%s\\n' \"$0 $*\" >> \"$LAB_TEST_COMMAND_LOG\"\n"
+        "exit 0\n",
+        encoding="utf-8",
+    )
+    go_bin.chmod(0o755)
     environment = os.environ | {
         "PATH": f"{bin_dir}:{os.environ['PATH']}",
         "LAB_MARKER_PATH": str(marker),
         "LAB_ROOT": str(source_root),
         "LAB_ENV_FILE": str(source_root / ".env"),
         "LIMNOPULSE_LAB_UV": str(uv_bin),
+        "LIMNOPULSE_LAB_GO": str(go_bin),
         "LAB_TEST_COMMAND_LOG": str(command_log),
     }
     test_env_file = Path(environment["LAB_ENV_FILE"])
@@ -153,6 +163,9 @@ def test_lab_deploy_uses_only_local_runtime_commands(tmp_path: Path) -> None:
     assert "run --locked python scripts/dev/init_dynamodb.py" in command_log
     assert "run --locked python scripts/dev/seed_local.py" in command_log
     assert "systemctl enable --now limnopulse-lab-api.service" in command_log
+    # ADR-020: the evaluator is built with the lab's Go toolchain, not as a Compose image.
+    assert "lab-go build -trimpath -o /dev/null ./cmd/alert-evaluator" in command_log
+    assert "compose build" not in command_log
     assert "aws " not in command_log.lower()
     assert "infisical" not in command_log.lower()
 
@@ -220,3 +233,29 @@ def test_lab_smoke_uses_a_distinct_mqtt_client_for_each_sample(monkeypatch) -> N
         "limnopulse-lab-smoke-5",
         "limnopulse-lab-smoke-6",
     ]
+
+
+def test_lab_smoke_runs_the_evaluator_executable_instead_of_compose() -> None:
+    from ops.lab.smoke import ROOT as SMOKE_ROOT
+    from ops.lab.smoke import evaluator_command
+
+    assert evaluator_command("2026-08-13T12:02:00Z") == [
+        str(SMOKE_ROOT / "scripts/dev/run_worker.sh"),
+        "alert-evaluator",
+        "run",
+        "--evaluation-time=2026-08-13T12:02:00Z",
+        "--max-sample-age=2m",
+    ]
+    smoke = (LAB / "smoke.py").read_text(encoding="utf-8")
+    assert '"compose"' not in smoke
+
+
+def test_lab_pins_the_go_toolchain_of_go_mods_minor_by_checksum() -> None:
+    lib = (LAB / "lib.sh").read_text(encoding="utf-8")
+    version = re.search(r'^GO_VERSION="(\d+\.\d+)\.\d+"$', lib, re.MULTILINE)
+    assert version
+    go_mod = (ROOT / "go.mod").read_text(encoding="utf-8")
+    assert re.search(rf"^go {re.escape(version.group(1))}\.\d+$", go_mod, re.MULTILINE)
+    assert re.search(r'^GO_ARCHIVE_SHA256="[0-9a-f]{64}"$', lib, re.MULTILINE)
+    assert "sha256sum --check" in lib.split("ensure_lab_go()", 1)[1]
+    assert 'GO="$(lab_go)"' in (LAB / "verify").read_text(encoding="utf-8")

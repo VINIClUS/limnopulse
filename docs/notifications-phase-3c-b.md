@@ -2,9 +2,7 @@
 
 Phase 3C-B adds tenant-scoped Telegram binding and delivery to the Phase 3C-A
 durable notification pipeline. It uses a dedicated SQS queue and the
-continuous `telegram-worker` executable (ADR-020; the legacy
-`notifications telegram-worker` still backs the local Compose service until
-ADR-020 S3 removes it). The existing one-shot `notification-relay` remains
+continuous `telegram-worker` executable (ADR-020). The existing one-shot `notification-relay` remains
 externally scheduled and routes each channel to its own queue. DynamoDB remains
 authoritative for binding, destination, preference, Delivery, Attempt,
 transition and idempotency state. Redis is only a fail-closed rate limiter.
@@ -85,11 +83,12 @@ docker compose --profile notifications up -d \
 python scripts/dev/init_dynamodb.py
 ```
 
-Run the dedicated worker and the one-shot relay:
+Run the dedicated worker and the one-shot relay as executables (ADR-020;
+`scripts/dev/workers/<role>.env` holds their local settings):
 
 ```bash
-docker compose --profile notifications up telegram-notification-worker
-docker compose --profile notifications run --rm notification-relay
+scripts/dev/run_worker.sh telegram-worker
+scripts/dev/run_worker.sh notification-relay
 ```
 
 WireMock listens on `127.0.0.1:8089` for integration inspection and returns a

@@ -7,6 +7,10 @@ LIMNOPULSE_LAB_COMPOSE_PROJECT="${LIMNOPULSE_LAB_COMPOSE_PROJECT:-limnopulse_lab
 export COMPOSE_PROJECT_NAME="$LIMNOPULSE_LAB_COMPOSE_PROJECT"
 UV_VERSION="0.11.28"
 UV_ARCHIVE_SHA256="e490a6464492183c5d4534a5527fb4440f7f2bb2f228162ad7e4afe076dc0224"
+# ADR-020: the lab builds the Go workers it runs (scripts/dev/run_worker.sh) with this
+# toolchain, the latest patch of go.mod's Go minor; the checksum is go.dev/dl's.
+GO_VERSION="1.26.10"
+GO_ARCHIVE_SHA256="ccfe7ae822d2c2f41f4fe7c956199967a4dac22d0ee0d2b2bfdb440aab3b20c5"
 
 fail() {
   local message="$1"
@@ -66,6 +70,34 @@ ensure_lab_uv() {
   tar -xzf "$archive" -C "$root/.lab-tools"
   mv "$root/.lab-tools/uv-x86_64-unknown-linux-gnu" "$extract_dir"
   [[ -x "$uv_bin" ]] || fail "uv bootstrap did not provide $uv_bin" 3
+}
+
+lab_go() {
+  local root
+  root="$(lab_root)"
+  printf '%s\n' "${LIMNOPULSE_LAB_GO:-$root/.lab-tools/go-$GO_VERSION/bin/go}"
+}
+
+ensure_lab_go() {
+  local root go_bin archive extract_dir
+  root="$(lab_root)"
+  go_bin="$(lab_go)"
+  [[ -x "$go_bin" ]] && return
+  require_command curl
+  require_command sha256sum
+  require_command tar
+  archive="$root/.lab-tools/go-$GO_VERSION.tar.gz"
+  extract_dir="$root/.lab-tools/go-$GO_VERSION"
+  install -d -m 755 "$root/.lab-tools"
+  curl --fail --location --silent --show-error \
+    "https://go.dev/dl/go$GO_VERSION.linux-amd64.tar.gz" \
+    --output "$archive"
+  printf '%s  %s\n' "$GO_ARCHIVE_SHA256" "$archive" | sha256sum --check --status || \
+    fail "Go archive checksum mismatch" 3
+  rm -rf "$extract_dir" "$root/.lab-tools/go"
+  tar -xzf "$archive" -C "$root/.lab-tools"
+  mv "$root/.lab-tools/go" "$extract_dir"
+  [[ -x "$go_bin" ]] || fail "Go bootstrap did not provide $go_bin" 3
 }
 
 wait_for_compose_services() {

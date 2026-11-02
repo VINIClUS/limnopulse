@@ -127,12 +127,11 @@ def test_no_role_links_code_that_uses_the_multi_consumer_supervisor(name: str) -
     # The supervision moved to systemd: no role multiplexes consumers in one process.
     files = closure_files(f"cmd/{name}")
     assert files
+    # ADR-020 S3 deleted the Supervisor with cmd/notifications; no file may bring it back.
+    assert not (ROOT / "internal/notifications/worker/supervisor.go").exists()
     for file in files:
         if file.package == WORKER_PACKAGE:
-            # Only its own (legacy, S3-deleted) file may name the type.
-            assert file.path.name == "supervisor.go" or not re.search(
-                r"\bSupervisor\b", file.code
-            ), file.relative
+            assert not re.search(r"\bSupervisor\b", file.code), file.relative
         else:
             assert not file.uses(WORKER_PACKAGE, r"Supervisor\b"), file.relative
 

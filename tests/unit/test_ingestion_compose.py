@@ -38,7 +38,8 @@ WORKER_PLACEHOLDERS = (
     "TELEMETRY_INGEST_AWS_SECRET_ACCESS_KEY",
     "TELEMETRY_INGEST_INFLUXDB_TOKEN",
 )
-# Services on main before P3-10; P3-10 only adds the worker.
+# Services on main before P3-10, less the Go workers ADR-020 moved out of Compose
+# (scripts/dev/run_worker.sh runs them); P3-10 only adds the worker.
 LOCAL_SERVICES_BEFORE_P3_10 = {
     "redis",
     "dynamodb-local",
@@ -46,11 +47,7 @@ LOCAL_SERVICES_BEFORE_P3_10 = {
     "influxdb",
     "mqtt-broker",
     "telegraf",
-    "alert-evaluator",
-    "notification-relay",
-    "notification-worker",
     "telegram-bot-api-fake",
-    "telegram-notification-worker",
 }
 PRODUCTION_SERVICES_BEFORE_P3_10 = {"api", "web", "redis", "influxdb"}
 HARDENING_KEYS = ("read_only", "tmpfs", "security_opt", "cap_drop", "logging")

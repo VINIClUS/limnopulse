@@ -7,8 +7,8 @@ scheduler, `email-worker` is the continuous jobs consumer and
 `ses-feedback-worker` is the continuous SES feedback consumer. The two consumers
 are separate processes with separate settings; neither polls the other's queue.
 The relay backfill is the operator command `limnopulse-admin backfill-relay`.
-The legacy `notifications` binary still backs the local Compose services until
-ADR-020 S3 removes it. Telegram is not delivered in Phase 3C-A; existing Telegram
+Locally each role runs as its executable through `scripts/dev/run_worker.sh`; no
+Compose service runs a Go worker. Telegram is not delivered in Phase 3C-A; existing Telegram
 outboxes remain outside the email relay index, and the legacy backfill marks the
 rows it visits as deferred for Phase 3C-B.
 
@@ -90,20 +90,28 @@ docker compose up -d dynamodb-local elasticmq
 python scripts/dev/init_dynamodb.py
 ```
 
-Run the continuous fake-email worker in one terminal:
+Run the continuous fake-email worker in one terminal. `scripts/dev/run_worker.sh`
+builds each role's executable and runs it with the local settings in
+`scripts/dev/workers/<role>.env` (ADR-020: Compose runs no Go worker):
 
 ```bash
-docker compose --profile notifications up notification-worker
+scripts/dev/run_worker.sh email-worker
+```
+
+Run the SES feedback consumer, its own process, in a second terminal:
+
+```bash
+scripts/dev/run_worker.sh ses-feedback-worker
 ```
 
 Run the one-shot relay in another terminal. Its scheduler remains outside the
 domain:
 
 ```bash
-docker compose --profile notifications run --rm notification-relay
+scripts/dev/run_worker.sh notification-relay
 ```
 
-The Compose worker uses the deterministic `success` sender and never contacts
+The local email worker uses the deterministic `success` sender and never contacts
 SES. Other local/test-only modes are `retryable`, `permanent`,
 `ambiguous_timeout` and `connection_reset`. Production and staging reject fake
 senders. A synthetic, address-free SES event can be published locally with:
