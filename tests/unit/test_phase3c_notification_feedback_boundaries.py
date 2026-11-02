@@ -58,3 +58,21 @@ def test_feedback_metrics_are_bounded_and_worker_does_not_consume_dlqs() -> None
     assert "QueueURL: config.SQSFeedbackURL" in command
     assert "DLQ" not in command
     assert "DLQ" not in config
+
+
+def test_adr020_email_and_feedback_consumers_each_poll_one_queue_without_dlqs() -> None:
+    email = _production_sources(ROOT / "internal" / "notifications" / "worker" / "compose")
+    feedback = _production_sources(ROOT / "internal" / "notifications" / "feedback" / "compose")
+    feedback_config = (
+        ROOT / "internal" / "notifications" / "feedback" / "config" / "config.go"
+    ).read_text(encoding="utf-8")
+
+    for source in (email, feedback):
+        assert source.count("workersqs.Queue{") == 1
+        assert "QueueURL: config.SQSQueueURL" in source
+        assert "DLQ" not in source
+    assert "SQSFeedbackURL" not in email
+    assert "feedback.Processor{" in feedback
+    assert "Sender" not in feedback
+    assert '"SQS_SES_EVENTS_URL": &config.SQSQueueURL' in feedback_config
+    assert "DLQ" not in feedback_config

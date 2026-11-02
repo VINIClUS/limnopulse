@@ -16,7 +16,9 @@ def test_notification_relay_is_query_only_bounded_and_one_shot() -> None:
     command_source = (ROOT / "cmd" / "notifications" / "main.go").read_text(
         encoding="utf-8"
     )
-    sources = relay_sources + "\n" + command_source
+    # ADR-020: the notification-relay executable and its composition stay one-shot too.
+    entrypoint_source = _production_go_sources(ROOT / "cmd" / "notification-relay")
+    sources = relay_sources + "\n" + command_source + "\n" + entrypoint_source
 
     assert ".Scan(" not in sources
     assert "ScanInput" not in sources
@@ -27,6 +29,8 @@ def test_notification_relay_is_query_only_bounded_and_one_shot() -> None:
     assert "attribute_not_exists(#relay_work_kind)" in sources
     assert "TransactItems" in sources
     assert "SendMessage" in sources
+    assert "relaycompose.Run" in entrypoint_source
+    assert "workerproc.Continuous" not in entrypoint_source
 
 
 def test_notification_job_and_run_summary_fields_are_no_pii() -> None:
