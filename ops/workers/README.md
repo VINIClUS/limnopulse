@@ -155,6 +155,18 @@ needs it:
 - worker-monitor, whose `systemctl show` reaches systemd over
   `/run/dbus/system_bus_socket`.
 
+**worker-monitor's static user.** PID 1 starts `dbus-daemon` with
+`SYSTEMD_NSS_DYNAMIC_BYPASS=1`, so the bus cannot resolve a dynamic user's groups and
+drops its connection. A dynamic monitor fails every run with "Transport endpoint is not
+connected" (Ubuntu 24.04 and 26.04 alike). Its unit therefore keeps `DynamicUser=yes` and
+adds `User=limnopulse-worker-monitor`: systemd uses an existing user of that name instead
+of allocating one, and the sandbox stays the same.
+`ops/workers/sysusers.d/limnopulse-workers.conf` declares the user, with no login shell.
+The host installs it as `/etc/sysusers.d/limnopulse-workers.conf` and runs
+`systemd-sysusers` before it enables the monitor's timer. Without the user, the monitor
+publishes nothing and the unit-health alarms breach. `scripts/workers/units.py` renders
+the file too.
+
 `tests/unit/test_workers_units.py` runs `systemd-analyze verify` on every unit and
 requires `systemd-analyze security` to score each service at or below its pinned
 exposure threshold.

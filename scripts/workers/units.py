@@ -1,7 +1,7 @@
 """Render the ADR-020 systemd units from `ops/workers/roles.yaml`.
 
 `ops/workers/systemd/` holds the rendered units, and the workers bundle ships exactly those
-files. `tests/unit/test_workers_units.py` checks that they equal this rendering, so edit this
+files. `ops/workers/sysusers.d/` declares the static users they name; the host installs it. `tests/unit/test_workers_units.py` checks that they equal this rendering, so edit this
 file or roles.yaml, never a unit, and regenerate them from the repository root:
 
     .venv/bin/python -m scripts.workers.units --write
@@ -31,9 +31,14 @@ HEADER = (
 # `run` (anything else exits 78); every other role takes flags only and runs without any.
 EXEC_ARGS: dict[str, tuple[str, ...]] = {"alert-evaluator": ("run",)}
 # Roles that query systemd over the system D-Bus (internal/workermonitor/doc.go). As a
-# DynamicUser, `systemctl show` reaches PID 1 through /run/dbus/system_bus_socket.
+# non-root user, `systemctl show` reaches PID 1 through /run/dbus/system_bus_socket.
 SYSTEM_BUS_ROLES = frozenset({"worker-monitor"})
 SYSTEM_BUS_SOCKET = "/run/dbus/system_bus_socket"
+# PID 1 starts dbus-daemon with SYSTEMD_NSS_DYNAMIC_BYPASS=1, so the bus cannot resolve a
+# dynamic user and drops its connection. A system-bus role therefore names a static user
+# that ops/workers/sysusers.d declares: with DynamicUser=yes, systemd uses an existing
+# user of that name instead of allocating one, and the rest of the sandbox is unchanged.
+SYSUSERS_PATH = ROOT / "ops/workers/sysusers.d/limnopulse-workers.conf"
 # Continuous units back off from 5 s to 60 s between restarts, so a crash loop never hits
 # the start rate limit and never gives up.
 RESTART = ("RestartSec=5s", "RestartSteps=5", "RestartMaxDelaySec=60s")
@@ -89,6 +94,26 @@ def address_families(role: dict[str, Any]) -> str:
     if role["lifecycle"] == "continuous" or role["name"] in SYSTEM_BUS_ROLES:
         families.insert(0, "AF_UNIX")
     return " ".join(families)
+
+
+def static_user(role: dict[str, Any]) -> str | None:
+    """The static user a role runs as, or None for a dynamic one."""
+    return f"limnopulse-{role['name']}" if role["name"] in SYSTEM_BUS_ROLES else None
+
+
+def render_sysusers(table: dict[str, Any]) -> str:
+    """The sysusers.d entries for every static user the units name."""
+    lines = [
+        "# Rendered from ops/workers/roles.yaml by scripts/workers/units.py; do not edit by hand.",
+        "# The static users the ADR-020 units name (ops/workers/README.md, \"Units\"). The host",
+        "# installs this file as /etc/sysusers.d/limnopulse-workers.conf and runs",
+        "# systemd-sysusers before it enables a unit that names one of them.",
+    ]
+    for role in unit_roles(table):
+        user = static_user(role)
+        if user:
+            lines.append(f'u {user} - "LimnoPulse {role["name"]}" / /usr/sbin/nologin')
+    return "\n".join(lines) + "\n"
 
 
 def exec_start(role: dict[str, Any]) -> str:
@@ -153,6 +178,7 @@ def render_service(table: dict[str, Any], role: dict[str, Any]) -> str:
         f"EnvironmentFile={role['env_file']}",
         *(f"Environment={key}={value}" for key, value in table["go_unit_environment"].items()),
         *credential_lines(table, role),
+        *([f"User={static_user(role)}"] if static_user(role) else []),
         *HARDENING,
         f"RestrictAddressFamilies={address_families(role)}",
     ]
@@ -226,7 +252,13 @@ def drift(table: dict[str, Any], directory: Path = UNITS_DIR) -> list[str]:
     )
 
 
-def write(table: dict[str, Any], directory: Path = UNITS_DIR) -> None:
+def sysusers_drift(table: dict[str, Any], path: Path = SYSUSERS_PATH) -> bool:
+    return not path.is_file() or path.read_text(encoding="utf-8") != render_sysusers(table)
+
+
+def write(
+    table: dict[str, Any], directory: Path = UNITS_DIR, sysusers: Path = SYSUSERS_PATH
+) -> None:
     directory.mkdir(parents=True, exist_ok=True)
     expected = render(table)
     for path in directory.iterdir():
@@ -234,20 +266,30 @@ def write(table: dict[str, Any], directory: Path = UNITS_DIR) -> None:
             path.unlink()
     for name, text in expected.items():
         (directory / name).write_text(text, encoding="utf-8")
+    sysusers.parent.mkdir(parents=True, exist_ok=True)
+    sysusers.write_text(render_sysusers(table), encoding="utf-8")
 
 
-def main(argv: list[str] | None = None, directory: Path = UNITS_DIR) -> int:
+def main(
+    argv: list[str] | None = None,
+    directory: Path = UNITS_DIR,
+    sysusers: Path = SYSUSERS_PATH,
+) -> int:
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
-    parser.add_argument("--write", action="store_true", help="rewrite ops/workers/systemd")
+    parser.add_argument(
+        "--write", action="store_true", help="rewrite ops/workers/systemd and sysusers.d"
+    )
     args = parser.parse_args(argv)
     table = load_roles()
     if args.write:
-        write(table, directory)
+        write(table, directory, sysusers)
         return 0
     stale = drift(table, directory)
+    if sysusers_drift(table, sysusers):
+        stale.append(sysusers.name)
     if stale:
         print(
-            f"ops/workers/systemd differs from roles.yaml: {stale}; "
+            f"ops/workers/systemd or sysusers.d differs from roles.yaml: {stale}; "
             "run .venv/bin/python -m scripts.workers.units --write",
             file=sys.stderr,
         )

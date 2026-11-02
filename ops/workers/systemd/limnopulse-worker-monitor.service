@@ -17,6 +17,7 @@ Environment=GOTRACEBACK=crash
 Environment=LIMNOPULSE_SUPERVISOR=systemd
 LoadCredential=aws-access-key-id:/etc/limnopulse/workers/credentials/worker-monitor/aws-access-key-id
 LoadCredential=aws-secret-access-key:/etc/limnopulse/workers/credentials/worker-monitor/aws-secret-access-key
+User=limnopulse-worker-monitor
 DynamicUser=yes
 CapabilityBoundingSet=
 AmbientCapabilities=

@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import os
 import re
+import shlex
 import shutil
 import subprocess
 from pathlib import Path
@@ -182,18 +183,24 @@ def test_the_unit_set_is_exactly_what_roles_yaml_declares():
 
 
 def test_check_fails_and_write_repairs_a_drifted_unit(tmp_path, capsys):
-    units.write(load_roles(), tmp_path)
-    (tmp_path / "limnopulse-email-worker.service").write_text("[Service]\n")
-    (tmp_path / "limnopulse-notifications.service").write_text("[Service]\n")
-    assert units.drift(load_roles(), tmp_path) == [
+    systemd, sysusers = tmp_path / "systemd", tmp_path / "sysusers.d/limnopulse-workers.conf"
+    units.write(load_roles(), systemd, sysusers)
+    (systemd / "limnopulse-email-worker.service").write_text("[Service]\n")
+    (systemd / "limnopulse-notifications.service").write_text("[Service]\n")
+    sysusers.write_text("u limnopulse-notifications - - / /usr/sbin/nologin\n")
+    assert units.drift(load_roles(), systemd) == [
         "limnopulse-email-worker.service",
         "limnopulse-notifications.service",
     ]
-    assert units.main([], directory=tmp_path) == 1
-    assert "limnopulse-email-worker.service" in capsys.readouterr().err
-    assert units.main(["--write"], directory=tmp_path) == 0
-    assert units.main([], directory=tmp_path) == 0
-    assert not (tmp_path / "limnopulse-notifications.service").exists()
+    assert units.main([], directory=systemd, sysusers=sysusers) == 1
+    error = capsys.readouterr().err
+    assert "limnopulse-email-worker.service" in error and "limnopulse-workers.conf" in error
+    assert units.main(["--write"], directory=systemd, sysusers=sysusers) == 0
+    assert units.main([], directory=systemd, sysusers=sysusers) == 0
+    assert not (systemd / "limnopulse-notifications.service").exists()
+    assert sysusers.read_text() == units.render_sysusers(load_roles())
+    sysusers.unlink()
+    assert units.main([], directory=systemd, sysusers=sysusers) == 1
 
 
 def test_the_timers_fire_once_a_minute_only():
@@ -249,8 +256,10 @@ def test_each_service_has_the_shared_sandbox(name):
     for key, values in HARDENING.items():
         assert service.get(key) == values, (name, key)
     # Every role talks to AWS; none is cut off from the network.
-    for key in ("PrivateNetwork", "IPAddressDeny", "User", "Group", "SupplementaryGroups"):
+    for key in ("PrivateNetwork", "IPAddressDeny", "Group", "SupplementaryGroups"):
         assert key not in service, (name, key)
+    # Only the system-bus role names a user (see the sysusers.d tests below).
+    assert service.get("User") == (["limnopulse-worker-monitor"] if name == MONITOR else None)
 
 
 @pytest.mark.parametrize("name", CONTINUOUS + ONESHOT)
@@ -320,6 +329,61 @@ def test_only_the_monitor_orders_itself_after_other_roles():
     for path in UNITS_DIR.glob("*.service"):
         if path.name != "limnopulse-worker-monitor.service":
             assert parse_unit(path.read_text())["Unit"]["After"] == ["network-online.target"]
+
+
+# --- the static user of the system-bus role ----------------------------------------------
+
+SYSUSERS = ROOT / "ops/workers/sysusers.d/limnopulse-workers.conf"
+
+
+def test_the_committed_sysusers_file_is_the_rendering_of_roles_yaml():
+    assert SYSUSERS.read_text(encoding="utf-8") == units.render_sysusers(load_roles())
+
+
+def test_sysusers_declares_exactly_the_users_the_units_name():
+    named = {
+        user
+        for path in UNITS_DIR.glob("*.service")
+        for user in parse_unit(path.read_text())["Service"].get("User", [])
+    }
+    entries = [
+        shlex.split(line)
+        for line in SYSUSERS.read_text(encoding="utf-8").splitlines()
+        if line and not line.startswith("#")
+    ]
+    assert named == {"limnopulse-worker-monitor"}
+    assert {entry[1] for entry in entries} == named
+    for kind, user, uid, gecos, home, shell in entries:
+        # A system user from the dynamic range sysusers picks, which can never log in.
+        assert (kind, uid, home, shell) == ("u", "-", "/", "/usr/sbin/nologin"), user
+        assert gecos.startswith("LimnoPulse "), user
+
+
+def test_the_monitor_names_a_static_user_because_the_bus_cannot_resolve_a_dynamic_one():
+    service = unit("limnopulse-worker-monitor.service")["Service"]
+    # DynamicUser=yes uses an existing user of the name given instead of allocating one.
+    assert service["DynamicUser"] == ["yes"]
+    assert service["User"] == [units.static_user(role(MONITOR))]
+    for name in CONTINUOUS + ONESHOT:
+        if name != MONITOR:
+            assert units.static_user(role(name)) is None, name
+
+
+def test_systemd_sysusers_accepts_the_file(tmp_path):
+    tool = shutil.which("systemd-sysusers")
+    if tool is None:
+        if os.environ.get("GITHUB_ACTIONS") == "true":
+            pytest.fail("systemd-sysusers is missing on the CI runner")
+        pytest.skip("systemd-sysusers is not installed")
+    (tmp_path / "etc").mkdir()
+    result = subprocess.run(
+        [tool, "--dry-run", f"--root={tmp_path}", str(SYSUSERS)],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert result.returncode == 0, result.stderr
+    assert "Creating user 'limnopulse-worker-monitor'" in result.stdout + result.stderr
 
 
 # --- the env file templates --------------------------------------------------------------

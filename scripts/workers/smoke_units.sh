@@ -9,7 +9,8 @@
 #   exit 78 (a configuration error, not a crash or a seccomp kill), and a continuous unit
 #   must not be restarted.
 # - worker-monitor gets dummy keys and AWS_REGION. Nothing is enabled, so it reads every
-#   unit over D-Bus, publishes nothing and must exit 0.
+#   unit over D-Bus, publishes nothing and must exit 0. It runs as the static user that
+#   ops/workers/sysusers.d declares, which the script creates first, as the host does.
 #
 # It writes /opt/limnopulse/workers, /etc/limnopulse/workers and /etc/systemd/system, so it
 # refuses to run outside GitHub Actions.
@@ -24,6 +25,7 @@ if [[ "${GITHUB_ACTIONS:-}" != "true" || "$EUID" -ne 0 ]]; then
   exit 2
 fi
 
+ROOT="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/../.." && pwd -P)"
 tarball="$1"
 tag="$2"
 workers=/opt/limnopulse/workers
@@ -65,6 +67,7 @@ for row in "${roles[@]}"; do
 done
 printf 'AWS_REGION=us-east-1\n' >"$config/$monitor.env"
 chmod 0600 "$config/"*.env
+systemd-sysusers "$ROOT/ops/workers/sysusers.d/limnopulse-workers.conf"
 systemctl daemon-reload
 
 show() {
@@ -104,6 +107,11 @@ if ! systemctl start "limnopulse-$monitor.service"; then
 fi
 expect "limnopulse-$monitor.service" Result success
 expect "limnopulse-$monitor.service" ExecMainStatus 0
+# A dynamic user would have been disconnected by the bus; the static one must be in use.
+if ! getent passwd "limnopulse-$monitor" >/dev/null; then
+  echo "::error::sysusers.d did not create limnopulse-$monitor"
+  failed=1
+fi
 
 for row in "${roles[@]}"; do
   IFS=$'\t' read -r _ _ service _ <<<"$row"
