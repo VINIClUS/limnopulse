@@ -307,6 +307,12 @@ def test_a_duplicate_unit_is_rejected(table):
             "telemetry-ingest: host_enable_env must be an environment variable name",
         ),
         (
+            lambda t: roles_by_name(t)["telemetry-ingest"].update(
+                host_enable_env="TELEMETRY_V2_WRITE_ENABLED\n"
+            ),
+            "telemetry-ingest: host_enable_env must be an environment variable name",
+        ),
+        (
             lambda t: roles_by_name(t)["telemetry-ingest"].update(restart="on-failure:5"),
             "telemetry-ingest: a Compose worker restarts unless-stopped",
         ),

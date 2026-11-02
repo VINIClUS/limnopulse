@@ -9,6 +9,7 @@ workers and the bundle back to the recorded release, under the same host-switch 
 
 from __future__ import annotations
 
+import fcntl
 import json
 import os
 import re
@@ -45,21 +46,34 @@ UNSET = "<unset>"
 WITH_BUNDLE = f"IMAGE_TAG={PREVIOUS}\nWORKERS_BUNDLE_SHA256={PREVIOUS_SHA}\n"
 # Production today: a release from before ADR-020, with no workers bundle.
 IMAGE_ONLY = f"IMAGE_TAG={PREVIOUS}\n"
+# What the helper's `status` reports on a host consistent with each.
+BUNDLE_STATUS = (
+    f"current {PREVIOUS}\nrelease {PREVIOUS} sha256={PREVIOUS_SHA} current\n"
+    "floor email-worker 1\nunit limnopulse-email-worker.service\n"
+)
+NO_BUNDLE_STATUS = "current none\n"
 
 # Parses `compose --env-file .env --env-file <file> -f compose.production.yaml
 # [--profile ingestion]... <operation> <args>`. The candidate env file is the promotion; the
-# recorded .env.image is the rollback. Like Compose, `config` lists the profiled worker only
-# with its profile active, and `ps`/`rm` refuse it without the profile.
+# recorded .env.image is the rollback. Like Compose, the active profiles are the --profile
+# flags, else COMPOSE_PROFILES from the environment when set (even empty), else from the env
+# files; `config` lists the profiled worker only with its profile active, and `ps`/`rm` refuse
+# it without the profile. FAKE_WORKER_STATE exists while the worker has a container.
 FAKE_DOCKER = """\
 import json, os, pathlib, sys
 args = sys.argv[1:]
 entry = {"tool": "docker", "argv": args, "tag": None, "profiles": [], "op": None, "rest": []}
+entry["compose_profiles"] = os.environ.get("COMPOSE_PROFILES")
+def env_value(path, key):
+    value = None
+    if path is not None and path.exists():
+        for line in path.read_text().splitlines():
+            if line.startswith(key + "="):
+                value = line.split("=", 1)[1]
+    return value
 if args[:1] == ["compose"]:
     env_file = pathlib.Path(args[4]) if len(args) > 4 else None
-    if env_file is not None and env_file.exists():
-        for line in env_file.read_text().splitlines():
-            if line.startswith("IMAGE_TAG="):
-                entry["tag"] = line.split("=", 1)[1]
+    entry["tag"] = env_value(env_file, "IMAGE_TAG")
     index = 7
     while args[index:index + 1] == ["--profile"]:
         entry["profiles"].append(args[index + 1])
@@ -68,6 +82,7 @@ if args[:1] == ["compose"]:
 with open(os.environ["FAKE_CALLS"], "a") as log:
     log.write(json.dumps(entry) + "\\n")
 worker = "telemetry-ingest-worker"
+state = pathlib.Path(os.environ["FAKE_WORKER_STATE"])
 if args[:1] == ["compose"]:
     if args[:4] != ["compose", "--env-file", ".env", "--env-file"]:
         sys.exit(90)
@@ -75,21 +90,28 @@ if args[:1] == ["compose"]:
         sys.exit(90)
     if args[5:7] != ["-f", "compose.production.yaml"] or set(entry["profiles"]) - {"ingestion"}:
         sys.exit(95)
-    operation, rest, profiled = entry["op"], entry["rest"], "ingestion" in entry["profiles"]
+    chosen = ",".join(entry["profiles"]) or entry["compose_profiles"]
+    if chosen is None:
+        for path in (pathlib.Path(".env"), env_file):
+            value = env_value(path, "COMPOSE_PROFILES")
+            chosen = chosen if value is None else value
+    profiled = "ingestion" in (chosen or "").split(",")
+    operation, rest = entry["op"], entry["rest"]
     expected = {
         "config": [["--format", "json"]],
         "pull": [[]],
         "up": [["-d", "--remove-orphans"]],
         "stop": [[]],
         "rm": [["--stop", "--force", worker]],
-        "ps": [["-q", "api"], ["-q", worker]],
+        "ps": [["-q", "api"], ["-q", worker], ["-a", "-q", worker]],
     }
     if rest not in expected.get(operation, []):
         sys.exit(93)
     if worker in rest and not profiled:
         sys.exit(97)
+    key = "ps-a" if rest[:1] == ["-a"] else operation
     candidate = args[4] == ".env.image.candidate"
-    if candidate and operation == os.environ.get("FAKE_FAIL_OPERATION"):
+    if candidate and key == os.environ.get("FAKE_FAIL_OPERATION"):
         sys.exit(21)
     if not candidate and operation != "config" and os.environ.get("FAKE_FAIL_ROLLBACK") == "1":
         sys.exit(22)
@@ -102,6 +124,13 @@ if args[:1] == ["compose"]:
                 environment["TELEMETRY_V2_WRITE_ENABLED"] = switch
             services[worker] = {"profiles": ["ingestion"], "environment": environment}
         print(json.dumps({"name": "limnopulse", "services": services}))
+    elif operation == "rm" and os.environ.get("FAKE_KEEP_WORKER") != "1":
+        state.unlink(missing_ok=True)
+    elif operation == "up" and profiled:
+        state.touch()
+    elif key == "ps-a":
+        if state.exists():
+            print("fake-worker-container")
     elif operation == "ps":
         print(f"fake-{rest[1]}-container")
 elif args[:1] == ["inspect"]:
@@ -121,6 +150,7 @@ class Deploy:
     stack: Path
     calls: list[dict]
     log: str
+    worker_exists: bool
 
 
 def steps(calls):
@@ -132,7 +162,9 @@ def steps(calls):
             flow.append(tuple(argv[2:]))
         elif call["tool"] == "docker" and argv[0] == "compose":
             operation, tag, profiles = call["op"], call["tag"], ",".join(call["profiles"])
-            if operation in ("ps", "rm"):
+            if call["rest"][:1] == ["-a"]:
+                flow.append(("ps-a", call["rest"][-1], tag))
+            elif operation in ("ps", "rm"):
                 flow.append((operation, call["rest"][-1], tag))
             elif operation in ("pull", "up", "stop"):
                 flow.append((operation, tag, profiles))
@@ -148,12 +180,12 @@ def deploy(tmp_path):
     host = Host(tmp_path / "host")
     stack = tmp_path / "stack with spaces"
     stack.mkdir()
-    (stack / ".env").write_text("APP_ENV=prod\n")
     (stack / "compose.production.yaml").write_text("services: {}\n")
     write_tool(host.bin, "docker", FAKE_DOCKER)
     write_tool(host.bin, "sudo", FAKE_SUDO)
     fake_helper = write_tool(host.bin, "fake-activate", FAKE_HELPER)
     log_file = tmp_path / "deploy.log"
+    worker_state = tmp_path / "worker-container"
 
     def run(
         *,
@@ -165,11 +197,20 @@ def deploy(tmp_path):
         unhealthy="",
         rollback_fail=False,
         helper_exits=None,
+        status=None,
+        keep_worker=False,
+        environment=None,
+        dotenv="APP_ENV=prod\n",
         real_helper=False,
     ):
+        (stack / ".env").write_text(dotenv)
         image_file = stack / ".env.image"
         if previous is not None:
             image_file.write_text(previous)
+        if status is None:
+            status = BUNDLE_STATUS if previous == WITH_BUNDLE else NO_BUNDLE_STATUS
+        # The previous release left the worker running.
+        worker_state.touch()
         host.reset_calls()
         env = {
             **host.env,
@@ -183,7 +224,11 @@ def deploy(tmp_path):
             "FAKE_UNHEALTHY": unhealthy,
             "FAKE_FAIL_ROLLBACK": "1" if rollback_fail else "0",
             "FAKE_HELPER_EXITS": json.dumps(helper_exits or {}),
+            "FAKE_HELPER_STATUS": status,
+            "FAKE_KEEP_WORKER": "1" if keep_worker else "0",
+            "FAKE_WORKER_STATE": str(worker_state),
             "FAKE_ACTIVATE": str(HELPER if real_helper else fake_helper),
+            **(environment or {}),
         }
         result = subprocess.run(
             ["bash", str(SCRIPT)],
@@ -195,22 +240,31 @@ def deploy(tmp_path):
             timeout=60,
         )
         log = log_file.read_text() if log_file.exists() else ""
-        return Deploy(result, image_file, stack, host.calls(), log)
+        calls = host.calls()
+        # Only the script's --profile flags choose profiles, never COMPOSE_PROFILES.
+        assert all(
+            call["compose_profiles"] == ""
+            for call in calls
+            if call["tool"] == "docker" and call["argv"][0] == "compose"
+        )
+        return Deploy(result, image_file, stack, calls, log, worker_state.exists())
 
     run.host = host
     return run
 
 
 def start(tag, enabled):
-    """Compose's steps for one release: pull, remove a disabled worker, then up."""
+    """Compose's steps for one release: pull, remove a disabled worker, up, check it is gone."""
     profiles = "ingestion" if enabled else ""
-    removal = [] if enabled else [("rm", WORKER, tag)]
-    return [("pull", tag, profiles), *removal, ("up", tag, profiles)]
+    if enabled:
+        return [("pull", tag, profiles), ("up", tag, profiles)]
+    return [("pull", tag, ""), ("rm", WORKER, tag), ("up", tag, ""), ("ps-a", WORKER, tag)]
 
 
 def promotion(through, enabled=True):
     """The candidate's steps in order, up to and including `through`."""
     flow = [
+        ("status",),
         ("config", CANDIDATE),
         ("stage", CANDIDATE, CANDIDATE_SHA),
         *start(CANDIDATE, enabled),
@@ -221,8 +275,14 @@ def promotion(through, enabled=True):
     return flow[: flow.index(through) + 1]
 
 
-def rollback(previous, enabled=True):
-    bundle = [("activate", PREVIOUS)] if previous == WITH_BUNDLE else [("deactivate",)]
+def rollback(previous, enabled=True, *, activated=True):
+    """The rollback's steps. The bundle moves back only if the candidate's activation ran."""
+    if not activated:
+        bundle = []
+    elif previous == WITH_BUNDLE:
+        bundle = [("activate", PREVIOUS)]
+    else:
+        bundle = [("deactivate",)]
     return [("config", PREVIOUS), *start(PREVIOUS, enabled), *bundle]
 
 
@@ -247,6 +307,36 @@ def test_a_disabled_worker_is_removed_not_started_and_not_waited_for(deploy):
     promoted(run)
     assert steps(run.calls) == [*promotion(("activate", CANDIDATE), enabled=False), ("prune",)]
     assert ("ps", WORKER, CANDIDATE) not in steps(run.calls)
+    assert not run.worker_exists
+
+
+@pytest.mark.parametrize(
+    ("dotenv", "environment"),
+    [
+        ("APP_ENV=prod\nCOMPOSE_PROFILES=ingestion\n", None),
+        ("APP_ENV=prod\n", {"COMPOSE_PROFILES": "ingestion"}),
+        ("COMPOSE_PROFILES=ingestion\n", {"COMPOSE_PROFILES": "ingestion"}),
+    ],
+    ids=["env-file", "environment", "both"],
+)
+def test_compose_profiles_cannot_bring_a_disabled_worker_back(deploy, dotenv, environment):
+    # Plain `up` would otherwise take its profiles from COMPOSE_PROFILES and restart the worker.
+    run = deploy(switch="false", dotenv=dotenv, environment=environment)
+    promoted(run)
+    assert steps(run.calls) == [*promotion(("activate", CANDIDATE), enabled=False), ("prune",)]
+    assert not run.worker_exists
+
+
+def test_a_disabled_worker_that_outlives_up_fails_the_deploy(deploy):
+    run = deploy(switch="false", keep_worker=True)
+    assert run.result.returncode == 1
+    assert steps(run.calls) == promotion(("ps-a", WORKER, CANDIDATE), enabled=False) + rollback(
+        WITH_BUNDLE, enabled=False, activated=False
+    )
+    assert "disabled worker telemetry-ingest-worker still has a container" in run.log
+    # The rollback cannot remove it either, so it is reported for a manual look.
+    assert "rollback failed" in run.log
+    assert run.image_file.read_text() == WITH_BUNDLE
 
 
 def pydantic_bool(value):
@@ -288,7 +378,7 @@ def test_the_host_switch_follows_the_workers_own_boolean_parsing(deploy, value):
     expected = None if value == UNSET else pydantic_bool(value)
     if expected is None:
         assert run.result.returncode == 1
-        assert steps(run.calls) == [("config", CANDIDATE)]
+        assert steps(run.calls) == [("status",), ("config", CANDIDATE)]
         assert run.image_file.read_text() == WITH_BUNDLE
         assert not (run.stack / ".env.image.candidate").exists()
         assert "cannot resolve the profiled workers' host switches" in run.log
@@ -300,7 +390,7 @@ def test_the_host_switch_follows_the_workers_own_boolean_parsing(deploy, value):
 def test_a_failed_switch_read_stops_the_deploy_before_anything_changes(deploy):
     run = deploy(fail="config")
     assert run.result.returncode == 1
-    assert steps(run.calls) == [("config", CANDIDATE)]
+    assert steps(run.calls) == [("status",), ("config", CANDIDATE)]
     assert run.image_file.read_text() == WITH_BUNDLE
     assert not (run.stack / ".env.image.candidate").exists()
 
@@ -309,7 +399,11 @@ def test_a_failed_switch_read_stops_the_deploy_before_anything_changes(deploy):
 def test_a_refused_stage_stops_the_deploy_before_anything_changes(deploy, status):
     run = deploy(helper_exits={"stage": status})
     assert run.result.returncode == status
-    assert steps(run.calls) == [("config", CANDIDATE), ("stage", CANDIDATE, CANDIDATE_SHA)]
+    assert steps(run.calls) == [
+        ("status",),
+        ("config", CANDIDATE),
+        ("stage", CANDIDATE, CANDIDATE_SHA),
+    ]
     assert run.image_file.read_text() == WITH_BUNDLE
     assert not (run.stack / ".env.image.candidate").exists()
     assert "nothing changed" in run.log
@@ -327,6 +421,7 @@ DISABLED_FAILURES = {
     "pull": ({"fail": "pull"}, ("pull", CANDIDATE, "")),
     "rm": ({"fail": "rm"}, ("rm", WORKER, CANDIDATE)),
     "up": ({"fail": "up"}, ("up", CANDIDATE, "")),
+    "absence check": ({"fail": "ps-a"}, ("ps-a", WORKER, CANDIDATE)),
     "api health": ({"unhealthy": "api"}, ("ps", "api", CANDIDATE)),
     "activate": ({"helper_exits": {f"activate:{CANDIDATE}": 1}}, ("activate", CANDIDATE)),
 }
@@ -340,12 +435,15 @@ def test_a_failed_promotion_moves_api_workers_and_bundle_back(deploy, enabled, f
     options, last = (FAILURES if enabled else DISABLED_FAILURES)[failure]
     run = deploy(previous=previous, switch="true" if enabled else "false", **options)
     assert run.result.returncode == 1
-    expected = promotion(last, enabled) + rollback(previous, enabled)
+    # Before step 4 the bundle never moved, so the rollback leaves it alone.
+    activated = last[0] == "activate"
+    expected = promotion(last, enabled) + rollback(previous, enabled, activated=activated)
     assert steps(run.calls) == expected
     assert run.image_file.read_text() == previous
     assert not (run.stack / ".env.image.candidate").exists()
     assert "deploy ok" not in run.log
     assert "rollback failed" not in run.log
+    assert ("the workers bundle never moved" in run.log) is not activated
 
 
 @pytest.mark.parametrize(("switch", "rollback_switch"), [("true", "false"), ("false", "true")])
@@ -366,7 +464,7 @@ def test_rollback_keeps_the_promotion_switches_when_it_cannot_reread_them(deploy
     run = deploy(switch="false", rollback_switch="maybe", fail="up")
     assert run.result.returncode == 1
     assert steps(run.calls) == promotion(("up", CANDIDATE, ""), enabled=False) + rollback(
-        WITH_BUNDLE, enabled=False
+        WITH_BUNDLE, enabled=False, activated=False
     )
     assert "rolling back with the values read at promotion" in run.log
     assert "rollback failed" not in run.log
@@ -386,11 +484,7 @@ def test_failed_rollback_is_reported_and_does_not_recurse(deploy):
     run = deploy(fail="up", rollback_fail=True)
     assert run.result.returncode == 1
     flow = promotion(("up", CANDIDATE, "ingestion"))
-    assert steps(run.calls) == flow + [
-        ("config", PREVIOUS),
-        ("pull", PREVIOUS, "ingestion"),
-        ("activate", PREVIOUS),
-    ]
+    assert steps(run.calls) == flow + [("config", PREVIOUS), ("pull", PREVIOUS, "ingestion")]
     assert "rollback failed" in run.log.lower()
     assert "deploy ok" not in run.log
     assert run.image_file.read_text() == WITH_BUNDLE
@@ -402,9 +496,10 @@ def test_first_deploy_failure_stops_candidate_and_deactivates(deploy, failure, e
     options, last = (FAILURES if enabled else DISABLED_FAILURES)[failure]
     run = deploy(previous=None, switch="true" if enabled else "false", **options)
     assert run.result.returncode == 1
+    deactivation = [("deactivate",)] if last[0] == "activate" else []
     assert steps(run.calls) == promotion(last, enabled) + [
         ("stop", CANDIDATE, "ingestion"),
-        ("deactivate",),
+        *deactivation,
     ]
     assert not run.image_file.exists()
     assert not (run.stack / ".env.image.candidate").exists()
@@ -447,6 +542,104 @@ def test_the_rejected_request_is_logged_escaped(deploy):
     assert "\nforged log line" not in run.log
 
 
+def test_a_second_deploy_waits_for_nothing_and_changes_nothing(deploy, tmp_path):
+    lock = tmp_path / "stack with spaces" / ".deploy.lock"
+    with lock.open("a") as held:
+        fcntl.flock(held, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        run = deploy()
+    assert run.result.returncode == 1
+    assert run.calls == []
+    assert "another deploy is running" in run.log
+    assert run.image_file.read_text() == WITH_BUNDLE
+    assert not (run.stack / ".env.image.candidate").exists()
+
+
+# .env.image values the deploy refuses before asking the helper anything.
+MALFORMED_RECORDS = {
+    "empty": "",
+    "no tag": f"WORKERS_BUNDLE_SHA256={PREVIOUS_SHA}\n",
+    "empty tag": "IMAGE_TAG=\n",
+    "not a release": "IMAGE_TAG=latest\n",
+    "short hex": "IMAGE_TAG=main-abcdef\n",
+    "long hex": f"IMAGE_TAG={PREVIOUS}0\n",
+    "uppercase": f"IMAGE_TAG={PREVIOUS.upper()}\n",
+    "trailing space": f"IMAGE_TAG={PREVIOUS} \n",
+    "carriage return": f"IMAGE_TAG={PREVIOUS}\r\n",
+    "short tag with a bundle": f"IMAGE_TAG=main-abcdef0\nWORKERS_BUNDLE_SHA256={PREVIOUS_SHA}\n",
+    "short sha": f"IMAGE_TAG={PREVIOUS}\nWORKERS_BUNDLE_SHA256={PREVIOUS_SHA[:-1]}\n",
+    "uppercase sha": f"IMAGE_TAG={PREVIOUS}\nWORKERS_BUNDLE_SHA256={PREVIOUS_SHA.upper()}\n",
+    "sha with a space": f"IMAGE_TAG={PREVIOUS}\nWORKERS_BUNDLE_SHA256={PREVIOUS_SHA} x\n",
+}
+
+
+@pytest.mark.parametrize("previous", MALFORMED_RECORDS.values(), ids=MALFORMED_RECORDS.keys())
+def test_a_malformed_record_stops_the_deploy_before_anything_changes(deploy, previous):
+    run = deploy(previous=previous, status=BUNDLE_STATUS)
+    assert run.result.returncode == 1
+    assert run.calls == []
+    assert "host state inconsistent" in run.log
+    assert "fix it by hand" in run.log
+    assert run.image_file.read_bytes() == previous.encode()
+    assert not (run.stack / ".env.image.candidate").exists()
+
+
+OTHER = f"main-{'e' * 40}"
+# The helper's current bundle against what .env.image records.
+INCONSISTENT_HOSTS = {
+    "recorded bundle, none current": (WITH_BUNDLE, NO_BUNDLE_STATUS),
+    "recorded bundle, another current": (
+        WITH_BUNDLE,
+        (
+            f"current {OTHER}\nrelease {PREVIOUS} sha256={PREVIOUS_SHA}\n"
+            f"release {OTHER} sha256={PREVIOUS_SHA} current\n"
+        ),
+    ),
+    "recorded bundle, another sha": (
+        WITH_BUNDLE,
+        f"current {PREVIOUS}\nrelease {PREVIOUS} sha256={'e' * 64} current\n",
+    ),
+    "recorded bundle, unrecorded sha": (
+        WITH_BUNDLE,
+        f"current {PREVIOUS}\nrelease {PREVIOUS} sha256=unrecorded current\n",
+    ),
+    "recorded bundle, staged but not current": (
+        WITH_BUNDLE,
+        f"current none\nrelease {PREVIOUS} sha256={PREVIOUS_SHA}\n",
+    ),
+    "no recorded bundle, one current": (IMAGE_ONLY, BUNDLE_STATUS),
+    "no record, one current": (None, BUNDLE_STATUS),
+}
+
+
+@pytest.mark.parametrize(
+    ("previous", "status"), INCONSISTENT_HOSTS.values(), ids=INCONSISTENT_HOSTS.keys()
+)
+def test_a_bundle_other_than_the_recorded_one_stops_the_deploy(deploy, previous, status):
+    run = deploy(previous=previous, status=status)
+    assert run.result.returncode == 1
+    assert steps(run.calls) == [("status",)]
+    assert "host state inconsistent" in run.log
+    assert "fix it by hand" in run.log
+    if previous is None:
+        assert not run.image_file.exists()
+    else:
+        assert run.image_file.read_text() == previous
+    assert not (run.stack / ".env.image.candidate").exists()
+
+
+def test_a_helper_that_cannot_report_its_status_stops_the_deploy(deploy):
+    run = deploy(helper_exits={"status": 1})
+    assert run.result.returncode == 1
+    assert steps(run.calls) == [("status",)]
+    assert "the activation helper cannot report its status" in run.log
+    assert run.image_file.read_text() == WITH_BUNDLE
+
+
+def test_a_short_tag_from_before_adr_020_is_still_a_valid_record(deploy):
+    run = deploy(previous="IMAGE_TAG=main-abcdef0\n", status=NO_BUNDLE_STATUS)
+    promoted(run)
+
+
 # --- the real helper behind the fake sudo -------------------------------------------------
 
 
@@ -471,8 +664,8 @@ def test_end_to_end_tampered_bundle_is_refused_before_docker(deploy):
     tarball_path.write_bytes(tarball_path.read_bytes() + b"\0")
     run = deploy(previous=IMAGE_ONLY, request=f"{CANDIDATE} {digest}", real_helper=True)
     assert run.result.returncode == 1
-    assert steps(run.calls) == [("config", CANDIDATE), ("stage", CANDIDATE, digest)]
-    assert [call["tool"] for call in run.calls] == ["docker", "sudo", "oras"]
+    assert steps(run.calls) == [("status",), ("config", CANDIDATE), ("stage", CANDIDATE, digest)]
+    assert [call["tool"] for call in run.calls] == ["sudo", "docker", "sudo", "oras"]
     assert run.image_file.read_text() == IMAGE_ONLY
     assert not (host.releases / CANDIDATE).exists()
 
@@ -480,11 +673,30 @@ def test_end_to_end_tampered_bundle_is_refused_before_docker(deploy):
 def test_end_to_end_missing_bundle_is_refused_before_docker(deploy):
     run = deploy(previous=IMAGE_ONLY, request=f"{CANDIDATE} {CANDIDATE_SHA}", real_helper=True)
     assert run.result.returncode == 1
-    assert steps(run.calls) == [("config", CANDIDATE), ("stage", CANDIDATE, CANDIDATE_SHA)]
+    assert steps(run.calls) == [
+        ("status",),
+        ("config", CANDIDATE),
+        ("stage", CANDIDATE, CANDIDATE_SHA),
+    ]
     assert run.image_file.read_text() == IMAGE_ONLY
 
 
-def test_end_to_end_rollback_reactivates_the_previous_bundle(deploy):
+def test_end_to_end_promotion_from_a_release_with_a_bundle(deploy):
+    host = deploy.host
+    previous = host.deploy_release(PREVIOUS)
+    digest = host.publish(CANDIDATE)
+    run = deploy(
+        previous=f"IMAGE_TAG={PREVIOUS}\nWORKERS_BUNDLE_SHA256={previous}\n",
+        request=f"{CANDIDATE} {digest}",
+        real_helper=True,
+    )
+    promoted_to = f"IMAGE_TAG={CANDIDATE}\nWORKERS_BUNDLE_SHA256={digest}\n"
+    assert run.result.returncode == 0, run.log
+    assert run.image_file.read_text() == promoted_to
+    assert os.readlink(host.current) == f"releases/{CANDIDATE}"
+
+
+def test_end_to_end_unhealthy_promotion_leaves_the_previous_bundle_alone(deploy):
     host = deploy.host
     previous = host.deploy_release(PREVIOUS)
     recorded = f"IMAGE_TAG={PREVIOUS}\nWORKERS_BUNDLE_SHA256={previous}\n"
@@ -496,8 +708,27 @@ def test_end_to_end_rollback_reactivates_the_previous_bundle(deploy):
         real_helper=True,
     )
     assert run.result.returncode == 1, run.log
+    assert ("stage", CANDIDATE, digest) in steps(run.calls)
+    assert not [step for step in steps(run.calls) if step[0] == "activate"]
     assert os.readlink(host.current) == f"releases/{PREVIOUS}"
     assert sorted(path.name for path in host.releases.iterdir()) == sorted([PREVIOUS, CANDIDATE])
+    assert run.image_file.read_text() == recorded
+
+
+def test_end_to_end_rollback_reactivates_the_previous_bundle(deploy):
+    host = deploy.host
+    unit = "limnopulse-email-worker.service"
+    previous = host.deploy_release(PREVIOUS)
+    recorded = f"IMAGE_TAG={PREVIOUS}\nWORKERS_BUNDLE_SHA256={previous}\n"
+    digest = host.publish(CANDIDATE)
+    # The candidate's activation swaps current, then fails its try-restart.
+    host.env.update(FAKE_ENABLED=unit, FAKE_FAIL_RESTART=unit, FAKE_FAIL_RESTART_RELEASE=CANDIDATE)
+    run = deploy(previous=recorded, request=f"{CANDIDATE} {digest}", real_helper=True)
+    assert run.result.returncode == 1, run.log
+    assert ("activate", CANDIDATE) in steps(run.calls)
+    assert steps(run.calls)[-1] == ("activate", PREVIOUS)
+    assert "rollback failed" not in run.log
+    assert os.readlink(host.current) == f"releases/{PREVIOUS}"
     assert run.image_file.read_text() == recorded
 
 
@@ -867,7 +1098,10 @@ def test_the_workflow_request_is_what_the_forced_command_accepts():
 
 def test_the_workflow_never_stages_tags_from_the_old_short_form():
     assert "{7,40}" not in WORKFLOW.read_text()
-    assert "{7,40}" not in SCRIPT.read_text()
+    # The script takes a short tag only as the release .env.image recorded before ADR-020.
+    assert [line.strip() for line in SCRIPT.read_text().splitlines() if "{7,40}" in line] == [
+        'if [ -f .env.image ] && ! [[ "$PREV_TAG" =~ ^main-[0-9a-f]{7,40}$ ]]; then'
+    ]
 
 
 def test_the_bootstrap_covers_the_helper_dirs_and_every_unit_role():

@@ -9,7 +9,9 @@ import fcntl
 import importlib.machinery
 import importlib.util
 import io
+import json
 import os
+import shutil
 import sys
 import tarfile
 import threading
@@ -278,6 +280,34 @@ def _with_member(member, data=None):
     return tarball(complete(bundle_files(A)), extra=((member, data),))
 
 
+def _built(**build):
+    return tarball(complete(bundle_files(A, **build)))
+
+
+def _service_unit(role_name, unit):
+    """A role table edit that declares `unit` as the role's service unit."""
+
+    def edit(table):
+        for role in table["roles"]:
+            if role["name"] == role_name:
+                role["units"]["service"] = unit
+
+    return edit
+
+
+def _env_with(extra):
+    return tarball(complete(_members_with(**{"bundle.env": bundle_files(A)["bundle.env"] + extra})))
+
+
+def _sums_with(extra):
+    files = complete(bundle_files(A))
+    return tarball({**files, "SHA256SUMS": files["SHA256SUMS"] + extra(files)})
+
+
+def _sums_line(files, path):
+    return f"{sha256(files[path])}  {path}\n".encode()
+
+
 BAD_BUNDLES = {
     "SHA256SUMS lists a wrong digest": _tampered_sums,
     "a file SHA256SUMS does not list": _unlisted_file,
@@ -334,6 +364,21 @@ BAD_BUNDLES = {
     ),
     "a missing binary": lambda: tarball(complete(_members_with(**{"bin/telegram-worker": None}))),
     "not a gzip tarball": lambda: b"not a tarball",
+    # Only limnopulse-* unit names reach /etc/systemd/system, never ssh.service.
+    "a unit outside the limnopulse- names": lambda: _built(
+        edit=_service_unit("email-worker", "ssh.service")
+    ),
+    "a unit declared by two roles": lambda: _built(
+        edit=_service_unit("telegram-worker", "limnopulse-email-worker.service")
+    ),
+    "a floor above its epoch": lambda: _built(floors={FEEDBACK: 2}),
+    "a zero epoch": lambda: _built(epochs={FEEDBACK: 0}),
+    "an epoch for a non-Go role": lambda: _env_with(b"EPOCH_TELEMETRY_INGEST=1\n"),
+    "a floor for an unknown role": lambda: _env_with(b"FLOOR_NOBODY=0\n"),
+    "a repeated bundle.env key": lambda: _env_with(b"BUNDLE_FORMAT=1\n"),
+    "a non-ASCII bundle.env": lambda: _env_with("NOTE=caf\u00e9\n".encode()),
+    "a repeated SHA256SUMS line": lambda: _sums_with(lambda files: _sums_line(files, "bundle.env")),
+    "a non-ASCII SHA256SUMS": lambda: _sums_with(lambda files: "caf\u00e9\n".encode()),
 }
 
 REFUSAL_REASONS = {
@@ -358,6 +403,16 @@ REFUSAL_REASONS = {
     "a missing unit": "missing ['systemd/limnopulse-email-worker.service']",
     "a missing binary": "missing ['bin/telegram-worker']",
     "not a gzip tarball": "not a gzip tarball",
+    "a unit outside the limnopulse- names": "email-worker: roles.json declares an invalid service unit",
+    "a unit declared by two roles": "roles.json declares a unit twice",
+    "a floor above its epoch": f"{FEEDBACK}: rollback needs 0 <= floor <= epoch >= 1",
+    "a zero epoch": f"{FEEDBACK}: rollback needs 0 <= floor <= epoch >= 1",
+    "an epoch for a non-Go role": "sets ['EPOCH_TELEMETRY_INGEST'] for no Go role",
+    "a floor for an unknown role": "sets ['FLOOR_NOBODY'] for no Go role",
+    "a repeated bundle.env key": "malformed or repeated line",
+    "a non-ASCII bundle.env": "bundle.env is not ASCII",
+    "a repeated SHA256SUMS line": "SHA256SUMS lists 'bundle.env' twice",
+    "a non-ASCII SHA256SUMS": "SHA256SUMS is not ASCII",
 }
 
 
@@ -411,6 +466,20 @@ def test_restaging_a_verified_release_is_idempotent(host):
     assert host.run("stage", A, digest).returncode == 0
     assert host.calls() == []
     assert host.snapshot() == before
+
+
+def test_restaging_a_verified_release_still_checks_the_floor(host):
+    # The refusal must come at stage, before the deploy moves Compose, not at activate.
+    old = host.deploy_release(A)
+    host.deploy_release(B, epochs={FEEDBACK: 2}, floors={FEEDBACK: 2})
+    assert (host.releases / A).is_dir()
+    host.reset_calls()
+    before = host.snapshot()
+    result = host.run("stage", A, old)
+    assert result.returncode == 3, result.stderr
+    assert "rollback floor refused" in result.stderr
+    assert host.snapshot() == before
+    assert host.calls() == []
 
 
 def test_restaging_the_current_release_with_another_sha_is_refused(host):
@@ -579,6 +648,63 @@ def test_activate_refuses_a_current_that_is_a_directory(host):
     assert host.current.is_dir() and not host.current.is_symlink()
 
 
+@pytest.mark.parametrize("command", [("status",), ("activate", B), ("deactivate",)])
+def test_a_current_outside_releases_is_refused(host, command):
+    host.deploy_release(A)
+    host.deploy_release(B)
+    elsewhere = host.workers / "elsewhere"
+    shutil.copytree(host.releases / A, elsewhere / A)
+    host.current.unlink()
+    host.current.symlink_to(f"elsewhere/{A}")
+    host.reset_calls()
+    before = host.snapshot()
+    result = host.run(*command)
+    assert result.returncode == 1
+    assert "not a release" in result.stderr
+    assert host.snapshot() == before
+    assert host.calls() == []
+
+
+# Each state file the helper reads, damaged so that it refuses rather than guess.
+MALFORMED_STATE = {
+    "floors not JSON": ("floors.json", b"{", "floors.json is not valid JSON"),
+    "floors a list": ("floors.json", b"[]", "floors.json is malformed"),
+    "floors zero": ("floors.json", b"0", "floors.json is malformed"),
+    "negative floor": ("floors.json", b'{"email-worker": -1}', "floors.json is malformed"),
+    "boolean floor": ("floors.json", b'{"email-worker": true}', "floors.json is malformed"),
+    "units not JSON": ("units.json", b"{", "units.json is not valid JSON"),
+    "units an object": ("units.json", b"{}", "units.json is malformed"),
+    "units false": ("units.json", b"false", "units.json is malformed"),
+    "a foreign unit": ("units.json", b'["ssh.service"]', "units.json is malformed"),
+    "record not JSON": (f"{A}.json", b"{", f"{A}.json is not valid JSON"),
+    "record for another tag": (
+        f"{A}.json",
+        json.dumps({"tag": B, "tarball_sha256": SHA, "manifest_sha256": SHA}).encode(),
+        f"the state record for {A} is malformed",
+    ),
+    "record without a digest": (
+        f"{A}.json",
+        json.dumps({"tag": A, "tarball_sha256": SHA}).encode(),
+        f"the state record for {A} is malformed",
+    ),
+}
+
+
+@pytest.mark.parametrize("command", [("status",), ("activate", A)])
+@pytest.mark.parametrize("case", sorted(MALFORMED_STATE))
+def test_a_malformed_state_file_is_refused(host, case, command):
+    name, data, reason = MALFORMED_STATE[case]
+    host.deploy_release(A)
+    (host.state / name).write_bytes(data)
+    host.reset_calls()
+    before = host.snapshot()
+    result = host.run(*command)
+    assert result.returncode == 1
+    assert reason in result.stderr
+    assert host.snapshot() == before
+    assert host.calls() == []
+
+
 def test_activate_removes_the_units_a_release_dropped(host):
     host.deploy_release(A)
     host.reset_calls()
@@ -675,6 +801,29 @@ def test_two_releases_are_kept_and_never_the_current_one(host):
         f"{C}.json",
         f"{D}.json",
     ]
+
+
+def test_a_release_that_cannot_be_pruned_never_fails_the_command(host):
+    host.deploy_release(A)
+    host.deploy_release(B)
+    stuck = host.releases / A / "bin"
+    stuck.chmod(0o555)
+    try:
+        staged = host.run("stage", C, host.publish(C, epochs={FEEDBACK: 2}, floors={FEEDBACK: 2}))
+        assert staged.returncode == 0, staged.stderr
+        assert f"could not prune {A}" in staged.stderr
+        activated = host.run("activate", C)
+        assert activated.returncode == 0, activated.stderr
+        assert f"could not prune {A}" in activated.stderr
+    finally:
+        stuck.chmod(0o755)
+    assert os.readlink(host.current) == release_link(C)
+    assert f'"{FEEDBACK}": 2' in (host.state / "floors.json").read_text()
+    # The release it could not remove keeps its record, for the next prune.
+    assert (host.state / f"{A}.json").exists()
+    assert host.run("stage", D, host.publish(D, epochs={FEEDBACK: 2})).returncode == 0
+    assert sorted(path.name for path in host.releases.iterdir()) == [C, D]
+    assert not (host.state / f"{A}.json").exists()
 
 
 def test_without_a_current_release_the_newest_two_are_kept(host):

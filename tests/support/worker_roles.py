@@ -110,7 +110,7 @@ LIFECYCLE_FIELDS = {
 UNIT_ONLY_FIELDS = ("units", "env_file", "credentials")
 QUEUE_ALARMS = ("queue-age", "queue-depth", "queue-dlq")
 SNAKE = re.compile(r"^[a-z][a-z0-9_]*$")
-ENV_NAME = re.compile(r"^[A-Z][A-Z0-9_]*$")
+ENV_NAME = re.compile(r"[A-Z][A-Z0-9_]*")
 KEBAB = re.compile(r"^[a-z][a-z0-9-]*$")
 
 
@@ -321,7 +321,7 @@ def _validate_role(
             problems.append(f"{name}: healthcheck must be {role['entrypoint']} healthcheck")
         if not str(role["liveness_file"]).startswith("/tmp/"):
             problems.append(f"{name}: liveness_file lives under the container's /tmp")
-        if not ENV_NAME.match(str(role["host_enable_env"])):
+        if not ENV_NAME.fullmatch(str(role["host_enable_env"])):
             problems.append(f"{name}: host_enable_env must be an environment variable name")
     if name == "ses-feedback-worker" and role.get("single_instance") is not True:
         problems.append("ses-feedback-worker runs as a single instance")

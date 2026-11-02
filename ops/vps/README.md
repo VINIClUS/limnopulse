@@ -317,7 +317,15 @@ This parses the production manifest using the example environment and a dummy
 image tag; it does not start services or contact the VPS. The build workflow
 uses the same gate.
 
-The deploy first reads each profiled worker's host switch through
+The deploy first checks the host. `.env.image` must hold a well-formed
+`IMAGE_TAG` and, if it records one, a well-formed `WORKERS_BUNDLE_SHA256`. The
+helper's `status` must report that recorded release, with that SHA-256, as
+`current`, or `current none` when `.env.image` records no bundle. Otherwise the
+deploy logs "host state inconsistent", changes nothing, and exits 1. Then the
+host needs a fix by hand: activate the recorded release as root, or correct
+`.env.image`, before retrying.
+
+Next it reads each profiled worker's host switch through
 `docker compose config`. For the telemetry ingest worker that switch is
 `TELEMETRY_V2_WRITE_ENABLED` in `.env`. A value the worker could not parse as a
 boolean stops the deploy before anything changes. It then stages the workers
@@ -326,7 +334,9 @@ stops it before anything changes, with the helper's exit code.
 
 Next, Compose starts with the profile of each enabled worker. Each disabled
 worker's container is stopped and removed, so no old-tag container is left
-running. The deploy waits for `api` and each enabled worker to be healthy, then
+running. The deploy clears `COMPOSE_PROFILES`, so a value in `.env` cannot
+start a disabled worker. After `up` it checks that the disabled worker has no
+container. The deploy waits for `api` and each enabled worker to be healthy, then
 activates the bundle. Only then does it record `IMAGE_TAG`
 and `WORKERS_BUNDLE_SHA256` in `.env.image`. Until that last step, Compose
 reads the candidate tag from `.env.image.candidate`.
@@ -336,8 +346,10 @@ the deploy rolls back to the release that `.env.image` records:
 
 - Compose pulls and starts the previous tag under the same host-switch rule,
   with the switches as they are at rollback time.
-- The helper re-activates the previous bundle. If `.env.image` recorded no
-  bundle, as with releases from before ADR-020, it runs `deactivate` instead.
+- If the failure came at or after the activation, the helper re-activates the
+  previous bundle. If `.env.image` recorded no bundle, as with releases from
+  before ADR-020, it runs `deactivate` instead. An earlier failure leaves the
+  bundle alone, since it never moved.
   `deactivate` stops the units it removes. A later `activate` only
   try-restarts, so an enabled role stays stopped until someone starts it again
   or the host reboots.
@@ -346,7 +358,8 @@ the deploy rolls back to the release that `.env.image` records:
   nonzero.
 
 On a first deployment with no previous tag, the deploy stops the candidate
-services and deactivates the bundle, preserving all volumes. Inspect
+services, preserving all volumes, and deactivates the bundle if its activation
+ran. Inspect
 `/var/log/limnopulse-deploy.log` before retrying a failed promotion.
 
 With `TELEMETRY_V2_WRITE_ENABLED=false`, the ingest worker's state after the P3

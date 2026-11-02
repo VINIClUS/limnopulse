@@ -23,6 +23,9 @@
 # -E: the ERR trap (rollback) must also fire inside functions such as activation().
 set -Eeuo pipefail
 export LC_ALL=C
+# Compose also reads COMPOSE_PROFILES from .env, which would start a disabled worker; only the
+# --profile flags this script passes may choose profiles. An empty value overrides the file.
+export COMPOSE_PROFILES=
 
 STACK_DIR="${LIMNOPULSE_STACK_DIR:-/opt/limnopulse}"
 LOG="${LIMNOPULSE_DEPLOY_LOG:-/var/log/limnopulse-deploy.log}"
@@ -120,6 +123,18 @@ start_release() {
     fi
   done
   "$@" "${enabled_profiles[@]}" up -d --remove-orphans >>"$LOG" 2>&1 || return 1
+  # A disabled worker must be gone, however Compose chose its profiles.
+  local remaining
+  for entry in "${PROFILED_WORKERS[@]}"; do
+    read -r service profile _ <<<"$entry"
+    if contains "$service" "${DISABLED_WORKERS[@]}"; then
+      remaining="$("$@" --profile "$profile" ps -a -q "$service" 2>>"$LOG")" || return 1
+      if [ -n "$remaining" ]; then
+        log "disabled worker $service still has a container after up" || true
+        return 1
+      fi
+    fi
+  done
 }
 
 # --- request validation; nothing above this line does deploy I/O ---
@@ -150,6 +165,33 @@ if [ -f .env.image ]; then
   PREV_BUNDLE_SHA256="$(sed -n 's/^WORKERS_BUNDLE_SHA256=//p' .env.image | tail -n 1)"
 fi
 
+# The recorded release must be well formed and be the helper's current bundle (or none when it
+# recorded no bundle). Rollback can then restore it, and staging never prunes it.
+# Releases from before ADR-020 may have short tags.
+host_state_problem() {
+  local status current
+  if [ -f .env.image ] && ! [[ "$PREV_TAG" =~ ^main-[0-9a-f]{7,40}$ ]]; then
+    echo ".env.image has no valid IMAGE_TAG"
+  elif [ -n "$PREV_BUNDLE_SHA256" ] && ! [[ "$PREV_TAG $PREV_BUNDLE_SHA256" =~ $FORCED_COMMAND ]]; then
+    echo ".env.image has an invalid bundle tag or WORKERS_BUNDLE_SHA256"
+  elif ! status="$(activation status 2>>"$LOG")"; then
+    echo "the activation helper cannot report its status"
+  else
+    current="$(sed -n 's/^current //p' <<<"$status")"
+    if [ -z "$PREV_BUNDLE_SHA256" ] && [ "$current" != none ]; then
+      echo ".env.image records no bundle but the helper's current is $current"
+    elif [ -n "$PREV_BUNDLE_SHA256" ] &&
+      ! grep -qxF "release $PREV_TAG sha256=$PREV_BUNDLE_SHA256 current" <<<"$status"; then
+      echo "the helper's current is $current, not the recorded $PREV_TAG bundle"
+    fi
+  fi
+}
+problem="$(host_state_problem)"
+if [ -n "$problem" ]; then
+  log "rejected tag=$TAG: host state inconsistent ($problem); fix it by hand; nothing changed"
+  exit 1
+fi
+
 # The host switches decide which profiled workers this release starts and waits for.
 printf 'IMAGE_TAG=%s\n' "$TAG" > .env.image.candidate
 if ! resolve_workers "${CANDIDATE_COMPOSE[@]}"; then
@@ -169,6 +211,7 @@ if [ "$stage_status" -ne 0 ]; then
   exit "$stage_status"
 fi
 
+ACTIVATION_STARTED=0
 rollback() {
   # Recovery failures must not recursively trigger another rollback.
   trap - ERR
@@ -187,8 +230,11 @@ rollback() {
   fi
   rm -f -- .env.image.candidate .env.image.next || rollback_failed=1
   # Re-activate the previous release from its verified directory, or return to the
-  # "no bundle" state when .env.image recorded none. Never with --override-floor.
-  if [ -n "$PREV_BUNDLE_SHA256" ]; then
+  # "no bundle" state when .env.image recorded none. Never with --override-floor. Before
+  # step 4 the bundle has not moved: the pre-stage check proved it is the recorded one.
+  if [ "$ACTIVATION_STARTED" -eq 0 ]; then
+    log "the workers bundle never moved from ${PREV_TAG:-none}" || true
+  elif [ -n "$PREV_BUNDLE_SHA256" ]; then
     activation activate "$PREV_TAG" >>"$LOG" 2>&1 || bundle_status=$?
   else
     activation deactivate >>"$LOG" 2>&1 || bundle_status=$?
@@ -232,7 +278,8 @@ until all_healthy; do
   sleep 3
 done
 
-# 4. Activate the bundle.
+# 4. Activate the bundle. From here on, a rollback must move the bundle back too.
+ACTIVATION_STARTED=1
 activation activate "$TAG" >>"$LOG" 2>&1
 
 # 5. Record the release. Nothing after the rename may roll it back.

@@ -459,7 +459,9 @@ def read_record(paths: Paths, tag: str) -> dict[str, str] | None:
 
 
 def read_floors(paths: Paths) -> dict[str, int]:
-    floors = read_json(paths.state / FLOORS_FILE) or {}
+    floors = read_json(paths.state / FLOORS_FILE)
+    if floors is None:
+        return {}
     if not isinstance(floors, dict) or not all(
         isinstance(role, str) and type(value) is int and value >= 0
         for role, value in floors.items()
@@ -469,7 +471,9 @@ def read_floors(paths: Paths) -> dict[str, int]:
 
 
 def read_installed_units(paths: Paths) -> list[str]:
-    units = read_json(paths.state / UNITS_FILE) or []
+    units = read_json(paths.state / UNITS_FILE)
+    if units is None:
+        return []
     if not isinstance(units, list) or not all(
         isinstance(unit, str) and UNIT_RE.fullmatch(unit) for unit in units
     ):
@@ -520,22 +524,34 @@ def load_release(paths: Paths, tag: str) -> Metadata:
 
 
 def prune(paths: Paths, keep: set[str | None]) -> None:
-    """Keep `keep` (the current release and its rollback target) up to RELEASES_KEPT."""
+    """Keep `keep` (the current release and its rollback target) up to RELEASES_KEPT.
+
+    Best effort: it runs after the command has done its work, so a release it cannot remove
+    is logged and left, with its record, for the next run.
+    """
     protected = {tag for tag in keep if tag}
-    tags = [name for name in os.listdir(paths.releases) if TAG_RE.fullmatch(name)]
-    others = sorted(
-        (tag for tag in tags if tag not in protected),
-        key=lambda tag: os.lstat(paths.releases / tag).st_mtime_ns,
-        reverse=True,
-    )
-    survivors = protected | set(others[: max(0, RELEASES_KEPT - len(protected))])
-    for tag in tags:
-        if tag not in survivors:
-            log(f"pruning release {tag}")
-            shutil.rmtree(paths.releases / tag)
-    for name in os.listdir(paths.state):
-        if name.endswith(".json") and TAG_RE.fullmatch(name[:-5]) and name[:-5] not in survivors:
-            os.unlink(paths.state / name)
+    try:
+        tags = [name for name in os.listdir(paths.releases) if TAG_RE.fullmatch(name)]
+        others = sorted(
+            (tag for tag in tags if tag not in protected),
+            key=lambda tag: os.lstat(paths.releases / tag).st_mtime_ns,
+            reverse=True,
+        )
+        survivors = protected | set(others[: max(0, RELEASES_KEPT - len(protected))])
+        for tag in tags:
+            if tag not in survivors:
+                log(f"pruning release {tag}")
+                try:
+                    shutil.rmtree(paths.releases / tag)
+                except OSError as error:
+                    log(f"could not prune {tag}, left for the next run: {error}")
+                    survivors.add(tag)
+        for name in os.listdir(paths.state):
+            tag = name.removesuffix(".json")
+            if name.endswith(".json") and TAG_RE.fullmatch(tag) and tag not in survivors:
+                os.unlink(paths.state / name)
+    except OSError as error:
+        log(f"pruning stopped, left for the next run: {error}")
 
 
 def clean_leftovers(paths: Paths) -> None:

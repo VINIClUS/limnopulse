@@ -112,11 +112,19 @@ The SSH forced command accepts exactly `main-<40 hex> <64 hex>`: the release tag
 bundle SHA-256. `deploy.yml` computes the SHA-256 after pulling the bundle and verifying
 its attestation.
 
+Before step 1 the deploy checks the host. `.env.image` must hold a well-formed
+`IMAGE_TAG` and, if it records one, a well-formed `WORKERS_BUNDLE_SHA256`. The helper's
+current bundle must be that recorded release with that SHA-256, or none when `.env.image`
+records none. Otherwise the deploy stops before anything changes, and the host needs a
+fix by hand.
+
 1. Stage the bundle. A missing or tampered bundle stops the deploy before anything
    changes.
 2. Pull and start Compose with each profile in `deploy.compose_profiles` whose role is
    enabled on the host. Stop and remove each disabled role's service explicitly: a plain
-   `up -d` without its profile would leave an old-tag container running.
+   `up -d` without its profile would leave an old-tag container running. Only these
+   `--profile` flags choose profiles. The deploy clears `COMPOSE_PROFILES`, which `.env`
+   could otherwise set, and after `up` it checks that each disabled role has no container.
 3. Wait for `api` and each enabled profiled worker to be healthy.
 4. Activate the bundle.
 5. Record `IMAGE_TAG` and `WORKERS_BUNDLE_SHA256` in `.env.image`.
@@ -129,7 +137,14 @@ stops the deploy before anything changes. The switch is not `enable_variable`, w
 gates the role's AWS resources in OpenTofu. An enabled worker that cannot run, parked on
 a configuration error for example, never turns healthy, so it fails the deploy.
 
-Rollback moves the API, the profiled Compose workers and the bundle back to the previous
-tag, re-activating that release from its already verified directory. When the previous
-release had no bundle, rollback runs `deactivate`. Rollback applies the same host-switch
-rule, with the switch as it is at rollback time.
+**Refinement of ADR-020.** ADR-020 says the deploy passes the ingest worker's profile
+explicitly on promotion and rollback. That holds only while the worker's host switch is
+on. With the switch off, the worker would park on exit 78, never turn healthy, and so fail
+every promotion. The deploy therefore removes it instead. ADR-020 itself is unchanged, and
+this section is the rule.
+
+Rollback moves the API and the profiled Compose workers back to the previous tag, applying
+the same host-switch rule with the switch as it is at rollback time. The bundle moves back
+only if step 4 ran; before that it never moved. Then rollback re-activates the previous
+release from its already verified directory, or runs `deactivate` when the previous
+release had no bundle.

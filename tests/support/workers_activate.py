@@ -16,6 +16,7 @@ import os
 import subprocess
 import sys
 import tarfile
+from collections.abc import Callable
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
@@ -59,8 +60,10 @@ if args[:1] == ["is-enabled"]:
     enabled = args[1] in split("FAKE_ENABLED")
     print("enabled" if enabled else "disabled")
     sys.exit(0 if enabled else 1)
+failing_release = os.environ.get("FAKE_FAIL_RESTART_RELEASE")
 if args[:1] == ["try-restart"] and args[1] in split("FAKE_FAIL_RESTART"):
-    sys.exit(1)
+    if not failing_release or target == f"releases/{failing_release}":
+        sys.exit(1)
 if args[:1] and args[0] in split("FAKE_FAIL_SYSTEMCTL"):
     sys.exit(1)
 """
@@ -79,13 +82,16 @@ helper = os.environ["FAKE_ACTIVATE"]
 os.execve(sys.executable, [sys.executable, "-I", helper, *args[2:]], env)
 """
 
-# A scripted helper for deploy-flow tests: FAKE_HELPER_EXITS maps "stage", "activate",
-# "activate:<tag>" or "deactivate" to an exit code (default 0).
+# A scripted helper for deploy-flow tests: FAKE_HELPER_EXITS maps "status", "stage",
+# "activate", "activate:<tag>" or "deactivate" to an exit code (default 0). `status` prints
+# FAKE_HELPER_STATUS.
 FAKE_HELPER = """\
 import json, os, sys
 args = sys.argv[1:]
 exits = json.loads(os.environ.get("FAKE_HELPER_EXITS") or "{}")
 key = f"{args[0]}:{args[1]}" if len(args) > 1 and args[0] == "activate" else args[0]
+if args == ["status"]:
+    sys.stdout.write(os.environ["FAKE_HELPER_STATUS"])
 sys.exit(exits.get(key, exits.get(args[0], 0)))
 """
 
@@ -115,10 +121,16 @@ def bundle_files(
     epochs: dict[str, int] | None = None,
     floors: dict[str, int] | None = None,
     drop_roles: tuple[str, ...] = (),
+    edit: Callable[[dict[str, Any]], None] | None = None,
 ) -> dict[str, bytes]:
-    """The files of a bundle built from roles.yaml, without SHA256SUMS."""
+    """The files of a bundle built from roles.yaml, without SHA256SUMS.
+
+    `edit` changes the role table before the bundle is built from it.
+    """
     table = copy.deepcopy(load_roles())
     table["roles"] = [role for role in table["roles"] if role["name"] not in drop_roles]
+    if edit is not None:
+        edit(table)
     files: dict[str, bytes] = {}
     env = ["BUNDLE_FORMAT=1", f"BUNDLE_TAG={release}"]
     for role in table["roles"]:
