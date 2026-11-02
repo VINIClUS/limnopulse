@@ -9,6 +9,7 @@ import (
 	"time"
 
 	"github.com/VINIClUS/limnopulse/internal/notifications"
+	"github.com/VINIClUS/limnopulse/internal/workerflag"
 )
 
 const (
@@ -103,6 +104,24 @@ func Load(args []string, lookup LookupEnv) (RunConfig, error) {
 		}
 		config.TelegramDeliveryEnabled = parsed
 	}
+
+	fs := flag.NewFlagSet("notification-relay", flag.ContinueOnError)
+	fs.SetOutput(io.Discard)
+	relayTime := ""
+	fs.StringVar(&relayTime, "relay-time", "", "logical RFC3339 relay time")
+	fs.IntVar(&config.Shard, "shard", config.Shard, "logical shard number")
+	fs.IntVar(&config.ShardCount, "shard-count", config.ShardCount, "logical shard count")
+	fs.IntVar(&config.QueryParallelism, "query-parallelism", config.QueryParallelism, "parallel GSI queries")
+	fs.IntVar(&config.WorkParallelism, "work-parallelism", config.WorkParallelism, "parallel relay work")
+	fs.IntVar(&config.MaxWork, "max-work", config.MaxWork, "maximum work items per run")
+	fs.IntVar(&config.FanoutPageSize, "fanout-page-size", config.FanoutPageSize, "fanout transaction page size")
+	if err = workerflag.Parse(fs, args); err != nil {
+		return RunConfig{}, err
+	}
+	if len(fs.Args()) != 0 {
+		return RunConfig{}, fmt.Errorf("relay does not accept positional arguments")
+	}
+	// After the flags, so -h prints the usage without any environment.
 	for _, required := range []struct {
 		name  string
 		value string
@@ -115,27 +134,10 @@ func Load(args []string, lookup LookupEnv) (RunConfig, error) {
 			return RunConfig{}, fmt.Errorf("%s is required", required.name)
 		}
 	}
-
-	fs := flag.NewFlagSet("notifications relay", flag.ContinueOnError)
-	fs.SetOutput(io.Discard)
-	relayTime := ""
-	fs.StringVar(&relayTime, "relay-time", "", "logical RFC3339 relay time")
-	fs.IntVar(&config.Shard, "shard", config.Shard, "logical shard number")
-	fs.IntVar(&config.ShardCount, "shard-count", config.ShardCount, "logical shard count")
-	fs.IntVar(&config.QueryParallelism, "query-parallelism", config.QueryParallelism, "parallel GSI queries")
-	fs.IntVar(&config.WorkParallelism, "work-parallelism", config.WorkParallelism, "parallel relay work")
-	fs.IntVar(&config.MaxWork, "max-work", config.MaxWork, "maximum work items per run")
-	fs.IntVar(&config.FanoutPageSize, "fanout-page-size", config.FanoutPageSize, "fanout transaction page size")
-	if err = fs.Parse(args); err != nil {
-		return RunConfig{}, err
-	}
-	if len(fs.Args()) != 0 {
-		return RunConfig{}, fmt.Errorf("relay does not accept positional arguments")
-	}
 	if relayTime != "" {
 		parsed, parseErr := time.Parse(time.RFC3339Nano, relayTime)
 		if parseErr != nil {
-			return RunConfig{}, fmt.Errorf("relay-time: %w", parseErr)
+			return RunConfig{}, fmt.Errorf("--relay-time: %w", parseErr)
 		}
 		parsed = parsed.UTC()
 		config.RelayTime = &parsed
@@ -143,8 +145,16 @@ func Load(args []string, lookup LookupEnv) (RunConfig, error) {
 	if _, err = notifications.OwnedRelayBuckets(config.Shard, config.ShardCount); err != nil {
 		return RunConfig{}, err
 	}
-	if config.QueryParallelism < 1 || config.WorkParallelism < 1 || config.MaxWork < 1 {
-		return RunConfig{}, fmt.Errorf("parallelism and work limits must be positive")
+	for _, limit := range []struct {
+		name  string
+		value int
+	}{
+		{"query-parallelism", config.QueryParallelism}, {"work-parallelism", config.WorkParallelism},
+		{"max-work", config.MaxWork},
+	} {
+		if limit.value < 1 {
+			return RunConfig{}, fmt.Errorf("%s must be positive", limit.name)
+		}
 	}
 	if config.FanoutPageSize < 1 || config.FanoutPageSize > 99 {
 		return RunConfig{}, fmt.Errorf("fanout-page-size must be between 1 and 99")

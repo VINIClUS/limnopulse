@@ -20,9 +20,14 @@ def test_phase3c_operations_document_rollout_order_and_rollback_are_explicit() -
     )
     positions = [normalized.index(step) for step in ordered_rollout]
     assert positions == sorted(positions)
-    assert "`notifications backfill-relay`" in normalized
-    assert "`notifications relay`" in normalized
-    assert "`notifications worker`" in normalized
+    # ADR-020: one executable per role, the backfill an operator command.
+    assert "`limnopulse-admin backfill-relay`" in normalized
+    assert "`notification-relay`" in normalized
+    assert "`email-worker`" in normalized
+    assert "`ses-feedback-worker`" in normalized
+    assert "notifications relay" not in normalized
+    assert "notifications backfill-relay" not in normalized
+    assert "| 78 | Configuration error" in normalized
     assert "Never run an automatic DLQ consumer" in normalized
     assert "turn off the relay first" in normalized
     assert "preserve DynamoDB delivery and attempt rows" in normalized

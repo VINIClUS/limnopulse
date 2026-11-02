@@ -1,9 +1,12 @@
 package config
 
 import (
+	"errors"
 	"strings"
 	"testing"
 	"time"
+
+	"github.com/VINIClUS/limnopulse/internal/workerflag"
 )
 
 func TestLoadAcceptsRelayFlagsAndRequiredEnvironment(t *testing.T) {
@@ -148,5 +151,31 @@ func requiredLookup() LookupEnv {
 	return func(key string) (string, bool) {
 		value, ok := values[key]
 		return value, ok
+	}
+}
+
+func TestLoadNamesTheFlagThatFailed(t *testing.T) {
+	for _, test := range []struct {
+		args   []string
+		prefix string
+	}{
+		{[]string{"--query-parallelism=0"}, "query-parallelism must be positive"},
+		{[]string{"--work-parallelism=0"}, "work-parallelism must be positive"},
+		{[]string{"--max-work=0"}, "max-work must be positive"},
+		{[]string{"--shard-count=65"}, "--shard-count must be between 1 and 64"},
+		{[]string{"--shard=1", "--shard-count=1"}, "--shard must be between 0 and --shard-count minus 1"},
+	} {
+		if _, err := Load(test.args, requiredLookup()); err == nil || !strings.HasPrefix(err.Error(), test.prefix) {
+			t.Fatalf("Load(%v) error = %v, want %q", test.args, err, test.prefix)
+		}
+	}
+}
+
+func TestLoadAnswersHelpWithoutAnyEnvironment(t *testing.T) {
+	var help *workerflag.Help
+	_, err := Load([]string{"-h"}, func(string) (string, bool) { return "", false })
+	if !errors.As(err, &help) || !strings.HasPrefix(help.Usage, "Usage of notification-relay:\n") ||
+		!strings.Contains(help.Usage, "-max-work") {
+		t.Fatalf("Load(-h) error = %v", err)
 	}
 }

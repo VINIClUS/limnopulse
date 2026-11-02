@@ -7,6 +7,8 @@ import (
 	"sync/atomic"
 	"testing"
 	"time"
+
+	"github.com/VINIClUS/limnopulse/internal/workerproc"
 )
 
 func TestRunnerStopsReceivingAndGracefullyDrainsInflightWork(t *testing.T) {
@@ -387,6 +389,7 @@ type runnerQueue struct {
 	receiveWait     chan time.Duration
 	receiveMax      chan int
 	changedMessages chan QueueMessage
+	deleted         chan struct{}
 }
 
 func newRunnerQueue(messages []QueueMessage) *runnerQueue { return &runnerQueue{initial: messages} }
@@ -421,6 +424,9 @@ func (queue *runnerQueue) Receive(ctx context.Context, max int, wait time.Durati
 }
 func (queue *runnerQueue) Delete(context.Context, QueueMessage) error {
 	queue.deletes.Add(1)
+	if queue.deleted != nil {
+		close(queue.deleted)
+	}
 	return queue.deleteError
 }
 func (queue *runnerQueue) ChangeVisibility(_ context.Context, message QueueMessage, _ time.Duration) error {
@@ -429,4 +435,147 @@ func (queue *runnerQueue) ChangeVisibility(_ context.Context, message QueueMessa
 		queue.changedMessages <- message
 	}
 	return queue.changeError
+}
+
+func TestRunnerReportsReadyOnceAndProgressOnEmptyReceives(t *testing.T) {
+	queue := &emptyQueue{}
+	loop := &recordingLoop{turns: make(chan struct{}, 1)}
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan RunSummary, 1)
+	go func() {
+		done <- (Runner{Queue: queue, Handler: handlerFunc(func(context.Context, QueueMessage) Decision {
+			return Decision{Action: ActionDelete}
+		}), Concurrency: 1, ReceiveBatch: 10, Visibility: time.Minute, Loop: loop}).Run(ctx)
+	}()
+	for range 3 {
+		<-loop.turns
+	}
+	cancel()
+	summary := <-done
+	if !summary.Graceful || summary.Fatal || summary.MessagesReceived != 0 {
+		t.Fatalf("summary = %#v", summary)
+	}
+	if loop.ready.Load() != 1 || loop.progress.Load() < 3 {
+		t.Fatalf("ready=%d progress=%d", loop.ready.Load(), loop.progress.Load())
+	}
+}
+
+func TestRunnerReportsProgressWhenAMessageFinishes(t *testing.T) {
+	queue := newRunnerQueue([]QueueMessage{{MessageID: "m1", ReceiptHandle: "r1"}})
+	loop := &recordingLoop{}
+	finished := make(chan struct{})
+	handler := handlerFunc(func(context.Context, QueueMessage) Decision {
+		return Decision{Action: ActionDelete}
+	})
+	queue.deleted = finished
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan RunSummary, 1)
+	go func() {
+		done <- (Runner{Queue: queue, Handler: handler, Concurrency: 1, ReceiveBatch: 10,
+			ReceiveWait: 20 * time.Second, Visibility: time.Minute, Loop: loop}).Run(ctx)
+	}()
+	<-finished
+	cancel()
+	summary := <-done
+	// One mark for the receive turn and one for the finished message.
+	if summary.MessagesDeleted != 1 || loop.ready.Load() != 1 || loop.progress.Load() < 2 {
+		t.Fatalf("summary=%#v ready=%d progress=%d", summary, loop.ready.Load(), loop.progress.Load())
+	}
+}
+
+func TestRunnerStopsWithoutHandlingWhenReadinessCannotBeReported(t *testing.T) {
+	queue := newRunnerQueue([]QueueMessage{{MessageID: "m1", ReceiptHandle: "r1"}})
+	loop := &recordingLoop{readyErr: errors.New("notify socket gone")}
+	var handled atomic.Int32
+	summary := (Runner{Queue: queue, Handler: handlerFunc(func(context.Context, QueueMessage) Decision {
+		handled.Add(1)
+		return Decision{Action: ActionDelete}
+	}), Concurrency: 1, ReceiveBatch: 10, ReceiveWait: 20 * time.Second, Visibility: time.Minute,
+		Loop: loop}).Run(context.Background())
+	if !summary.Fatal || summary.ExitCode != 1 || handled.Load() != 0 ||
+		summary.ErrorCategories["readiness_notification_failure"] != 1 || loop.progress.Load() != 0 {
+		t.Fatalf("summary=%#v handled=%d progress=%d", summary, handled.Load(), loop.progress.Load())
+	}
+}
+
+type recordingLoop struct {
+	readyErr error
+	ready    atomic.Int32
+	progress atomic.Int32
+	turns    chan struct{}
+}
+
+func (loop *recordingLoop) Ready() error {
+	loop.ready.Add(1)
+	return loop.readyErr
+}
+
+func (loop *recordingLoop) Progress() {
+	loop.progress.Add(1)
+	if loop.turns != nil {
+		select {
+		case loop.turns <- struct{}{}:
+		default:
+		}
+	}
+}
+
+type emptyQueue struct{}
+
+func (*emptyQueue) Receive(ctx context.Context, _ int, _ time.Duration, _ time.Duration) ([]QueueMessage, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	return nil, nil
+}
+func (*emptyQueue) Delete(context.Context, QueueMessage) error { return nil }
+func (*emptyQueue) ChangeVisibility(context.Context, QueueMessage, time.Duration) error {
+	return nil
+}
+
+// waitingHandler stands for a send waiting on the rate limiter: it returns only when its
+// context ends.
+type waitingHandler struct{ started, aborted chan struct{} }
+
+func (handler waitingHandler) Handle(ctx context.Context, _ QueueMessage) Decision {
+	close(handler.started)
+	<-ctx.Done()
+	close(handler.aborted)
+	return Decision{Action: ActionChangeVisibility, Visibility: time.Second}
+}
+
+func TestRunnerAbortsInflightWorkAtOnceWhenTheLoopStalls(t *testing.T) {
+	for _, test := range []struct {
+		cause       error
+		wantAborted bool
+	}{
+		{cause: workerproc.ErrStalled, wantAborted: true},
+		// A stop signal keeps the drain budget, so the waiter is still running before it ends.
+		{cause: workerproc.ErrStopSignal},
+	} {
+		queue := newRunnerQueue([]QueueMessage{{MessageID: "m1", ReceiptHandle: "r1"}})
+		handler := waitingHandler{started: make(chan struct{}), aborted: make(chan struct{})}
+		runner := Runner{Queue: queue, Handler: handler, Concurrency: 1, ReceiveBatch: 1,
+			ReceiveWait: time.Second, Visibility: time.Minute, DrainTimeout: 2 * time.Second}
+		ctx, cancel := context.WithCancelCause(context.Background())
+		done := make(chan RunSummary, 1)
+		go func() { done <- runner.Run(ctx) }()
+		<-handler.started
+		cancel(test.cause)
+		select {
+		case <-handler.aborted:
+			if !test.wantAborted {
+				t.Fatalf("cause %v: in-flight work was aborted before the drain budget", test.cause)
+			}
+			<-done
+		case <-time.After(500 * time.Millisecond):
+			if test.wantAborted {
+				t.Fatalf("cause %v: in-flight work kept running after a stall", test.cause)
+			}
+			// The drain budget ends it instead.
+			if summary := <-done; !summary.DrainTimedOut {
+				t.Fatalf("cause %v: summary = %#v", test.cause, summary)
+			}
+		}
+	}
 }

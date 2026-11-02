@@ -5,6 +5,8 @@ import (
 	"strings"
 	"testing"
 	"time"
+
+	"github.com/VINIClUS/limnopulse/internal/workerproc"
 )
 
 func TestLoadDefaultsAndWorkerEnvironment(t *testing.T) {
@@ -51,7 +53,7 @@ func TestLoadAllowsFakeMessageIDOnlyForLocalFakeSender(t *testing.T) {
 		"SQS_NOTIFICATION_JOBS_URL": "https://sqs/jobs", "SQS_SES_EVENTS_URL": "https://sqs/events",
 		"SES_FROM_EMAIL": "alerts@example.com", "NOTIFICATION_FAKE_MESSAGE_ID": "provider_message_1",
 	}
-	if _, err := Load(nil, lookup(base)); err == nil || !strings.Contains(err.Error(), "fake message ID") {
+	if _, err := Load(nil, lookup(base)); err == nil || !strings.Contains(err.Error(), "NOTIFICATION_FAKE_MESSAGE_ID requires") {
 		t.Fatalf("AWS sender accepted fake message ID: %v", err)
 	}
 	base["NOTIFICATION_EMAIL_SENDER_MODE"] = "success"
@@ -60,7 +62,7 @@ func TestLoadAllowsFakeMessageIDOnlyForLocalFakeSender(t *testing.T) {
 	}
 	base["APP_ENV"] = "prod"
 	base["NOTIFICATION_MAX_SEND_RATE"] = "1"
-	if _, err := Load(nil, lookup(base)); err == nil || !strings.Contains(err.Error(), "fake email sender") {
+	if _, err := Load(nil, lookup(base)); err == nil || !strings.Contains(err.Error(), "NOTIFICATION_EMAIL_SENDER_MODE must be aws") {
 		t.Fatalf("production accepted fake sender: %v", err)
 	}
 }
@@ -145,9 +147,108 @@ func TestLoadRejectsInvalidSESConfigurationSetName(t *testing.T) {
 	}
 }
 
+func TestLoadEmailNeedsNoFeedbackQueueAndAcceptsNoFeedbackSetting(t *testing.T) {
+	base := map[string]string{
+		"APP_ENV": "local", "AWS_REGION": "sa-east-1", "DYNAMODB_DOMAIN_TABLE": "domain",
+		"SQS_NOTIFICATION_JOBS_URL": "https://sqs/jobs", "SES_FROM_EMAIL": "alerts@example.com",
+		// The email-only loader never reads these, so neither a shared queue nor a bad
+		// number can fail it.
+		"SQS_SES_EVENTS_URL": "https://sqs/jobs", "NOTIFICATION_FEEDBACK_CONCURRENCY": "many",
+	}
+	loaded, err := LoadEmail([]string{"--send-concurrency=3"}, lookup(base))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if loaded.SQSFeedbackURL != "" || loaded.FeedbackConcurrency != 0 ||
+		loaded.SQSQueueURL != "https://sqs/jobs" || loaded.SendConcurrency != 3 {
+		t.Fatalf("email config = %#v", loaded)
+	}
+	if _, err := LoadEmail([]string{"--feedback-concurrency=2"}, lookup(base)); !workerproc.IsConfiguration(err) {
+		t.Fatalf("email-only loader accepted a feedback flag: %v", err)
+	}
+}
+
+func TestLoadReportsBadFlagsAsConfigurationErrors(t *testing.T) {
+	base := map[string]string{
+		"APP_ENV": "local", "AWS_REGION": "sa-east-1", "DYNAMODB_DOMAIN_TABLE": "domain",
+		"SQS_NOTIFICATION_JOBS_URL": "https://sqs/jobs", "SES_FROM_EMAIL": "alerts@example.com",
+	}
+	for _, args := range [][]string{{"--unknown"}, {"--send-concurrency=x"}, {"--receive-wait"}} {
+		if _, err := LoadEmail(args, lookup(base)); !workerproc.IsConfiguration(err) {
+			t.Fatalf("LoadEmail(%v) error = %v, want a configuration error", args, err)
+		}
+	}
+	base["NOTIFICATION_SEND_BURST"] = "x"
+	if _, err := LoadEmail(nil, lookup(base)); err == nil || !strings.Contains(err.Error(), "NOTIFICATION_SEND_BURST") {
+		t.Fatalf("bad burst error = %v", err)
+	}
+}
+
+func TestLoadTakesAnExplicitProductionRateFromTheFlag(t *testing.T) {
+	loaded, err := LoadEmail([]string{"--max-send-rate=2"}, lookup(map[string]string{
+		"APP_ENV": "prod", "AWS_REGION": "sa-east-1", "DYNAMODB_DOMAIN_TABLE": "domain",
+		"SQS_NOTIFICATION_JOBS_URL": "https://sqs/jobs", "SES_FROM_EMAIL": "alerts@example.com",
+	}))
+	if err != nil || loaded.MaxSendRate != 2 {
+		t.Fatalf("config=%#v err=%v", loaded, err)
+	}
+}
+
+func TestHostedEnvironmentAndQueueTiming(t *testing.T) {
+	for appEnv, want := range map[string]bool{"local": false, "test": false, "staging": true, "prod": true} {
+		if hosted, err := HostedEnvironment(appEnv); err != nil || hosted != want {
+			t.Fatalf("HostedEnvironment(%q) = %t, %v", appEnv, hosted, err)
+		}
+	}
+	if _, err := HostedEnvironment("dev"); err == nil {
+		t.Fatal("unknown APP_ENV was accepted")
+	}
+	for _, test := range []struct {
+		hosted            bool
+		wait, visibility  time.Duration
+		wantErrorFragment string
+	}{
+		{hosted: true, wait: 0, visibility: InvalidVisibility, wantErrorFragment: "--receive-wait may be 0s"},
+		{hosted: true, wait: ReceiveWait, visibility: time.Second, wantErrorFragment: "--invalid-visibility may be overridden"},
+		{wait: 21 * time.Second, visibility: InvalidVisibility, wantErrorFragment: "--receive-wait must be a whole number"},
+		{wait: ReceiveWait, visibility: 13 * time.Hour, wantErrorFragment: "--invalid-visibility must be a whole number"},
+	} {
+		err := ValidateQueueTiming(test.hosted, test.wait, test.visibility)
+		if err == nil || !strings.Contains(err.Error(), test.wantErrorFragment) {
+			t.Fatalf("ValidateQueueTiming(%+v) = %v", test, err)
+		}
+	}
+	if err := ValidateQueueTiming(true, ReceiveWait, InvalidVisibility); err != nil {
+		t.Fatal(err)
+	}
+}
+
 func lookup(values map[string]string) LookupEnv {
 	return func(key string) (string, bool) {
 		value, ok := values[key]
 		return value, ok
+	}
+}
+
+func TestLoadNamesTheSettingThatFailed(t *testing.T) {
+	base := map[string]string{
+		"APP_ENV": "local", "AWS_REGION": "sa-east-1", "DYNAMODB_DOMAIN_TABLE": "domain",
+		"SQS_NOTIFICATION_JOBS_URL": "https://sqs/jobs", "SES_FROM_EMAIL": "alerts@example.com",
+		"SQS_SES_EVENTS_URL": "https://sqs/events",
+	}
+	for _, test := range []struct {
+		args   []string
+		prefix string
+	}{
+		{[]string{"--send-concurrency=0"}, "--send-concurrency (NOTIFICATION_SEND_CONCURRENCY) must be positive"},
+		{[]string{"--feedback-concurrency=0"}, "--feedback-concurrency (NOTIFICATION_FEEDBACK_CONCURRENCY) must be positive"},
+		{[]string{"--max-send-rate=0"}, "--max-send-rate (NOTIFICATION_MAX_SEND_RATE) must be a positive number"},
+		{[]string{"--max-send-rate=+Inf"}, "--max-send-rate (NOTIFICATION_MAX_SEND_RATE) must be a positive number"},
+		{[]string{"--send-burst=0"}, "--send-burst (NOTIFICATION_SEND_BURST) must be positive"},
+		{[]string{"--invalid-visibility=0s"}, "--invalid-visibility must be a whole number"},
+	} {
+		if _, err := Load(test.args, lookup(base)); err == nil || !strings.HasPrefix(err.Error(), test.prefix) {
+			t.Fatalf("Load(%v) error = %v, want %q", test.args, err, test.prefix)
+		}
 	}
 }

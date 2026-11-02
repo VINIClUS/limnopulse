@@ -29,6 +29,32 @@ ROOT = Path(__file__).resolve().parents[2]
 RUN_INTEGRATION = os.getenv("RUN_NOTIFICATION_INTEGRATION") == "1"
 SQS_ENDPOINT = "http://127.0.0.1:9324"
 TELEGRAM_FAKE_ENDPOINT = "http://127.0.0.1:8089"
+# ADR-020: one executable per worker role.
+ROLE_BINARIES = (
+    "alert-evaluator",
+    "notification-relay",
+    "email-worker",
+    "ses-feedback-worker",
+    "telegram-worker",
+    "limnopulse-admin",
+)
+# The arguments that ask each executable for its usage; the flag set's name heads it.
+HELP_REQUESTS = {
+    "alert-evaluator": (["run", "-h"], "alert-evaluator run"),
+    "notification-relay": (["-h"], "notification-relay"),
+    "email-worker": (["-h"], "email-worker"),
+    "ses-feedback-worker": (["-h"], "ses-feedback-worker"),
+    "telegram-worker": (["-h"], "telegram-worker"),
+    "limnopulse-admin": (["backfill-relay", "-h"], "limnopulse-admin backfill-relay"),
+}
+# A developer shell or CI runner must not make a test process look systemd-supervised.
+SUPERVISOR_ENVIRONMENT = (
+    "NOTIFY_SOCKET",
+    "WATCHDOG_USEC",
+    "WATCHDOG_PID",
+    "CREDENTIALS_DIRECTORY",
+    "LIMNOPULSE_SUPERVISOR",
+)
 
 
 pytestmark = pytest.mark.skipif(
@@ -39,7 +65,7 @@ pytestmark = pytest.mark.skipif(
 
 @dataclass(frozen=True)
 class Runtime:
-    binary: Path
+    binaries: Path
     dynamodb: Any
     table: Any
     sqs: Any
@@ -124,41 +150,58 @@ def _create_queue_set(sqs: Any, prefix: str) -> dict[str, str]:
 
 
 @pytest.fixture(scope="session")
-def notification_binary(tmp_path_factory: pytest.TempPathFactory) -> Path:
-    binary = tmp_path_factory.mktemp("notification-bin") / "notifications"
+def notification_binaries(tmp_path_factory: pytest.TempPathFactory) -> Path:
+    directory = tmp_path_factory.mktemp("notification-bin")
     subprocess.run(
-        ["go", "build", "-trimpath", "-o", str(binary), "./cmd/notifications"],
+        [
+            "go",
+            "build",
+            "-trimpath",
+            "-o",
+            f"{directory}{os.sep}",
+            *(f"./cmd/{name}" for name in ROLE_BINARIES),
+        ],
         cwd=ROOT,
         check=True,
-        timeout=120,
+        timeout=300,
     )
-    return binary
+    for name in ROLE_BINARIES:
+        assert (directory / name).is_file(), name
+    return directory
+
+
+@pytest.fixture(scope="session")
+def telegram_fake() -> None:
+    """Load the Compose WireMock mapping into the fake, which may run without the mount."""
+    mapping = (ROOT / "infra/telegram/wiremock/send-message.json").read_bytes()
+    request = urllib.request.Request(
+        f"{TELEGRAM_FAKE_ENDPOINT}/__admin/mappings",
+        data=mapping,
+        method="POST",
+        headers={"Content-Type": "application/json"},
+    )
+    try:
+        with urllib.request.urlopen(request, timeout=5):
+            pass
+    except OSError as error:
+        pytest.fail(f"could not load the local Telegram fake mapping: {error}")
 
 
 @pytest.fixture
-def runtime(notification_binary: Path) -> Iterator[Runtime]:
+def runtime(notification_binaries: Path) -> Iterator[Runtime]:
     dynamodb = _aws_client("dynamodb", "http://127.0.0.1:8001")
     sqs = _aws_client("sqs", SQS_ENDPOINT)
     suffix = uuid.uuid4().hex[:12]
     table_name = f"LimnopulseNotificationsIntegration-{suffix}"
     try:
         ensure_table(dynamodb, table_name, include_alert_indexes=True)
-        queue_names = {url.rsplit("/", 1)[-1] for url in sqs.list_queues().get("QueueUrls", [])}
+        sqs.list_queues()
     except EndpointConnectionError as error:
         pytest.fail(
             "local notification integration requires `docker compose up -d dynamodb-local elasticmq`: "
             f"{error}"
         )
-    required_queue_names = {
-        "limnopulse-notification-jobs",
-        "limnopulse-notification-jobs-dlq",
-        "limnopulse-ses-events",
-        "limnopulse-ses-events-dlq",
-        "limnopulse-ses-events-routing-dlq",
-        "limnopulse-telegram-notification-jobs",
-        "limnopulse-telegram-notification-jobs-dlq",
-    }
-    assert required_queue_names <= queue_names
+    # Each test creates its own queues; the Compose defaults need not exist.
     queue_urls = _create_queue_set(sqs, f"limnopulse-it-{suffix}")
 
     resource = boto3.resource(
@@ -170,7 +213,7 @@ def runtime(notification_binary: Path) -> Iterator[Runtime]:
         config=Config(connect_timeout=2, read_timeout=5, retries={"max_attempts": 1}),
     )
     current = Runtime(
-        binary=notification_binary,
+        binaries=notification_binaries,
         dynamodb=dynamodb,
         table=resource.Table(table_name),
         sqs=sqs,
@@ -250,14 +293,25 @@ def _telegram_content_hash(template_id: str, body_text: str) -> str:
     return digest.hexdigest()
 
 
-def _base_environment(runtime: Runtime, mode: str) -> dict[str, str]:
+def _local_environment() -> dict[str, str]:
     environment = os.environ.copy()
+    for name in SUPERVISOR_ENVIRONMENT:
+        environment.pop(name, None)
     environment.update(
         {
             "APP_ENV": "local",
             "AWS_ACCESS_KEY_ID": "local",
             "AWS_SECRET_ACCESS_KEY": "local",
             "AWS_EC2_METADATA_DISABLED": "true",
+        }
+    )
+    return environment
+
+
+def _base_environment(runtime: Runtime, mode: str) -> dict[str, str]:
+    environment = _local_environment()
+    environment.update(
+        {
             "AWS_REGION": "us-east-1",
             "DYNAMODB_DOMAIN_TABLE": runtime.table.name,
             "DYNAMODB_ENDPOINT_URL": "http://127.0.0.1:8001",
@@ -274,31 +328,51 @@ def _base_environment(runtime: Runtime, mode: str) -> dict[str, str]:
     return environment
 
 
+@dataclass(frozen=True)
+class Workers:
+    """email-worker and ses-feedback-worker, the two SES consumers, as separate processes."""
+
+    email: subprocess.Popen[str]
+    feedback: subprocess.Popen[str]
+
+    def poll(self) -> int | None:
+        codes = [self.email.poll(), self.feedback.poll()]
+        return None if None in codes else max(code for code in codes if code is not None)
+
+
+def _spawn(
+    runtime: Runtime, role: str, args: list[str], environment: dict[str, str]
+) -> subprocess.Popen[str]:
+    return subprocess.Popen(
+        [str(runtime.binaries / role), *args],
+        cwd=ROOT,
+        env=environment,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+    )
+
+
 def _start_worker(
     runtime: Runtime,
     mode: str = "success",
     *,
     invalid_visibility: str | None = None,
-) -> subprocess.Popen[str]:
-    command = [
-        str(runtime.binary),
-        "worker",
-        "--send-concurrency=1",
-        "--feedback-concurrency=1",
-        "--max-send-rate=100",
-        "--send-burst=1",
-        "--receive-wait=0s",
-    ]
+) -> Workers:
+    shared = ["--receive-wait=0s"]
     if invalid_visibility is not None:
-        command.append(f"--invalid-visibility={invalid_visibility}")
-    return subprocess.Popen(
-        command,
-        cwd=ROOT,
-        env=_base_environment(runtime, mode),
-        stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
-        text=True,
+        shared.append(f"--invalid-visibility={invalid_visibility}")
+    environment = _base_environment(runtime, mode)
+    feedback = _spawn(
+        runtime, "ses-feedback-worker", ["--feedback-concurrency=1", *shared], environment
     )
+    email = _spawn(
+        runtime,
+        "email-worker",
+        ["--send-concurrency=1", "--max-send-rate=100", "--send-burst=1", *shared],
+        environment,
+    )
+    return Workers(email=email, feedback=feedback)
 
 
 def _start_telegram_worker(runtime: Runtime) -> subprocess.Popen[str]:
@@ -316,22 +390,13 @@ def _start_telegram_worker(runtime: Runtime) -> subprocess.Popen[str]:
             "TELEGRAM_DESTINATION_BURST": "10",
         }
     )
-    return subprocess.Popen(
-        [
-            str(runtime.binary),
-            "telegram-worker",
-            "--send-concurrency=1",
-            "--receive-wait=0s",
-        ],
-        cwd=ROOT,
-        env=environment,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
-        text=True,
+    return _spawn(
+        runtime, "telegram-worker", ["--send-concurrency=1", "--receive-wait=0s"], environment
     )
 
 
-def _stop_worker(process: subprocess.Popen[str]) -> dict[str, Any]:
+def _stop_process(process: subprocess.Popen[str]) -> dict[str, Any]:
+    role = Path(process.args[0]).name
     if process.poll() is None:
         process.send_signal(signal.SIGTERM)
     try:
@@ -339,19 +404,48 @@ def _stop_worker(process: subprocess.Popen[str]) -> dict[str, Any]:
     except subprocess.TimeoutExpired:
         process.kill()
         process.communicate(timeout=10)
-        pytest.fail("notification worker did not drain within 40s")
+        pytest.fail(f"{role} did not drain within 40s")
     assert process.returncode == 0, (
-        f"notification worker exited with code {process.returncode}; "
+        f"{role} exited with code {process.returncode}; "
         f"stdout_bytes={len(stdout)} stderr_bytes={len(stderr)}"
     )
     return json.loads(stdout)
 
 
+def _stop_worker(worker: Workers | subprocess.Popen[str]) -> dict[str, Any]:
+    """Stop the worker processes. For the SES pair, the totals cover both consumers and the
+    per-process summaries are under "email" and "feedback"."""
+    if not isinstance(worker, Workers):
+        return _stop_process(worker)
+    try:
+        email = _stop_process(worker.email)
+    finally:
+        feedback = _stop_process(worker.feedback)
+    totals = {
+        key: email[key] + feedback[key]
+        for key in ("messages_received", "messages_deleted", "visibility_changed")
+    }
+    return {**totals, "email": email, "feedback": feedback}
+
+
+def _run_once(
+    binaries: Path, role: str, args: list[str], environment: dict[str, str]
+) -> subprocess.CompletedProcess[str]:
+    return subprocess.run(
+        [str(binaries / role), *args],
+        cwd=ROOT,
+        env=environment,
+        capture_output=True,
+        check=False,
+        text=True,
+        timeout=60,
+    )
+
+
 def _run_relay(runtime: Runtime, relay_time: datetime) -> dict[str, Any]:
     completed = subprocess.run(
         [
-            str(runtime.binary),
-            "relay",
+            str(runtime.binaries / "notification-relay"),
             f"--relay-time={relay_time.astimezone(UTC).isoformat().replace('+00:00', 'Z')}",
             "--query-parallelism=16",
             "--work-parallelism=8",
@@ -688,6 +782,7 @@ def _seed_direct_telegram_delivery(runtime: Runtime, now: datetime) -> dict[str,
 
 def test_telegram_worker_sends_once_through_dedicated_queue_and_local_fake(
     runtime: Runtime,
+    telegram_fake: None,
 ) -> None:
     _reset_wiremock()
     identity = _seed_direct_telegram_delivery(
@@ -864,11 +959,11 @@ def test_multiprocess_happy_path_recovery_dependency_feedback_and_suppression(
         if worker.poll() is None:
             _stop_worker(worker)
         else:
-            stdout, stderr = worker.communicate(timeout=5)
-            pytest.fail(
-                f"notification worker exited early with code {worker.returncode}; "
-                f"stdout={stdout!r} stderr={stderr!r}"
-            )
+            details = [
+                (Path(process.args[0]).name, process.returncode, *process.communicate(timeout=5))
+                for process in (worker.email, worker.feedback)
+            ]
+            pytest.fail(f"a notification worker exited early: {details!r}")
 
 
 def test_crash_republication_and_duplicate_job_create_one_attempt(runtime: Runtime) -> None:
@@ -1207,12 +1302,14 @@ def test_elasticmq_redrives_after_eight_receives_without_automatic_dlq_consumpti
         if worker.poll() is None:
             _stop_worker(worker)
 
-    feedback_summary = summary["consumers"]["ses_feedback"]
+    feedback_summary = summary["feedback"]
     assert feedback_summary["messages_received"] == 8
     assert feedback_summary["messages_deleted"] == 0
     assert feedback_summary["visibility_changed"] == 8
     assert feedback_summary["error_categories"]["invalid_feedback"] == 8
-    assert summary["feedback_metrics"]["malformed"] == 8
+    assert feedback_summary["feedback_metrics"]["malformed"] == 8
+    # The email consumer is its own process and never touched the SES events queue.
+    assert summary["email"]["messages_received"] == 0
     source = runtime.sqs.get_queue_attributes(
         QueueUrl=runtime.events_url,
         AttributeNames=["ApproximateNumberOfMessages", "ApproximateNumberOfMessagesNotVisible"],
@@ -1232,3 +1329,61 @@ def test_elasticmq_redrives_after_eight_receives_without_automatic_dlq_consumpti
     ).get("Messages", [])
     assert len(dlq) == 1
     assert dlq[0]["Body"] == "not-json"
+
+
+@pytest.mark.parametrize("role", ROLE_BINARIES)
+def test_each_executable_prints_its_usage_and_exits_0_on_help(
+    notification_binaries: Path, role: str
+) -> None:
+    args, name = HELP_REQUESTS[role]
+    completed = _run_once(notification_binaries, role, args, _local_environment())
+    assert completed.returncode == 0, (role, completed.returncode, completed.stdout)
+    assert completed.stdout.startswith(f"Usage of {name}:\n"), completed.stdout
+
+
+def test_a_malformed_ses_source_exits_78_naming_the_setting_but_not_its_value(
+    runtime: Runtime,
+) -> None:
+    # A configuration error must stop the unit (RestartPreventExitStatus=78), not restart it.
+    environment = _base_environment(runtime, "aws")
+    environment["SES_FROM_EMAIL"] = "Alerts alerts@example.test"
+    completed = _run_once(runtime.binaries, "email-worker", ["--receive-wait=0s"], environment)
+    assert completed.returncode == 78, completed.stdout
+    failure = json.loads(completed.stdout)
+    assert failure["exit_code"] == 78
+    assert failure["error_categories"] == {"configuration": 1}
+    assert failure["settings"] == ["SES_FROM_EMAIL"]
+    assert "alerts@example.test" not in completed.stdout + completed.stderr
+
+
+@pytest.mark.parametrize(
+    ("role", "args", "settings"),
+    (
+        ("alert-evaluator", [], None),
+        ("alert-evaluator", ["backfill-relay"], None),
+        ("limnopulse-admin", [], None),
+        ("limnopulse-admin", ["backfill-relay"], ["tenant"]),
+        ("notification-relay", ["--max-work=0"], ["max-work"]),
+    ),
+)
+def test_a_oneshot_or_admin_usage_error_exits_78(
+    runtime: Runtime, role: str, args: list[str], settings: list[str] | None
+) -> None:
+    completed = _run_once(runtime.binaries, role, args, _base_environment(runtime, "success"))
+    assert completed.returncode == 78, (role, args, completed.stdout)
+    failure = json.loads(completed.stdout)
+    assert failure["exit_code"] == 78
+    assert failure.get("settings") == settings
+
+
+def test_admin_backfill_dry_run_over_the_local_table_exits_0(runtime: Runtime) -> None:
+    completed = _run_once(
+        runtime.binaries,
+        "limnopulse-admin",
+        ["backfill-relay", "--tenant=tnt_admin_integration"],
+        _base_environment(runtime, "success"),
+    )
+    assert completed.returncode == 0, completed.stdout
+    result = json.loads(completed.stdout)
+    assert result["result"] == "success"
+    assert result["scope_completed"] is True

@@ -71,7 +71,7 @@ func (sender Sender) Preflight(request worker.SendRequest) error {
 		request.AttemptID == "" || request.AttemptNumber < 1 {
 		return worker.NewSendError(worker.ErrorFatalConfigurationSet, errors.New("SES sender configuration is invalid"))
 	}
-	if err := validateSource(sender.FromEmail); err != nil {
+	if err := ValidateSource(sender.FromEmail); err != nil {
 		return worker.NewSendError(worker.ErrorFatalFromIdentity, err)
 	}
 	if _, err := notifications.RestoreDelivery(request.Delivery); err != nil ||
@@ -174,7 +174,10 @@ func validateRecipient(value string) error {
 	return nil
 }
 
-func validateSource(value string) error {
+// ValidateSource reports whether value is a source identity SES accepts: a strict mailbox
+// or a conservative ASCII "Name <mailbox>" form. cmd/email-worker checks it at load, so a
+// bad SES_FROM_EMAIL exits 78 instead of failing on the first delivery.
+func ValidateSource(value string) error {
 	if value == "" || value != strings.TrimSpace(value) || strings.ContainsAny(value, "\r\n") {
 		return errors.New("SES source identity is invalid")
 	}

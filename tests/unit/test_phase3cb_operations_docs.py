@@ -13,7 +13,7 @@ def test_phase3cb_runbook_records_safe_rollout_backfill_and_rollback() -> None:
         "3. Deploy the FastAPI binding and webhook code",
         "4. Register the Telegram webhook",
         "5. Deploy the evaluator, relay and worker binaries",
-        "6. Run `notifications backfill-telegram`",
+        "6. Run `limnopulse-admin backfill-telegram`",
         "7. Start the Telegram worker",
         "8. Enable Telegram on the relay and evaluator",
         "9. Monitor the queue, DLQ, limiter and durable states",
@@ -27,8 +27,11 @@ def test_phase3cb_runbook_records_safe_rollout_backfill_and_rollback() -> None:
         "turn off Telegram on the relay and evaluator first",
         "Never run an automatic Telegram DLQ consumer",
         "DynamoDB remains authoritative",
+        "continuous `telegram-worker` executable",
+        "`redis-password` credential",
     ):
         assert phrase in normalized
+    assert "notifications backfill-telegram" not in normalized
 
 
 def test_phase3cb_runbook_records_auth_pii_and_failure_boundaries() -> None:

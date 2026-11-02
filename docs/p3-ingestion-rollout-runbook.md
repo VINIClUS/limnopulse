@@ -423,8 +423,8 @@ Agents do not change production. These are owner actions, recorded on #15:
   the owner completes the [D16 owner gate](#d16-owner-gate), and #104 stays open until then.
 - **Required status checks.** Add the CI checks to the default-branch ruleset, with strict
   up-to-date branches and required thread resolution: `python`, `go`, `opentofu`, `compose`,
-  `frontend`, `influx`, `ingestion` (from `verify.yml`) and `sonar`, plus the Trivy and build workflow
-  jobs if wanted.
+  `frontend`, `influx`, `ingestion`, `notifications` (from `verify.yml`) and `sonar`, plus the Trivy
+  and build workflow jobs if wanted.
 
 ### D16 owner gate
 

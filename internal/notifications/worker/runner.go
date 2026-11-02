@@ -2,12 +2,24 @@ package worker
 
 import (
 	"context"
+	"errors"
 	"sync"
 	"time"
+
+	"github.com/VINIClUS/limnopulse/internal/workerproc"
 )
 
 type Handler interface {
 	Handle(context.Context, QueueMessage) Decision
+}
+
+// Loop hears from the receive loop, so the process supervisor can tell a live consumer from a
+// stalled one (ADR-020); workerproc.Loop implements it. Ready is called once, after the first
+// receive that worked. Progress follows every receive turn, empty ones included, and every
+// finished message, so a loop whose slots are all busy still reports while messages finish.
+type Loop interface {
+	Ready() error
+	Progress()
 }
 
 type RunSummary struct {
@@ -56,6 +68,8 @@ type Runner struct {
 	ReceiveWait  time.Duration
 	Visibility   time.Duration
 	DrainTimeout time.Duration
+	// Loop is optional; without it the runner reports nothing.
+	Loop Loop
 
 	// afterSlotAcquired is a deterministic admission seam for package tests.
 	afterSlotAcquired func(QueueMessage)
@@ -113,6 +127,7 @@ func (runner Runner) Run(ctx context.Context) RunSummary {
 	semaphore := make(chan struct{}, runner.Concurrency)
 	var inflight sync.WaitGroup
 	fatal := newRunFatalState()
+	ready := false
 
 receiveLoop:
 	for {
@@ -139,6 +154,15 @@ receiveLoop:
 			fatal.record("queue_receive_contract_failure")
 			break receiveLoop
 		}
+		if !ready {
+			ready = true
+			if err := runner.ready(); err != nil {
+				releaseCapacity(semaphore, reserved)
+				fatal.record("readiness_notification_failure")
+				break receiveLoop
+			}
+		}
+		runner.progress()
 		releaseCapacity(semaphore, reserved-len(messages))
 		collector.addReceived(len(messages))
 		for index, message := range messages {
@@ -163,10 +187,16 @@ receiveLoop:
 					cancelReceive()
 				}
 				runner.applyDecision(processCtx, collector, message, decision)
+				runner.progress()
 			}(message)
 		}
 	}
 	cancelReceive()
+	// After a stall the process exits within workerproc's short grace, not the drain budget.
+	// Abort in-flight work now, so no limiter waiter starts a send the exit would cut off.
+	if errors.Is(context.Cause(ctx), workerproc.ErrStalled) {
+		cancelProcess()
+	}
 	drained := make(chan struct{})
 	go func() { inflight.Wait(); close(drained) }()
 	select {
@@ -187,6 +217,19 @@ receiveLoop:
 		collector.setFatal()
 	}
 	return collector.snapshot()
+}
+
+func (runner Runner) ready() error {
+	if runner.Loop == nil {
+		return nil
+	}
+	return runner.Loop.Ready()
+}
+
+func (runner Runner) progress() {
+	if runner.Loop != nil {
+		runner.Loop.Progress()
+	}
 }
 
 func reserveCapacity(

@@ -9,20 +9,21 @@ or frontend active-alert view for a tenant:
 2. For each explicit tenant, run a dry-run and inspect its count:
 
    ```sh
-   alert-evaluator backfill-active-alert-index --tenant-id tnt_123
+   limnopulse-admin backfill-active-alert-index --tenant-id tnt_123
    ```
 
 3. Apply the backfill for that tenant, repeating with `--limit` when operating
    in batches:
 
    ```sh
-   alert-evaluator backfill-active-alert-index --tenant-id tnt_123 --apply
+   limnopulse-admin backfill-active-alert-index --tenant-id tnt_123 --apply
    ```
 
 4. Re-run the dry-run until it reports zero pending updates, then enable the
    active-alert API/frontend path for that tenant.
 
-The command is dry-run by default, requires explicit tenant IDs, paginates the
+The command is dry-run by default (ADR-020 moved it from `alert-evaluator` to
+the `limnopulse-admin` operator command), requires explicit tenant IDs, paginates the
 historical query, and uses conditional idempotent updates. It is safe to rerun
 after interruptions. Do not switch a tenant's consumers to the active index
 before its backfill reaches zero pending updates.

@@ -6,6 +6,8 @@ import (
 	"io"
 	"strconv"
 	"time"
+
+	"github.com/VINIClUS/limnopulse/internal/workerflag"
 )
 
 type LookupEnv func(string) (string, bool)
@@ -110,7 +112,7 @@ func LoadRunConfig(args []string, lookup LookupEnv) (RunConfig, error) {
 	fs.DurationVar(&config.AllowedLateness, "allowed-lateness", config.AllowedLateness, "telemetry lateness allowance")
 	fs.DurationVar(&config.MaximumSampleAge, "max-sample-age", config.MaximumSampleAge, "maximum sample age")
 	fs.StringVar(&config.TelemetrySource, "telemetry-source", config.TelemetrySource, "window reader source: legacy or v2")
-	if err := fs.Parse(args); err != nil {
+	if err := workerflag.Parse(fs, args); err != nil {
 		return RunConfig{}, err
 	}
 	fs.Visit(func(item *flag.Flag) {
@@ -121,7 +123,7 @@ func LoadRunConfig(args []string, lookup LookupEnv) (RunConfig, error) {
 	if evaluationTime != "" {
 		parsed, err := time.Parse(time.RFC3339Nano, evaluationTime)
 		if err != nil {
-			return RunConfig{}, fmt.Errorf("evaluation-time: %w", err)
+			return RunConfig{}, fmt.Errorf("--evaluation-time: %w", err)
 		}
 		parsed = parsed.UTC()
 		config.EvaluationTime = &parsed
@@ -225,22 +227,46 @@ func validateRunConfig(
 		return err
 	}
 	if config.GlobalDeadline <= 0 || config.GlobalDeadline >= time.Minute {
-		return fmt.Errorf("global-deadline must be positive and less than the cadence")
+		return fmt.Errorf("--global-deadline (ALERT_EVALUATOR_GLOBAL_DEADLINE) must be positive and less than the cadence")
 	}
 	if config.DrainGrace <= 0 || config.DrainGrace >= config.GlobalDeadline {
-		return fmt.Errorf("drain-grace must be positive and less than global-deadline")
+		return fmt.Errorf("--drain-grace (ALERT_EVALUATOR_DRAIN_GRACE) must be positive and less than --global-deadline")
 	}
-	if config.PerRuleTimeout <= 0 || config.LeaseTTL <= config.PerRuleTimeout {
-		return fmt.Errorf("lease-ttl must be greater than per-rule-timeout")
+	if config.PerRuleTimeout <= 0 {
+		return fmt.Errorf("--per-rule-timeout (ALERT_EVALUATOR_PER_RULE_TIMEOUT) must be positive")
 	}
-	if config.EvaluationParallelism < 1 || config.QueryParallelism < 1 || config.MaxRules < 1 || config.PageSize < 1 || config.SystemicErrorThreshold < 1 {
-		return fmt.Errorf("parallelism and work limits must be positive")
+	if config.LeaseTTL <= config.PerRuleTimeout {
+		return fmt.Errorf("--lease-ttl (ALERT_EVALUATOR_LEASE_TTL) must be greater than --per-rule-timeout")
 	}
-	if config.ExpectedSampleInterval <= 0 || config.MinimumCoverageRatio <= 0 || config.MinimumCoverageRatio > 1 || config.MinimumPoints < 1 || config.AllowedLateness < 0 || config.MaximumSampleAge <= 0 {
-		return fmt.Errorf("quality settings are invalid")
+	for _, limit := range []struct {
+		name  string
+		value int
+	}{
+		{"--evaluation-parallelism (ALERT_EVALUATOR_EVALUATION_PARALLELISM)", config.EvaluationParallelism},
+		{"--query-parallelism (ALERT_EVALUATOR_QUERY_PARALLELISM)", config.QueryParallelism},
+		{"--max-rules (ALERT_EVALUATOR_MAX_RULES)", config.MaxRules},
+		{"--page-size (ALERT_EVALUATOR_PAGE_SIZE)", config.PageSize},
+		{"--systemic-error-threshold (ALERT_EVALUATOR_SYSTEMIC_ERROR_THRESHOLD)", config.SystemicErrorThreshold},
+		{"--min-points (ALERT_EVALUATOR_MIN_POINTS)", config.MinimumPoints},
+	} {
+		if limit.value < 1 {
+			return fmt.Errorf("%s must be positive", limit.name)
+		}
+	}
+	if config.ExpectedSampleInterval <= 0 {
+		return fmt.Errorf("--expected-sample-interval (ALERT_EVALUATOR_EXPECTED_SAMPLE_INTERVAL) must be positive")
+	}
+	if config.MinimumCoverageRatio <= 0 || config.MinimumCoverageRatio > 1 {
+		return fmt.Errorf("--min-coverage-ratio (ALERT_EVALUATOR_MIN_COVERAGE_RATIO) must be greater than 0 and at most 1")
+	}
+	if config.AllowedLateness < 0 {
+		return fmt.Errorf("--allowed-lateness (ALERT_EVALUATOR_ALLOWED_LATENESS) must not be negative")
+	}
+	if config.MaximumSampleAge <= 0 {
+		return fmt.Errorf("--max-sample-age (ALERT_EVALUATOR_MAX_SAMPLE_AGE) must be positive")
 	}
 	if config.TelemetrySource != TelemetrySourceLegacy && config.TelemetrySource != TelemetrySourceV2 {
-		return fmt.Errorf("telemetry-source must be legacy or v2")
+		return fmt.Errorf("--telemetry-source (ALERT_EVALUATOR_TELEMETRY_SOURCE) must be legacy or v2")
 	}
 	if config.AppEnv != "local" && config.AppEnv != "test" && config.AppEnv != "staging" && config.AppEnv != "prod" {
 		return fmt.Errorf("APP_ENV must be local, test, staging or prod")
@@ -249,9 +275,9 @@ func validateRunConfig(
 		if !telegramDeliveryExplicit {
 			return fmt.Errorf("TELEGRAM_DELIVERY_ENABLED must be explicit in %s", config.AppEnv)
 		}
-		for flagName := range qualityFlagToEnv {
+		for flagName, envName := range qualityFlagToEnv {
 			if !qualityExplicit[flagName] {
-				return fmt.Errorf("%s must be explicit in %s", flagName, config.AppEnv)
+				return fmt.Errorf("--%s (%s) must be explicit in %s", flagName, envName, config.AppEnv)
 			}
 		}
 	}

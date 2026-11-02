@@ -1,0 +1,339 @@
+"""ADR-020 S1: one Go executable per worker role, checked against ops/workers/roles.yaml."""
+
+import re
+from pathlib import Path
+
+import pytest
+
+from tests.support.go_sources import MODULE, closure, closure_files, strip_comments
+from tests.support.worker_roles import load_roles, roles_by_name
+
+ROOT = Path(__file__).resolve().parents[2]
+# The roles S1 gives an entrypoint; worker-monitor is S2's.
+S1_ROLES = (
+    "alert-evaluator",
+    "notification-relay",
+    "email-worker",
+    "ses-feedback-worker",
+    "telegram-worker",
+    "limnopulse-admin",
+)
+ONESHOT_ROLES = ("alert-evaluator", "notification-relay")
+CONTINUOUS_ROLES = ("email-worker", "ses-feedback-worker", "telegram-worker")
+WORKER_PACKAGE = MODULE + "internal/notifications/worker"
+WORKERPROC = MODULE + "internal/workerproc"
+FEEDBACK_PACKAGE = MODULE + "internal/notifications/feedback"
+# Any SES SDK package (sesv2, sesv2/types, ...) or the email sender.
+SES_PACKAGE = re.compile(
+    r"^github\.com/aws/aws-sdk-go-v2/service/ses(?:v2)?(?:/|$)"
+    rf"|^{re.escape(MODULE)}internal/notifications/worker/ses(?:/|$)"
+)
+# Bare names, so a function value (`nap := time.Sleep`) counts as much as a call.
+TIMER_NAMES = r"(?:Sleep|Tick|NewTicker|NewTimer|After|AfterFunc|Ticker|Timer)\b"
+ENV_NAMES = r"(?:Getenv|LookupEnv|Environ|ExpandEnv)\b"
+# A main names os.LookupEnv once, as the value of its dependencies' LookupEnv field, and
+# never reads the env any other way.
+MAIN_ENV_READS = r"(?:Getenv|Environ|ExpandEnv)\b"
+# A secret's env key is named exactly once by its loader and once by the main that maps it to
+# a credential, and nowhere else.
+SECRET_KEYS = {
+    "INFLUXDB_TOKEN": {"internal/alertevaluator/config.go", "cmd/alert-evaluator/main.go"},
+    "REDIS_PASSWORD": {
+        "internal/notifications/telegramworker/config/config.go",
+        "cmd/telegram-worker/main.go",
+    },
+}
+
+
+# Each continuous role's loader and the package whose shutdown constants it uses.
+# The feedback worker reuses the email worker's drain constant.
+STOP_CONSTANTS = {
+    "email-worker": (
+        "internal/notifications/worker/config/config.go",
+        "internal/notifications/worker/config/config.go",
+    ),
+    "ses-feedback-worker": (
+        "internal/notifications/feedback/config/config.go",
+        "internal/notifications/worker/config/config.go",
+    ),
+    "telegram-worker": (
+        "internal/notifications/telegramworker/config/config.go",
+        "internal/notifications/telegramworker/config/config.go",
+    ),
+}
+# Every configuration error names its setting, so a 78 exit's failure line can (ADR-020).
+SETTING_LOADERS = (
+    "internal/alertevaluator/config.go",
+    "internal/notifications/relay/config/config.go",
+    "internal/notifications/worker/config/config.go",
+    "internal/notifications/feedback/config/config.go",
+    "internal/notifications/telegramworker/config/config.go",
+    "cmd/email-worker/main.go",
+    "cmd/telegram-worker/main.go",
+    "cmd/limnopulse-admin/main.go",
+)
+ERROR_CALL = re.compile(r'(?:fmt\.Errorf|errors\.New)\(\s*"((?:[^"\\]|\\.)*)"(?:\s*,\s*([\w.]+))?')
+# What workercmd.Settings reads: an env key, a --flag, "<flag> must|is|may ..." or a credential.
+NAMED_SETTING = re.compile(
+    r"[A-Z][A-Z0-9]*(?:_[A-Z0-9]+)+|(?:^|[\s(])--[a-z]"
+    r"|^[a-z][a-z0-9]*(?:-[a-z0-9]+)+ (?:must|is|may)\b|credential"
+)
+# A message whose leading %s is a setting name passed by the loader.
+NAME_ARGUMENT = re.compile(r"(?:^|\.)(?:key|name|flag|flagName)$")
+# Argument-shape errors name no setting; they are argv mistakes.
+ARGV_ERRORS = re.compile(r"positional arguments|^expected a command: ")
+STRING_LITERAL = re.compile(r'"(?:[^"\\]|\\.)*"|`[^`]*`')
+
+
+def _production_files(directory: Path) -> list[Path]:
+    return sorted(
+        path for path in directory.glob("*.go") if not path.name.endswith("_test.go")
+    )
+
+
+def _production_source(directory: Path) -> str:
+    return "\n".join(path.read_text(encoding="utf-8") for path in _production_files(directory))
+
+
+def _ses_links(entrypoint: str) -> list[str]:
+    return sorted(package for package in closure(entrypoint) if SES_PACKAGE.search(package))
+
+
+def _seconds(path: str, name: str) -> int:
+    source = (ROOT / path).read_text(encoding="utf-8")
+    match = re.search(rf"^\s*{name}\s*=\s*(\d+) \* time\.Second$", source, re.MULTILINE)
+    assert match, (path, name)
+    return int(match.group(1))
+
+def _role(name: str) -> dict:
+    return roles_by_name(load_roles())[name]
+
+
+def _main(name: str) -> str:
+    return (ROOT / "cmd" / name / "main.go").read_text(encoding="utf-8")
+
+
+@pytest.mark.parametrize("name", S1_ROLES)
+def test_each_role_has_its_own_executable(name: str) -> None:
+    role = _role(name)
+    assert role["entrypoint"] == f"cmd/{name}"
+    main = _main(name)
+    assert re.search(r"^package main$", main, re.MULTILINE)
+    assert "func main() {" in main
+
+
+@pytest.mark.parametrize("name", S1_ROLES)
+def test_no_role_links_code_that_uses_the_multi_consumer_supervisor(name: str) -> None:
+    # The supervision moved to systemd: no role multiplexes consumers in one process.
+    files = closure_files(f"cmd/{name}")
+    assert files
+    for file in files:
+        if file.package == WORKER_PACKAGE:
+            # Only its own (legacy, S3-deleted) file may name the type.
+            assert file.path.name == "supervisor.go" or not re.search(
+                r"\bSupervisor\b", file.code
+            ), file.relative
+        else:
+            assert not file.uses(WORKER_PACKAGE, r"Supervisor\b"), file.relative
+
+
+@pytest.mark.parametrize("name", ONESHOT_ROLES)
+def test_oneshot_closures_never_sleep_poll_or_supervise(name: str) -> None:
+    for file in closure_files(f"cmd/{name}"):
+        assert not file.uses(WORKERPROC, r"Continuous\b"), file.relative
+        assert "ReceiveMessage" not in file.code, file.relative
+        # workerproc's ticker and stall grace serve continuous roles only.
+        if file.package != WORKERPROC:
+            assert not file.uses("time", TIMER_NAMES), file.relative
+
+
+@pytest.mark.parametrize("name", S1_ROLES)
+def test_roles_read_settings_only_through_their_lookup(name: str) -> None:
+    main = MODULE + f"cmd/{name}"
+    lookups = []
+    for file in closure_files(f"cmd/{name}"):
+        if file.package == main:
+            assert not file.uses("os", MAIN_ENV_READS), file.relative
+            assert not file.uses("syscall", ENV_NAMES), file.relative
+            lookups += [(file, found) for found in file.references("os", r"LookupEnv\b")]
+        elif file.package != WORKERPROC:
+            assert not file.uses("os", ENV_NAMES), file.relative
+            assert not file.uses("syscall", ENV_NAMES), file.relative
+        for key, allowed in SECRET_KEYS.items():
+            # A second literal in an allowed file is a second read, e.g. deps.LookupEnv(key).
+            count = file.code.count(f'"{key}"')
+            assert count == (1 if file.relative in allowed else 0), (key, file.relative, count)
+    # Exactly one os.LookupEnv in the whole main package: the injected lookup itself.
+    assert len(lookups) == 1, [(file.relative, found) for file, found in lookups]
+    file, found = lookups[0]
+    assert found != "."
+    assert re.search(rf"(?<![\w.])LookupEnv:\s*{re.escape(found)}\b", file.code), file.relative
+
+
+@pytest.mark.parametrize("name", CONTINUOUS_ROLES)
+def test_continuous_roles_run_under_workerproc_continuous_with_their_stall_limit(
+    name: str,
+) -> None:
+    role = _role(name)
+    assert role["lifecycle"] == "continuous"
+    main = _main(name)
+    assert f"const stallAfter = {role['stall_after_seconds']} * time.Second" in main
+    assert "workerproc.Continuous{StallAfter: stallAfter}" in main
+    assert "consumer.Role[" in main
+    # Continuous owns SIGTERM/SIGINT; a second handler would race its stop.
+    assert "signal.Notify" not in main
+    consumer = _production_source(ROOT / "internal/notifications/worker/consumer")
+    assert "supervisor.Run(ctx" in consumer
+    assert "workercmd.AWSLoaderFromEnv(lookup)" in consumer
+
+
+@pytest.mark.parametrize("name", ONESHOT_ROLES)
+def test_oneshot_roles_have_no_loop_sleep_or_supervisor(name: str) -> None:
+    assert _role(name)["lifecycle"] == "oneshot"
+    main = _production_source(ROOT / "cmd" / name)
+    for forbidden in ("for {", "time.Sleep", "workerproc.Continuous", "ReceiveMessage"):
+        assert forbidden not in main
+    assert "signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)" in main
+    assert "workercmd.AWSLoaderFromEnv(deps.LookupEnv)" in main
+
+
+def test_alert_evaluator_is_run_only_and_the_backfills_moved_to_the_admin() -> None:
+    evaluator = _main("alert-evaluator")
+    admin = _production_source(ROOT / "cmd" / "limnopulse-admin")
+    assert 'args[0] != "run"' in evaluator
+    for command in (
+        "backfill-schedule",
+        "backfill-active-alert-index",
+        "backfill-relay",
+        "backfill-telegram",
+    ):
+        assert f'"{command}"' not in evaluator
+        assert f'case "{command}":' in admin
+    assert _role("limnopulse-admin")["lifecycle"] == "cli"
+    assert "workercmd.AWSLoaderFromEnv(deps.LookupEnv)" in admin
+
+
+def test_secrets_come_from_their_credentials_when_loaded() -> None:
+    assert "influxdb-token" in _role("alert-evaluator")["credentials"]
+    assert "redis-password" in _role("telegram-worker")["credentials"]
+    evaluator = _main("alert-evaluator")
+    telegram = _main("telegram-worker")
+    assert (
+        "workercmd.SecretLookup(deps.LookupEnv, creds, workerproc.CredentialInfluxDBToken, "
+        '"INFLUXDB_TOKEN")' in evaluator
+    )
+    assert "alertevaluator.LoadRunConfig(args[1:], lookup)" in evaluator
+    assert (
+        "Secret: &consumer.Secret{Credential: workerproc.CredentialRedisPassword, "
+        'Key: "REDIS_PASSWORD"}' in telegram
+    )
+    # AWS clients load only through workercmd, which applies the LoadCredential= keys.
+    for directory in [ROOT / "cmd" / name for name in S1_ROLES] + [
+        ROOT / "internal/notifications/worker/compose",
+        ROOT / "internal/notifications/feedback/compose",
+        ROOT / "internal/notifications/relay/compose",
+        ROOT / "internal/notifications/telegramworker/compose",
+    ]:
+        assert "LoadDefaultConfig" not in _production_source(directory), directory
+    assert "creds.AWSLoadOptions()" in _production_source(ROOT / "internal/workercmd")
+
+
+@pytest.mark.parametrize(
+    "loader",
+    (
+        "internal/alertevaluator/config.go",
+        "internal/notifications/relay/config/config.go",
+        "internal/notifications/worker/config/config.go",
+        "internal/notifications/feedback/config/config.go",
+        "internal/notifications/telegramworker/config/config.go",
+        "cmd/limnopulse-admin/main.go",
+    ),
+)
+def test_flag_errors_are_configuration_errors_and_help_is_not(loader: str) -> None:
+    source = (ROOT / loader).read_text(encoding="utf-8")
+    assert "workerflag.Parse(fs, " in source
+    assert "fs.Parse(" not in source
+    assert "flag.ExitOnError" not in source
+    workerflag = _production_source(ROOT / "internal/workerflag")
+    assert "workerproc.ParseFlags(fs, args)" in workerflag
+    assert "return &Help{Usage: usage.String()}" in workerflag
+    # A help request prints the usage and exits 0; everything else fails through workercmd.
+    assert "errors.As(err, &help)" in _production_source(ROOT / "internal/workercmd")
+
+
+def test_admin_commands_parse_through_the_shared_helper() -> None:
+    for name in ("notifications.go", "alerts.go"):
+        source = (ROOT / "cmd/limnopulse-admin" / name).read_text(encoding="utf-8")
+        assert "if err := parse(fs, args); err != nil {" in source
+        assert "ParseFlags" not in source
+        assert "fs.Parse(" not in source
+
+
+def test_email_and_ses_feedback_are_separate_processes_with_separate_loaders() -> None:
+    email = _main("email-worker")
+    feedback = _main("ses-feedback-worker")
+    assert "workerconfig.LoadEmail(args, lookup)" in email
+    assert "Run: workercompose.Run" in email
+    assert "feedbackconfig.Load(args, lookup)" in feedback
+    assert "Run: feedbackcompose.Run" in feedback
+
+    email_load = (ROOT / "internal/notifications/worker/config/config.go").read_text(
+        encoding="utf-8"
+    )
+    assert 'return load("email-worker", args, lookup, false)' in email_load
+
+    email_links = closure("cmd/email-worker")
+    feedback_links = closure("cmd/ses-feedback-worker")
+    assert not any(package.startswith(FEEDBACK_PACKAGE) for package in email_links)
+    assert MODULE + "internal/notifications/feedback/compose" in feedback_links
+    assert MODULE + "internal/notifications/worker/compose" not in feedback_links
+
+
+@pytest.mark.parametrize("name", ("ses-feedback-worker", "telegram-worker"))
+def test_only_the_email_worker_links_ses(name: str) -> None:
+    assert _ses_links(f"cmd/{name}") == []
+    assert _ses_links("cmd/email-worker")
+
+
+@pytest.mark.parametrize("name", CONTINUOUS_ROLES)
+def test_a_stop_drains_and_flushes_within_the_units_stop_timeout(name: str) -> None:
+    # On SIGTERM a role drains in-flight work, then flushes telemetry; systemd kills it after
+    # TimeoutStopSec, which would cut a send or a delivery-state write short.
+    loader, constants = STOP_CONSTANTS[name]
+    source = (ROOT / loader).read_text(encoding="utf-8")
+    # The drain budget is a constant, not a setting an env file or flag could raise.
+    code = strip_comments(source)
+    assert re.search(r"DrainTimeout:\s+(?:workerconfig\.)?DrainTimeout,", code)
+    assert not [text for text in STRING_LITERAL.findall(code) if "drain" in text.lower()]
+    assert not re.search(r"&config\.DrainTimeout\b|config\.DrainTimeout\s*=[^=]", code)
+    budget = _seconds(constants, "DrainTimeout") + _seconds(constants, "OTLPFlushTimeout")
+    assert budget < _role(name)["timeout_stop_seconds"], (name, budget)
+
+
+def test_the_legacy_duplication_exclusion_lives_only_as_long_as_cmd_notifications() -> None:
+    properties = (ROOT / "sonar-project.properties").read_text(encoding="utf-8")
+    exclusions = re.findall(r"^sonar\.cpd\.exclusions=.*$", properties, re.MULTILINE)
+    legacy = ["sonar.cpd.exclusions=cmd/notifications/**"]
+    assert exclusions == (legacy if (ROOT / "cmd/notifications").exists() else [])
+
+
+@pytest.mark.parametrize("loader", SETTING_LOADERS)
+def test_each_configuration_error_names_its_setting(loader: str) -> None:
+    code = strip_comments((ROOT / loader).read_text(encoding="utf-8"))
+    # A message built elsewhere (errors.New(check.message)) would escape this check.
+    calls = re.findall(r"(?:fmt\.Errorf|errors\.New)\(", code)
+    messages = ERROR_CALL.findall(code)
+    assert messages, loader
+    assert len(messages) == len(calls), loader
+    for message, argument in messages:
+        if NAMED_SETTING.search(message) or ARGV_ERRORS.search(message):
+            continue
+        assert re.match(r"(?:--)?%s\b", message) and NAME_ARGUMENT.search(argument), message
+
+
+def test_shard_errors_name_the_shard_flags() -> None:
+    for path in ("internal/alertevaluator/schedule.go", "internal/notifications/schedule.go"):
+        messages = [m for m, _ in ERROR_CALL.findall((ROOT / path).read_text(encoding="utf-8"))]
+        shard = [message for message in messages if "shard" in message]
+        assert len(shard) == 2, path
+        assert all(message.startswith(("--shard-count ", "--shard ")) for message in shard), shard

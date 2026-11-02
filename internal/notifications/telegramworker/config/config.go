@@ -9,6 +9,8 @@ import (
 	"strconv"
 	"strings"
 	"time"
+
+	"github.com/VINIClUS/limnopulse/internal/workerflag"
 )
 
 const (
@@ -141,12 +143,12 @@ func Load(args []string, lookup LookupEnv) (RunConfig, error) {
 		config.RedisTLS = parsed
 	}
 
-	fs := flag.NewFlagSet("notifications telegram-worker", flag.ContinueOnError)
+	fs := flag.NewFlagSet("telegram-worker", flag.ContinueOnError)
 	fs.SetOutput(io.Discard)
 	fs.IntVar(&config.SendConcurrency, "send-concurrency", config.SendConcurrency, "concurrent Telegram sends")
 	fs.DurationVar(&config.ReceiveWait, "receive-wait", config.ReceiveWait, "SQS long-poll wait")
 	fs.DurationVar(&config.InvalidVisibility, "invalid-visibility", config.InvalidVisibility, "visibility for invalid messages")
-	if err := fs.Parse(args); err != nil {
+	if err := workerflag.Parse(fs, args); err != nil {
 		return RunConfig{}, err
 	}
 	if len(fs.Args()) != 0 {
@@ -181,18 +183,36 @@ func Load(args []string, lookup LookupEnv) (RunConfig, error) {
 		if config.BotAPIBaseURL != DefaultBotAPIBaseURL {
 			return RunConfig{}, fmt.Errorf("TELEGRAM_BOT_API_BASE_URL override is allowed only in local or test")
 		}
-		if config.ReceiveWait == 0 || config.InvalidVisibility != InvalidVisibility {
-			return RunConfig{}, fmt.Errorf("short queue timings are allowed only in local or test")
+		if config.ReceiveWait == 0 {
+			return RunConfig{}, fmt.Errorf("--receive-wait may be 0s only in local or test")
+		}
+		if config.InvalidVisibility != InvalidVisibility {
+			return RunConfig{}, fmt.Errorf("--invalid-visibility may be overridden only in local or test")
 		}
 	}
-	if config.SendConcurrency < 1 || config.GlobalRate <= 0 || math.IsNaN(config.GlobalRate) || math.IsInf(config.GlobalRate, 0) ||
-		config.DestinationRate <= 0 || math.IsNaN(config.DestinationRate) || math.IsInf(config.DestinationRate, 0) ||
-		config.GlobalBurst < 1 || config.DestinationBurst < 1 || config.RedisDB < 0 {
-		return RunConfig{}, fmt.Errorf("Telegram concurrency, rates, bursts and Redis DB are invalid")
+	if config.SendConcurrency < 1 {
+		return RunConfig{}, fmt.Errorf("--send-concurrency (TELEGRAM_SEND_CONCURRENCY) must be positive")
 	}
-	if config.ReceiveWait < 0 || config.ReceiveWait > 20*time.Second || config.ReceiveWait%time.Second != 0 ||
-		config.InvalidVisibility <= 0 || config.InvalidVisibility > 12*time.Hour || config.InvalidVisibility%time.Second != 0 {
-		return RunConfig{}, fmt.Errorf("Telegram queue timing is invalid")
+	if !positiveRate(config.GlobalRate) {
+		return RunConfig{}, fmt.Errorf("TELEGRAM_GLOBAL_RATE must be a positive number")
+	}
+	if !positiveRate(config.DestinationRate) {
+		return RunConfig{}, fmt.Errorf("TELEGRAM_DESTINATION_RATE must be a positive number")
+	}
+	if config.GlobalBurst < 1 {
+		return RunConfig{}, fmt.Errorf("TELEGRAM_GLOBAL_BURST must be positive")
+	}
+	if config.DestinationBurst < 1 {
+		return RunConfig{}, fmt.Errorf("TELEGRAM_DESTINATION_BURST must be positive")
+	}
+	if config.RedisDB < 0 {
+		return RunConfig{}, fmt.Errorf("REDIS_DB must not be negative")
+	}
+	if config.ReceiveWait < 0 || config.ReceiveWait > 20*time.Second || config.ReceiveWait%time.Second != 0 {
+		return RunConfig{}, fmt.Errorf("--receive-wait must be a whole number of seconds between 0s and 20s")
+	}
+	if config.InvalidVisibility <= 0 || config.InvalidVisibility > 12*time.Hour || config.InvalidVisibility%time.Second != 0 {
+		return RunConfig{}, fmt.Errorf("--invalid-visibility must be a whole number of seconds between 1s and 12h")
 	}
 	parsedBase, err := url.Parse(config.BotAPIBaseURL)
 	if err != nil || parsedBase.Host == "" || (parsedBase.Scheme != "https" && parsedBase.Scheme != "http") ||
@@ -200,4 +220,8 @@ func Load(args []string, lookup LookupEnv) (RunConfig, error) {
 		return RunConfig{}, fmt.Errorf("TELEGRAM_BOT_API_BASE_URL is invalid")
 	}
 	return config, nil
+}
+
+func positiveRate(rate float64) bool {
+	return rate > 0 && !math.IsNaN(rate) && !math.IsInf(rate, 0)
 }

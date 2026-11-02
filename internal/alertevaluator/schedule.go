@@ -16,10 +16,10 @@ func EvaluationBucket(tenantID, ruleID string) int {
 
 func ValidateShard(shard, shardCount int) ([]int, error) {
 	if shardCount < 1 || shardCount > EvaluationBucketCount {
-		return nil, fmt.Errorf("shard-count must be between 1 and %d", EvaluationBucketCount)
+		return nil, fmt.Errorf("--shard-count (ALERT_EVALUATOR_SHARD_COUNT) must be between 1 and %d", EvaluationBucketCount)
 	}
 	if shard < 0 || shard >= shardCount {
-		return nil, fmt.Errorf("shard must be between 0 and shard-count-1")
+		return nil, fmt.Errorf("--shard (ALERT_EVALUATOR_SHARD) must be between 0 and --shard-count minus 1")
 	}
 	buckets := make([]int, 0, EvaluationBucketCount/shardCount+1)
 	for bucket := 0; bucket < EvaluationBucketCount; bucket++ {

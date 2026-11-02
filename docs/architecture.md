@@ -300,7 +300,7 @@ mode or link preview. Definite destination failures suppress the destination;
 unconfirmed sends become terminal `unknown` without automatic resend.
 
 Deferred Telegram outboxes are migrated through explicit-tenant paginated
-`Query` with `notifications backfill-telegram`; no Scan is used. Email remains
+`Query` with `limnopulse-admin backfill-telegram`; no Scan is used. Email remains
 schema v1 and keeps its prior identity, queue, SES and feedback semantics.
 WhatsApp, SMS and mobile push remain later commercial/product decisions.
 

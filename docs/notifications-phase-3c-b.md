@@ -1,9 +1,11 @@
 # Telegram Notification Delivery Phase 3C-B Operations
 
 Phase 3C-B adds tenant-scoped Telegram binding and delivery to the Phase 3C-A
-durable notification pipeline. It uses a dedicated SQS queue and continuous
-`notifications telegram-worker`. The existing one-shot relay remains externally
-scheduled and routes each channel to its own queue. DynamoDB remains
+durable notification pipeline. It uses a dedicated SQS queue and the
+continuous `telegram-worker` executable (ADR-020; the legacy
+`notifications telegram-worker` still backs the local Compose service until
+ADR-020 S3 removes it). The existing one-shot `notification-relay` remains
+externally scheduled and routes each channel to its own queue. DynamoDB remains
 authoritative for binding, destination, preference, Delivery, Attempt,
 transition and idempotency state. Redis is only a fail-closed rate limiter.
 
@@ -125,7 +127,7 @@ binding and migration are verified.
    Telegram rows before they consume discovery caps; it still never claims or
    publishes them. Verify the worker has only its queue, data-plane and
    bot-secret IAM.
-6. Run `notifications backfill-telegram` for explicit tenant batches. It never
+6. Run `limnopulse-admin backfill-telegram` for explicit tenant batches. It never
    uses DynamoDB Scan; it uses paginated `Query` and conditional updates:
 
    Pause the evaluator scheduler before the final backfill. While delivery is
@@ -134,18 +136,27 @@ binding and migration are verified.
    the final clean dry-run and before relay/evaluator activation.
 
    ```bash
-   notifications backfill-telegram --tenant-file tenants.txt --max-rows 10000 --timeout 5m
-   notifications backfill-telegram --tenant-file tenants.txt --apply --max-rows 10000 --timeout 5m
-   notifications backfill-telegram --tenant-file tenants.txt --max-rows 10000 --timeout 5m
+   limnopulse-admin backfill-telegram --tenant-file tenants.txt --max-rows 10000 --timeout 5m
+   limnopulse-admin backfill-telegram --tenant-file tenants.txt --apply --max-rows 10000 --timeout 5m
+   limnopulse-admin backfill-telegram --tenant-file tenants.txt --max-rows 10000 --timeout 5m
    ```
 
    Continue bounded idempotent batches until the dry-run reports zero rows
    needing update. Investigate schema conflicts rather than overwriting them.
+   The command exits 0 on success, 1 on a fatal or incomplete run, 2 on row
+   failures and 78 on a bad flag or tenant scope.
    Keep the evaluator paused until the relay and evaluator flags are enabled in
    the next step.
 7. Start the Telegram worker with `TELEGRAM_DELIVERY_ENABLED=true` while relay
    and evaluator remain false. Confirm Redis and Bot API health, zero DLQ input,
-   and graceful shutdown behavior.
+   and graceful shutdown behavior. Under systemd `telegram-worker` reads the
+   Redis password from its `redis-password` credential and exits 78 if
+   `REDIS_PASSWORD` is also set in its env file. It exits 0 only after
+   `SIGTERM`/`SIGINT`, 1 after a fatal error or a stalled receive loop, and 78
+   on a configuration error. That includes a `TELEGRAM_GLOBAL_RATE` or
+   `TELEGRAM_DESTINATION_RATE` so low that one limiter wait plus the provider
+   timeout would reach the stall limit, because the worker waits for the limiter
+   in-process.
 8. Enable Telegram on the relay and evaluator, in that order, for a controlled
    tenant cohort. Confirm one opening and recovery before broader activation.
 9. Monitor the queue, DLQ, limiter and durable states. Track queue age,
