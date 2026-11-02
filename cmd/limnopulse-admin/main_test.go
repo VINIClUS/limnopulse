@@ -357,6 +357,7 @@ func TestBackfillRelayExitCodesCoverSuccessPartialAndFatalResults(t *testing.T) 
 		wantUpdates  int
 		wantCategory string
 		wantSummary  bool
+		wantSettings []string
 	}{
 		{
 			name: "dry-run success", args: []string{"backfill-relay", "--tenant", "private_tenant"},
@@ -394,14 +395,17 @@ func TestBackfillRelayExitCodesCoverSuccessPartialAndFatalResults(t *testing.T) 
 		},
 		{
 			name: "empty table configuration", args: []string{"backfill-relay", "--tenant", "private_tenant"},
-			client: &fakeDynamo{},
-			lookupEnv: func(key string) (string, bool) {
-				if key == "DYNAMODB_DOMAIN_TABLE" {
-					return "", true
-				}
-				return "", false
-			},
-			wantExit: workerproc.ExitConfiguration, wantResult: "fatal_failure", wantCategory: "configuration",
+			client:    &fakeDynamo{},
+			lookupEnv: emptySetting("DYNAMODB_DOMAIN_TABLE"),
+			wantExit:  workerproc.ExitConfiguration, wantResult: "fatal_failure", wantCategory: "configuration",
+			wantSettings: []string{"DYNAMODB_DOMAIN_TABLE"},
+		},
+		{
+			name: "empty region configuration", args: []string{"backfill-relay", "--tenant", "private_tenant"},
+			client:    &fakeDynamo{},
+			lookupEnv: emptySetting("AWS_REGION"),
+			wantExit:  workerproc.ExitConfiguration, wantResult: "fatal_failure", wantCategory: "configuration",
+			wantSettings: []string{"AWS_REGION"},
 		},
 	}
 	for _, test := range tests {
@@ -439,8 +443,8 @@ func TestBackfillRelayExitCodesCoverSuccessPartialAndFatalResults(t *testing.T) 
 			if (result.Summary != nil) != test.wantSummary {
 				t.Fatalf("summary presence = %v, want %v; result = %#v", result.Summary != nil, test.wantSummary, result)
 			}
-			if test.wantCategory == "configuration" && !reflect.DeepEqual(result.Settings, []string{"DYNAMODB_DOMAIN_TABLE"}) {
-				t.Fatalf("settings = %#v, want only DYNAMODB_DOMAIN_TABLE", result.Settings)
+			if !reflect.DeepEqual(result.Settings, test.wantSettings) {
+				t.Fatalf("settings = %#v, want %#v", result.Settings, test.wantSettings)
 			}
 		})
 	}
@@ -571,5 +575,12 @@ func TestAdminPrintsACommandsUsageAndExits0OnHelp(t *testing.T) {
 			!strings.HasPrefix(output.String(), "Usage of limnopulse-admin "+test.command+":") {
 			t.Fatalf("%s: exit=%d loads=%d output=%s", test.command, code, loadCalls, output.String())
 		}
+	}
+}
+
+// emptySetting is an environment that sets key, and only key, to the empty string.
+func emptySetting(key string) func(string) (string, bool) {
+	return func(name string) (string, bool) {
+		return "", name == key
 	}
 }

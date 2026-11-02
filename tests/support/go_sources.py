@@ -30,19 +30,24 @@ class GoFile:
     def relative(self) -> str:
         return self.path.relative_to(ROOT).as_posix()
 
-    def uses(self, import_path: str, member: str) -> bool:
-        """Whether the code refers to `<local name>.<member>` (a regex) of import_path under
-        any of its local names, called or not."""
-        for name in self.imports.get(import_path, ()):
+    def references(self, import_path: str, member: str) -> list[str]:
+        """Each `<local name>.<member>` (a regex) of import_path the code names, under any of
+        its local names, called or not. A dot import hides every qualified reference, so it
+        counts as one reference, "."."""
+        found: list[str] = []
+        for name in sorted(self.imports.get(import_path, ())):
             if name == "_":
                 continue
             if name == ".":
-                # A dot import hides every qualified reference; count it as a use.
-                return True
+                found.append(".")
+                continue
             pattern = rf"(?<![\w.]){re.escape(name)}\s*\.\s*(?:{member})"
-            if re.search(pattern, self.code):
-                return True
-        return False
+            found.extend(match.group(0) for match in re.finditer(pattern, self.code))
+        return found
+
+    def uses(self, import_path: str, member: str) -> bool:
+        """Whether the code names `<local name>.<member>` (a regex) of import_path."""
+        return bool(self.references(import_path, member))
 
 
 def strip_comments(source: str) -> str:

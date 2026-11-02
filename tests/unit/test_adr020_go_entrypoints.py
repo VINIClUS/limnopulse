@@ -30,10 +30,12 @@ SES_PACKAGE = re.compile(
 )
 # Bare names, so a function value (`nap := time.Sleep`) counts as much as a call.
 TIMER_NAMES = r"(?:Sleep|Tick|NewTicker|NewTimer|After|AfterFunc|Ticker|Timer)\b"
-ENV_NAMES = r"(?:Getenv|LookupEnv|Environ)\b"
-# A main hands os.LookupEnv to its loader as a value and never reads the env itself.
-MAIN_ENV_READS = r"(?:Getenv|Environ)\b|LookupEnv\s*\("
-# A secret's env key may be named only by its loader and by the main that maps it to a credential.
+ENV_NAMES = r"(?:Getenv|LookupEnv|Environ|ExpandEnv)\b"
+# A main names os.LookupEnv once, as the value of its dependencies' LookupEnv field, and
+# never reads the env any other way.
+MAIN_ENV_READS = r"(?:Getenv|Environ|ExpandEnv)\b"
+# A secret's env key is named exactly once by its loader and once by the main that maps it to
+# a credential, and nowhere else.
 SECRET_KEYS = {
     "INFLUXDB_TOKEN": {"internal/alertevaluator/config.go", "cmd/alert-evaluator/main.go"},
     "REDIS_PASSWORD": {
@@ -148,16 +150,24 @@ def test_oneshot_closures_never_sleep_poll_or_supervise(name: str) -> None:
 @pytest.mark.parametrize("name", S1_ROLES)
 def test_roles_read_settings_only_through_their_lookup(name: str) -> None:
     main = MODULE + f"cmd/{name}"
+    lookups = []
     for file in closure_files(f"cmd/{name}"):
         if file.package == main:
             assert not file.uses("os", MAIN_ENV_READS), file.relative
             assert not file.uses("syscall", ENV_NAMES), file.relative
+            lookups += [(file, found) for found in file.references("os", r"LookupEnv\b")]
         elif file.package != WORKERPROC:
             assert not file.uses("os", ENV_NAMES), file.relative
             assert not file.uses("syscall", ENV_NAMES), file.relative
         for key, allowed in SECRET_KEYS.items():
-            if f'"{key}"' in file.code:
-                assert file.relative in allowed, (key, file.relative)
+            # A second literal in an allowed file is a second read, e.g. deps.LookupEnv(key).
+            count = file.code.count(f'"{key}"')
+            assert count == (1 if file.relative in allowed else 0), (key, file.relative, count)
+    # Exactly one os.LookupEnv in the whole main package: the injected lookup itself.
+    assert len(lookups) == 1, [(file.relative, found) for file, found in lookups]
+    file, found = lookups[0]
+    assert found != "."
+    assert re.search(rf"(?<![\w.])LookupEnv:\s*{re.escape(found)}\b", file.code), file.relative
 
 
 @pytest.mark.parametrize("name", CONTINUOUS_ROLES)
