@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	"flag"
+	"io"
 	"time"
 
 	alertdynamo "github.com/VINIClUS/limnopulse/internal/alertevaluator/dynamo"
@@ -13,6 +14,7 @@ import (
 // backfillSchedule writes the AlertEvaluationByDue attributes of rules that predate them.
 func backfillSchedule(ctx context.Context, args []string, deps dependencies, load workercmd.AWSLoader) int {
 	fs := flag.NewFlagSet("limnopulse-admin backfill-schedule", flag.ContinueOnError)
+	fs.SetOutput(io.Discard)
 	var sources []tenantSource
 	fs.Var(tenantSourceFlagValue{Kind: tenantSourceFlag, Sources: &sources}, "tenant", "explicit tenant ID; repeatable")
 	evaluationTime := fs.String("evaluation-time", "", "stable RFC3339 schedule time; default now")
@@ -47,6 +49,7 @@ func backfillSchedule(ctx context.Context, args []string, deps dependencies, loa
 // alert events.
 func backfillActiveAlertIndex(ctx context.Context, args []string, deps dependencies, load workercmd.AWSLoader) int {
 	fs := flag.NewFlagSet("limnopulse-admin backfill-active-alert-index", flag.ContinueOnError)
+	fs.SetOutput(io.Discard)
 	var sources []tenantSource
 	for _, name := range []string{"tenant", "tenant-id"} {
 		fs.Var(tenantSourceFlagValue{Kind: tenantSourceFlag, Sources: &sources}, name, "explicit tenant ID; repeatable")

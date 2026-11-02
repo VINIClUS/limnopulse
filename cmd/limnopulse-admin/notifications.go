@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	"flag"
+	"io"
 	"time"
 
 	"github.com/VINIClUS/limnopulse/internal/notifications"
@@ -28,6 +29,7 @@ func backfillRelay(
 	load workercmd.AWSLoader,
 ) int {
 	fs := flag.NewFlagSet("limnopulse-admin "+name, flag.ContinueOnError)
+	fs.SetOutput(io.Discard)
 	var sources []tenantSource
 	fs.Var(tenantSourceFlagValue{Kind: tenantSourceFlag, Sources: &sources}, "tenant", "explicit tenant ID; repeatable")
 	fs.Var(tenantSourceFlagValue{Kind: tenantSourceFile, Sources: &sources}, "tenant-file", "file containing tenant IDs; repeatable")

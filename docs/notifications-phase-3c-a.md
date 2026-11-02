@@ -236,13 +236,17 @@ unnecessary overlap.
 error.
 
 A systemd deployment uses a oneshot service and a timer; the relay itself must
-not contain a loop:
+not contain a loop. The unit follows `ops/workers/roles.yaml` (see
+`ops/workers/README.md`); without its credentials it exits 78:
 
 ```ini
 # limnopulse-notification-relay.service
 [Service]
 Type=oneshot
 EnvironmentFile=/etc/limnopulse/workers/notification-relay.env
+Environment=GOTRACEBACK=crash LIMNOPULSE_SUPERVISOR=systemd
+LoadCredential=aws-access-key-id:/etc/limnopulse/workers/credentials/notification-relay/aws-access-key-id
+LoadCredential=aws-secret-access-key:/etc/limnopulse/workers/credentials/notification-relay/aws-secret-access-key
 ExecStart=/opt/limnopulse/workers/current/bin/notification-relay --shard=0 --shard-count=1
 TimeoutStartSec=50
 ```

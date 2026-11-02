@@ -21,6 +21,7 @@ Build or run without Compose:
 
 ```bash
 go build -o bin/alert-evaluator ./cmd/alert-evaluator
+go build -o bin/limnopulse-admin ./cmd/limnopulse-admin
 DYNAMODB_ENDPOINT_URL=http://127.0.0.1:8001 \
   ./bin/alert-evaluator run --shard=0 --shard-count=1
 ```
@@ -80,7 +81,10 @@ use a oneshot service and timer:
 [Service]
 Type=oneshot
 EnvironmentFile=/etc/limnopulse/workers/alert-evaluator.env
-LoadCredential=influxdb-token
+Environment=GOTRACEBACK=crash LIMNOPULSE_SUPERVISOR=systemd
+LoadCredential=aws-access-key-id:/etc/limnopulse/workers/credentials/alert-evaluator/aws-access-key-id
+LoadCredential=aws-secret-access-key:/etc/limnopulse/workers/credentials/alert-evaluator/aws-secret-access-key
+LoadCredential=influxdb-token:/etc/limnopulse/workers/credentials/alert-evaluator/influxdb-token
 ExecStart=/opt/limnopulse/workers/current/bin/alert-evaluator run --shard=0 --shard-count=1
 TimeoutStartSec=50
 ```
@@ -95,8 +99,10 @@ Persistent=true
 WantedBy=timers.target
 ```
 
-Under systemd the evaluator reads the InfluxDB token from its `influxdb-token`
-credential, never from the env file: `INFLUXDB_TOKEN` set next to a loaded
+This is the shape of the unit that `ops/workers/roles.yaml` describes (the
+credential list, `go_unit_environment` and `paths.credential_source`); see
+`ops/workers/README.md`. Under systemd the evaluator reads the InfluxDB token from
+its `influxdb-token` credential, never from the env file: `INFLUXDB_TOKEN` set next to a loaded
 credential exits 78. AWS keys come from the `aws-access-key-id` and
 `aws-secret-access-key` credentials.
 
