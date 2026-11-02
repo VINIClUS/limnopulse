@@ -4,7 +4,8 @@ Phase 3B ships `alert-evaluator`, a one-shot Go process. Each `run` captures one
 stable logical evaluation time, queries eligible rules, commits durable
 decisions, emits a JSON summary and exits. It has no scheduler, infinite loop,
 sleep or continuous polling. Invoke it every 60 seconds from the scheduler that
-fits the deployment.
+fits the deployment. `run` is its only command (ADR-020): any other argument
+exits 78, and the backfills are `limnopulse-admin` commands.
 
 ## Run locally
 
@@ -53,19 +54,20 @@ explicit tenant IDs and uses tenant `Query` operations only; it never scans the
 table. It is a dry-run unless `--apply` is present:
 
 ```bash
-./bin/alert-evaluator backfill-schedule \
+./bin/limnopulse-admin backfill-schedule \
   --tenant=tnt_001 \
   --tenant=tnt_002 \
   --evaluation-time=2026-07-15T12:00:00Z
 
-./bin/alert-evaluator backfill-schedule \
+./bin/limnopulse-admin backfill-schedule \
   --tenant=tnt_001 \
   --tenant=tnt_002 \
   --evaluation-time=2026-07-15T12:00:00Z \
   --apply
 ```
 
-Review the dry-run counts before applying. Disabled and replaced rules are not
+Review the dry-run counts before applying. A missing tenant or a bad flag exits
+78 before any AWS call. Disabled and replaced rules are not
 indexed.
 
 ## Scheduler examples
@@ -77,8 +79,9 @@ use a oneshot service and timer:
 # /etc/systemd/system/limnopulse-alert-evaluator.service
 [Service]
 Type=oneshot
-EnvironmentFile=/etc/limnopulse/alert-evaluator.env
-ExecStart=/usr/local/bin/alert-evaluator run --shard=0 --shard-count=1
+EnvironmentFile=/etc/limnopulse/workers/alert-evaluator.env
+LoadCredential=influxdb-token
+ExecStart=/opt/limnopulse/workers/current/bin/alert-evaluator run --shard=0 --shard-count=1
 TimeoutStartSec=50
 ```
 
@@ -91,6 +94,11 @@ Persistent=true
 [Install]
 WantedBy=timers.target
 ```
+
+Under systemd the evaluator reads the InfluxDB token from its `influxdb-token`
+credential, never from the env file: `INFLUXDB_TOKEN` set next to a loaded
+credential exits 78. AWS keys come from the `aws-access-key-id` and
+`aws-secret-access-key` credentials.
 
 A Kubernetes `CronJob` should use `schedule: "* * * * *"`,
 `concurrencyPolicy: Forbid`, `activeDeadlineSeconds: 50` and the same container
@@ -139,7 +147,9 @@ Every invocation writes one JSON summary to stdout. Exit codes are:
 - `1`: fatal dependency error, deadline/cap incomplete scope, or lost
   authoritative coordination;
 - `2`: isolated rule query failures were recorded durably and other work
-  completed.
+  completed;
+- `78`: configuration error (a bad command, flag, setting or credential). No
+  rerun can fix it, so the summary sets `retry_recommended=false`.
 
 Set `OTEL_EXPORTER_OTLP_ENDPOINT` to enable OTLP/HTTP metrics. Export and
 shutdown are bounded by `ALERT_EVALUATOR_OTLP_FLUSH_TIMEOUT` (two seconds by

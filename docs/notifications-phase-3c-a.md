@@ -1,9 +1,14 @@
 # Notification Delivery Phase 3C-A Operations
 
 Phase 3C-A delivers email notifications through a durable DynamoDB-to-SQS-to-SES
-pipeline. `notifications relay` is a one-shot publisher intended for an external
-60-second scheduler. `notifications worker` is the continuous jobs and SES
-feedback consumer. Telegram is not delivered in Phase 3C-A; existing Telegram
+pipeline. Under ADR-020 each worker role is its own executable:
+`notification-relay` is a one-shot publisher intended for an external 60-second
+scheduler, `email-worker` is the continuous jobs consumer and
+`ses-feedback-worker` is the continuous SES feedback consumer. The two consumers
+are separate processes with separate settings; neither polls the other's queue.
+The relay backfill is the operator command `limnopulse-admin backfill-relay`.
+The legacy `notifications` binary still backs the local Compose services until
+ADR-020 S3 removes it. Telegram is not delivered in Phase 3C-A; existing Telegram
 outboxes remain outside the email relay index, and the legacy backfill marks the
 rows it visits as deferred for Phase 3C-B.
 
@@ -140,13 +145,13 @@ enabling either publisher or consumer.
 4. Keep relay and worker off while the old rows and SES prerequisites are
    checked. Provision the jobs queue, SES events queue and all three DLQs first.
 5. Backfill relay attributes by explicit tenant Query. Run
-   `notifications backfill-relay` as a dry-run, review `row_failures`, then use
+   `limnopulse-admin backfill-relay` as a dry-run, review `row_failures`, then use
    `--apply` and repeat the dry-run until `rows_needing_update` is zero:
 
    ```bash
-   notifications backfill-relay --tenant-file tenants.txt --max-rows 10000 --timeout 5m
-   notifications backfill-relay --tenant-file tenants.txt --apply --max-rows 10000 --timeout 5m
-   notifications backfill-relay --tenant-file tenants.txt --max-rows 10000 --timeout 5m
+   limnopulse-admin backfill-relay --tenant-file tenants.txt --max-rows 10000 --timeout 5m
+   limnopulse-admin backfill-relay --tenant-file tenants.txt --apply --max-rows 10000 --timeout 5m
+   limnopulse-admin backfill-relay --tenant-file tenants.txt --max-rows 10000 --timeout 5m
    ```
 
    The command never scans DynamoDB: after each email outbox Query it paginates
@@ -156,7 +161,8 @@ enabling either publisher or consumer.
    that read work. It exits partially with
    `scope_completed=false` and either `row_limit_reached` or `deadline_reached`
    when a bound is reached; increase the explicit bound or narrow the tenant
-   batch, then repeat the idempotent run. Telegram rows are marked
+   batch, then repeat the idempotent run. A bad flag or tenant scope exits 78
+   before any AWS call. Telegram rows are marked
    `deferred_unsupported_channel` and are not indexed for email relay.
 
    Deliverability identities use the lowercase ASCII mailbox hash. Readers keep
@@ -177,7 +183,8 @@ enabling either publisher or consumer.
    production-access or sandbox recipient coverage. Confirm the EventBridge rule
    can write both the SES events queue and routing DLQ.
 7. Start one worker replica only after draining and stopping every older
-   feedback-worker replica, then deploy and verify the new feedback workers.
+   feedback-worker replica, then deploy and verify the new feedback workers:
+   start `ses-feedback-worker` first, then one `email-worker`.
    This ordering is required for `waiting_dependency`: an older worker can
    reconcile its opening feedback but cannot promote or cancel that newer
    recovery state. Do not run old and new feedback workers concurrently during
@@ -188,7 +195,7 @@ enabling either publisher or consumer.
    ASCII friendly-name form (`Limnopulse <alerts@example.com>`); malformed
    values stop the worker before rate limiting, Attempt creation or an SES call.
 8. Schedule the relay every 60 seconds only after the new feedback worker is
-   healthy. Run `notifications relay` as a one-shot
+   healthy. Run `notification-relay` as a one-shot
    task with a timeout below the cadence. systemd timer, Kubernetes CronJob,
    EventBridge Scheduler/ECS or an equivalent external scheduler may invoke the
    same image; the domain contains no scheduling loop.
@@ -199,7 +206,7 @@ enabling either publisher or consumer.
 For deterministic replay or incident diagnosis:
 
 ```bash
-notifications relay \
+notification-relay \
   --relay-time=2026-07-17T12:00:00Z \
   --shard=0 \
   --shard-count=1
@@ -216,6 +223,18 @@ scheduler/operator must run it again. Overlapping invocations remain safe due
 to leases, fencing and conditional writes, but the scheduler should still avoid
 unnecessary overlap.
 
+| Exit | Meaning |
+| --- | --- |
+| 0 | The run completed its scope. |
+| 1 | Fatal: discovery, AWS or composition failed; the next run retries. |
+| 2 | Partial: some work failed or a bound was reached; the next run retries. |
+| 78 | Configuration error: a bad flag, setting or credential. Rerunning cannot fix it. |
+
+`email-worker` and `ses-feedback-worker` exit 0 only after `SIGTERM`/`SIGINT`,
+1 after a fatal error or a stalled receive loop (no progress for
+`stall_after_seconds` in `ops/workers/roles.yaml`), and 78 on a configuration
+error.
+
 A systemd deployment uses a oneshot service and a timer; the relay itself must
 not contain a loop:
 
@@ -223,8 +242,8 @@ not contain a loop:
 # limnopulse-notification-relay.service
 [Service]
 Type=oneshot
-EnvironmentFile=/etc/limnopulse/notifications.env
-ExecStart=/usr/local/bin/notifications relay --shard=0 --shard-count=1
+EnvironmentFile=/etc/limnopulse/workers/notification-relay.env
+ExecStart=/opt/limnopulse/workers/current/bin/notification-relay --shard=0 --shard-count=1
 TimeoutStartSec=50
 ```
 
@@ -236,8 +255,8 @@ Persistent=true
 ```
 
 A Kubernetes CronJob should use `schedule: "* * * * *"`,
-`concurrencyPolicy: Forbid`, `activeDeadlineSeconds: 50` and container arguments
-`["relay", "--shard=0", "--shard-count=1"]`. EventBridge Scheduler can launch
+`concurrencyPolicy: Forbid`, `activeDeadlineSeconds: 50` and the container
+command `["notification-relay", "--shard=0", "--shard-count=1"]`. EventBridge Scheduler can launch
 the same image as an ECS task every minute. Sharded deployments create one
 scheduled invocation for each `shard` under the same `shard-count`; changing
 process count needs no DynamoDB migration because the persisted total remains
@@ -248,7 +267,7 @@ process count needs no DynamoDB migration because the persisted total remains
 If delivery behavior is unsafe, turn off the relay first so no new SQS jobs are
 published. Once any `waiting_dependency` recovery exists, do not roll back to
 an older feedback worker; keep the compatible worker running to reconcile it.
-Send `SIGTERM` to the worker and allow its 30-second internal drain
+Send `SIGTERM` to `email-worker` and allow its 30-second internal drain
 budget plus shutdown headroom; do not kill it during a provider call unless the
 incident requires accepting an ambiguous outcome, and preserve DynamoDB
 delivery and attempt rows, relay index attributes, queues and DLQs. They are the
@@ -289,7 +308,7 @@ SES events queue only after confirming that the event shape and tags are valid.
 
 ## Observability
 
-Both commands emit one bounded JSON result to stdout and never include message
+Every command emits one bounded JSON result to stdout and never include message
 bodies, queue URLs, email addresses, subjects or rendered content. Set
 `OTEL_EXPORTER_OTLP_ENDPOINT` for OTLP/HTTP metrics.
 
@@ -297,9 +316,9 @@ Relay alarms should cover `notification_relay_backlog_items`, oldest backlog
 age, run duration, deadline/cap reached, work errors, SQS errors and published
 jobs. Worker alarms should cover attempts, retries, ambiguity, possible
 duplicates, unknown outcomes, limiter waiters, active concurrency, throttling
-and daily quota. The worker JSON summary also exposes per-consumer received,
-deleted, visibility-changed and queue-error counts plus bounded feedback counts
-for applied, duplicate, ignored, malformed, awaiting-DLQ, persistence error and
+and daily quota. Each consumer's JSON summary also exposes its received,
+deleted, visibility-changed and queue-error counts; the `ses-feedback-worker`
+summary adds bounded feedback counts for applied, duplicate, ignored, malformed, awaiting-DLQ, persistence error and
 suppression outcomes.
 
 At minimum, alert on a nonzero DLQ depth, repeated relay partial/fatal exits,
