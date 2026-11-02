@@ -20,9 +20,12 @@ The rules live elsewhere, and this page links to them instead of repeating them:
 - **Host:** commands marked *host* run as root on the VPS.
 - **Workstation:** commands marked *workstation* run on the operator's workstation, from
   `infra/opentofu` in a checkout, with the operator's own AWS credentials. That covers
-  `tofu`, `aws`, `install_worker_key` and `limnopulse-admin`. Operator credentials never
-  go onto the VPS. The one exception is the fallback that "Access keys" describes for a
-  host whose `sudo` needs a password.
+  `tofu`, `install_worker_key`, `limnopulse-admin` and every `aws` call made with operator
+  credentials. Operator credentials never go onto the VPS, except in the fallback that
+  "Access keys" describes for a host whose `sudo` needs a password.
+- **Host exceptions:** two steps run on the host. The SES check's test send uses the email
+  worker's own key, as root on the host ("The email-worker's SES check", step 2). The
+  `influx` CLI runs inside the `influxdb` container.
 
 ## Starting state
 
@@ -84,7 +87,9 @@ actions follow "Enabling and disabling a role" in
 3. `email-worker`.
 4. `telegram-worker`, with Telegram still off on the relay and the evaluator.
 5. `notification-relay`.
-6. `alert-evaluator`.
+6. `alert-evaluator`. If this rollout includes Telegram, hold the evaluator until
+   [Telegram on the producers](#telegram-on-the-producers), and enable it there with
+   Telegram on.
 
 Consumers come before producers. A producer started first leaves its jobs aging in a queue
 that nothing reads.
@@ -102,8 +107,9 @@ For each role:
    `*_ENDPOINT_URL`.
 2. *Workstation:* define `install_worker_key` from "Access keys" in
    [`infra/opentofu/README.md`](../infra/opentofu/README.md), then install the role's key
-   with it. *Host:* write any other credential the role lists (`influxdb-token`,
-   `redis-password`) with the `read -rs` pattern in `ops/vps/README.md`, step 7.4.
+   with it. *Host:* write the Telegram worker's `redis-password` with the `read -rs`
+   pattern in `ops/vps/README.md`, step 7.4. Write the evaluator's `influxdb-token` as its
+   gate below says.
 3. Pass the role's gate below.
 4. *Host:* run `systemctl enable --now limnopulse-<role>.timer` for a one-shot, or
    `systemctl enable --now limnopulse-<role>.service` for a continuous role. The enable
@@ -116,34 +122,49 @@ For each role:
 |---|---|
 | `worker-monitor` | The static user exists: `getent passwd limnopulse-worker-monitor` shows a uid below 61184 (`ops/vps/README.md`, step 7.5). |
 | `ses-feedback-worker` | `email_delivery` is applied. The 3C-A "Cloud rollout" steps 1 to 6 are done: the relay index is `ACTIVE`, the email outboxes are backfilled and SES is validated. No older feedback worker is running. |
-| `email-worker` | The SES-feedback worker is enabled and its alarms are `OK`. The SES check passes (`infra/opentofu/README.md`, "The email-worker's SES check"). The apply that first created `NotificationRelayByAvailableAt` is not the one that enables it ("Notification rollout boundary"). |
+| `email-worker` | The SES-feedback worker is enabled and its alarms are `OK`. The SES check passes (`infra/opentofu/README.md`, "The email-worker's SES check"). Its simulation runs on the *workstation* and its test send on the *host*. The apply that first created `NotificationRelayByAvailableAt` is not the one that enables it ("Notification rollout boundary"). |
 | `telegram-worker` | The 3C-B "Cloud rollout" steps 1 to 6 are done: queue, secrets, webhook and binding, binaries with every Telegram flag `false`, and the final `limnopulse-admin backfill-telegram` with the evaluator timer stopped. Redis is published on the host loopback with a password, and in the same change the API's `REDIS_URL` gets that password. `compose.production.yaml` publishes no Redis port and hard-codes a password-less `REDIS_URL`, so that change comes first. The password is the worker's `redis-password` credential. Only the worker's env file sets `TELEGRAM_DELIVERY_ENABLED=true` (3C-B step 7). |
 | `notification-relay` | `NotificationRelayByAvailableAt` is `ACTIVE`, and `limnopulse-admin backfill-relay` reports zero rows needing update. The apply that first created the index is not the one that enables it. With Telegram on, the env file also sets `SQS_TELEGRAM_JOBS_URL` and `LIMNOPULSE_WEB_URL`. |
-| `alert-evaluator` | The `influxdb-token` credential can read `INFLUXDB_BUCKET_RAW`. The data-quality settings in the env file match the devices. `limnopulse-admin backfill-schedule` has been applied ([`docs/alert-evaluator-phase-3b.md`](alert-evaluator-phase-3b.md), "Initial schedule backfill"). |
+| `alert-evaluator` | The `influxdb-token` credential is a dedicated token, readable only against `INFLUXDB_BUCKET_RAW`. It is never the bootstrap admin `INFLUXDB_TOKEN` that the API and InfluxDB use. Create it as the P3 runbook creates the ingest worker's token ("Production environment"), but with `--read-bucket` and `--description alert-evaluator`. Write its `token` field straight into the credential file without printing it. The data-quality settings in the env file match the devices. `limnopulse-admin backfill-schedule` has been applied ([`docs/alert-evaluator-phase-3b.md`](alert-evaluator-phase-3b.md), "Initial schedule backfill"). |
 
 **Backfills.** *Workstation:* run each backfill under the assumed `limnopulse_admin` role,
 as "limnopulse-admin" in [`infra/opentofu/README.md`](../infra/opentofu/README.md)
 describes. Name the tenants explicitly. Do a dry run, review it, run with `--apply`, then
 dry-run again until it reports nothing left to update.
 
-**Telegram on the producers.** Turn Telegram on later, as 3C-B step 8 describes: first the
-relay, then the evaluator, for a controlled tenant cohort. Then confirm one opening and one
-recovery. If the evaluator timer was stopped for the final Telegram backfill, start it
-again only once its env file has Telegram on.
+### Telegram on the producers
+
+Turn Telegram on as 3C-B step 8 describes: first the relay, then the evaluator, for a
+controlled tenant cohort. Then confirm one opening and one recovery.
+
+From the final `backfill-telegram` until the evaluator's env file has Telegram on, the
+evaluator timer stays stopped. An evaluator run with Telegram off marks each new Telegram
+outbox `deferred_unsupported_channel`, and nothing indexes those outboxes later. If the
+evaluator did run in that window:
+
+1. Stop its timer.
+2. Repeat the `backfill-telegram` dry run, `--apply` and dry run until it reports nothing
+   to update.
+3. Turn on the flags.
 
 ## Disable a Go role
 
-Within a role, reverse the enable steps (*workstation*, then *host*):
+Within a role, reverse the enable steps:
 
-1. Set `<role>_enabled = false` and apply it, so its alarms notify nobody.
-2. Disable the unit:
+1. *Workstation:* set `<role>_enabled = false` and apply it, so its alarms notify nobody.
+2. *Host:* disable the unit:
 
    ```bash
    systemctl disable --now limnopulse-<role>.timer     # one-shot
    systemctl disable --now limnopulse-<role>.service   # continuous
    ```
 
-3. Delete the role's access key and its credential files.
+3. *Workstation:* delete the role's access key (`aws iam list-access-keys`, then
+   `aws iam delete-access-key`).
+4. *Host:* remove the files under `/etc/limnopulse/workers/credentials/<role>/`. For the
+   evaluator, also delete its dedicated InfluxDB token by id, with `influx auth list` and
+   then `influx auth delete --id <id>`. Run `influx` inside the `influxdb` container, as
+   the P3 runbook does. Never delete the bootstrap admin token.
 
 Across roles, disable in the reverse of the enable order, and `worker-monitor` last. Every
 other unit-health alarm treats missing data as breaching. So stopping the monitor while
@@ -164,12 +185,14 @@ another role's alarm actions are on pages for that role within minutes.
    `aws iam list-access-keys --user-name <user>` and delete the other key with
    `aws iam delete-access-key`.
 
-**InfluxDB token.**
+**InfluxDB token (evaluator).** All steps run on the *host*.
 
-1. Create a new token with the same read scope.
-2. *Host:* write it over `influxdb-token` with the `read -rs` pattern.
-3. Restart the unit, or wait for the next tick.
-4. Delete the old token in InfluxDB once a run succeeds.
+1. Create a second dedicated read token, the same way as in the evaluator's gate.
+2. Write its `token` field over `influxdb-token` without printing it.
+3. Let the next tick read it.
+4. Once a run succeeds, delete the old dedicated token by id, with `influx auth list` and
+   then `influx auth delete --id <id>`. Run `influx` inside the `influxdb` container, as
+   the P3 runbook does. Never delete the bootstrap admin token.
 
 **Redis password.** It changes the Redis server, the API's `REDIS_URL` and the
 `redis-password` credential together, as one change.
