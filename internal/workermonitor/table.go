@@ -1,7 +1,3 @@
-// Package workermonitor publishes ADR-020 unit health. For every role whose unit is
-// enabled it reads the unit state through systemctl and sends one Limnopulse/Workers
-// UnitHealthy datum (1 or 0) to CloudWatch. It is one-shot: a systemd timer runs it once
-// per schedule interval, and it keeps no loop, sleep or state of its own.
 package workermonitor
 
 import (

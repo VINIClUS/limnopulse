@@ -55,11 +55,16 @@ func TestParseShowReadsUnitState(t *testing.T) {
 }
 
 func TestParseShowRejectsValuesItCannotRead(t *testing.T) {
+	const states = "LoadState=loaded\nActiveState=failed\n"
 	cases := map[string]string{
-		"code":         "ExecMainCode=exited\n",
-		"status":       "ExecMainStatus=2/INVALIDARGUMENT\n",
-		"local zone":   "ExecMainExitTimestamp=Sun 2026-11-01 13:00:05 CET\n",
-		"unix seconds": "ExecMainExitTimestamp=@1793534405\n",
+		"empty output":    "",
+		"no properties":   "Failed to get properties: Access denied\n",
+		"no load state":   "ActiveState=inactive\nUnitFileState=enabled\n",
+		"no active state": "LoadState=loaded\nUnitFileState=enabled\n",
+		"code":            states + "ExecMainCode=exited\n",
+		"status":          states + "ExecMainStatus=2/INVALIDARGUMENT\n",
+		"local zone":      states + "ExecMainExitTimestamp=Sun 2026-11-01 13:00:05 CET\n",
+		"unix seconds":    states + "ExecMainExitTimestamp=@1793534405\n",
 	}
 	for name, out := range cases {
 		t.Run(name, func(t *testing.T) {

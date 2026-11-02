@@ -80,14 +80,21 @@ func (systemctl ExecSystemctl) Show(ctx context.Context, unit string) (UnitState
 	return state, nil
 }
 
-// ParseShow reads `systemctl show` Key=Value lines. A property that is missing or empty
-// keeps its zero value: a timer has no ExecMain* properties, and an unset timestamp
-// prints empty.
+// ParseShow reads `systemctl show` Key=Value lines. systemctl prints LoadState and
+// ActiveState for every unit, even one that is not installed, so output without them is
+// an error rather than a unit that publishes nothing. Any other property that is missing
+// or empty keeps its zero value: a timer has no ExecMain* properties, and an unset
+// timestamp prints empty.
 func ParseShow(out []byte) (UnitState, error) {
 	values := make(map[string]string)
 	for _, line := range strings.Split(string(out), "\n") {
 		if key, value, ok := strings.Cut(line, "="); ok {
 			values[key] = strings.TrimSpace(value)
+		}
+	}
+	for _, key := range []string{"LoadState", "ActiveState"} {
+		if values[key] == "" {
+			return UnitState{}, fmt.Errorf("output has no %s", key)
 		}
 	}
 	state := UnitState{

@@ -74,12 +74,11 @@ func evaluateOneshot(role Role, health UnitHealth, timer, service UnitState, now
 // oneshotHealth is healthy only when the timer is active and the last finished run exited
 // with a success code no longer than oneshot_stale_after_intervals schedules ago.
 //
-// systemd clears Result and every ExecMain* property when a run starts, so a run in
-// progress hides the previous run's outcome. That counts as unhealthy, so worker-monitor's
-// service must be ordered After= the other one-shot services and its timer offset from
-// theirs: it then samples them between runs. The monitor
-// itself is always mid-run when it looks, so for it the current run is the evidence and
-// only its timer is checked; a monitor that stopped running publishes nothing at all.
+// A run in progress reads unhealthy: systemd clears Result and every ExecMain* property
+// when a run starts, so the previous run's outcome is not visible. The package comment
+// lists the unit ordering that keeps such samples rare. The monitor itself is always
+// mid-run when it looks, so for it the current run is the evidence and only its timer is
+// checked. A monitor that stopped running publishes nothing at all.
 func oneshotHealth(role Role, health UnitHealth, timer, service UnitState, now time.Time) (bool, string) {
 	if timer.ActiveState != activeActive {
 		return false, fmt.Sprintf("timer %s/%s", timer.ActiveState, timer.SubState)
@@ -104,6 +103,9 @@ func oneshotHealth(role Role, health UnitHealth, timer, service UnitState, now t
 	}
 	stale := time.Duration(health.OneshotStaleAfterIntervals) * time.Duration(role.ScheduleSeconds) * time.Second
 	age := now.Sub(service.ExecMainExit)
+	if age < 0 {
+		return false, fmt.Sprintf("last run's exit time is %s ahead of the clock; the wall clock stepped back", (-age).Truncate(time.Second))
+	}
 	if age > stale {
 		return false, fmt.Sprintf("last run finished %s ago; stale after %s", age.Truncate(time.Second), stale)
 	}

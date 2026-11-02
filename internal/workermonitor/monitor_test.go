@@ -172,6 +172,16 @@ func TestMonitorPublishesUnitHealthForEnabledRolesOnly(t *testing.T) {
 			want:   map[string]float64{"alert-evaluator": 1},
 		},
 		{
+			name:   "one-shot run that finished this second",
+			states: map[string]UnitState{evaluatorTimer: timerUnit("enabled", "active"), evaluatorService: finishedRun(1, 0, resultSuccess, ago(0))},
+			want:   map[string]float64{"alert-evaluator": 1},
+		},
+		{
+			name:   "one-shot exit time ahead of a clock that stepped back",
+			states: map[string]UnitState{evaluatorTimer: timerUnit("enabled", "active"), evaluatorService: finishedRun(1, 0, resultSuccess, ago(-30))},
+			want:   map[string]float64{"alert-evaluator": 0},
+		},
+		{
 			name:   "stale one-shot role",
 			states: map[string]UnitState{evaluatorTimer: timerUnit("enabled", "active"), evaluatorService: finishedRun(1, 0, resultSuccess, ago(181))},
 			want:   map[string]float64{"alert-evaluator": 0},

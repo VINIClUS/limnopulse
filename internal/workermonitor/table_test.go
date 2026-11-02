@@ -13,11 +13,9 @@ import (
 	"github.com/VINIClUS/limnopulse/internal/workerproc"
 )
 
-// testdata/roles.json is ops/workers/roles.yaml rendered as JSON, as the workers bundle
-// ships it. tests/unit/test_worker_monitor_table.py fails when the two differ; regenerate
-// it with:
-//
-//	.venv/bin/python -c 'import json, yaml; print(json.dumps(yaml.safe_load(open("ops/workers/roles.yaml", encoding="utf-8")), indent=2, ensure_ascii=False))' > internal/workermonitor/testdata/roles.json
+// testdata/roles.json holds the fields of ops/workers/roles.yaml that Table decodes, as
+// JSON. tests/unit/test_worker_monitor_table.py keeps it equal to roles.yaml and
+// regenerates it.
 var testTablePath = filepath.Join("testdata", "roles.json")
 
 var rolesYAMLPath = filepath.Join("..", "..", "ops", "workers", "roles.yaml")
