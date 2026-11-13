@@ -10,13 +10,13 @@ does not absorb the LimnoPulse functional roadmap.
 
 | State | Status | Meaning |
 | --- | --- | --- |
-| Código integrado | Pendente | This index is on the implementation branch until its PR is reviewed and merged. |
+| Código integrado | Sim | This index was reviewed and merged to `main` at `082daa2ef82095ca87fe016e848ff2cfddbb4559` (PR #148). |
 | Pronto produção | Não | The candidate has no recoverable artifacts and the owner gate is incomplete. |
 | Produção aceita | Não | The LimnoPulse owner has not recorded an explicit acceptance. |
 
-The implementation base is `0af52a6a6db0a15e1f911154c05ff60da8b727b0`.
-The controller must replace this branch-local record with the merged commit when
-publishing the index. A merge or a successful deploy is not an acceptance.
+The implementation base was `0af52a6a6db0a15e1f911154c05ff60da8b727b0`; the index
+was merged at `082daa2ef82095ca87fe016e848ff2cfddbb4559`. A merge or a successful
+deploy is not an acceptance.
 
 The only allowed scope is this Markdown index. It does not change application code,
 IAM, OpenTofu, workflows, data, feature flags, DNS, or a production host.
