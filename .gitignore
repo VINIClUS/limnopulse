@@ -5,6 +5,7 @@ __pycache__/
 .serena/
 .Codex/
 .worktrees/
+.claude/
 .pytest_cache/
 # ops/e2e harness runs (Node-RED user dir, MQTTX capture, verdicts)
 .e2e-out/
